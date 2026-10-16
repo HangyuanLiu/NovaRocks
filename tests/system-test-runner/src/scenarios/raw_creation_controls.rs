@@ -39,8 +39,7 @@ impl RawCreationObservationOwner {
     pub fn freeze(
         &self,
         cluster_size: usize,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
         let mut owner = self
@@ -49,14 +48,13 @@ impl RawCreationObservationOwner {
             .map_err(|_| anyhow::anyhow!("raw creation observation owner poisoned"))?;
         ensure!(owner.is_none(), "raw creation observation already frozen");
         ensure!(cluster_size == 3, "raw creation requires native 1FE+3BE");
-        let controlled =
-            controlled.context("raw Task markers require an explicit --test-control-binary")?;
+        let controlled = binary;
         // Allocate through the authoritative fixture producer, exactly once.
         let identity = RawBackendSession::declare_identity();
         let mut plan = ClusterTestSessionPlan::new(deadline)?;
         let root = plan.reserve_transport("native-raw-observations")?;
         let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
-        plan.authorize_ordinary_launch(&frontend, ordinary.to_path_buf())?;
+        plan.authorize_ordinary_launch(&frontend, binary.to_path_buf())?;
         let backend = plan.reserve_launch(RoleSlot::Backend(0))?;
         let parameters = json!({"action":"grpc-fragment","root":root,"backend_index":0,
             "target_session_id":backend.session_id,"max_events":16384,
@@ -80,7 +78,7 @@ impl RawCreationObservationOwner {
         plan.set_launch_binary(&backend, controlled.to_path_buf())?;
         for index in 1..cluster_size {
             let reference = plan.reserve_launch(RoleSlot::Backend(index))?;
-            plan.authorize_ordinary_launch(&reference, ordinary.to_path_buf())?;
+            plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
         }
         plan.validate_selected_intents(cluster_size)?;
         *owner = Some(Frozen {
@@ -143,7 +141,7 @@ mod tests {
         let binary = std::env::current_exe().unwrap();
         let owner = RawCreationObservationOwner::default();
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        let plan = owner.freeze(3, &binary, Some(&binary), deadline).unwrap();
+        let plan = owner.freeze(3, &binary, deadline).unwrap();
         let original = owner.0.lock().unwrap().as_ref().unwrap().identity;
         assert_eq!(original.0.hi, 0x5b5b);
         assert_eq!(owner.take_identity(plan.deadline()).unwrap(), original);

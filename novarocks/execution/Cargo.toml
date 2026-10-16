@@ -11,13 +11,10 @@ workspace = true
 doctest = false
 
 [features]
-normal-build = ["novarocks-failpoint?/normal-build"]
-test-controls = ["dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
-test-support = []
 core-pipeline-integration = []
 
 [dependencies]
-novarocks-failpoint = { workspace = true, optional = true }
+novarocks-failpoint = { workspace = true }
 novarocks-result-contract.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
@@ -63,7 +60,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
-novarocks-functions = { workspace = true, features = ["test-support"] }
+novarocks-functions = { workspace = true }
 prost.workspace = true
 novarocks-workload-control.workspace = true
 novarocks-query-application.workspace = true
@@ -72,6 +69,6 @@ novarocks-local-compiler.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
-novarocks-plan-codec = { workspace = true, features = ["test-support"] }
-novarocks-sql = { workspace = true, features = ["test-support"] }
+novarocks-plan-codec = { workspace = true }
+novarocks-sql = { workspace = true }
 novarocks-parser.workspace = true

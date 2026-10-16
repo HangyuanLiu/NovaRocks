@@ -8,16 +8,14 @@ license.workspace = true
 workspace = true
 
 [features]
-normal-build = ["novarocks-query-application/normal-build", "novarocks-failpoint?/normal-build"]
-test-controls = ["novarocks-query-application/test-controls", "dep:novarocks-failpoint", "novarocks-failpoint/test-controls", "dep:serde", "dep:serde_json"]
 # Private finite Closing pressure instrumentation; default-off and independent of the exact fixture.
 mem-1-m07-closing-pressure = ["dep:sha2"]
 mem-1-m07-exact-mysql-write = ["dep:sha2", "novarocks-query-application/mem-1-m07-exact-mysql-write"]
 
 [dependencies]
-serde = { workspace = true, optional = true, features = ["derive"] }
-serde_json = { workspace = true, optional = true }
-novarocks-failpoint = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+novarocks-failpoint = { workspace = true }
 async-trait.workspace = true
 arrow.workspace = true
 libc.workspace = true
@@ -37,7 +35,7 @@ tracing.workspace = true
 novarocks-execution-contract.workspace = true
 sha2.workspace = true
 novarocks-parser.workspace = true
-novarocks-query-application = { workspace = true, features = ["test-support"] }
+novarocks-query-application = { workspace = true }
 novarocks-sql.workspace = true
 novarocks-user-error.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }

@@ -4324,6 +4324,18 @@ version = "0.1.0"
 name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "mysql",
+ "novarocks-failpoint",
+ "novarocks-server-application",
+ "novarocks-test-support",
+ "tempfile",
+]
+
+[[package]]
+name = "novarocks-server-application"
+version = "0.1.0"
+dependencies = [
  "anyhow",
  "arrow",
  "arrow-schema",
@@ -4431,7 +4443,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-sql-test-runner"
+name = "novarocks-sql-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "novarocks-sql-test-library",
+]
+
+[[package]]
+name = "novarocks-sql-test-library"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4566,6 +4586,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-system-test-cli"
+version = "0.1.0"
+dependencies = [
+ "novarocks-system-test-runner",
+]
+
+[[package]]
 name = "novarocks-system-test-runner"
 version = "0.1.0"
 dependencies = [
@@ -4653,7 +4680,7 @@ dependencies = [
  "bytes",
  "futures",
  "novarocks-fs",
- "novarocks-server",
+ "novarocks-server-application",
  "novarocks-spi",
  "opendal",
  "parquet",

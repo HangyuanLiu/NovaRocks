@@ -465,7 +465,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                         novarocks_sql::compiler::SessionOptimizerSettings::default(),
                         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                     ).with_result_capacity(capacity.clone()).map_err(|error| Self::failure(error.to_string()))?;
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 let execution = match phase
                     .take_test_statement_nomination()
                     .map_err(|error| Self::failure(error.to_string()))?

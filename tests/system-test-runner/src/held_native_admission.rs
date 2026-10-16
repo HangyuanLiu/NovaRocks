@@ -298,6 +298,7 @@ pub(crate) fn admit(
     binding_path: &Path,
     server: &Path,
     base_config: &Path,
+    build: &crate::build_information::BuildInformation,
 ) -> Result<AdmittedHeldNativeRun> {
     let deadline = Instant::now() + Duration::from_millis(PREP_MS); // one prep clock, no scene20 renewal
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -354,6 +355,7 @@ pub(crate) fn admit(
         &original_owner.canonical,
         &server_owner.canonical,
         &config_owner.canonical,
+        build,
         deadline,
     )?;
     ensure!(

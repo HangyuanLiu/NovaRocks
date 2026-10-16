@@ -88,7 +88,7 @@ pub struct MvRewriteSelection {
 }
 
 impl MvRewriteSelection {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn unverified(name: String) -> Self {
         Self {
             name,

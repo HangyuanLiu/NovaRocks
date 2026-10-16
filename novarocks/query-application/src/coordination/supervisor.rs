@@ -622,7 +622,7 @@ async fn run_logical_execution(
         frontend_process_id,
         &prepared.eligible_backends,
         &prepared.scheduling,
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         prepared
             .owner
             .test_preferred_backend_process(initial_execution),
@@ -1714,7 +1714,7 @@ async fn prepare_native_attempt(
         frontend_process_id,
         &prepared.eligible_backends,
         &prepared.scheduling,
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         prepared.owner.test_preferred_backend_process(execution),
     )
     .map_err(|error| {

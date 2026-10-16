@@ -271,7 +271,7 @@ pub(crate) fn build_attempt_schedule(
     frontend_process_id: FrontendProcessId,
     eligible_backends: &[BackendProcessId],
     plan: &ExecutionSchedulingFacts,
-    #[cfg(feature = "test-controls")] preferred_process: Result<Option<BackendProcessId>, String>,
+    #[cfg(novarocks_dev_controls)] preferred_process: Result<Option<BackendProcessId>, String>,
 ) -> Result<AttemptSchedule, AttemptScheduleError> {
     if eligible_backends.is_empty() {
         return Err(AttemptScheduleError::new(
@@ -377,7 +377,7 @@ pub(crate) fn build_attempt_schedule(
     counts.insert(plan.execution_anchor_fragment_id, 1);
 
     let preferred = (execution.query_id().low() as usize) % backend_count;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let preferred = match preferred_process.map_err(AttemptScheduleError::new)? { Some(process) => backends.iter().position(|backend| *backend == process).ok_or_else(|| AttemptScheduleError::new("the exact controlled placement process is absent from the retained eligible set"))?, None => preferred };
     let mut next_stage = 1_u32;
     let mut next_task = 1_u32;
@@ -721,7 +721,7 @@ mod tests {
             frontend,
             backends,
             &scan_edge_inputs(work),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             Ok(None),
         )
         .unwrap()
@@ -849,7 +849,7 @@ mod tests {
             frontend,
             &backends,
             &scheduling,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             Ok(None),
         )
         .unwrap();
@@ -1053,7 +1053,7 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn controlled_single_fragment_placement_requires_the_retained_exact_process() {
         let execution =
             QueryExecutionId::new(QueryId::new(53, 59), AttemptId::new(1).unwrap()).unwrap();

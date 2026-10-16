@@ -103,7 +103,7 @@ impl FrontendMvProductAdapter {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 test_controls: readiness.test_controls_owner(),
             },
             readiness: Arc::clone(&readiness),
@@ -600,7 +600,7 @@ fn execute_scheduled_refresh(
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     result_capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> ScheduledRefreshDisposition {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if let Some(controls) = dependencies.readiness.test_controls() {
         match controls.scheduler(&request.target, &cancellation) {
             Ok(true) => return ScheduledRefreshDisposition::ShutdownCancelled(None),

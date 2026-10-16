@@ -349,7 +349,7 @@ Tests are layered by owner. Pick the layer that owns what you changed:
 | --- | --- |
 | Owner-local component tests | `cargo test -p <crate>` |
 | SQL / result / plan-shape contracts | `novarocks-sql-test` runner, see `tests/sql/README.md` |
-| Real 1FE+3BE lifecycle, faults, recovery | `cargo run -p novarocks-system-test-runner -- --list` |
+| Real 1FE+3BE lifecycle, faults, recovery | `cargo run -p novarocks-system-test-cli -- --list` |
 | Server binary composition, readiness, signal | `cargo test -p novarocks-server --test server_binary_smoke` |
 | Process, log and TCP-port mechanics | `cargo test -p novarocks-test-support` |
 

@@ -84,7 +84,6 @@ struct LaunchIntent {
     required_capabilities: Vec<(String, String)>,
     authorized: bool,
     ordinary: bool,
-    inert_controlled: bool,
     binary: Option<PathBuf>,
 }
 
@@ -235,7 +234,6 @@ impl ClusterTestSessionPlan {
                 required_capabilities: vec![],
                 authorized: false,
                 ordinary: false,
-                inert_controlled: false,
                 binary: None,
             });
         Ok(reference)
@@ -278,24 +276,11 @@ impl ClusterTestSessionPlan {
         reference: &RoleLaunchReference,
         binary: PathBuf,
     ) -> Result<()> {
-        self.set_launch_binary(reference, binary)?;
-        let intent = self
-            .intents
-            .values_mut()
-            .flat_map(|queue| queue.iter_mut())
-            .find(|intent| {
-                intent.reference.session_id == reference.session_id
-                    && intent.reference.process_receipt == reference.process_receipt
-            })
-            .context("unknown reserved ordinary role launch")?;
-        ensure!(!intent.authorized, "role launch was already authorized");
-        intent.ordinary = true;
-        intent.authorized = true;
-        Ok(())
+        self.authorize_uncontrolled_launch(reference, binary, vec![])
     }
-    /// A compiled control artifact with no session or receiver authority.
-    /// This preserves an exact variant artifact while requiring its self-report.
-    pub fn authorize_inert_controlled_launch(
+    /// Freeze a launch with no role session. Compiled capabilities are facts,
+    /// and required capabilities can bind a variant without granting actions.
+    pub fn authorize_uncontrolled_launch(
         &mut self,
         reference: &RoleLaunchReference,
         binary: PathBuf,
@@ -307,7 +292,7 @@ impl ClusterTestSessionPlan {
                 .all(|(owner, capability)| !owner.is_empty() && !capability.is_empty()),
             "invalid required build capability"
         );
-        self.authorize_ordinary_launch(reference, binary)?;
+        self.set_launch_binary(reference, binary)?;
         let intent = self
             .intents
             .values_mut()
@@ -316,9 +301,11 @@ impl ClusterTestSessionPlan {
                 intent.reference.session_id == reference.session_id
                     && intent.reference.process_receipt == reference.process_receipt
             })
-            .context("unknown inert controlled launch")?;
-        intent.inert_controlled = true;
+            .context("unknown reserved uncontrolled role launch")?;
+        ensure!(!intent.authorized, "role launch was already authorized");
+        intent.ordinary = true;
         intent.required_capabilities = required_capabilities;
+        intent.authorized = true;
         Ok(())
     }
     pub fn set_launch_binary(
@@ -379,7 +366,6 @@ impl ClusterTestSessionPlan {
                     intents.iter().map(move |intent|
             serde_json::json!({"role":role.label(),"session_id":intent.reference.session_id,
                 "process_receipt":intent.reference.process_receipt,"ordinary":intent.ordinary,
-                "inert_controlled":intent.inert_controlled,
                 "binary":intent.binary,"grants":intent.declaration.domain_grants.iter().map(|grant|
                     serde_json::json!({"domain":grant.domain,"grant_id":grant.grant_id,
                         "action":grant.parameters.get("action")})).collect::<Vec<_>>()})
@@ -471,7 +457,7 @@ impl ClusterTestSessionPlan {
             .context("role restart exceeds its predeclared launch intents")?;
         check_binary(
             binary,
-            !intent.ordinary || intent.inert_controlled,
+            !intent.ordinary,
             &intent.required_capabilities,
             deadline,
             evidence,
@@ -1064,13 +1050,11 @@ fn validate_binary_info(
         "build-info is not the supported Server identity"
     );
     ensure!(
-        value["build_kind"]
-            == if controlled {
-                "test-controls"
-            } else {
-                "normal-build"
-            },
-        "binary build kind does not match explicit role launch intent"
+        matches!(
+            value["build_kind"].as_str(),
+            Some("normal-build" | "test-controls")
+        ),
+        "binary omitted a supported actual build kind"
     );
     let owners = value["capabilities"]
         .as_array()
@@ -1091,12 +1075,6 @@ fn validate_binary_info(
             capabilities.iter().all(Value::is_string),
             "build-info contains an invalid capability"
         );
-        if !controlled {
-            ensure!(
-                capabilities.is_empty(),
-                "ordinary executable includes a controlled capability"
-            );
-        }
     }
     if controlled {
         ensure!(
@@ -1307,15 +1285,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_require_the_actual_explicit_build_kind_and_owner() {
+    fn compiled_capabilities_do_not_grant_runtime_authority() {
         validate_binary_info(&info("normal-build", vec![]), false, &[]).unwrap();
-        assert!(
-            validate_binary_info(&info("normal-build", vec!["test-controls"]), false, &[]).is_err()
-        );
-        assert!(
-            validate_binary_info(&info("test-controls", vec!["test-controls"]), false, &[])
-                .is_err()
-        );
+        validate_binary_info(&info("test-controls", vec!["test-controls"]), false, &[]).unwrap();
+        assert!(validate_binary_info(&info("normal-build", vec![]), true, &[]).is_err());
+        assert!(validate_binary_info(&info("runner", vec![]), false, &[]).is_err());
         assert!(
             validate_binary_info(
                 &info("test-controls", vec!["test-controls"]),
@@ -1327,7 +1301,6 @@ mod tests {
             )
             .is_err()
         );
-        // A truthful unknown profile remains usable for mechanism checks and is not promoted to release.
         validate_binary_info(&info("test-controls", vec!["test-controls"]), true, &[]).unwrap();
     }
     #[test]
@@ -1395,7 +1368,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut plan = ClusterTestSessionPlan::new(deadline).unwrap();
         let reference = plan.reserve_launch(RoleSlot::Backend(0)).unwrap();
-        plan.authorize_inert_controlled_launch(
+        plan.authorize_uncontrolled_launch(
             &reference,
             binary.clone(),
             vec![("novarocks-server".into(), "test-controls".into())],
@@ -1442,7 +1415,8 @@ mod tests {
                     &directory.path().join("normal.json"),
                     deadline
                 )
-                .is_err()
+                .unwrap()
+                .is_none()
         );
         assert!(normal.active.is_empty());
         assert!(!reference.process_receipt.exists());

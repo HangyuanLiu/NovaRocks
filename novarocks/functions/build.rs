@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "../../build-support/development.rs"]
+mod development;
+
 #[path = "src/scalar_resources/profile.rs"]
 mod scalar_arrow_profile;
 
 fn main() {
+    development::emit();
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed=src/scalar_resources/profile.rs");

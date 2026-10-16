@@ -905,7 +905,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
     session_catalog_resolver: SessionCatalogService,
     query_compiler: FrontendQueryCompiler,
@@ -935,7 +935,7 @@ pub struct FrontendQueryService {
 }
 
 impl FrontendQueryService {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_statement_observation(
         mut self,
         owner: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
@@ -974,7 +974,7 @@ impl FrontendQueryService {
         serving_admission: FrontendServingAdmission,
     ) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             statement_observation: None,
             session_catalog_resolver,
             query_compiler,
@@ -1410,13 +1410,13 @@ impl FrontendQuerySession {
         );
         let compiler = self.service.query_compiler.clone();
         let preparation_scope = preparation_scope.clone();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let observation = self
             .service
             .statement_observation
             .as_ref()
             .and_then(|owner| owner.bound_statement(statement_token));
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let rewrite_target = observation
             .as_ref()
             .and_then(|observation| observation.statement_target())
@@ -1440,7 +1440,7 @@ impl FrontendQuerySession {
                     &context,
                     Some(query_options),
                     &preparation_scope,
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     rewrite_target.as_ref(),
                 )
             },
@@ -1513,7 +1513,7 @@ impl FrontendQuerySession {
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(owner) = &self.service.statement_observation {
             if let Err(error) = owner.bind_statement(statement.token(), &source) {
                 return Ok(self.governed_typed_error(internal_error(error), statement));
@@ -1670,7 +1670,7 @@ impl FrontendQuerySession {
                         read,
                         child,
                         result_window,
-                        #[cfg(feature = "test-controls")]
+                        #[cfg(novarocks_dev_controls)]
                         self.service
                             .statement_observation
                             .as_ref()
@@ -1735,7 +1735,7 @@ impl FrontendQuerySession {
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(owner) = &self.service.statement_observation {
             if let Err(error) = owner.bind_statement(statement.token(), &sql) {
                 return Ok(self.governed_typed_error(internal_error(error), statement));
@@ -1807,7 +1807,7 @@ impl FrontendQuerySession {
                 read,
                 owner,
                 statement.result_window_alias(),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 self.service
                     .statement_observation
                     .as_ref()
@@ -1904,7 +1904,7 @@ impl FrontendQuerySession {
                 )
         }
         .map_err(|error| self.governed_statement_begin_error(error))?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let observation = match self
             .service
             .statement_observation
@@ -2045,8 +2045,8 @@ impl FrontendQuerySession {
                 }
             };
         let statement_token = statement.token();
-        #[cfg(feature = "test-controls")]
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
+        #[cfg(novarocks_dev_controls)]
         if let Some(nomination) = observation.as_ref().and_then(|handle| handle.nomination()) {
             let installed =
                 connector_context.request_scope_extension_or_insert_with(|| nomination.clone());
@@ -2057,7 +2057,7 @@ impl FrontendQuerySession {
                 ));
             }
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let context = match observation.as_ref().and_then(|handle| handle.nomination()) {
             Some(nomination) => {
                 match context.with_test_statement_nomination(Arc::new(nomination)) {
@@ -2113,7 +2113,7 @@ impl FrontendQuerySession {
                                     &context,
                                     Some(query_options),
                                     &preparation_scope,
-                                    #[cfg(feature = "test-controls")]
+                                    #[cfg(novarocks_dev_controls)]
                                     None,
                                 )
                                 .map_err(|error| match error {

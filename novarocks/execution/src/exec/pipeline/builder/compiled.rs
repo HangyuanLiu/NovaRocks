@@ -428,7 +428,7 @@ fn compiled_runtime_filter_consumers_selected(
     .map(|consumers| Some(Arc::new(consumers)))
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[expect(
     clippy::too_many_arguments,
     reason = "The test port preserves the production graph builder inputs"

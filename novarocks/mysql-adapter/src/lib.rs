@@ -17,14 +17,9 @@
 
 //! MySQL protocol adaptation for Query Application contracts.
 
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
-#[cfg(all(feature = "mem-1-m07-closing-pressure", not(feature = "test-controls")))]
+#[cfg(all(feature = "mem-1-m07-closing-pressure", not(novarocks_dev_controls)))]
 compile_error!("mem-1-m07-closing-pressure requires test-controls");
-#[cfg(all(
-    feature = "mem-1-m07-exact-mysql-write",
-    not(feature = "test-controls")
-))]
+#[cfg(all(feature = "mem-1-m07-exact-mysql-write", not(novarocks_dev_controls)))]
 compile_error!("mem-1-m07-exact-mysql-write requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
@@ -32,7 +27,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
             #[cfg(feature = "mem-1-m07-closing-pressure")]
             "mem-1-m07-closing-pressure",
@@ -184,5 +179,12 @@ pub use startup_profile::{
 #[cfg(feature = "mem-1-m07-closing-pressure")]
 pub use query_application_shim::serve_query_application_mysql_until_drain_then_shutdown_pressure as closing_pressure_fixture_listener;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod test_fixture_authorization;
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

@@ -166,7 +166,7 @@ impl TaskPreparationStopView {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn unstopped_for_test() -> Self {
         CreationCell::new().preparation_stop_view(std::time::Duration::from_millis(1))
     }

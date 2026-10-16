@@ -35,6 +35,7 @@ from pathlib import Path
 
 PROVIDER = "novarocks-connector-iceberg"
 SERVER = "novarocks-server"
+SERVER_APPLICATION = "novarocks-server-application"
 FRONTEND_APPLICATION = "novarocks-frontend-application"
 REST_SDK = "iceberg-catalog-rest"
 
@@ -150,7 +151,7 @@ def verify_roles(metadata):
     if direct & provider_direct:
         fail(f"{FRONTEND_APPLICATION} must not directly depend on {PROVIDER}")
 
-    server = package(metadata, SERVER)
+    server = package(metadata, SERVER_APPLICATION)
     direct = dependency_names(server, {None})
     missing = sorted({PROVIDER, "novarocks-state-store-sqlite"} - direct)
     if missing:

@@ -209,6 +209,7 @@ for forbidden in \
   novarocks-execution \
   novarocks-frontend-application \
   novarocks-server \
+  novarocks-server-application \
   novarocks-sql \
   novarocks-state-store-foundationdb \
   novarocks-state-store-mysql \
@@ -247,7 +248,8 @@ for forbidden in \
   novarocks-frontend-application \
   novarocks-native-adapter \
   novarocks-worker \
-  novarocks-server; do
+  novarocks-server \
+  novarocks-server-application; do
   plan_codec_forbidden="$tmpdir/plan-codec-${forbidden}.json"
   add_normal_resolve_edge novarocks-plan-codec "$forbidden" "$plan_codec_forbidden"
   assert_rejected "$plan_codec_forbidden" \
@@ -316,14 +318,16 @@ assert_rejected "$starrocks_server" \
   "novarocks-connector-starrocks normal dependency closure contains application owners:"
 grep -Fq "novarocks-server" "$starrocks_server.stderr"
 
-server_direct_wire="$tmpdir/server-direct-wire.json"
-jq '
-  (.packages[] | select(.name == "novarocks-server") | .dependencies) += [{
-    name: "novarocks-proto-codec", kind: null, optional: false
-  }]
-' "$base_metadata" >"$server_direct_wire"
-assert_rejected "$server_direct_wire" \
-  "novarocks-server must not directly declare normal wire dependencies: novarocks-proto-codec"
+for owner in novarocks-server novarocks-server-application; do
+  server_direct_wire="$tmpdir/$owner-direct-wire.json"
+  jq --arg owner "$owner" '
+    (.packages[] | select(.name == $owner) | .dependencies) += [{
+      name: "novarocks-proto-codec", kind: null, optional: false
+    }]
+  ' "$base_metadata" >"$server_direct_wire"
+  assert_rejected "$server_direct_wire" \
+    "$owner must not directly declare normal wire dependencies: novarocks-proto-codec"
+done
 
 for forbidden in novarocks-proto-codec novarocks-proto-models novarocks-spi; do
   failpoint_forbidden="$tmpdir/failpoint-${forbidden}.json"
@@ -347,13 +351,14 @@ assert_rejected "$failpoint_typed_feature" \
   "novarocks-failpoint typed normal dependency closure contains forbidden packages:"
 grep -Fq "novarocks-spi" "$failpoint_typed_feature.stderr"
 
-# Removing typed's neutral identity activation must remove the resolved edge
-# as well. Keep the optional declaration so this is a coherent feature graph.
+# Removing the neutral identity dependency must remove its activation, declaration
+# and resolved edge, including when the declaration is unconditional.
 failpoint_missing_types="$tmpdir/failpoint-missing-types.json"
 drop_normal_resolve_edge novarocks-failpoint novarocks-types "$failpoint_missing_types"
 jq '
-  (.packages[] | select(.name == "novarocks-failpoint") | .features.typed) |= map(
-    select(. != "dep:novarocks-types")
+  (.packages[] | select(.name == "novarocks-failpoint")) |= (
+    .features.typed |= map(select(. != "dep:novarocks-types")) |
+    .dependencies |= map(select(.name != "novarocks-types"))
   )
 ' "$failpoint_missing_types" >"$tmpdir/failpoint-missing-types-consistent.json"
 mv "$tmpdir/failpoint-missing-types-consistent.json" "$failpoint_missing_types"

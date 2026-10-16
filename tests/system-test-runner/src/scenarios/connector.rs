@@ -179,9 +179,7 @@ impl Scenario for Uea5dMultiSplitDop {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -191,8 +189,7 @@ impl Scenario for Uea5dMultiSplitDop {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -330,9 +327,7 @@ impl Scenario for TypedReadData {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -342,8 +337,7 @@ impl Scenario for TypedReadData {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -490,9 +484,7 @@ impl Scenario for DistributedReaderCancel {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -502,8 +494,7 @@ impl Scenario for DistributedReaderCancel {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -615,9 +606,7 @@ impl Scenario for DistributedReaderKillConnection {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -627,8 +616,7 @@ impl Scenario for DistributedReaderKillConnection {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -756,9 +744,7 @@ impl Scenario for CatalogReadyLifecycle {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -768,8 +754,7 @@ impl Scenario for CatalogReadyLifecycle {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -1167,9 +1152,7 @@ impl Scenario for CatalogReadWriteRuntime {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -1179,8 +1162,7 @@ impl Scenario for CatalogReadWriteRuntime {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -1383,9 +1365,7 @@ impl Scenario for VendedRestReadWritePem {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -1395,8 +1375,7 @@ impl Scenario for VendedRestReadWritePem {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -2212,9 +2191,7 @@ impl Scenario for VendedRestRefreshPem {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (scope, endpoint) = {
@@ -2257,8 +2234,7 @@ impl Scenario for VendedRestRefreshPem {
         }];
         let (plan, inputs) = storage_control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             authority,
             &queries,
@@ -2345,7 +2321,7 @@ impl Scenario for VendedRestRefreshPem {
         ));
         await_resource_convergence(context, &baseline, "vended target priming read")?;
 
-        context.action("let the target consumer's material expire between two ordinary reads");
+        context.action("let the target consumer's material expire between two binary reads");
         thread::sleep(Duration::from_secs(7).min(context.remaining("age vended material")?));
         let renewal_baseline = self.vended_proxy_audit()?;
         {
@@ -2690,9 +2666,7 @@ impl Scenario for VendedCredentialFaultPem {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (scope, mut endpoint) = self.with_fixture(|fixture| {
@@ -2750,8 +2724,7 @@ impl Scenario for VendedCredentialFaultPem {
         }
         let (plan, inputs) = storage_control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             authority,
             &queries,
@@ -3295,9 +3268,7 @@ impl Scenario for CatalogFeRestartCache {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -3307,8 +3278,7 @@ impl Scenario for CatalogFeRestartCache {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -3500,9 +3470,7 @@ impl Scenario for StaticCredentialGeneration {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -3512,8 +3480,7 @@ impl Scenario for StaticCredentialGeneration {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -3556,9 +3523,7 @@ impl Scenario for AccessDomainCacheIsolation {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -3568,8 +3533,7 @@ impl Scenario for AccessDomainCacheIsolation {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -4147,9 +4111,7 @@ impl Scenario for CatalogVersionDrain {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
@@ -4159,8 +4121,7 @@ impl Scenario for CatalogVersionDrain {
                 fe_restart,
                 &be_restarts,
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)

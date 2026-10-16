@@ -483,7 +483,7 @@ pub fn builtin_sql_function_catalog() -> &'static dyn crate::compiler::SqlFuncti
     builtin_engine_function_catalog()
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_resolved_aggregate(
     name: &str,
     argument_types: &[DataType],
@@ -519,7 +519,7 @@ pub(crate) fn test_resolved_aggregate(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_function_catalog_snapshot() -> Arc<dyn crate::compiler::SqlFunctionCatalog> {
     builtin_sql_function_catalog().snapshot()
 }

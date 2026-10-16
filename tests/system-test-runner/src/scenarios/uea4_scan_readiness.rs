@@ -754,17 +754,14 @@ impl Scenario for ScanProducerReadiness {
         _: &ScenarioLaunchConfig,
         _: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             scan_specs(readiness_sqls(), cluster_size),
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -1000,17 +997,14 @@ impl Scenario for ScanProducerCancel {
         _: &ScenarioLaunchConfig,
         _: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             scan_specs(candidate_sqls(), cluster_size),
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -1070,7 +1064,6 @@ mod tests {
                 &[],
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .unwrap();
@@ -1104,7 +1097,6 @@ mod tests {
                 &[],
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .unwrap();

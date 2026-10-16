@@ -250,9 +250,9 @@ pub struct NativeQueryContextHost {
     catalog_install_runtime: BackendDataRuntime,
     contexts: Mutex<HostContexts>,
     catalog_metrics_publish: Mutex<()>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
 }
 
@@ -303,14 +303,14 @@ impl NativeQueryContextHost {
             catalog_install_runtime,
             contexts: Mutex::new(HostContexts::default()),
             catalog_metrics_publish: Mutex::new(()),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observations: None,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
         controls: Option<Arc<crate::test_controls::NativeTestControls>>,
@@ -318,7 +318,7 @@ impl NativeQueryContextHost {
         self.test_controls = controls;
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_observation_controls(
         mut self,
         controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
@@ -382,7 +382,7 @@ impl NativeQueryContextHost {
         facts.participant.clone()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn wait_for_accepted_contribution_retry_rendezvous(&self, context: QueryContextRef) {
         let participant = {
             let contexts = self
@@ -749,7 +749,7 @@ impl NativeQueryContextHost {
         // this establish is a cold install. That is the only state the
         // runner-owned rendezvous below is about, and it is the state the
         // marker names.
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.observations.as_deref() {
             if let Some(observer) = controls
                 .observation_for("catalog-lifecycle", execution_id)
@@ -803,7 +803,7 @@ impl NativeQueryContextHost {
 
         for properties in catalogs {
             let factories = Arc::clone(&self.execution_role_binding_factories);
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             let observation = self
                 .observations
                 .as_deref()
@@ -825,7 +825,7 @@ impl NativeQueryContextHost {
                         factories
                             .bind(
                                 properties,
-                                #[cfg(feature = "test-controls")]
+                                #[cfg(novarocks_dev_controls)]
                                 observation.clone(),
                             )
                             .map_err(CatalogManagerError::from_materialization)
@@ -972,7 +972,7 @@ impl QueryContextHost for NativeQueryContextHost {
     }
 
     fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         self.wait_for_accepted_contribution_retry_rendezvous(context);
         let installed = {
             let mut contexts = self
@@ -1249,7 +1249,7 @@ fn sealed_participant() -> HostRejection {
 /// The identity is printed in the task protocol's marker shape -- the same
 /// `execution_id=<high>:<low>:<attempt>` word the operation markers use -- so
 /// one execution's evidence can be selected across all of them.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_catalog_install_started(
     observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
     execution_id: QueryExecutionId,
@@ -2931,7 +2931,7 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
             return false;
         };
         let sink = TaskRuntimeFilterFeedbackEgress::new(carrier, reporter.clone());
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let sink = {
             let sink = if let Some(controls) = self.test_controls.clone() {
                 sink.with_test_controls(controls)

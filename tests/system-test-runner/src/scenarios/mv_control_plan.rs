@@ -173,12 +173,11 @@ fn statement_observer(plan: &ClusterTestSessionPlan) -> Result<DomainGrant> {
     })
 }
 
-/// Empty intent slots select the ordinary successor explicitly. No action is
+/// Empty intent slots select an uncontrolled successor explicitly. No action is
 /// inferred from a scenario name or an inherited child environment.
 pub(in crate::scenarios) fn plan(
     cluster_size: usize,
-    ordinary_binary: &Path,
-    controlled_binary: Option<&Path>,
+    binary: &Path,
     original_deadline: Instant,
     frontend_launches: Vec<FeLaunchIntent>,
 ) -> Result<ClusterTestSessionPlan> {
@@ -192,7 +191,7 @@ pub(in crate::scenarios) fn plan(
         let reference = plan.reserve_launch(RoleSlot::Frontend)?;
         let grants = match intent {
             FeLaunchIntent::Ordinary => {
-                plan.authorize_ordinary_launch(&reference, ordinary_binary.to_path_buf())?;
+                plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
                 continue;
             }
             FeLaunchIntent::MvActions(grants) => grants,
@@ -205,14 +204,12 @@ pub(in crate::scenarios) fn plan(
             !grants.is_empty(),
             "controlled MV launch has no explicit action"
         );
-        let binary =
-            controlled_binary.context("selected MV action requires a test-controls binary")?;
         plan.set_launch_binary(&reference, binary.to_path_buf())?;
         plan.authorize_launch(&reference, grants, mv_requirements())?;
     }
     for index in 0..cluster_size {
         let reference = plan.reserve_launch(RoleSlot::Backend(index))?;
-        plan.authorize_ordinary_launch(&reference, ordinary_binary.to_path_buf())?;
+        plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
     }
     plan.validate_selected_intents(cluster_size)?;
     Ok(plan)
@@ -220,15 +217,13 @@ pub(in crate::scenarios) fn plan(
 
 pub(in crate::scenarios) fn first_refresh_plan(
     cluster_size: usize,
-    ordinary_binary: &Path,
-    controlled_binary: Option<&Path>,
+    binary: &Path,
     original_deadline: Instant,
 ) -> Result<ClusterTestSessionPlan> {
     ensure!(
         cluster_size == 3,
         "MV first refresh requires native 1FE+3BE"
     );
-    let binary = controlled_binary.context("MV first refresh requires a test-controls binary")?;
     let mut plan = ClusterTestSessionPlan::new(original_deadline)?;
     let root = plan.reserve_transport("query-lifecycle-faults")?;
     let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
@@ -267,7 +262,7 @@ pub(in crate::scenarios) fn first_refresh_plan(
     )?;
     for index in 1..cluster_size {
         let reference = plan.reserve_launch(RoleSlot::Backend(index))?;
-        plan.authorize_ordinary_launch(&reference, ordinary_binary.to_path_buf())?;
+        plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
     }
     plan.validate_selected_intents(cluster_size)?;
     Ok(plan)

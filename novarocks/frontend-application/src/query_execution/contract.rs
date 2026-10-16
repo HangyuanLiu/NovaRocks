@@ -215,7 +215,7 @@ pub enum DistributedQueryIntent {
 /// unrelated prepared/native artifacts or replace its cancellation/completion
 /// capabilities.
 pub struct DistributedQueryRequest {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     result_capacity:
@@ -263,7 +263,7 @@ impl RestartableReadExecution {
         execution: &QueryExecutionContext,
     ) -> DistributedQueryRequest {
         DistributedQueryRequest {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: execution.test_statement_nomination().cloned(),
             result_capacity: execution.result_capacity().cloned(),
             cow_match: None,
@@ -394,7 +394,7 @@ impl DistributedQueryRequest {
             } => (description, artifacts, options),
         };
         DistributedQueryRequestParts {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: self.test_statement_nomination,
             result_capacity: self.result_capacity,
             cow_match: self.cow_match,
@@ -415,7 +415,7 @@ impl DistributedQueryRequest {
 /// Consuming frontend handoff. There is deliberately no constructor,
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     pub(crate) result_capacity:
@@ -488,7 +488,7 @@ pub(crate) fn build_request_from_finalized_execution(
         }
     };
     Ok(DistributedQueryRequest {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         test_statement_nomination: execution.test_statement_nomination().cloned(),
         result_capacity: execution.result_capacity().cloned(),
         cow_match: None,

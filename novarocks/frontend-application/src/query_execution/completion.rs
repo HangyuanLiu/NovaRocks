@@ -67,13 +67,13 @@ pub struct QueryAttemptReservation {
     execution_id: QueryExecutionId,
     credential_collector: Arc<AttemptCredentialLeaseCollector>,
     request_scope: ConnectorRequestScope,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_nomination:
         std::sync::OnceLock<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
 }
 
 impl QueryAttemptReservation {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn test_statement_nomination(
         &self,
     ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
@@ -117,7 +117,7 @@ impl QueryAttemptReservation {
             execution_id,
             credential_collector: AttemptCredentialLeaseCollector::new(execution_id),
             request_scope: ConnectorRequestScope::new(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_nomination: std::sync::OnceLock::new(),
         })
     }
@@ -148,7 +148,7 @@ impl QueryAttemptReservation {
     pub(crate) fn connector_request_context(
         &self,
         context: ConnectorRequestContext,
-        #[cfg(feature = "test-controls")] nomination: Option<
+        #[cfg(novarocks_dev_controls)] nomination: Option<
             &Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
         >,
     ) -> Result<ConnectorRequestContext, String> {
@@ -156,7 +156,7 @@ impl QueryAttemptReservation {
             .with_request_scope(self.request_scope.clone())
             .with_storage_resolver(self.credential_storage_resolver())
             .with_vended_credential_lease_sink(self.credential_lease_sink());
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(nomination) = nomination {
             nomination.validate().map_err(|error| error.to_string())?;
             if let Err(candidate) = self.test_nomination.set(nomination.clone()) {

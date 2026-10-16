@@ -47,7 +47,8 @@ fn test_execution_function_set()
 fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
     let control_grpc_port = unused_port();
     BackendServerConfig {
-        #[cfg(feature = "test-controls")]
+        build_identity: "fixture-backend-build".to_owned(),
+        #[cfg(novarocks_dev_controls)]
         test_session: None,
         memory_authority: novarocks_native_adapter::backend_test_support::test_memory_authority(),
         bind_host: "127.0.0.1".to_string(),

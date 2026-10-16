@@ -33,7 +33,7 @@ futures.workspace = true
 opendal = { workspace = true, features = ["services-oss", "services-fs", "services-s3"] }
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 novarocks-fs.workspace = true
-novarocks-server.workspace = true
+novarocks-server-application.workspace = true
 novarocks-spi.workspace = true
 
 [lints]

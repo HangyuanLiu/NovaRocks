@@ -136,7 +136,7 @@ def verify_source(source_root):
     for relative in LEGACY_PATHS:
         if (source_root / relative).exists():
             fail(f"legacy parallel registry must be removed: {relative}")
-    for relative_root in ("novarocks-server/src", "novarocks/native-adapter/src"):
+    for relative_root in ("novarocks-server/src", "novarocks-server/library/src", "novarocks/native-adapter/src"):
         root = source_root / relative_root
         if not root.exists():
             continue
@@ -157,12 +157,16 @@ def verify_source(source_root):
                 f"{STARROCKS_PROVIDER_FACTORY} lacks {marker!r}"
             )
 
-    server_adapter = source_root / SERVER_STARROCKS_FACTORY_ADAPTER
-    if server_adapter.exists():
-        fail(
-            "Server must not define a parallel StarRocks role-binding factory adapter: "
-            f"{SERVER_STARROCKS_FACTORY_ADAPTER}"
-        )
+    server_adapters = (
+        source_root / SERVER_STARROCKS_FACTORY_ADAPTER,
+        source_root / "novarocks-server/library/src/connector_role_binding.rs",
+    )
+    for server_adapter in server_adapters:
+        if server_adapter.exists():
+            fail(
+                "Server must not define a parallel StarRocks role-binding factory adapter: "
+                f"{server_adapter.relative_to(source_root)}"
+            )
 
 
 def main():

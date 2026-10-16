@@ -116,7 +116,7 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
                 execution_runtime: Some(runtime),
                 query_memory: funded.then_some(binding),
                 task_identity: Some(task),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 exchange_test_observer: None,
             },
         )

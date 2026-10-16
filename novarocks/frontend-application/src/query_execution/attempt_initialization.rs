@@ -72,7 +72,7 @@ pub(crate) enum RoundCredentialLeaseSource {
 }
 
 impl RoundCredentialLeaseSource {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn test_statement_nomination(
         &self,
     ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
@@ -113,7 +113,7 @@ impl RoundCredentialLeaseSource {
                 .expect("attempt reservation exists before credential sealing")
                 .connector_request_context(
                     context,
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     None,
                 ),
         }

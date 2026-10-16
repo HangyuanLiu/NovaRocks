@@ -101,31 +101,42 @@ PY_CREATE
 | system [runner.rs `run_one`](../../../tests/system-test-runner/src/runner.rs) → stdout/stderr、场景 evidence 与 runtime/log 根 | 选择由 registry/`--only` 决定；失败保留材料、动作、诊断和 rerun 命令。正常路径先检查 cluster shutdown 与 fixture teardown，追加 cleanup action，再写 Passed；失败路径先写 Failed，随后处理 cleanup 错误 | evidence 的 `exit_code` 按 outcome 合成 0/1，不是每个子进程退出码。Failed 写出时尚未完成 cleanup；cleanup 出错或启动失败可能缺最终 evidence，须保留 runner 原始错误与实际退出事实。打印的旧 rerun 根不能直接复用，复跑换新根。现有 G6b/领域链路承接隔离与终态缺口。 |
 | CI [logging.sh `ci_render_summary`](../../../tools/ci/lib/logging.sh) → `CI_SUMMARY` | 外层传入的 Status、开始/结束/耗时、Repo/Branch/Commit/Run dir、runtime/SQL config 与 MySQL port；stage、system scenario、SQL suite/case rows 的原生 status/耗时/log/artifact；可选 blocked、SQL failure classification、failure tail | summary 是外层记录的汇总，未写入的行不能补为通过；Commit 不等于二进制来源或能力，config 路径不证明有效配置。状态不代替实际进程退出/清理日志、不可变判据引用或共享保留。G2 补构建事实；实际 CI/领域 owner 与 G6b 保留运行边界；共享历史服务尚未交付。 |
 
-Native build identity 仍由 [version/build.rs](../../../novarocks/version/build.rs) 提供，不是能力或发布认证。实际产物的 `--build-info` 由 [Server build_information](../../../novarocks-server/src/build_information.rs) 与两 runner 各自写出；owner 能力来自实际 crate 的编译事实，binary 的 `actual_cfg` 与 build-script 的 package 局部事实分列。未声明 profile、不可观测的最终 LTO/codegen/dependency overrides/额外 flags 保留 null/unknown；不能从源码 HEAD、target 路径、文件名、identity 或 runner profile 补造。`release_certification` 明确为 `not-certified-by-self-report`，字段存在不证明 G2 全部验收通过。
+Native build identity 的来源在薄 CLI build.rs 冻结并注入 Version，不是能力或发布认证。实际产物的 `--build-info` 由 [Server build_information](../../../novarocks-server/library/src/build_information.rs) 与两 runner 各自写出；owner 能力来自实际 crate 的编译事实，binary 的 `actual_cfg` 与 build-script 的 package 局部事实分列。未声明 profile、不可观测的最终 LTO/codegen/dependency overrides/额外 flags 保留 null/unknown；不能从源码 HEAD、target 路径、文件名、identity 或 runner profile 补造。`release_certification` 明确为 `not-certified-by-self-report`，字段存在不证明 G2 全部验收通过。
 
 ## 构建选择与控制授权
 
-[CI build_capabilities](../../../tools/ci/lib/build_capabilities.sh) 复用既有 Cargo 构建入口，普通、控制和兼容性变体各用独立 target。默认 `target/normal`、`target/test-controls`、`target/variants`，可通过 `NOVA_CI_NORMAL_TARGET_DIR`、`NOVA_CI_CONTROL_TARGET_DIR`、`NOVA_CI_VARIANT_TARGET_DIR` 指向已有 owner 管理的缓存；三根不能相同或互相包含。缓存复用不意味着证据根复用，不覆盖普通 binary 后再恢复，也不以清理缓存解决产物选择。
+日常开发只有一个 `dev` 主测试图。规范入口是 [dev-test.sh](../../../tools/ci/dev-test.sh)：`prepare <receipt>` 同次 `cargo build --workspace --tests --bins --profile dev --locked --target-dir "$PWD/target"`，从开始包含 dev-dependencies 和真实程序；`test [filter] -- [libtest options]` 保持 workspace package selection 并交给 Cargo 执行；`doc` 单独运行 doctest。clippy 的 `--all-targets` 是额外静态检查范围，不扩大行为测试到暂停项、bench 或 example。窄 `cargo test -p <owner>` 适合内循环，选包会改变依赖统一和必要链接，不能冒称完整规范图。
 
-CI 支持 `dev`、`dev-opt`、`release`，默认 `NOVA_CI_CARGO_PROFILE=dev-opt`；每次构建同时显式传 `--profile` 和 `NOVAROCKS_BUILD_PROFILE`。实际 `--build-info` 在无 config/fixture 时读取并先保存原始双流与退出，随后校验本次已声明的 kind/profile/capability/identity；未知事实不被补成构建参数。受支持 flags 检查与实际 cfg 校验是当前构建约束，不能认证所有依赖的最终设置。
+主缓存属于当前 worktree 的 `target/`。实际 `debug_assertions` 由共享 build helper 投影为 `novarocks_dev_controls`：标准 dev 编入控制能力，标准 release 排除；不再通过镜像 feature 或声明 profile 改变能力。`NOVAROCKS_BUILD_PROFILE` 不参与构建来源或能力判断。Server CLI 保留 `novarocks-server` 包名，SQL CLI 保留 `tests/sql/runner/Cargo.toml` 和 `novarocks-sql-test` 身份；库分别为 `novarocks-server-application` 与 `novarocks-sql-test-library`。System CLI 包是 `novarocks-system-test-cli`，库保留 `novarocks-system-test-runner`。Git 来源仅薄 CLI 冻结，库不监听来源。
 
-普通 Rust workspace 测试保持普通构建。full CI 的 `test-control owner tests` 单独显式选择 failpoint（含 `typed`）、MV、FE、Native、Worker、fs、Execution 七 owner 的 `--lib`，使用 control target 和原 profile，串行运行；不能同次选择普通 Server 或用 `--workspace --all-features` 合并两种身份。`--skip-cargo-test` 记录此组为 SKIP，不能据此宣称机制保护通过。HMS/MySQL 的旧 feature 专属模块另选各 owner，不包含在基础七包覆盖内，例如：
+规范 helper 从 Cargo JSON 的真实 bin artifact 绑定 Server、SQL/System runner 和 error-manifest 的可执行路径与 SHA-256。最后一次相关 Cargo 后重新采集，并在消费前检查内容；缺路径、缺 required bin 或内容变化失败，不能回退旧程序。SQL 列举、执行和 error-manifest 检查直接使用已准备程序，不另起 `cargo run`。自报保存 stdout/stderr/实际退出；capabilities 据实际编译事实保留，`declared_profile=null` 与其它 unknown 不补造。自报不认证依赖最终 profile 或发布资格。
 
-```bash
-NOVAROCKS_BUILD_PROFILE=dev-opt cargo test -p novarocks-connector-iceberg --lib \
-  --features test-controls,mem-1-m07-hms-listing-observe --profile dev-opt --locked \
-  --target-dir "$NOVA_CI_VARIANT_TARGET_DIR/hms" -- --test-threads=1
-NOVAROCKS_BUILD_PROFILE=dev-opt cargo test -p novarocks-mysql-adapter --lib \
-  --features test-controls,mem-1-m07-exact-mysql-write --profile dev-opt --locked \
-  --target-dir "$NOVA_CI_VARIANT_TARGET_DIR/exact-mysql" -- --test-threads=1
-NOVAROCKS_BUILD_PROFILE=dev-opt cargo test -p novarocks-mysql-adapter --lib \
-  --features test-controls,mem-1-m07-closing-pressure --profile dev-opt --locked \
-  --target-dir "$NOVA_CI_VARIANT_TARGET_DIR/closing" -- --test-threads=1
+普通 SQL 和有有限控制需求的 SQL/System 使用同一个显式主 Server。SQL 只接受 `NOVAROCKS_BIN`，System 使用 `--binary`。原生 owner 按本次实际选中动作冻结角色会话、statement、目标和授权，启动后控制仍需准确匹配；编入能力、debug/profile、`fault-scenario` 名称、旧环境或裸测试 CALL 均不授予动作权。非破坏观察也不授予 wipe。HMS/MySQL exact/closing 模块参与 dev 编译；其外部 fixture、私有历史矩阵和 required-but-not-run 仍独立报告，主图单测通过不代替完整原输入。
+
+### 兼容专项的选择
+
+`local-full-ci.sh` 只运行原生 `--list-default` 集合，排除所有 `native-compatibility/*` 与其它显式专项；默认结果仅覆盖功能集合，不声称所有注册场景通过，也不准备兼容变体。`tools/ci/native-compatibility-ci.sh` 是独立入口：不传 selector 运行完整兼容集合，重复 `--only <exact>` 运行精确子集；未知、跨套件或空 selector 在 fixture/变体准备前失败。专项只准备和执行自己的程序/场景，不顺带运行 Rust/SQL/普通 System 全量。[手动 workflow](../../../.github/workflows/native-compatibility.yml) 调用同一入口。
+
+身份兼容材料或比较、角色身份传播与准入/切换，或专项的构建、绑定、选择、授权接线发生实现/合同变更时，维护者按影响面选择兼容场景并记录理由；用户或 reviewer 显式要求时也运行。普通业务改动、普通提交仅更新 Git SHA/诊断 identity、来源刷新或重新编译不自动触发。场景性质、完整生命周期程序与 fixture 需求由 [System README](../../../tests/system-test-runner/README.md#兼容专项与程序需求) 说明，shell 只消费原生需求并集。G15 维护统一选择策略，G6b 在容量和前置就绪后消费同一入口安排低频完整运行；本入口没有 schedule、自动 diff 选择器或每个 PR 强制专项。
+
+Compatible 使用主 workspace/tests/bins/dev 图，仅改变薄 Server CLI 的诊断 identity；OtherIsland 默认仅准备 Server binary 和必要 compatibility feature，P05 的原始观察决定是否调整选包，不能凭路径推断成本。两个变体串行复用主 target，各从 Cargo artifact 独立复制到 `target/variants/{compatible,other-island}/novarocks`，只保留最终程序与绑定材料；不用硬链接/软链接、不克隆 Cargo cache。准备后恢复主输入并刷新主图，重新绑定主程序、自报和 hash 后才启动消费者。原始准备失败优先保留，恢复失败另列，不覆盖原退出。
+
+### IDE 与缓存维护
+
+IDE 的规范测试按钮也消费 workspace 流程，保留原生测试选择，不传 package 占位符缩小图。例如 VS Code 用户设置；先将 `/absolute/path/to/NovaRocks` 替换为当前 worktree 的实际绝对路径：
+
+```json
+{
+  "rust-analyzer.runnables.test.overrideCommand": ["/absolute/path/to/NovaRocks/tools/ci/dev-test.sh", "test", "--", "${executable_args}", "--nocapture"],
+  "rust-analyzer.cargo.targetDir": true
+}
 ```
 
-上述变量须先绑定真实、互斥的 owned cache，命令本身不是已运行证据。历史私有 exact/held/HMS 完整矩阵没有原输入时记录 `NOT_RUN`，不制造历史 SHA/receipt；局部 owner 测试、授权动作/退出与完整矩阵分开表达。
+测试 override 的工作目录是测试所属 package，而非 workspace 根，因此 helper 必须使用绝对路径。rust-analyzer 将 `${executable_args}` 展开为多个原生参数：单个测试保留 filter、`--exact` 和 `--include-ignored`，模块测试仅保留模块 filter 及额外测试参数，不强制 `--exact`。这些参数放在 `--` 后由 Cargo 交给原生测试程序，保留 workspace 构建范围。[runnable 工作目录与 override](https://github.com/rust-lang/rust-analyzer/blob/bb3bbbd9e4/crates/rust-analyzer/src/lsp/to_proto.rs#L1669-L1692)、[原生参数展开](https://github.com/rust-lang/rust-analyzer/blob/bb3bbbd9e4/crates/rust-analyzer/src/target_spec.rs#L280-L311)。
 
-System 使用实际 `--binary`、`--ordinary-binary`、`--test-control-binary`；兼容性场景冻结用户选中的各角色变体，CI 明确选择 controls Primary，ordinary 独立保留。SQL 使用 `NOVAROCKS_BIN` 与 `NOVAROCKS_TEST_CONTROL_BIN`，从实际选中的有限步骤生成必要授权；feature、路径、debug/profile、FaultScenario 名称及旧 env 不授予动作权。普通步骤继续普通产物，需要内部断言的步骤缺能力就失败，不能静默省略断言。裸测试 CALL 不授予权限，非破坏观察也不授予 wipe。
+`cargo.targetDir=true` 为 flycheck/build-script/proc-macro 使用 worktree target 下私有目录，不能让 overrideCommand 强制主 target。若覆盖 check 命令，必须先从编辑器有效命令确认实际目录，并通过 `tools/ci/dev-test.sh check --target-dir <actual-IDE-dir>` 显式透传。规范测试 runner 仍用主 target；IDE check 是独立编译单元，有额外磁盘和重编成本。不要覆盖用户其它编辑器设置。新 worktree 冷缓存和底层库改动的必要重链接是合法成本；历史 18s/32s 不是现机收益，最终 opt 选择只引用实际尝试材料。
+
+主 target 仍用于增量开发则保留。停止编辑器和构建、核对 owner/无消费者及材料交接后，用 `cargo clean --target-dir <exact-worktree-target>` 清理主缓存；仅回收 IDE 时给准确私有目录。兼容程序用准确 `target/variants/compatible` / `other-island` 目录回收，不把它们当 Cargo cache。finish/archive 承担临时变体处置和失败材料保留责任，不删除其它 worktree、共享 fixture 或未知缓存；未解决失败继续保留，历史报告不回写成新 PASS。
 
 当前 MV 测试保持受控过渡，LNP-3A/LNP-3D、storage-contract 和 system 现有 SQL/expected/独立 oracle 不重写，旧 CALL/directive 禁止扩展。whole-family wipe 绑定本次 FE launch 与 MV Accelerator family，一次认领、隔离串行，先由原 MV owner 停止 admission 并实际 join 后台；不能把传入 MV 名当逐 MV 权限，也不能删 whole StateStore 代替。
 

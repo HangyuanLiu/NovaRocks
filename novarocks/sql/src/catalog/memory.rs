@@ -83,7 +83,7 @@ impl PlannerMemoryCatalog {
             .unwrap_or_default()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn register(&mut self, database_name: &str, table: TableDef) -> Result<(), String> {
         let db_key = normalize_identifier(database_name)?;
         let database = self

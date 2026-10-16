@@ -61,7 +61,7 @@ use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema, WriterMultiplexRelationTemplate,
     WriterRelationPreparation,
 };
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
     TableWriteAggregateBoundary, TableWriteAggregateGuard,
 };
@@ -109,7 +109,7 @@ struct TableWriterPlan {
     /// process function set; a compiled writer from its prepared calls.
     partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
     local_partial_source: Option<LocalPreparedWriterPartial>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
@@ -215,7 +215,7 @@ impl TableWriterOperatorFactory {
                 ),
                 partial_aggregate_factory: None,
                 local_partial_source,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
         })
@@ -261,7 +261,7 @@ impl TableWriterOperatorFactory {
                 ),
                 partial_aggregate_factory,
                 local_partial_source: None,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
         })
@@ -301,7 +301,7 @@ impl TableWriterOperatorFactory {
                 ),
                 partial_aggregate_factory,
                 local_partial_source: None,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 aggregate_guard: Arc::clone(node.aggregate_guard()),
             }),
         })
@@ -556,7 +556,7 @@ impl TableWriterOperatorFactory {
             construction: None,
             partial_aggregate,
             local_partial_source: plan.local_partial_source.clone(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::clone(&plan.aggregate_guard),
             state: TableWriterState::Open,
             logical_rows: 0,
@@ -637,7 +637,7 @@ struct TableWriterOperator {
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     partial_aggregate: Option<Box<dyn Operator>>,
     local_partial_source: Option<LocalPreparedWriterPartial>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     state: TableWriterState,
     logical_rows: u64,
@@ -1020,7 +1020,7 @@ impl ProcessorOperator for TableWriterOperator {
             // bytes, so accounting never leaves live source buffers ownerless.
             drop(chunk);
             if let Some(partial) = self.partial_aggregate.as_mut() {
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 self.aggregate_guard
                     .check(TableWriteAggregateBoundary::PartialUpdate)
                     .map_err(|error| format!("update writer partial aggregate: {error}"))?;
@@ -1123,7 +1123,7 @@ impl ProcessorOperator for TableWriterOperator {
         self.state = TableWriterState::Draining;
         self.finish_blocked_intervals();
         if let Some(partial) = self.partial_aggregate.as_mut() {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             if let Err(error) = self
                 .aggregate_guard
                 .check(TableWriteAggregateBoundary::PartialFinalize)
@@ -1721,10 +1721,10 @@ pub(crate) mod tests {
         pred()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     struct RejectAggregateBoundary(TableWriteAggregateBoundary);
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     impl TableWriteAggregateGuard for RejectAggregateBoundary {
         fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
             if boundary == self.0 {
@@ -2734,7 +2734,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn partial_aggregate_guard_rejects_update_before_either_consumer_accepts_the_page() {
         let stats = Arc::new(WriteExecutionStats::default());
@@ -2762,7 +2762,7 @@ pub(crate) mod tests {
         assert!(!operator.as_processor_ref().expect("processor").has_output());
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn partial_aggregate_guard_rejects_finalize_without_success_output() {
         let stats = Arc::new(WriteExecutionStats::default());

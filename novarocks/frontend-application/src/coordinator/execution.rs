@@ -286,12 +286,12 @@ fn production_backend_services(
 }
 
 pub struct FrontendDistributedQueryCoordinator {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_native: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_observations:
         Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
 
     backend_topology: novarocks_query_application::api::BackendTopologyService,
@@ -321,7 +321,7 @@ pub struct FrontendDistributedQueryCoordinator {
 }
 
 impl FrontendDistributedQueryCoordinator {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
         native: Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
@@ -355,11 +355,11 @@ impl FrontendDistributedQueryCoordinator {
             "frontend query process namespace initialized"
         );
         Ok(Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_native: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observations: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             statement_observation: None,
             backend_topology,
             #[cfg(test)]
@@ -431,11 +431,11 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_native: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observations: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             statement_observation: None,
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             internal_result_cpu: None,
@@ -500,11 +500,11 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_native: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observations: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             statement_observation: None,
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             internal_result_cpu: None,
@@ -688,7 +688,7 @@ impl FrontendDistributedQueryCoordinator {
         let backend_services = production_backend_services(parts.topology.targets())?;
         let _query = self.registry.register(query_id, intent)?;
         let scheduler = &backend_services.scheduler;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let nominated_execution = match (
             &parts.test_statement_nomination,
             &self.statement_observation,
@@ -703,7 +703,7 @@ impl FrontendDistributedQueryCoordinator {
             }
             (None, _) => None,
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let scheduler =
             if let (Some(native), Some(nomination)) = (&self.test_native, &nominated_execution) {
                 scheduler
@@ -712,7 +712,7 @@ impl FrontendDistributedQueryCoordinator {
             } else {
                 scheduler.clone()
             };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(nomination) = &nominated_execution {
             if let Some(observations) = &self.test_observations {
                 let execution = novarocks_types::QueryExecutionId::new(
@@ -2859,7 +2859,6 @@ mod tests {
     use novarocks_types::identity::{StageId, TaskId};
     use novarocks_types::{AttemptId, QueryExecutionId};
     use novarocks_types::{BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace};
-    use novarocks_version::native_build_identity;
 
     #[test]
     fn statistics_failure_preserves_every_incompatible_task_and_round_cause() {
@@ -3151,7 +3150,7 @@ mod tests {
             RuntimeEndpoint::new(format!("control-{process_id}.test.invalid"), 19061)
                 .expect("test control endpoint"),
             "test-deployment",
-            native_build_identity(),
+            "fixture-build",
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             4096,
         )

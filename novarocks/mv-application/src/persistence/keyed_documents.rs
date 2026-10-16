@@ -808,7 +808,7 @@ pub(crate) fn observe_current_keyed_view_with_management(
     Ok((view, convergence))
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn keyed_view_fixture(
     snapshot: Option<i64>,
     published: bool,

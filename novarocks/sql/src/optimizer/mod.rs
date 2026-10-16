@@ -52,7 +52,7 @@ pub(crate) use optimized_tree::OptimizedOperatorNode;
 pub(crate) use property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use std::cell::RefCell;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -63,7 +63,7 @@ use crate::column_id::ColumnRefFactory;
 use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::ScalarArena;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use crate::optimizer::statistics::TableStatistics;
 use crate::optimizer::stats_input::{OptimizerStatsInput, QueryStatsSnapshot};
 use memo::MExpr;
@@ -180,7 +180,7 @@ pub(crate) fn optimize_with_root_distribution(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn optimize_with_test_table_statistics(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
@@ -529,7 +529,7 @@ impl PureCompileControl for OptimizerControl<'_> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_optimizer_control() -> &'static dyn PureCompileControl {
     static CONTROL: std::sync::LazyLock<crate::compiler::SqlCompileControl> =
         std::sync::LazyLock::new(crate::compiler::SqlCompileControl::unbounded);

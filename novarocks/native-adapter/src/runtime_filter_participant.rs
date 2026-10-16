@@ -23,7 +23,7 @@
 //! by this participant.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -136,7 +136,7 @@ pub struct RuntimeFilterParticipant {
     state: Arc<WorkerRuntimeFilterParticipant>,
     outbound: Arc<BackendParticipantOutbound>,
     close_hook: RuntimeFilterParticipantCloseHook,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous,
 }
 
@@ -146,14 +146,14 @@ pub struct RuntimeFilterParticipant {
 /// its ordinary dedupe owner.  This lives on the participant rather than in a
 /// registry or a transport fallback, so ordinary builds and all non-faulted
 /// attempts retain their normal release/no-op behavior.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 struct AcceptedContributionRetryRendezvous {
     state: Mutex<AcceptedContributionRetryRendezvousState>,
     changed: Condvar,
     claim: Mutex<Option<crate::test_controls::NativeFaultClaim>>,
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum AcceptedContributionRetryRendezvousState {
     Idle,
@@ -164,7 +164,7 @@ enum AcceptedContributionRetryRendezvousState {
     DuplicateObserved,
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl AcceptedContributionRetryRendezvous {
     fn new() -> Self {
         Self {
@@ -263,7 +263,7 @@ impl RuntimeFilterParticipant {
             state,
             outbound,
             close_hook: Arc::new(|_, _| Ok(())),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
         }))
     }
@@ -376,7 +376,7 @@ impl RuntimeFilterParticipant {
             | BackendEnvelopeKind::CompletedWithoutArtifact
             | BackendEnvelopeKind::DegradedLogical => self.dispatch_delivery_envelope(envelope),
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if result.status()
             == novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Duplicate
         {
@@ -388,7 +388,7 @@ impl RuntimeFilterParticipant {
 
     /// Arms the system-test-only receiver rendezvous after this participant
     /// has accepted the contribution whose unary response is being dropped.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn arm_accepted_contribution_retry_rendezvous(
         &self,
         channel_id: RuntimeFilterChannelId,
@@ -401,7 +401,7 @@ impl RuntimeFilterParticipant {
 
     /// Blocks only a debug-faulted participant's release until its exact
     /// duplicate retry arrives.  The ordinary participant never waits here.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn wait_for_accepted_contribution_retry_rendezvous(&self) {
         self.accepted_contribution_retry_rendezvous
             .wait_for_duplicate();
@@ -522,7 +522,7 @@ impl RuntimeFilterParticipant {
         self.state.record_row_effect(fragment_instance_id, effect);
     }
 
-    #[cfg(any(test, feature = "test-controls"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     #[doc(hidden)]
     pub fn with_close_hook_for_test(
         &self,
@@ -533,7 +533,7 @@ impl RuntimeFilterParticipant {
             state: Arc::clone(&self.state),
             outbound: Arc::clone(&self.outbound),
             close_hook,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
         })
     }
@@ -2179,7 +2179,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "test-controls"))]
+#[cfg(all(test, novarocks_dev_controls))]
 mod session_rendezvous_tests {
     use super::*;
     use crate::test_controls::tests::controlled;

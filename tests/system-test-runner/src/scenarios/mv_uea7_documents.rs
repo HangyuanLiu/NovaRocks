@@ -91,9 +91,7 @@ impl Scenario for Documents {
         _: &ScenarioLaunchConfig,
         root: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         let mut grants = Vec::new();
@@ -125,7 +123,7 @@ impl Scenario for Documents {
         } else {
             FeLaunchIntent::MvActions(grants)
         };
-        control_plan::plan(cluster_size, ordinary, controlled, deadline, vec![launch]).map(Some)
+        control_plan::plan(cluster_size, binary, deadline, vec![launch]).map(Some)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;

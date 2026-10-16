@@ -22,7 +22,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks-server", "novarocks/arrow-ipc-frame", "novarocks/catalog-application", "novarocks/connector-contract", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/constant-contract", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend-application", "novarocks/fs", "novarocks/function-contract", "novarocks/functions", "novarocks/local-compiler", "novarocks/local-program", "novarocks/memory", "novarocks/mv-application", "novarocks/mysql-adapter", "novarocks/native-adapter", "novarocks/native-trust", "novarocks/parser", "novarocks/physical-plan", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/result-contract", "novarocks/result-render", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/state-store/runtime", "novarocks/state-store/sqlite", "novarocks/state-store/testkit", "novarocks/statistics-application", "novarocks/table-maintenance", "novarocks/task-codec", "novarocks/type-contract", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "tests/cluster-harness", "tests/datasketches-tck", "tests/sql/runner", "tests/system-test-runner", "tests/test-support", "tools", "tools/error-manifest"]
+members = ["novarocks-server", "novarocks-server/library", "novarocks/arrow-ipc-frame", "novarocks/catalog-application", "novarocks/connector-contract", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/constant-contract", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend-application", "novarocks/fs", "novarocks/function-contract", "novarocks/functions", "novarocks/local-compiler", "novarocks/local-program", "novarocks/memory", "novarocks/mv-application", "novarocks/mysql-adapter", "novarocks/native-adapter", "novarocks/native-trust", "novarocks/parser", "novarocks/physical-plan", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/result-contract", "novarocks/result-render", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/state-store/runtime", "novarocks/state-store/sqlite", "novarocks/state-store/testkit", "novarocks/statistics-application", "novarocks/table-maintenance", "novarocks/task-codec", "novarocks/type-contract", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "tests/cluster-harness", "tests/datasketches-tck", "tests/sql/runner", "tests/sql/runner/library", "tests/system-test-runner", "tests/system-test-runner/cli", "tests/test-support", "tools", "tools/error-manifest"]
 # Native development defaults to the server package.
 default-members = ["novarocks-server"]
 # Vendored upstream packages keep their own workspace and lock authority.
@@ -149,7 +149,7 @@ novarocks-query-application = { path = "novarocks/query-application", version = 
 novarocks-result-contract = { path = "novarocks/result-contract", version = "0.1.0" }
 novarocks-result-render = { path = "novarocks/result-render", version = "0.1.0" }
 novarocks-secret = { path = "novarocks/secret", version = "0.1.0" }
-novarocks-server = { path = "novarocks-server", version = "0.1.0" }
+novarocks-server-application = { path = "novarocks-server/library", version = "0.1.0" }
 novarocks-spi = { path = "novarocks/spi", version = "0.1.0" }
 novarocks-sql = { path = "novarocks/sql", version = "0.1.0" }
 novarocks-mv-application = { path = "novarocks/mv-application", version = "0.1.0" }
@@ -168,28 +168,31 @@ novarocks-version = { path = "novarocks/version", version = "0.1.0" }
 novarocks-worker = { path = "novarocks/worker", version = "0.1.0" }
 novarocks-workload-control = { path = "novarocks/workload-control", version = "0.1.0" }
 
+# One development configuration for native tests, tools, and role binaries.
 [profile.dev]
 opt-level = 0
-debug = 2
+debug = "line-tables-only"
 incremental = true
+lto = false
+codegen-units = 256
+debug-assertions = true
+
+[profile.dev.package."*"]
+debug = false
+
+# Opt-in full symbols without changing the standard development control boundary.
+[profile.debugging]
+inherits = "dev"
+debug = 2
+
+[profile.debugging.package."*"]
+debug = 2
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-
-# Balanced profile for the dev/test loop: opt-level 1 gives a large runtime
-# speedup over dev (opt-level 0) while keeping compile times far below release.
-# debug = 1 (line tables only) trims debug-info/link cost; codegen-units = 256
-# and lto = false keep codegen highly parallel. Build with `--profile dev-opt`;
-# artifacts land under target/dev-opt/.
-[profile.dev-opt]
-inherits = "dev"
-opt-level = 1
-debug = 1
-incremental = true
-lto = false
-codegen-units = 256
+debug-assertions = false
 
 # Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
 # Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)

@@ -6,12 +6,10 @@ use std::path::PathBuf;
 pub struct Cli {
     pub list: bool,
     pub list_default: bool,
+    pub list_compatibility: bool,
+    pub list_binary_requirements: bool,
     pub only: Vec<String>,
     pub binary: Option<PathBuf>,
-    /// Explicit ordinary companion for a variant-bound primary binary.
-    pub ordinary_binary: Option<PathBuf>,
-    /// Actual test-controls artifact for selected owner-local demands.
-    pub test_control_binary: Option<PathBuf>,
     pub compatible_binary: Option<PathBuf>,
     pub other_island_binary: Option<PathBuf>,
     pub config: Option<PathBuf>,
@@ -39,10 +37,10 @@ impl Cli {
         let mut cli = Self {
             list: false,
             list_default: false,
+            list_compatibility: false,
+            list_binary_requirements: false,
             only: Vec::new(),
             binary: None,
-            ordinary_binary: None,
-            test_control_binary: None,
             compatible_binary: None,
             other_island_binary: None,
             config: None,
@@ -66,14 +64,10 @@ impl Cli {
             match argument.as_str() {
                 "--list" => cli.list = true,
                 "--list-default" => cli.list_default = true,
+                "--list-compatibility" => cli.list_compatibility = true,
+                "--list-binary-requirements" => cli.list_binary_requirements = true,
                 "--only" => cli.only.push(value("--only")?),
                 "--binary" => cli.binary = Some(PathBuf::from(value("--binary")?)),
-                "--ordinary-binary" => {
-                    cli.ordinary_binary = Some(PathBuf::from(value("--ordinary-binary")?))
-                }
-                "--test-control-binary" => {
-                    cli.test_control_binary = Some(PathBuf::from(value("--test-control-binary")?))
-                }
                 "--compatible-binary" => {
                     cli.compatible_binary = Some(PathBuf::from(value("--compatible-binary")?));
                 }
@@ -140,6 +134,8 @@ impl Cli {
         if cli.hms_bulk_readonly_binding.is_some()
             && (cli.list
                 || cli.list_default
+                || cli.list_compatibility
+                || cli.list_binary_requirements
                 || !cli.only.is_empty()
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
@@ -158,6 +154,8 @@ impl Cli {
         if cli.held_native_execution_binding.is_some()
             && (cli.list
                 || cli.list_default
+                || cli.list_compatibility
+                || cli.list_binary_requirements
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
                 || cli.exact_mysql_execution_binding.is_some()
@@ -173,6 +171,8 @@ impl Cli {
         if cli.hms_classification_binding.is_some()
             && (cli.list
                 || cli.list_default
+                || cli.list_compatibility
+                || cli.list_binary_requirements
                 || !cli.only.is_empty()
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
@@ -183,6 +183,8 @@ impl Cli {
         if cli.exact_mysql_execution_binding.is_some()
             && (cli.list
                 || cli.list_default
+                || cli.list_compatibility
+                || cli.list_binary_requirements
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
                 || cli.launch_profile != LaunchProfile::FaultScenario
@@ -192,8 +194,18 @@ impl Cli {
                 "--exact-mysql-execution-binding requires explicit fault-scenario 1FE+3BE without alternate modes"
             );
         }
-        if cli.list && cli.list_default {
-            bail!("--list and --list-default are mutually exclusive");
+        if [
+            cli.list,
+            cli.list_default,
+            cli.list_compatibility,
+            cli.list_binary_requirements,
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count()
+            > 1
+        {
+            bail!("list modes are mutually exclusive");
         }
         if cli.cluster_size == 0 {
             bail!("--cluster-size must be >= 1");
@@ -206,7 +218,7 @@ impl Cli {
 
     pub const fn usage() -> &'static str {
         concat!(
-            "usage: novarocks-system-tests [--list | --list-default] [--only <exact-name>]... ",
+            "usage: novarocks-system-tests [--list | --list-default | --list-compatibility | --list-binary-requirements] [--only <exact-name>]... ",
             "[--binary <path> [--compatible-binary <path>] ",
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",

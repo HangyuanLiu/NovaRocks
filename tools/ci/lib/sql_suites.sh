@@ -79,12 +79,10 @@ ci_discover_sql_suites() {
     selection_args=(--suite all)
   fi
 
-  ci_validate_build_environment || return $?
-  env NOVAROCKS_BUILD_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}" \
-  cargo run --quiet --locked --target-dir "$(ci_target_directory normal "$repo_root")" \
-    --manifest-path "$repo_root/tests/sql/runner/Cargo.toml" \
-    --profile "${NOVA_CI_CARGO_PROFILE:-dev-opt}" \
-    --bin novarocks-sql-test -- --list-suites "${selection_args[@]}"
+  local runner
+  runner="$(ci_bound_binary novarocks-sql-test)" || return $?
+  "$runner" --list-suites "${selection_args[@]}"
+
 }
 
 ci_suite_exists() {

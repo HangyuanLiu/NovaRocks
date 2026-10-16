@@ -52,7 +52,7 @@ use novarocks_types::UniqueId;
 use novarocks_worker::TypedScanRuntime;
 use novarocks_worker::connector_write_runtime::ObservedConnectorWriteExecution;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::connector_write_data_plane::QueryScopedTableWriteAggregateGuard;
 use crate::connector_write_data_plane::{
     NativeConnectorWriteObservationPort, RoleBoundCommitFragmentEncoder,
@@ -61,9 +61,9 @@ use crate::connector_write_data_plane::{
 
 /// The Task facts every compiled writer and finish of one task binds with.
 pub(crate) struct CompiledWriteTask<'a> {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) observation_controls:
         Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     pub(crate) backend_process_id: novarocks_types::BackendProcessId,
@@ -220,7 +220,7 @@ pub(crate) fn bind_compiled_writer(
         node_id,
         Arc::new({
             let observer = NativeConnectorWriteObservationPort::new(task.backend_process_id);
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             let observer = if let Some(controls) = task.test_controls.as_ref() {
                 observer.with_test_controls(Arc::clone(controls))
             } else {
@@ -228,7 +228,7 @@ pub(crate) fn bind_compiled_writer(
             };
             observer
         }),
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         task.observation_controls
             .as_ref()
             .map(|controls| controls.observation_for("writer-marker", execution_id))
@@ -238,7 +238,7 @@ pub(crate) fn bind_compiled_writer(
     ));
     let fragment_encoder =
         RoleBoundCommitFragmentEncoder::new(binding.fragment_encoder(), execution_id, node_id);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let fragment_encoder = if let Some(controls) = task.test_controls.as_ref() {
         fragment_encoder.with_test_controls(Arc::clone(controls))
     } else {
@@ -253,7 +253,7 @@ pub(crate) fn bind_compiled_writer(
         fragment_encoder,
     )
     .map_err(|error| refused(error.to_string()))?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let writer = if let Some(controls) = task.test_controls.as_ref() {
         writer.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
             execution_id,
@@ -274,14 +274,14 @@ pub(crate) fn bind_compiled_finish(
     let execution_id = task.runtime.execution_id();
     let node_id = display_id(id)?;
     let validator = RootCommitFragmentCarrierValidator::new(execution_id, node_id);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let validator = if let Some(controls) = task.test_controls.as_ref() {
         validator.with_test_controls(Arc::clone(controls))
     } else {
         validator
     };
     let finish = TableFinishRuntimeBinding::new(Arc::new(validator));
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let finish = if let Some(controls) = task.test_controls.as_ref() {
         finish.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
             execution_id,

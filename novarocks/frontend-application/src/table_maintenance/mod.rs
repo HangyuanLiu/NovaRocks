@@ -52,7 +52,7 @@ use novarocks_table_maintenance::{
 
 pub mod admission;
 pub mod result;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub(crate) mod test_controls;
 pub mod worker;
 
@@ -61,7 +61,7 @@ pub struct FrontendTableMaintenanceService {
     product: Arc<TableMaintenanceProduct>,
     runtime: Handle,
     root_admission: RootAdmissionHandle,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     controls: Option<Arc<test_controls::MaintenanceTestControls>>,
 }
 
@@ -88,7 +88,7 @@ impl FrontendTableMaintenanceService {
             product: Arc::new(product),
             runtime,
             root_admission,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             controls: None,
         })
     }
@@ -107,12 +107,12 @@ impl FrontendTableMaintenanceService {
             ),
             runtime: self.runtime,
             root_admission: self.root_admission,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             controls: self.controls,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
         controls: Option<Arc<test_controls::MaintenanceTestControls>>,
@@ -129,27 +129,27 @@ impl FrontendTableMaintenanceService {
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String> {
         let capture = FrontendOptimizeTargetCapturePort::for_statement(engine);
-        #[cfg(feature = "test-controls")]
-        {
-            let receipt = match self.controls.as_ref() {
-                Some(owner) => match engine.test_statement_nomination() {
-                    Some(nomination) => owner.begin_submission(&nomination, &target)?,
-                    None => None,
-                },
+        #[cfg(novarocks_dev_controls)]
+        let receipt = match self.controls.as_ref() {
+            Some(owner) => match engine.test_statement_nomination() {
+                Some(nomination) => owner.begin_submission(&nomination, &target)?,
                 None => None,
-            };
-            let capture = capture.with_test_receipt(receipt.as_ref());
-            let submission = self.block_on(self.product.submit_optimize(target, &capture));
+            },
+            None => None,
+        };
+        #[cfg(novarocks_dev_controls)]
+        let capture = capture.with_test_receipt(receipt.as_ref());
+        let submission = self.block_on(self.product.submit_optimize(target, &capture));
+        #[cfg(novarocks_dev_controls)]
+        {
             drop(capture);
             if let (Some(receipt), Ok(OptimizeSubmission::Submitted { job_id, .. })) =
                 (receipt, &submission)
             {
                 receipt.bind(*job_id)?;
             }
-            return submission;
         }
-        #[cfg(not(feature = "test-controls"))]
-        self.block_on(self.product.submit_optimize(target, &capture))
+        submission
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -217,7 +217,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             Arc::new(FrontendOptimizeJobExecutionPort::new(
                 Arc::downgrade(&engine),
                 Arc::downgrade(&self.product),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 self.controls.clone(),
             )),
         )

@@ -292,7 +292,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             finished: false,
             logged_first_pull: false,
             logged_first_none: false,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             last_partial_eos_marker_count: 0,
             native_runtime_filter_consumers: self.runtime_filter_consumers.clone(),
             gated_chunk: None,
@@ -318,7 +318,7 @@ struct ExchangeSourceOperator {
     finished: bool,
     logged_first_pull: bool,
     logged_first_none: bool,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     last_partial_eos_marker_count: usize,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     /// The first chunk received, held while the runtime-filter gate that its
@@ -522,7 +522,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
                 }
                 Some(exchange::ExchangePopResult::Finished(stats)) => {
                     self.idle_deadline.cancel();
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     if let Some(observer) = state
                         .exchange_test_observer()
                         .filter(|observer| observer.is_active())
@@ -582,7 +582,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
                     if first_none {
                         self.logged_first_none = true;
                     }
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     if let Some(observer) = state
                         .exchange_test_observer()
                         .filter(|observer| observer.is_active())

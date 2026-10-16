@@ -2960,10 +2960,10 @@ mod statistics {
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     struct Reject(crate::exec::node::table_write_relation::TableWriteAggregateBoundary);
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     impl crate::exec::node::table_write_relation::TableWriteAggregateGuard for Reject {
         fn check(
             &self,
@@ -2982,7 +2982,7 @@ mod statistics {
     /// The Task's aggregate guard installed on a compiled writer and finish
     /// is consulted by the compiled statistics at each aggregate boundary,
     /// exactly as on the plan-tree path.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn the_task_aggregate_guard_rejects_compiled_statistics_work() {
         use crate::exec::node::table_write_relation::TableWriteAggregateBoundary as Boundary;

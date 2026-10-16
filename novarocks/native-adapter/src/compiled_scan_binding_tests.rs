@@ -383,7 +383,7 @@ fn bind_filtered(
         consumers,
         layout,
         &CompiledScanTask {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             runtime,
             fragment_instance_id: UniqueId::new(3, 4),

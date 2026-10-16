@@ -1291,7 +1291,7 @@ fn validate_complete_output(
 }
 
 impl Operator for CompiledWindowProcessor {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> {
         self.output.clone()
     }
@@ -1548,7 +1548,7 @@ mod tests {
 }
 
 /// The real factory retains frozen declarations; prepare owns runtime creation.
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub fn prepare_window_factory_for_test(
     program: Arc<LocalProgram>,
     node: ProgramNodeId,

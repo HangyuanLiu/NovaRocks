@@ -23,10 +23,10 @@ use std::sync::Arc;
 use novarocks_execution::runtime_filter::{
     CanonicalContributionBytes, PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
 };
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_proto_models as proto;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
@@ -39,7 +39,7 @@ use novarocks_worker::runtime_filter::domain::{
 /// lifecycle registry owns the later install/routing authorization; this port
 /// only receives a wire-valid envelope and reports its exact ACK disposition.
 pub trait BackendRuntimeFilterEnvelopeIngress: Send + Sync {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_controls(&self) -> Option<std::sync::Arc<crate::test_controls::NativeTestControls>> {
         None
     }
@@ -50,7 +50,7 @@ pub trait BackendRuntimeFilterEnvelopeIngress: Send + Sync {
     /// accepted a Contribution whose response will be dropped. The normal
     /// production protocol has no such hold: it exists only so the system
     /// scenario can prove the exact retry reaches a still-live receiver.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn arm_accepted_contribution_retry_rendezvous(
         &self,
         _participant: BackendParticipantIdentity,
@@ -551,7 +551,7 @@ pub fn handle_runtime_filter_envelope(
 
     let acked_route_identity = Some(route_identity);
     let result = ingress.accept(envelope);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if drop_accepted_contribution_response(
         ingress.as_ref(),
         &result,
@@ -594,7 +594,7 @@ pub fn handle_runtime_filter_envelope(
 /// admitted a Contribution.  The token is consumed before the error is
 /// returned, so the exact retry reaches the ordinary domain dedupe owner and
 /// receives its Duplicate acknowledgement.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[expect(
     clippy::result_large_err,
     reason = "The native transport adapter returns tonic status directly."
@@ -639,7 +639,7 @@ fn drop_accepted_contribution_response(
     Ok(true)
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[expect(
     clippy::result_large_err,
     reason = "The native transport adapter returns tonic status directly."
@@ -891,7 +891,7 @@ mod tests {
         decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
         handle_runtime_filter_envelope, runtime_filter_envelope_encoded_len,
     };
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     use super::{drop_accepted_contribution_response, runtime_filter_fault_execution_id};
 
     /// Owner-local wire length oracle: generated Prost encoding and actual
@@ -1408,7 +1408,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn contribution_ack_drop_fault_never_claims_non_accepted_or_non_contribution_results() {
         let query_id = UniqueId::new(11, 12);
@@ -1443,7 +1443,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn contribution_ack_drop_fault_uses_the_native_query_and_attempt_identity() {
         let execution_id = runtime_filter_fault_execution_id(UniqueId::new(11, 12), 14)

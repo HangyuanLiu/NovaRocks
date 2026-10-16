@@ -22,7 +22,7 @@ pub fn native_result_writer(
     })
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn test_native_result_writer() -> Arc<dyn FragmentResultWriter> {
     native_result_writer(
         ResultRetainedBudget::new(

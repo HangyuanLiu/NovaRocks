@@ -1,0 +1,41 @@
+name: Native compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Exact native-compatibility scenario (empty runs the complete compatibility set)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake libclang-dev libssl-dev pkg-config
+      - run: rustup show
+      - name: Run selected compatibility scenarios
+        env:
+          SELECTED_SCENARIO: ${{ inputs.scenario }}
+        run: |
+          args=()
+          if [ -n "$SELECTED_SCENARIO" ]; then args+=(--only "$SELECTED_SCENARIO"); fi
+          tools/ci/native-compatibility-ci.sh "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: native-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/native-compatibility-*/
+          if-no-files-found: warn

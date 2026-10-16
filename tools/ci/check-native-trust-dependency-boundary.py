@@ -26,6 +26,7 @@ FORBIDDEN_INTERNAL = {
     "novarocks-proto-codec",
     "novarocks-proto-models",
     "novarocks-server",
+    "novarocks-server-application",
     "novarocks-spi",
     "novarocks-sql",
     "novarocks-state-store-foundationdb",

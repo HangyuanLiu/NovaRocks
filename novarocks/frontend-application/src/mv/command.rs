@@ -215,7 +215,7 @@ impl MvCommandExecutor {
         )? {
             return Ok(Some(result));
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(result) = crate::mv::domain::document_expiry::try_execute_document_expiry(
             &self.ports,
             statement,
@@ -246,7 +246,7 @@ impl MvCommandExecutor {
         )? {
             return Ok(Some(result));
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         return crate::mv::domain::execute_typed_novarocks_imv_stateless_rebuild(
             self.ports.connector_control(),
             self.ports.readiness().as_ref(),
@@ -255,7 +255,7 @@ impl MvCommandExecutor {
             current_database,
             connector_context.clone(),
         );
-        #[cfg(not(feature = "test-controls"))]
+        #[cfg(not(novarocks_dev_controls))]
         {
             let _ = (current_database, connector_context);
             Ok(None)

@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "../../build-support/development.rs"]
+mod development;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +32,7 @@ const NATIVE_PROTO_FILES: [&str; 6] = [
 ];
 
 fn main() {
+    development::emit();
     for file in NATIVE_PROTO_FILES {
         println!(
             "cargo:rerun-if-changed={}",

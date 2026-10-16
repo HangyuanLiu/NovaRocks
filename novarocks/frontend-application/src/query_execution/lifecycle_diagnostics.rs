@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(any(test, feature = "test-controls"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use std::sync::Mutex;
 
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
@@ -69,9 +69,9 @@ pub(crate) trait QueryLifecycleConvergenceReader: Send + Sync {
 /// management endpoints can observe this projection but cannot mutate it.
 #[derive(Default)]
 pub(crate) struct FrontendLifecycleDiagnostics {
-    #[cfg(any(test, feature = "test-controls"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     latest: Mutex<Option<Box<QueryLifecycleConvergenceSnapshot>>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observer: std::sync::OnceLock<
         std::sync::Weak<crate::preparation_diagnostics::StatementObservationOwner>,
     >,
@@ -79,14 +79,14 @@ pub(crate) struct FrontendLifecycleDiagnostics {
     whitebox: std::sync::atomic::AtomicBool,
 }
 impl FrontendLifecycleDiagnostics {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn close_observation(&self) {
         if let Ok(mut latest) = self.latest.lock() {
             *latest = None;
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn activate(
         &self,
         owner: &std::sync::Arc<crate::preparation_diagnostics::StatementObservationOwner>,
@@ -100,7 +100,7 @@ impl FrontendLifecycleDiagnostics {
         if self.whitebox.load(std::sync::atomic::Ordering::Acquire) {
             return true;
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         {
             return self
                 .observer
@@ -108,31 +108,31 @@ impl FrontendLifecycleDiagnostics {
                 .and_then(std::sync::Weak::upgrade)
                 .is_some_and(|owner| owner.is_active());
         }
-        #[cfg(not(feature = "test-controls"))]
+        #[cfg(not(novarocks_dev_controls))]
         false
     }
     pub(crate) fn publish(&self, snapshot: QueryLifecycleConvergenceSnapshot) {
         if !self.is_enabled() {
             return;
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(owner) = self.observer.get().and_then(std::sync::Weak::upgrade) {
             owner.publish(&snapshot);
         }
-        #[cfg(any(test, feature = "test-controls"))]
+        #[cfg(any(test, novarocks_dev_controls))]
         {
             *self
                 .latest
                 .lock()
                 .expect("frontend lifecycle diagnostics lock") = Some(Box::new(snapshot));
         }
-        #[cfg(not(any(test, feature = "test-controls")))]
+        #[cfg(not(any(test, novarocks_dev_controls)))]
         let _ = snapshot;
     }
 }
 impl QueryLifecycleConvergenceReader for FrontendLifecycleDiagnostics {
     fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
-        #[cfg(any(test, feature = "test-controls"))]
+        #[cfg(any(test, novarocks_dev_controls))]
         {
             let mut latest = self
                 .latest
@@ -144,7 +144,7 @@ impl QueryLifecycleConvergenceReader for FrontendLifecycleDiagnostics {
             }
             latest.as_deref().cloned()
         }
-        #[cfg(not(any(test, feature = "test-controls")))]
+        #[cfg(not(any(test, novarocks_dev_controls)))]
         None
     }
 }

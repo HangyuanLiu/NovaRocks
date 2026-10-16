@@ -76,7 +76,7 @@ use crate::compiled_runtime_filter::{
 /// The Task facts every compiled scan of one task binds with.
 pub(crate) struct CompiledScanTask<'a> {
     pub(crate) runtime: &'a TypedScanRuntime,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) observation_controls:
         Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     pub(crate) fragment_instance_id: UniqueId,
@@ -332,7 +332,7 @@ pub(crate) fn bind_compiled_scan(
         output_schema,
         task.runtime.runtime_filter(),
         Arc::new(NoLiveDynamicFilter),
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         task.observation_controls
             .as_deref()
             .map(|controls| controls.observation_for("reader-marker", task.runtime.execution_id()))

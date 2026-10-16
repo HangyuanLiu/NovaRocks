@@ -97,7 +97,7 @@ impl std::error::Error for PreparationMetadataFailure {
 
 /// Component tests invoke the same operator preparation boundary after their
 /// existing fixture has installed the actual construction factory.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn prepare_operator_schema_for_test(
     operator: &mut dyn crate::exec::pipeline::operator::Operator,
     observer: &mut dyn CompiledSchemaPreparationScope,

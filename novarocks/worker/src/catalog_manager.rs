@@ -66,7 +66,7 @@ impl ConnectorExecutionRoleBindingFactorySet {
     pub fn bind(
         &self,
         properties: &CatalogProperties,
-        #[cfg(feature = "test-controls")] observation: Option<
+        #[cfg(novarocks_dev_controls)] observation: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
     ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
@@ -86,7 +86,7 @@ impl ConnectorExecutionRoleBindingFactorySet {
             ));
         };
         let binding = factory.bind(&normalized)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(observer) = observation {
             observer.observe(&format!(
                 "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED catalog={:?}",

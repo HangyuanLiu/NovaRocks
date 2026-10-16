@@ -50,7 +50,7 @@ pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
     pub(super) provider_activation: Arc<dyn MvRefreshProviderActivation>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(super) test_controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
@@ -231,7 +231,7 @@ fn execute_data(
     context: ConnectorRequestContext,
     execution: &QueryExecutionContext,
 ) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let control_target = (
         finalize.target.catalog.clone().unwrap_or_default(),
         finalize.target.database.clone(),
@@ -268,7 +268,7 @@ fn execute_data(
         .map_err(MvApplicationError::from_compile)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if let Err(error) = wait_for_mv_recovery_phase(dependencies, &control_target, "data-prepared") {
         crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
             authority.session(), &context,
@@ -310,7 +310,7 @@ fn execute_data(
         .provider_activation
         .interpret_write_commit(intent, &receipt)
         .map_err(invalid)?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     wait_for_mv_recovery_phase(dependencies, &control_target, "write-committed")?;
     let publication_version = committed.committed_version().clone();
     let published = MvRefreshPublicationFinalizationFacts::try_new(
@@ -326,7 +326,7 @@ fn execute_data(
     // The publication is committed and its facts are frozen; only the
     // frontend's own projection is still missing. A single target commit makes
     // this the one window between the external effect and the record of it.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     wait_for_mv_recovery_phase(dependencies, &control_target, "publication-committed")?;
     let snapshot_id = published
         .publication_version()
@@ -341,7 +341,7 @@ fn execute_data(
             snapshot_id,
         },
         published,
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         test_controls: dependencies.test_controls.clone(),
     })
 }
@@ -452,7 +452,7 @@ fn execute_metadata_only(
     admitted: &mut crate::mv::domain::staged_create::AdmittedMvDataPublication,
     context: ConnectorRequestContext,
 ) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let control_target = (
         finalize.target.catalog.clone().unwrap_or_default(),
         finalize.target.database.clone(),
@@ -505,7 +505,7 @@ fn execute_metadata_only(
         .provider_activation
         .interpret_write_commit(intent, &receipt)
         .map_err(invalid)?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     wait_for_mv_recovery_phase(dependencies, &control_target, "write-committed")?;
     let published = MvRefreshPublicationFinalizationFacts::try_new(
         committed.intent().clone(),
@@ -517,7 +517,7 @@ fn execute_metadata_only(
         namespace: finalize.target.database.into(),
         table: finalize.target.name.into(),
     };
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     wait_for_mv_recovery_phase(dependencies, &control_target, "publication-committed")?;
     let snapshot_id = published
         .publication_version()
@@ -532,7 +532,7 @@ fn execute_metadata_only(
             snapshot_id,
         },
         published,
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         test_controls: dependencies.test_controls.clone(),
     })
 }
@@ -543,7 +543,7 @@ fn execute_metadata_only(
 struct FrontendKnownCommittedPublication {
     install: PublishedProjectionInstall,
     published: MvRefreshPublicationFinalizationFacts,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
@@ -571,7 +571,7 @@ impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
         target: &ProductMvTarget,
     ) -> Result<(), MvProviderFailure> {
         let attempt = self.published.intent().publication_id();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = &self.test_controls {
             controls
                 .known_committed(
@@ -630,7 +630,7 @@ fn product_error(error: MvProductError) -> MvApplicationError {
         .with_compile_control(error.compile_control_error())
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn wait_for_mv_recovery_phase(
     dependencies: &FrontendMvRefreshDependencies,
     target: &(String, String, String),

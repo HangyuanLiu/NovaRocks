@@ -16,15 +16,13 @@
 // under the License.
 
 //! Process-neutral fragment execution contracts.
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
         ],
     )
@@ -38,3 +36,10 @@ pub mod task_execution;
 
 #[cfg(test)]
 mod test_result_domain;
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

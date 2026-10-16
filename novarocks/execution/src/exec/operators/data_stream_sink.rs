@@ -1420,7 +1420,7 @@ impl Operator for DataStreamSinkOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(observer) = state.exchange_test_observer() {
             self.send_tracker.install_test_observer(observer.clone())?;
         }

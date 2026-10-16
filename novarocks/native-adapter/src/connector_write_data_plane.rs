@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use novarocks_execution::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, ConnectorCommitFragmentEncoder,
 };
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use novarocks_execution::exec::node::table_write_relation::{
     TableWriteAggregateBoundary, TableWriteAggregateGuard,
 };
@@ -52,25 +52,25 @@ const WRITE_EVENT_TARGET: &str = "novarocks::connector_write";
 /// It cannot open a writer or change its result.
 #[derive(Debug)]
 pub struct NativeConnectorWriteObservationPort {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     process_id: BackendProcessId,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
 }
 
 impl NativeConnectorWriteObservationPort {
     pub fn new(process_id: BackendProcessId) -> Self {
-        #[cfg(not(feature = "test-controls"))]
+        #[cfg(not(novarocks_dev_controls))]
         let _ = process_id;
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             process_id,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_controls(
         mut self,
         controls: Arc<crate::test_controls::NativeTestControls>,
@@ -78,7 +78,7 @@ impl NativeConnectorWriteObservationPort {
         self.test_controls = Some(controls);
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn claim_append_hold(
         &self,
         execution_id: QueryExecutionId,
@@ -209,7 +209,7 @@ impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn hold_append(
         &self,
         writer: ConnectorWriterObservation,
@@ -226,7 +226,7 @@ impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
     }
 }
 pub struct RoleBoundCommitFragmentEncoder {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     encoder: Arc<dyn ConnectorWriteFragmentWireEncoder>,
     execution_id: QueryExecutionId,
@@ -240,14 +240,14 @@ impl RoleBoundCommitFragmentEncoder {
         node_id: i32,
     ) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
             encoder,
             execution_id,
             node_id,
         }
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_controls(
         mut self,
         controls: Arc<crate::test_controls::NativeTestControls>,
@@ -263,7 +263,7 @@ impl ConnectorCommitFragmentEncoder for RoleBoundCommitFragmentEncoder {
         target: WriteTargetOrdinal,
         fragment: &ConnectorCommitFragment,
     ) -> Result<Vec<u8>, ConnectorError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.test_controls.as_ref() {
             writer_failpoint(controls, self.execution_id, self.node_id, target)?;
         }
@@ -288,7 +288,7 @@ impl ConnectorCommitFragmentEncoder for RoleBoundCommitFragmentEncoder {
 /// provider value, and it holds no provider binding that could produce one.
 // Design: ADR-0133 (docs/adr/ADR-0133-dataflow-connector-writer-and-frontend-commit.md)
 pub struct RootCommitFragmentCarrierValidator {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     execution_id: QueryExecutionId,
     node_id: i32,
@@ -301,7 +301,7 @@ pub struct RootCommitFragmentCarrierValidator {
 impl RootCommitFragmentCarrierValidator {
     pub const fn new(execution_id: QueryExecutionId, node_id: i32) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
             execution_id,
             node_id,
@@ -310,7 +310,7 @@ impl RootCommitFragmentCarrierValidator {
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_controls(
         mut self,
         controls: Arc<crate::test_controls::NativeTestControls>,
@@ -329,7 +329,7 @@ impl RootCommitFragmentCarrierValidator {
 
 impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValidator {
     fn validate(&self, target: WriteTargetOrdinal, encoded: &[u8]) -> Result<(), ConnectorError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.test_controls.as_ref() {
             root_failpoint(controls, self.execution_id, self.node_id, target)?;
         }
@@ -398,14 +398,14 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
 /// write aggregate. The backend owns binding a runner token to an exact native
 /// attempt; Execution sees only a typed boundary and can neither inspect the
 /// token protocol nor fabricate replacement aggregate data.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub struct QueryScopedTableWriteAggregateGuard {
     controls: Arc<crate::test_controls::NativeTestControls>,
     execution_id: QueryExecutionId,
     node_id: i32,
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl QueryScopedTableWriteAggregateGuard {
     pub fn new(
         execution_id: QueryExecutionId,
@@ -420,7 +420,7 @@ impl QueryScopedTableWriteAggregateGuard {
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl TableWriteAggregateGuard for QueryScopedTableWriteAggregateGuard {
     fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
         let kind = match boundary {
@@ -459,7 +459,7 @@ fn carrier_error(target: WriteTargetOrdinal, detail: String) -> ConnectorError {
         ),
     )
 }
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn writer_failpoint(
     controls: &crate::test_controls::NativeTestControls,
     execution_id: QueryExecutionId,
@@ -483,7 +483,7 @@ fn writer_failpoint(
 }
 
 /// Test-only root-aggregation fault. Like the writer fault it only rejects.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn root_failpoint(
     controls: &crate::test_controls::NativeTestControls,
     execution_id: QueryExecutionId,
@@ -515,7 +515,7 @@ fn root_failpoint(
 /// below consumes it. A kind the frontend's bind list does not name therefore
 /// stays inert rather than firing on the wrong attempt, which is the correct
 /// failure mode for a fault that is not fully wired.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub fn claim_write_fault(
     controls: &crate::test_controls::NativeTestControls,
     execution_id: QueryExecutionId,
@@ -552,7 +552,7 @@ mod tests {
 
     use super::*;
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn append_holds_belong_to_the_exact_admitted_backend_process_and_attempt() {
         let fixture = crate::test_controls::tests::controlled("connector-write-append-hold");

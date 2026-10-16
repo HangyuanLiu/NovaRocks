@@ -420,7 +420,7 @@ impl BackendMetricsRegistry {
                 .register(collector)
                 .map_err(|error| format!("register backend metrics collector: {error}"))?;
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         registry
             .register(Box::new(
                 Lazy::force(&BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS).clone(),
@@ -1006,7 +1006,7 @@ static BACKEND_CONNECTOR_WRITE_WRITER_ABORTS: Lazy<prometheus::IntCounterVec> = 
 });
 
 /// Debug-only write faults that reached their exact execution boundary.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 static BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
     prometheus::IntCounterVec::new(
         Opts::new(
@@ -1101,7 +1101,7 @@ pub fn record_connector_write_writer_abort(outcome: &'static str) {
         .inc();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub fn record_connector_write_debug_fault(kind: &'static str) {
     BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS
         .with_label_values(&[kind])
@@ -1496,7 +1496,7 @@ fn ensure_backend_metric_label_families() {
         let _ = BACKEND_CONNECTOR_WRITE_WRITER_ABORTS.get_metric_with_label_values(&[outcome]);
     }
     #[cfg(debug_assertions)]
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let _ = BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS.get_metric_with_label_values(&["append_hold"]);
     for terminal in ["finished", "aborted"] {
         let _ = BACKEND_FRAGMENT_RESULT_TERMINALS.get_metric_with_label_values(&[terminal]);
@@ -1592,13 +1592,13 @@ mod tests {
             Arc::new(UnusedPreparationHost),
             Arc::new(UnusedPreparationHost),
             crate::task_execution_observation::backend_task_execution_ports(
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None,
             ),
         )
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn root_ownership_scrape_omits_stale_or_absent_samples_in_both_formats() {
         let absent = BackendMetricsRegistry::new().unwrap();
@@ -1729,7 +1729,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn preparation_busy_scrape_omits_stale_values_without_blocking_control_metrics() {
         let owner = preparation_owner();
@@ -1814,7 +1814,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn preparation_poison_is_an_error_in_both_formats() {
         let owner = preparation_owner();

@@ -271,7 +271,7 @@ pub enum PhysicalPlanKind {
 }
 
 impl PhysicalPlanKind {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn variant_names_for_test() -> &'static [&'static str] {
         &[
             "Scan",

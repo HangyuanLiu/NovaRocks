@@ -665,7 +665,7 @@ impl TaskExecutionRegistry {
 
     /// Test-only rendezvous on the actual registry mutex. The callback owns
     /// no Worker state and cannot alter a task or context verdict.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_registry_lock_for_test<T>(&self, callback: impl FnOnce() -> T) -> T {
         let _state = self.state.lock().expect(REGISTRY_LOCK);
         callback()

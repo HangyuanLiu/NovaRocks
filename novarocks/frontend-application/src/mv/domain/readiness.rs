@@ -16,7 +16,7 @@ use novarocks_mv_application::readiness::{
     MvKeyedProjectionInstallOutcome, MvKeyedReadOnlyCurrentProjectionSource,
     MvKeyedReadinessService, MvProjectionError,
 };
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ pub struct MvReadinessPort {
     service: MvKeyedReadinessService,
     management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
     handle: tokio::runtime::Handle,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
@@ -130,12 +130,12 @@ impl MvReadinessPort {
             service,
             management,
             handle,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             controls: None,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
         controls: Arc<crate::mv::test_controls::MvTestControls>,
@@ -144,12 +144,12 @@ impl MvReadinessPort {
         self
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn test_controls(&self) -> Option<&crate::mv::test_controls::MvTestControls> {
         self.controls.as_deref()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn test_controls_owner(
         &self,
     ) -> Option<Arc<crate::mv::test_controls::MvTestControls>> {
@@ -362,7 +362,7 @@ impl MvReadinessPort {
     /// Reject the test/harness-only whole-family Accelerator wipe while this
     /// FE owns any publication. A wipe has no distributed coordination role;
     /// the runner immediately restarts this FE after the wipe succeeds.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn ensure_no_active_publications(&self) -> Result<(), MvRepositoryError> {
         self.service.ensure_no_active_publications()
     }
@@ -371,7 +371,7 @@ impl MvReadinessPort {
     /// Permanently stop MV admission and join the existing product workers
     /// before the authorized whole-family wipe. The caller must stop/reap this
     /// FE immediately; this operation cannot resume its old MV runtime.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn wipe_accelerator_for_test(
         &self,
         product: &novarocks_mv_application::service::MvKeyedProductService,
@@ -494,7 +494,7 @@ impl MvCandidateReader {
     }
 }
 
-#[cfg(all(test, unix, feature = "test-controls"))]
+#[cfg(all(test, unix, novarocks_dev_controls))]
 mod controlled_wipe_tests {
     use super::*;
     use crate::mv::test_controls::tests::{TestSession, wipe_grant};

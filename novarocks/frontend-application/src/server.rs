@@ -47,7 +47,6 @@ use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_state_store_runtime::{StateStoreHostInput, StateStoreProviderRegistry};
 use novarocks_types::naming::DEFAULT_DATABASE;
-use novarocks_version as version;
 
 use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
@@ -142,6 +141,8 @@ pub struct FrontendManagementConfig {
 /// listeners. The Server role owns their process supervision.
 #[derive(Clone)]
 pub struct FrontendServingConfig {
+    /// Executable-frozen version projected to the MySQL greeting.
+    pub server_version: String,
     pub report_bind_host: String,
     pub report_grpc_port: u16,
     /// Maximum time admitted FE workload leases may continue after drain starts.
@@ -323,17 +324,12 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
-    #[cfg(not(feature = "test-controls"))]
-    let query_control =
-        novarocks_query_application::query_control::QueryApplicationControl::service();
-    #[cfg(feature = "test-controls")]
     let query_application_control =
         Arc::new(novarocks_query_application::query_control::QueryApplicationControl::default());
-    #[cfg(feature = "test-controls")]
     let query_control = novarocks_query_application::session_control::QueryControlService::new(
         query_application_control.clone(),
     );
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if let Some(owner) = host
         .test_session
         .as_ref()
@@ -368,7 +364,7 @@ async fn build_frontend_role_products(
         )
     })?
     .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy());
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let maintenance_service = maintenance_service.with_test_controls(
         host.test_session
             .as_ref()
@@ -416,7 +412,7 @@ async fn build_frontend_role_products(
             .management_entrance()
             .expect("serving MV product owns management entrance"),
     );
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let mv_readiness = match &host.test_session {
         Some(session) => match &session.mv {
             Some(mv) => mv_readiness.with_test_controls(mv.clone()),
@@ -748,7 +744,7 @@ fn build_frontend_query_session_factory_from_role_products(
         host.lake_publication_runtime_policy(),
         host.serving_lifecycle().admission(),
     );
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let query_service = query_service.with_statement_observation(
         host.test_session
             .as_ref()
@@ -891,12 +887,12 @@ pub fn start_frontend_management_server(
         .test_session
         .as_ref()
         .and_then(|session| session.hms_admission_owner.clone());
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let statement_observation = host
         .test_session
         .as_ref()
         .and_then(|session| session.statement.clone());
-    #[cfg(not(feature = "test-controls"))]
+    #[cfg(not(novarocks_dev_controls))]
     let _ = host;
     let metrics_http_server = crate::metrics::MetricsHttpServer::start(
         &config.bind_host,
@@ -907,7 +903,7 @@ pub fn start_frontend_management_server(
         Some(management_convergence_reader),
         Arc::clone(&config.memory_authority),
         Some(host.catalog_activity_observer()),
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         statement_observation,
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
         hms_admission_observation
@@ -1063,6 +1059,7 @@ where
         ))]
         Arc::clone(&config.native_trust),
         config.mysql_listener,
+        config.server_version,
         session_factory,
         client_connections,
         shutdown,
@@ -1095,6 +1092,7 @@ async fn run_mysql_with_listener_supervision<F>(
     ))]
     native_trust: Arc<NativeTrust>,
     mysql_listener: ResolvedMysqlListenerSettings,
+    server_version: String,
     session_factory: Arc<dyn QuerySessionFactory>,
     client_connections: Arc<MysqlClientConnectionRegistry>,
     shutdown: F,
@@ -1138,6 +1136,7 @@ where
             return closing_pressure_fixture::serve(
                 fixture,
                 mysql_listener,
+                server_version,
                 session_factory,
                 client_connections,
                 shutdown,
@@ -1157,6 +1156,7 @@ where
         return exact_mysql_write_fixture::serve(
             fixture,
             mysql_listener,
+            server_version,
             session_factory,
             client_connections,
             shutdown,
@@ -1181,7 +1181,7 @@ where
     let mysql_server =
         novarocks_mysql_adapter::serve_query_application_mysql_until_drain_then_shutdown(
             mysql_listener,
-            version::short_version().to_string(),
+            server_version,
             Arc::clone(&session_factory),
             Arc::clone(&client_connections),
             wait_for_signal(drain_rx),
@@ -2221,7 +2221,7 @@ mod tests {
         assert_eq!(captured, input);
     }
 
-    #[cfg(all(unix, feature = "test-controls"))]
+    #[cfg(all(unix, novarocks_dev_controls))]
     mod real_statement_entry_tests {
         use super::*;
         use anyhow::{Result, anyhow, ensure};

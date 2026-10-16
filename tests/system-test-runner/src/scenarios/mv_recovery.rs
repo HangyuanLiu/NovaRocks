@@ -74,15 +74,12 @@ impl Scenario for MvStateStoreRestart {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![FeLaunchIntent::Ordinary, FeLaunchIntent::Ordinary],
         )
@@ -250,15 +247,12 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         _launch: &ScenarioLaunchConfig,
         scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![
                 FeLaunchIntent::MvActions(vec![
@@ -504,15 +498,12 @@ impl Scenario for MvRewriteBindingBarrier {
         _launch: &ScenarioLaunchConfig,
         scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![FeLaunchIntent::ObservedMvActions(vec![
                 control_plan::rewrite(
@@ -677,15 +668,12 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         _launch: &ScenarioLaunchConfig,
         scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![FeLaunchIntent::MvActions(vec![control_plan::recovery(
                 "configuration-data-prepared",
@@ -962,15 +950,12 @@ impl Scenario for MvCurrentDependencyRecheck {
         _launch: &ScenarioLaunchConfig,
         scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![FeLaunchIntent::MvActions(vec![control_plan::recovery(
                 "dependency-data-prepared",
@@ -1097,15 +1082,12 @@ impl Scenario for MvLegacyInterpretationRebuild {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![FeLaunchIntent::Ordinary, FeLaunchIntent::Ordinary],
         )
@@ -1259,15 +1241,12 @@ impl Scenario for MvStagedPublishedRecovery {
         _launch: &ScenarioLaunchConfig,
         scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![
                 FeLaunchIntent::MvActions(vec![control_plan::recovery(
@@ -1457,18 +1436,10 @@ impl Scenario for MvFirstRefreshStaging {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
-        control_plan::first_refresh_plan(
-            cluster_size,
-            ordinary_binary,
-            controlled_binary,
-            original_deadline,
-        )
-        .map(Some)
+        control_plan::first_refresh_plan(cluster_size, binary, original_deadline).map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -1630,15 +1601,12 @@ impl Scenario for MvBaseIdentityReplacement {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![FeLaunchIntent::Ordinary, FeLaunchIntent::Ordinary],
         )
@@ -1748,15 +1716,12 @@ impl Scenario for MvLakePublicationRestartRebuild {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![
                 FeLaunchIntent::MvActions(vec![
@@ -2747,39 +2712,38 @@ mod control_plan_tests {
 
     struct PlanInputs {
         root: tempfile::TempDir,
-        ordinary: PathBuf,
-        controlled: PathBuf,
+        binary: PathBuf,
     }
     impl PlanInputs {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let ordinary = root.path().join("ordinary-selection");
-            let controlled = root.path().join("controlled-selection");
+            let binary = root.path().join("binary-selection");
             // Selection-only fixtures; no executable is started or self-report trusted.
-            fs::write(&ordinary, b"selection fixture").unwrap();
-            fs::write(&controlled, b"selection fixture").unwrap();
-            Self {
-                root,
-                ordinary,
-                controlled,
-            }
+            fs::write(&binary, b"selection fixture").unwrap();
+            Self { root, binary }
         }
-        fn summaries(&self, scenario: &dyn Scenario, controlled: Option<&Path>) -> Value {
+        fn summaries(&self, scenario: &dyn Scenario) -> Value {
             let deadline = Instant::now() + Duration::from_secs(5);
             let plan = scenario
                 .test_session_plan(
                     &ScenarioLaunchConfig::default(),
                     self.root.path(),
                     3,
-                    &self.ordinary,
-                    &self.ordinary,
-                    controlled,
+                    &self.binary,
                     deadline,
                 )
                 .unwrap()
                 .unwrap();
             assert_eq!(plan.deadline(), deadline);
-            plan.planned_launch_summaries()
+            let summaries = plan.planned_launch_summaries();
+            assert!(
+                summaries
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|launch| launch["binary"] == json!(self.binary))
+            );
+            summaries
         }
     }
     fn frontend_launches(value: &Value) -> Vec<&Value> {
@@ -2813,10 +2777,7 @@ mod control_plan_tests {
     #[test]
     fn staged_recovery_grants_follow_the_two_actual_restart_boundaries() {
         let input = PlanInputs::new();
-        let value = input.summaries(
-            &MvStagedPublishedRecovery::default(),
-            Some(&input.controlled),
-        );
+        let value = input.summaries(&MvStagedPublishedRecovery::default());
         let launches = frontend_launches(&value);
         assert_eq!(launches.len(), 3);
         assert_eq!(actions(launches[0]), ["recovery-hold"]);
@@ -2832,7 +2793,7 @@ mod control_plan_tests {
     #[test]
     fn scheduler_successor_only_receives_its_remaining_transient_action() {
         let input = PlanInputs::new();
-        let value = input.summaries(&MvSchedulerRecovery::default(), Some(&input.controlled));
+        let value = input.summaries(&MvSchedulerRecovery::default());
         let launches = frontend_launches(&value);
         assert_eq!(launches.len(), 2);
         assert_eq!(
@@ -2846,19 +2807,16 @@ mod control_plan_tests {
     #[test]
     fn lake_wipe_is_not_inherited_by_the_ordinary_successor() {
         let input = PlanInputs::new();
-        let value = input.summaries(
-            &MvLakePublicationRestartRebuild::default(),
-            Some(&input.controlled),
-        );
+        let value = input.summaries(&MvLakePublicationRestartRebuild::default());
         let launches = frontend_launches(&value);
         assert_eq!(launches.len(), 2);
         assert_eq!(
             actions(launches[0]),
             ["document-observation", "accelerator-wipe"]
         );
-        assert_eq!(launches[0]["binary"], json!(input.controlled));
+        assert_eq!(launches[0]["binary"], json!(input.binary));
         assert_eq!(launches[1]["ordinary"], true);
-        assert_eq!(launches[1]["binary"], json!(input.ordinary));
+        assert_eq!(launches[1]["binary"], json!(input.binary));
         assert!(actions(launches[1]).is_empty());
         assert_backends_ordinary(&value);
     }
@@ -2866,19 +2824,19 @@ mod control_plan_tests {
     #[test]
     fn retained_state_restart_does_not_request_any_control_capability() {
         let input = PlanInputs::new();
-        let value = input.summaries(&MvStateStoreRestart::default(), None);
+        let value = input.summaries(&MvStateStoreRestart::default());
         assert_eq!(frontend_launches(&value).len(), 2);
         for launch in value.as_array().unwrap() {
             assert_eq!(launch["ordinary"], true);
             assert!(actions(launch).is_empty());
-            assert_eq!(launch["binary"], json!(input.ordinary));
+            assert_eq!(launch["binary"], json!(input.binary));
         }
     }
 
     #[test]
     fn first_refresh_fault_targets_only_the_selected_backend_launch() {
         let input = PlanInputs::new();
-        let value = input.summaries(&MvFirstRefreshStaging::default(), Some(&input.controlled));
+        let value = input.summaries(&MvFirstRefreshStaging::default());
         let launches = value.as_array().unwrap();
         let frontend = launches
             .iter()
@@ -2912,10 +2870,8 @@ mod control_plan_tests {
     #[test]
     fn storage_rewrite_observer_does_not_survive_the_ordinary_restart_slot() {
         let input = PlanInputs::new();
-        let value = input.summaries(
-            &crate::scenarios::mv_uea7_storage::MvStorageContract::default(),
-            Some(&input.controlled),
-        );
+        let value =
+            input.summaries(&crate::scenarios::mv_uea7_storage::MvStorageContract::default());
         let launches = frontend_launches(&value);
         assert_eq!(launches.len(), 2);
         assert_eq!(actions(launches[0]), ["rewrite-hold", "observe"]);
@@ -2925,23 +2881,20 @@ mod control_plan_tests {
     }
 
     #[test]
-    fn selected_mv_control_fails_prelaunch_without_its_controlled_binary() {
+    fn selected_mv_control_requires_an_existing_primary_binary() {
         let input = PlanInputs::new();
         let result = MvLakePublicationRestartRebuild::default().test_session_plan(
             &ScenarioLaunchConfig::default(),
             input.root.path(),
             3,
-            &input.ordinary,
-            &input.ordinary,
-            None,
+            &input.root.path().join("missing-primary"),
             Instant::now() + Duration::from_secs(5),
         );
         assert!(
             result
-                .err()
-                .unwrap()
+                .unwrap_err()
                 .to_string()
-                .contains("test-controls binary")
+                .contains("binary is missing")
         );
     }
 }

@@ -122,9 +122,9 @@ fn bind(
         ProgramNodeId::new(1),
         recipe,
         &CompiledWriteTask {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             runtime,
@@ -204,9 +204,9 @@ fn a_compiled_finish_binds_the_canonical_carrier_validator() {
     bind_compiled_finish(
         ProgramNodeId::new(2),
         &CompiledWriteTask {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             runtime: &runtime,

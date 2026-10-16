@@ -23,9 +23,9 @@ under the License.
 
 ## 原生运行与输入
 
-生产验收使用 cross-process 1FE+3BE。runner 通过 `NOVAROCKS_BIN` 指定普通二进制，内部诊断/注入步骤另外通过 `NOVAROCKS_TEST_CONTROL_BIN` 指定受控二进制，拥有 spawn、READY、执行和实际 shutdown；`all-in-one` 模式只连接配置中的已有服务，属于本地 smoke，不替代生产拓扑。
+生产验收使用 cross-process 1FE+3BE。runner 通过唯一显式 `NOVAROCKS_BIN` 指定主 Server，原生 owner 为实际选中有限动作建立准确授权并拥有 spawn、READY、执行和实际 shutdown；`all-in-one` 只作 smoke。标准 dev 的能力由实际 cfg 编入，能力不授予控制权。
 
-普通、控制及兼容性变体使用独立 Cargo target；默认是 `target/normal`、`target/test-controls`、`target/variants`，可按已有 owner 的缓存根覆盖，参见 [构建选择](../../docs/guides/development/test-governance.md#构建选择与控制授权) 与 [CI helper](../../tools/ci/lib/build_capabilities.sh)。缓存可复用，运行材料每次独占；构建显式传 profile 和 `NOVAROCKS_BUILD_PROFILE`，不能从目录推断能力。下面只展示 runner 命令，实际产物须先构建并读取各自 `--build-info`。
+先用规范 [dev-test.sh](../../tools/ci/dev-test.sh) 同次准备 workspace tests/bins，真实 Cargo JSON 绑定路径、自报和 hash。CLI 保留原 `tests/sql/runner/Cargo.toml` 与包身份，库位于其子目录；裸 `cargo run --manifest-path tests/sql/runner/Cargo.toml -- ...` 仍明确运行 SQL CLI。日常/CI 使用已准备程序，退出次级构建。完整合同见 [构建选择](../../docs/guides/development/test-governance.md#构建选择与控制授权)。
 
 非隔离套件先绑定验证过 BOM 的 fixture，再解析一次 immutable publication；不猜固定端点和凭据：
 
@@ -33,20 +33,19 @@ under the License.
 docker/iceberg-rest/up.sh
 fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
 source "$fixture_publication/env.sh"
-normal_target="${NOVA_CI_NORMAL_TARGET_DIR:-$PWD/target/normal}"
-control_target="${NOVA_CI_CONTROL_TARGET_DIR:-$PWD/target/test-controls}"
-export NOVAROCKS_BUILD_PROFILE=dev-opt
-export NOVAROCKS_BIN="$normal_target/dev-opt/novarocks"
-export NOVAROCKS_TEST_CONTROL_BIN="$control_target/dev-opt/novarocks"
-cargo run --locked --profile dev-opt --target-dir "$normal_target" \
-  --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
+tools/ci/dev-test.sh prepare logs/sql-attempt/artifacts.json
+source tools/ci/lib/build_capabilities.sh
+export NOVA_CI_ARTIFACT_RECEIPT="$PWD/logs/sql-attempt/artifacts.json"
+export NOVAROCKS_BIN="$(ci_bound_binary novarocks)"
+sql_runner="$(ci_bound_binary novarocks-sql-test)"
+"$sql_runner" \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite filter --mode verify \
   --cluster-mode cross-process --cluster-size 3 -j 1
 ```
 
 `--list-suites` 列出所有注册套件，包括 explicit-only；`--suite all` 按 suite manifest 排除 explicit-only。`--list-extensions` 不启动集群。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
 
-能力需求来自 merge/过滤后真正选中的有限步骤、已有指令与原生 capability tag；普通 SQL 仍用普通产物，内部断言不能因缺测试产物而跳过。feature 编入、profile、suite 名或旧环境不授予控制，裸测试 CALL 也没有自动权限。`test-capability:mv-document-observation` 只声明非破坏观察，不授予 wipe；未知 `test-capability:` 值明确拒绝。`mv_storage_contract_shared_document_revisions.sql` query 5/6 已就近声明此 tag，并保留原六个普通标签；两步只请求非破坏观察，SQL/expected/oracle 不变。G2 的完整 storage-contract 十个 case 已通过，验证范围与未运行项见 [G2 验证记录](../../docs/guides/development/tst-g2-validation-status.md)。
+能力需求来自 merge/过滤后真正选中的有限步骤、已有指令与原生 capability tag；普通 SQL 仍使用同一主产物，内部断言不能因缺测试产物而跳过。feature 编入、profile、suite 名或旧环境不授予控制，裸测试 CALL 也没有自动权限。`test-capability:mv-document-observation` 只声明非破坏观察，不授予 wipe；未知 `test-capability:` 值明确拒绝。`mv_storage_contract_shared_document_revisions.sql` query 5/6 已就近声明此 tag，并保留原六个普通标签；两步只请求非破坏观察，SQL/expected/oracle 不变。G2 的完整 storage-contract 十个 case 已通过，验证范围与未运行项见 [G2 验证记录](../../docs/guides/development/tst-g2-validation-status.md)。
 
 每次 FE/BE launch/restart 在 spawn 前读真实产物自报，保存原双流、实际退出和角色映射；会话绑定实际 Native process 与准确 statement/动作目标。自报的 profile 声明、binary cfg、package 局部事实及 null/unknown 分列，明确不作发布认证。缺授权、错误产物、原期限到期和实际资源/进程清理失败都保留原始失败，不能用未命中注入的正常结果代替通过。
 
@@ -68,8 +67,7 @@ tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh \
 同次 publication、真实 Spark image/BOM、schema与对象布局由既有输入 owner 核对。消费者只运行 `--check`，核对 READY 的 dataset key、manifest URI、publication identity/ETag及实际 warehouse；缺失、失效或不匹配即非零退出，不启动集群或重写数据。新对象存储需重新显式供给，共享 READY 不属于 worktree purge。
 
 ```bash
-cargo run --locked --profile dev-opt --target-dir "$normal_target" \
-  --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
+"$sql_runner" \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite ssb,tpc-h,tpc-ds --mode verify \
   --cluster-mode cross-process --cluster-size 3 -j 1 --cluster-launch-profile performance
 ```

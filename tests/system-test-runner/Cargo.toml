@@ -25,10 +25,6 @@ publish = false
 [lints]
 workspace = true
 
-[[bin]]
-name = "novarocks-system-tests"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true

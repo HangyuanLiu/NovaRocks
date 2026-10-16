@@ -17,16 +17,16 @@
 
 //! Evidence markers and file metrics of the page streams a typed scan reads.
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use novarocks_execution::connector::ScheduledSplitFacts;
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_spi::connector::read_stack::PageSourceFileMetrics;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::read_attempt::ReceivedReadSplit;
 
 /// Test-only identity emitted with one provider-owned reader lifecycle.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[derive(Clone)]
 pub struct TypedConnectorReaderMarker {
     observation: std::sync::Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
@@ -36,7 +36,7 @@ pub struct TypedConnectorReaderMarker {
     scheduled_split_sequence_id: u64,
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl TypedConnectorReaderMarker {
     pub fn for_split(
         split: &ReceivedReadSplit,
@@ -66,7 +66,7 @@ impl TypedConnectorReaderMarker {
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn hex_encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));

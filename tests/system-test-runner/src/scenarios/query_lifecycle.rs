@@ -104,9 +104,7 @@ impl Scenario for LiveBackendPartition {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -116,8 +114,7 @@ impl Scenario for LiveBackendPartition {
             ],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -299,28 +296,28 @@ fn start_partitioned_read(
 #[derive(Default)]
 struct DistributedBaseline {
     intent: SqlIntentOwner,
-    ordinary_binary: Mutex<Option<PathBuf>>,
+    binary: Mutex<Option<PathBuf>>,
 }
 
 impl DistributedBaseline {
     fn run_ordinary_baseline(&self, context: &mut ScenarioContext) -> Result<()> {
         use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
 
-        let ordinary = self
-            .ordinary_binary
+        let binary = self
+            .binary
             .lock()
-            .map_err(|_| anyhow::anyhow!("ordinary baseline artifact owner poisoned"))?
+            .map_err(|_| anyhow::anyhow!("binary baseline artifact owner poisoned"))?
             .take()
-            .context("ordinary baseline artifact was not frozen before launch")?;
+            .context("binary baseline artifact was not frozen before launch")?;
         let deadline = context.deadline();
         let mut plan = ClusterTestSessionPlan::new(deadline)?;
         let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
         let backends = (0..REQUIRED_BACKENDS)
             .map(|index| plan.reserve_launch(RoleSlot::Backend(index)))
             .collect::<Result<Vec<_>>>()?;
-        plan.authorize_ordinary_launch(&frontend, ordinary.clone())?;
+        plan.authorize_ordinary_launch(&frontend, binary.clone())?;
         for backend in &backends {
-            plan.authorize_ordinary_launch(backend, ordinary.clone())?;
+            plan.authorize_ordinary_launch(backend, binary.clone())?;
         }
         let mut peer = context.launch_peer_cluster_with_test_session(
             "ordinary-baseline",
@@ -333,10 +330,10 @@ impl DistributedBaseline {
                 "ordinary baseline requires native 1FE+3BE, got 1FE+{}BE",
                 peer.be_count()
             );
-            let baseline = peer.query_execution_resource_snapshot()?.context(
-                "ordinary baseline peer did not expose the public query-resource oracle",
-            )?;
-            context.action("captured ordinary artifact native 1FE+3BE query-resource baseline");
+            let baseline = peer
+                .query_execution_resource_snapshot()?
+                .context("binary baseline peer did not expose the public query-resource oracle")?;
+            context.action("captured binary artifact native 1FE+3BE query-resource baseline");
             let query = mysql_actor::connect_until(
                 peer.mysql_user(),
                 peer.runtime().fe_mysql_port,
@@ -358,12 +355,12 @@ impl DistributedBaseline {
                             }
                             Err(error) => {
                                 return Err(anyhow::Error::new(error)
-                                    .context("ordinary test-only CALL did not return a public SQL error"));
+                                    .context("binary test-only CALL did not return a public SQL error"));
                             }
-                            Ok(()) => bail!("ordinary artifact accepted test-only {level} CALL"),
+                            Ok(()) => bail!("binary artifact accepted test-only {level} CALL"),
                         }
                     }
-                    for ordinal in ["ordinary first", "ordinary second", "ordinary third"] {
+                    for ordinal in ["binary first", "binary second", "binary third"] {
                         execute_baseline_query(connection, ordinal)?;
                     }
                     Ok(())
@@ -371,7 +368,7 @@ impl DistributedBaseline {
             });
             let convergence = peer
                 .await_query_execution_resource_convergence(&baseline, deadline)
-                .context("await ordinary baseline public query-resource convergence");
+                .context("await binary baseline public query-resource convergence");
             match (query, convergence) {
                 (Ok(()), Ok(())) => {
                     ensure!(
@@ -384,7 +381,7 @@ impl DistributedBaseline {
                     Ok(())
                 }
                 (Err(primary), Err(cleanup)) => {
-                    bail!("{primary:#}; ordinary baseline resource convergence: {cleanup:#}")
+                    bail!("{primary:#}; binary baseline resource convergence: {cleanup:#}")
                 }
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
@@ -395,11 +392,11 @@ impl DistributedBaseline {
         let cleanup = ServerHandle::shutdown(&mut peer);
         match (primary, cleanup) {
             (Ok(()), Ok(())) => {
-                context.action("ordinary baseline peer roles actually stopped and reaped");
+                context.action("binary baseline peer roles actually stopped and reaped");
                 Ok(())
             }
             (Err(primary), Err(cleanup)) => {
-                bail!("{primary:#}; ordinary baseline peer shutdown: {cleanup:#}")
+                bail!("{primary:#}; binary baseline peer shutdown: {cleanup:#}")
             }
             (Err(error), _) | (_, Err(error)) => Err(error),
         }
@@ -416,28 +413,25 @@ impl Scenario for DistributedBaseline {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        let mut ordinary_binary = self
-            .ordinary_binary
+        let mut frozen_binary = self
+            .binary
             .lock()
-            .map_err(|_| anyhow::anyhow!("ordinary baseline artifact owner poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("binary baseline artifact owner poisoned"))?;
         ensure!(
-            ordinary_binary.is_none(),
+            frozen_binary.is_none(),
             "ordinary baseline artifact was already frozen"
         );
         let plan = self.intent.freeze(
             (0..3).map(|_| observed_statement(BASELINE_QUERY)).collect(),
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?;
-        *ordinary_binary = Some(ordinary.to_path_buf());
+        *frozen_binary = Some(binary.to_path_buf());
         Ok(Some(plan))
     }
 
@@ -597,9 +591,7 @@ impl Scenario for NoEffectReadAfterBackendExit {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let statement = StatementSpec {
@@ -615,8 +607,7 @@ impl Scenario for NoEffectReadAfterBackendExit {
             vec![statement],
             &[0, 1, 2],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -762,9 +753,7 @@ impl Scenario for Nid2CreateRejected {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -774,8 +763,7 @@ impl Scenario for Nid2CreateRejected {
             )],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -843,9 +831,7 @@ impl Scenario for Nid2CreateReceiptForeignTask {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -855,8 +841,7 @@ impl Scenario for Nid2CreateReceiptForeignTask {
             )],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -920,9 +905,7 @@ impl Scenario for Nid2ForeignStatusProcess {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -932,8 +915,7 @@ impl Scenario for Nid2ForeignStatusProcess {
             )],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

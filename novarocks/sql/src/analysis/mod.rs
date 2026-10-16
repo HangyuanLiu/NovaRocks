@@ -478,7 +478,7 @@ pub(crate) fn resolve_function_binding(
 /// Builds an explicit, fully typed function contract for structural IR tests
 /// that do not run the analyzer. Production code must always resolve through
 /// the injected catalog before constructing a function call.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_function_binding(
     name: &str,
     args: &[TypedExpr],
@@ -542,7 +542,7 @@ pub(crate) fn test_function_binding(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_window_binding(
     name: &str,
     args: &[TypedExpr],

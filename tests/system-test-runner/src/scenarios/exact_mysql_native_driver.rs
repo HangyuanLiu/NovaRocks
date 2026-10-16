@@ -413,9 +413,7 @@ impl Scenario for ExactNativeCase {
         launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         self.run.validate_shape()?;
@@ -437,9 +435,7 @@ impl Scenario for ExactNativeCase {
             tokens.push(health_token.as_str());
         }
         Ok(Some(variant_sessions::fixture_plan(
-            primary_binary,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             cluster_size,
             original_deadline,
             vec![variant_sessions::grant(
@@ -1042,7 +1038,7 @@ async fn census(context: &mut ScenarioContext, deadline: Instant) -> Result<Cens
                 "novarocks_backend_worker_reservation_last_published_unixtime_seconds",
                 &[],
             )? > 0;
-        for class in ["ordinary", "control", "root_result"] {
+        for class in ["binary", "control", "root_result"] {
             for phase in ["running", "waiting"] {
                 idle &= metric(
                     rows,

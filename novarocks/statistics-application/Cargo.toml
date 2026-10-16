@@ -25,11 +25,9 @@ license.workspace = true
 workspace = true
 
 [features]
-normal-build = ["novarocks-failpoint?/normal-build", "novarocks-query-application/normal-build"]
-test-controls = ["dep:novarocks-failpoint", "novarocks-failpoint/test-controls", "novarocks-query-application/test-controls"]
 
 [dependencies]
-novarocks-failpoint = { workspace = true, optional = true }
+novarocks-failpoint = { workspace = true }
 novarocks-type-contract.workspace = true
 novarocks-query-application.workspace = true
 novarocks-workload-control.workspace = true

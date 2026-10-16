@@ -119,7 +119,7 @@ pub trait ConnectorWriteObservationPort: Send + Sync {
 
     /// Scoped hold permission only; Worker retains the provider operation and
     /// its original cancellation owner. Session end merely releases this hold.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn hold_append(
         &self,
         _writer: ConnectorWriterObservation,
@@ -138,7 +138,7 @@ pub struct ObservedConnectorWriteExecution {
     execution_id: QueryExecutionId,
     node_id: i32,
     observation: Arc<dyn ConnectorWriteObservationPort>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     writer_observer: Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>>,
 }
 
@@ -148,7 +148,7 @@ impl ObservedConnectorWriteExecution {
         execution_id: QueryExecutionId,
         node_id: i32,
         observation: Arc<dyn ConnectorWriteObservationPort>,
-        #[cfg(feature = "test-controls")] writer_observer: Option<
+        #[cfg(novarocks_dev_controls)] writer_observer: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
     ) -> Self {
@@ -157,7 +157,7 @@ impl ObservedConnectorWriteExecution {
             execution_id,
             node_id,
             observation,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             writer_observer,
         }
     }
@@ -184,7 +184,7 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
             Ok(inner) => {
                 self.observation
                     .observe(ConnectorWriteObservation::WriterOpened { writer, catalog });
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 emit_writer_marker(
                     self.writer_observer.as_deref(),
                     "NOVAROCKS_CONNECTOR_WRITER_OPENED",
@@ -223,7 +223,7 @@ struct ObservedConnectorBatchWriter {
 #[async_trait::async_trait]
 impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(cancellation) = self.observation.hold_append(self.writer)? {
             cancellation.cancelled().await;
         }
@@ -274,7 +274,7 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
 
 /// The owner supplies a live, bounded observation grant; no startup boolean
 /// can keep this evidence surface active after its session closes.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_writer_marker(
     observer: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
     marker: &str,
@@ -430,7 +430,7 @@ mod tests {
             execution_id(),
             7,
             Arc::clone(&observation) as Arc<dyn ConnectorWriteObservationPort>,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
         );
         let physical = ConnectorWriterPhysicalContext::new([1; 16], 2, [3; 16], 4, 5);

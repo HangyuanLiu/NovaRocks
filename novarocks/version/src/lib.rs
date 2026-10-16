@@ -15,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
 #[cfg(all(
     feature = "native-compatibility-test-fixture",
-    not(feature = "test-controls")
+    not(novarocks_dev_controls)
 ))]
 compile_error!("native-compatibility-test-fixture requires test-controls");
 
@@ -28,7 +26,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
             #[cfg(feature = "native-compatibility-test-fixture")]
             "native-compatibility-test-fixture",
@@ -41,10 +39,6 @@ use std::fmt;
 use novarocks_proto_models::FILE_DESCRIPTOR_SET;
 use novarocks_types::NativeCompatibilityId;
 use sha2::{Digest, Sha256};
-
-const GIT_HASH: &str = env!("NOVAROCKS_GIT_HASH");
-const GIT_TIME: &str = env!("NOVAROCKS_GIT_TIME");
-const NATIVE_BUILD_IDENTITY: &str = env!("NOVAROCKS_NATIVE_BUILD_IDENTITY");
 
 // Design: ADR-0124 (docs/adr/ADR-0124-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
@@ -424,38 +418,11 @@ pub fn derive_repository_native_compatibility_material(
     )
 }
 
-/// Immutable release identity used to admit native Backend processes.
-///
-/// It is supplied explicitly at build time or derived from the full Git commit.
-/// It is intentionally distinct from the shorter human-facing version strings.
-pub const fn native_build_identity() -> &'static str {
-    NATIVE_BUILD_IDENTITY
-}
-
-/// Actual build-time Git commit, independently of an explicit native build identity.
-/// Empty for builds without an available Git checkout.
-pub const fn build_git_commit() -> &'static str {
-    env!("NOVAROCKS_GIT_COMMIT_FULL")
-}
-
-/// Short version string reported via heartbeat, e.g. "novarocks-1b9f054a".
-/// Matches StarRocks BE convention of "version-commit".
-pub fn short_version() -> &'static str {
-    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| format!("novarocks-{GIT_HASH}"))
-}
-
-/// Full version string including commit time for logging at startup.
-pub fn full_version() -> &'static str {
-    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| format!("novarocks-{GIT_HASH} ({GIT_TIME})"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         NATIVE_COMPAT_EPOCH, NativeCarrierDeclaration, NativeCompatibilityError,
-        StaticPlanInterpreter, derive_native_compatibility_material, native_build_identity,
+        StaticPlanInterpreter, derive_native_compatibility_material,
     };
 
     const PLAN_TREE: StaticPlanInterpreter = StaticPlanInterpreter::PlanTree;
@@ -465,17 +432,6 @@ mod tests {
             NativeCarrierDeclaration::try_new("iceberg", 1).expect("iceberg declaration"),
             NativeCarrierDeclaration::try_new("starrocks", 1).expect("starrocks declaration"),
         ]
-    }
-
-    #[test]
-    fn native_build_identity_is_present_and_not_unknown() {
-        let identity = native_build_identity();
-        assert!(!identity.is_empty());
-        assert_ne!(identity, "unknown");
-        assert!(identity.len() <= 128);
-        assert!(identity.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-        }));
     }
 
     #[test]
@@ -865,3 +821,10 @@ mod tests {
         );
     }
 }
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

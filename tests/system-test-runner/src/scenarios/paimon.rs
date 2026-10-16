@@ -122,9 +122,7 @@ impl Scenario for PaimonReadData {
         _: &ScenarioLaunchConfig,
         _: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(
@@ -135,8 +133,7 @@ impl Scenario for PaimonReadData {
                     .collect(),
                 &[],
                 cluster_size,
-                ordinary,
-                controlled,
+                binary,
                 deadline,
             )?,
         ))
@@ -248,9 +245,7 @@ impl Scenario for PaimonSnapshotAndSchema {
         _: &ScenarioLaunchConfig,
         _: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -260,8 +255,7 @@ impl Scenario for PaimonSnapshotAndSchema {
             )],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -494,9 +488,7 @@ impl Scenario for PaimonCancelAndBudget {
         _: &ScenarioLaunchConfig,
         _: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -506,8 +498,7 @@ impl Scenario for PaimonCancelAndBudget {
             )],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -701,9 +692,7 @@ impl Scenario for IcebergPaimonRead {
         _: &ScenarioLaunchConfig,
         _: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -716,8 +705,7 @@ impl Scenario for IcebergPaimonRead {
                 }],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -1371,7 +1359,6 @@ mod tests {
                 &[],
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .unwrap();

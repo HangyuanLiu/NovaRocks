@@ -101,7 +101,7 @@ pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 4;
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_iceberg_write_phase_marker(
     slot: Option<&crate::test_observation::IcebergObservationSlot>,
     context: &ConnectorRequestContext,
@@ -122,7 +122,7 @@ fn emit_iceberg_write_phase_marker(
     });
 }
 
-#[cfg(any(test, feature = "test-controls"))]
+#[cfg(any(test, novarocks_dev_controls))]
 fn iceberg_write_phase_marker(
     session_id: IcebergWriteSessionId,
     attempt: usize,
@@ -221,7 +221,7 @@ pub(crate) fn decode_write_recovery_facts_for_test(
 /// The frontend-only Iceberg write authority of one exact catalog generation.
 // Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 pub struct IcebergWriteSessionControl {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observation_slot: Option<crate::test_observation::IcebergObservationSlot>,
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
@@ -230,7 +230,7 @@ pub struct IcebergWriteSessionControl {
 }
 
 impl IcebergWriteSessionControl {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
         mut self,
         slot: Option<crate::test_observation::IcebergObservationSlot>,
@@ -254,7 +254,7 @@ impl IcebergWriteSessionControl {
             catalog_handle,
         );
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: None,
             key,
             descriptor,
@@ -1010,11 +1010,11 @@ impl IcebergWriteSessionControl {
         document_publication: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let phase_started = std::time::Instant::now();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let session_id = handle.session_id();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),
             context,
@@ -1030,7 +1030,7 @@ impl IcebergWriteSessionControl {
         if validated.is_empty()
             && handle.empty_write_decision() == IcebergEmptyWriteDecision::SkipExternalCommit
         {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             emit_iceberg_write_phase_marker(
                 self.observation_slot.as_ref(),
                 context,
@@ -1042,7 +1042,7 @@ impl IcebergWriteSessionControl {
             return settle_empty_write_without_commit(handle);
         }
 
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),
             context,
@@ -1052,7 +1052,7 @@ impl IcebergWriteSessionControl {
             phase_started,
         );
         handle.begin_commit()?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),
             context,
@@ -1061,7 +1061,7 @@ impl IcebergWriteSessionControl {
             "publication_admission_exit",
             phase_started,
         );
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),
             context,
@@ -1095,7 +1095,7 @@ impl IcebergWriteSessionControl {
                 error.to_string(),
             );
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),
             context,
@@ -1145,7 +1145,7 @@ impl IcebergWriteSessionControl {
                 handle.retain_finalization(cleanup.clone());
             }
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),
             context,

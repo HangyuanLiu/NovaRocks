@@ -30,7 +30,7 @@ mkdir -p "$source_root/novarocks/frontend-application/src/connector" \
   "$source_root/novarocks/spi/src/connector/binding" \
   "$source_root/novarocks/spi/src/connector/provider" \
   "$source_root/novarocks/connector/starrocks/src" \
-  "$source_root/novarocks-server/src"
+  "$source_root/novarocks-server/library/src"
 touch "$source_root/novarocks/spi/src/connector/binding/role.rs"
 touch "$source_root/novarocks/spi/src/connector/provider/role.rs"
 cat >"$source_root/novarocks/connector/starrocks/src/role_binding.rs" <<'EOF'
@@ -68,7 +68,7 @@ jq '
 assert_rejected "$native_adapter_missing" \
   "novarocks-native-adapter must directly declare a normal dependency on novarocks-spi"
 
-touch "$source_root/novarocks-server/src/connector_role_binding.rs"
+touch "$source_root/novarocks-server/library/src/connector_role_binding.rs"
 if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \
   >"$tmpdir/server.stdout" 2>"$tmpdir/server.stderr"; then
   echo "Server StarRocks factory adapter mutation was accepted" >&2

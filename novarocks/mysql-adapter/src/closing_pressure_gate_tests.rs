@@ -694,21 +694,21 @@ async fn tcp_cut<W: AsyncWrite + Unpin>(
 // Both paths borrow the same original TCP actor and independent wire oracle.
 enum TcpCutController {
     Kernel(PressureController),
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     Authorized(crate::closing_pressure_fixture::ClosingPressureFixture),
 }
 impl TcpCutController {
     fn arm(&mut self, frontend: FrontendProcessId) -> io::Result<()> {
         match self {
             Self::Kernel(owner) => owner.arm_targets(frontend, inputs()),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             Self::Authorized(owner) => owner.arm_targets(frontend, inputs()),
         }
     }
     fn stop(&mut self) {
         match self {
             Self::Kernel(owner) => owner.stop(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             Self::Authorized(owner) => owner.stop(),
         }
     }
@@ -1045,7 +1045,7 @@ async fn actual_tcp_vectored_rows_cut_original_drop_and_peer_join() {
     tcp_cut(|writer| writer).await.unwrap();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 mod authorization_tests {
     use super::*;
     use crate::{

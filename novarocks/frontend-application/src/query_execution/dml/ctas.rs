@@ -1637,7 +1637,7 @@ impl CtasEngine for DmlExecutionKernel {
             reservation
                 .connector_request_context(
                     connector_context,
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     request.execution.test_statement_nomination(),
                 )
                 .map_err(internal_failure)?

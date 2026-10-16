@@ -477,7 +477,7 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
 }
 
 /// Borrow the actual Native creator without exposing a provenance constructor.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn with_native_type_construction_for_test<R>(
     tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
     control: &dyn PureCompileControl,
@@ -499,7 +499,7 @@ pub fn with_native_type_construction_for_test<R>(
 
 /// Test-support composition of the actual admitted creator and funded receiver.
 /// The test supplies its real tracker/control and original funding hosts.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn compile_native_package_with_funding_for_test(
     compiler: &dyn CompiledPackageCompiler,
     package: &[u8],

@@ -66,6 +66,7 @@ FORBIDDEN_CODEC_CLOSURE = {
     "novarocks-execution",
     "novarocks-frontend-application",
     "novarocks-server",
+    "novarocks-server-application",
     "novarocks-sql",
     "novarocks-state-store-foundationdb",
     "novarocks-state-store-mysql",
@@ -76,6 +77,7 @@ FORBIDDEN_EXECUTION_CONTRACT_CLOSURE = WIRE_PACKAGES | {
     "novarocks-execution",
     "novarocks-frontend-application",
     "novarocks-server",
+    "novarocks-server-application",
     "novarocks-sql",
 }
 
@@ -91,6 +93,7 @@ FORBIDDEN_PLAN_CODEC_CLOSURE = {
     NATIVE_ADAPTER,
     "novarocks-worker",
     SERVER,
+    "novarocks-server-application",
     "novarocks-sql",
 }
 
@@ -112,7 +115,7 @@ LOWER_LAYER_ROOTS = {
     "novarocks-state-store-sqlite",
 }
 
-STARROCKS_FORBIDDEN_CLOSURE = {FRONTEND_APPLICATION, NATIVE_ADAPTER, SERVER}
+STARROCKS_FORBIDDEN_CLOSURE = {FRONTEND_APPLICATION, NATIVE_ADAPTER, SERVER, "novarocks-server-application"}
 
 
 def fail(message):
@@ -355,13 +358,11 @@ def verify_starrocks_provider_boundary(metadata):
 
 
 def verify_server_direct_dependencies(metadata):
-    direct = normal_dependency_names(package_by_name(metadata, SERVER))
-    forbidden = sorted(direct & WIRE_PACKAGES)
-    if forbidden:
-        fail(
-            f"{SERVER} must not directly declare normal wire dependencies: "
-            + ", ".join(forbidden)
-        )
+    for owner in (SERVER, "novarocks-server-application"):
+        direct = normal_dependency_names(package_by_name(metadata, owner))
+        forbidden = sorted(direct & WIRE_PACKAGES)
+        if forbidden:
+            fail(f"{owner} must not directly declare normal wire dependencies: " + ", ".join(forbidden))
 
 
 def verify_failpoint_typed_closure(metadata):

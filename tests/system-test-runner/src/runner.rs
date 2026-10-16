@@ -8,10 +8,10 @@ use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
 use std::fs;
 
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
     let exact =
         cli.exact_mysql_execution_binding.is_some() || cli.held_native_execution_binding.is_some();
-    let result = run_dispatch(cli);
+    let result = run_dispatch(cli, build);
     if exact {
         finish_exact_mysql_scenario(result.err(), Ok(()), Ok(()))
     } else {
@@ -19,7 +19,7 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn run_dispatch(cli: Cli) -> Result<()> {
+fn run_dispatch(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
     let scenarios = scenarios::all();
     if cli.list || cli.list_default {
         for scenario in list_scenarios(&scenarios, cli.list_default)? {
@@ -31,13 +31,47 @@ fn run_dispatch(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
-    if cli.list_default {
-        for scenario in select(&scenarios, &[])? {
+    if cli.list_compatibility {
+        let selected = if cli.only.is_empty() {
+            scenarios
+                .iter()
+                .filter(|scenario| scenario.is_compatibility_stage())
+                .map(|scenario| scenario.as_ref())
+                .collect::<Vec<_>>()
+        } else {
+            select(&scenarios, &cli.only)?
+        };
+        anyhow::ensure!(!selected.is_empty(), "no compatibility scenarios selected");
+        for scenario in selected {
+            anyhow::ensure!(
+                scenario.is_compatibility_stage(),
+                "scenario is outside compatibility stages: {}",
+                scenario.name()
+            );
             println!("{}", scenario.name());
         }
         return Ok(());
     }
-    let config = RunnerConfig::from_cli(&cli)?;
+    if cli.list_binary_requirements {
+        let selected = select(&scenarios, &cli.only)?;
+        anyhow::ensure!(!selected.is_empty(), "no scenarios selected");
+        let requirements = selected
+            .iter()
+            .flat_map(|scenario| scenario.binary_requirements().iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        for required in requirements {
+            println!(
+                "{}",
+                match required {
+                    crate::scenario::ScenarioBinary::Primary => "primary",
+                    crate::scenario::ScenarioBinary::Compatible => "compatible",
+                    crate::scenario::ScenarioBinary::OtherIsland => "other-island",
+                }
+            );
+        }
+        return Ok(());
+    }
+    let config = RunnerConfig::from_cli(&cli, build)?;
     if let Some(binding) = &config.held_native_execution_binding {
         #[cfg(unix)]
         {
@@ -48,8 +82,12 @@ fn run_dispatch(cli: Cli) -> Result<()> {
                         == novarocks_cluster_harness::LaunchProfile::FaultScenario,
                 "held native admission requires fault-scenario 1FE+3BE"
             );
-            let admitted =
-                held_native_admission::admit(binding, &config.binary, &config.base_config_path)?;
+            let admitted = held_native_admission::admit(
+                binding,
+                &config.binary,
+                &config.base_config_path,
+                &config.build,
+            )?;
             let scene = scenarios::exact_mysql_native_driver::held_late_ack_from_admitted(
                 admitted.for_scene(),
                 config.held_live_collector_fences,
@@ -61,15 +99,19 @@ fn run_dispatch(cli: Cli) -> Result<()> {
             let primary = run_one(scene.as_ref(), &config);
             // Re-admission is preparation only, never a renewed scene20/protocol5.
             // All role cleanup has already settled through original run_one ownership.
-            let postrun =
-                held_native_admission::admit(binding, &config.binary, &config.base_config_path)
-                    .and_then(|after| {
-                        anyhow::ensure!(
-                            after == admitted,
-                            "held admission changed during original scene"
-                        );
-                        Ok(())
-                    });
+            let postrun = held_native_admission::admit(
+                binding,
+                &config.binary,
+                &config.base_config_path,
+                &config.build,
+            )
+            .and_then(|after| {
+                anyhow::ensure!(
+                    after == admitted,
+                    "held admission changed during original scene"
+                );
+                Ok(())
+            });
             return finish_exact_mysql_scenario(primary.err(), postrun, Ok(()));
         }
         #[cfg(not(unix))]
@@ -87,6 +129,7 @@ fn run_dispatch(cli: Cli) -> Result<()> {
                 binding,
                 &config.binary,
                 &config.base_config_path,
+                &config.build,
             )?;
             let exact =
                 scenarios::exact_mysql_native_driver::scenarios_from_admitted(admitted.clone())?;
@@ -96,6 +139,7 @@ fn run_dispatch(cli: Cli) -> Result<()> {
                     binding,
                     &config.binary,
                     &config.base_config_path,
+                    &config.build,
                 )?;
                 anyhow::ensure!(
                     current == admitted,
@@ -109,6 +153,7 @@ fn run_dispatch(cli: Cli) -> Result<()> {
                     binding,
                     &config.binary,
                     &config.base_config_path,
+                    &config.build,
                 )?;
                 anyhow::ensure!(
                     after == admitted,
@@ -127,6 +172,7 @@ fn run_dispatch(cli: Cli) -> Result<()> {
                 binding,
                 &config.binary,
                 &config.base_config_path,
+                &config.build,
             )?;
             let result = run_one(&scenario, &config);
             let recheck = scenario.recheck_admission();
@@ -154,6 +200,7 @@ fn run_dispatch(cli: Cli) -> Result<()> {
     }
     for scenario in &selected {
         scenario.validate_runner_inputs(config.launch_profile)?;
+        validate_required_programs(*scenario, &config)?;
     }
     for scenario in selected {
         run_one(scenario, &config)?;
@@ -215,6 +262,28 @@ fn select<'a>(
         selected.push(scenario);
     }
     Ok(selected)
+}
+
+fn validate_required_programs(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
+    use crate::scenario::ScenarioBinary;
+    for required in scenario.binary_requirements() {
+        let (binary, flag) = match required {
+            ScenarioBinary::Primary => (Some(config.binary.as_path()), "--binary"),
+            ScenarioBinary::Compatible => {
+                (config.compatible_binary.as_deref(), "--compatible-binary")
+            }
+            ScenarioBinary::OtherIsland => (
+                config.other_island_binary.as_deref(),
+                "--other-island-binary",
+            ),
+        };
+        anyhow::ensure!(
+            binary.is_some_and(std::path::Path::is_file),
+            "scenario {} requires an existing {flag} for its complete lifecycle",
+            scenario.name()
+        );
+    }
+    Ok(())
 }
 
 fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
@@ -316,8 +385,6 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         &scenario_root,
         config.cluster_size,
         &config.binary,
-        config.ordinary_binary.as_deref().unwrap_or(&config.binary),
-        config.test_control_binary.as_deref(),
         original_deadline,
     ) {
         Ok(plan) => plan,
@@ -522,6 +589,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         config.base_config_path.clone(),
         config.cluster_size,
         config.launch_profile,
+        config.build,
         exact_mysql_clock,
     );
     context.action("cluster launched and topology barrier passed");
@@ -722,6 +790,40 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_stages_are_explicit_and_declare_complete_lifecycle_programs() {
+        use crate::scenario::ScenarioBinary::{Compatible, OtherIsland, Primary};
+        let scenarios = crate::scenarios::all();
+        let defaults = select(&scenarios, &[]).unwrap();
+        assert!(
+            defaults
+                .iter()
+                .all(|scenario| !scenario.is_compatibility_stage())
+        );
+        for scenario in scenarios
+            .iter()
+            .filter(|scenario| scenario.is_compatibility_stage())
+        {
+            assert!(scenario.is_explicit_stage());
+            assert_eq!(
+                select(&scenarios, &[scenario.name().into()]).unwrap()[0].name(),
+                scenario.name()
+            );
+            assert!(scenario.binary_requirements().contains(&Primary));
+        }
+        // These stages start additional programs after initial layout resolution.
+        // Their requirements must cover those later launches before any process starts.
+        for name in [
+            "native-compatibility/target-island-cutover",
+            "native-compatibility/island-drain-and-replacement",
+        ] {
+            let selected = select(&scenarios, &[name.into()]).unwrap();
+            assert!(selected[0].binary_requirements().contains(&Compatible));
+            assert!(selected[0].binary_requirements().contains(&OtherIsland));
+        }
+        assert!(select(&scenarios, &[String::new()]).is_err());
+    }
+
+    #[test]
     fn default_selection_accepts_the_default_launch_inputs() {
         let scenarios = crate::scenarios::all();
         for scenario in select(&scenarios, &[]).expect("select default system baseline") {
@@ -852,7 +954,7 @@ mod exact_mysql_presentation_tests {
             "--exact-mysql-execution-binding".into(),
             binding.display().to_string(),
         ])?;
-        let result = run(cli);
+        let result = run(cli, crate::build_information::BuildInformation::fixture());
         root.close()?;
         let error = result.unwrap_err();
         assert!(error.chain().any(|source| source.is::<serde_json::Error>()));
@@ -939,8 +1041,7 @@ mod exact_mysql_prelaunch_teardown_tests {
         let root =
             std::env::temp_dir().join(format!("novarocks-exact-prelaunch-{}", std::process::id()));
         let mut config = RunnerConfig {
-            ordinary_binary: None,
-            test_control_binary: None,
+            build: crate::build_information::BuildInformation::fixture(),
             binary: root.join("deliberately-no-binary"),
             compatible_binary: None,
             other_island_binary: None,
@@ -1097,8 +1198,7 @@ mod neutral_root_prelaunch_tests {
     }
     fn configuration(root: &std::path::Path) -> RunnerConfig {
         RunnerConfig {
-            ordinary_binary: None,
-            test_control_binary: None,
+            build: crate::build_information::BuildInformation::fixture(),
             binary: root.join("no-binary"),
             compatible_binary: None,
             other_island_binary: None,

@@ -71,12 +71,12 @@ impl<'a> PreparationControlLoan<'a> {
 
 /// An actual creation cell for direct host contract tests. Production obtains
 /// its loan only from the Worker creation winner, never from this test owner.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub struct TestPreparationControl {
     cell: crate::task_registry_entry::CreationCell,
     cadence: std::time::Duration,
 }
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 impl TestPreparationControl {
     pub fn new(cadence: std::time::Duration) -> Self {
         assert!(

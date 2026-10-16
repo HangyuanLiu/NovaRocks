@@ -25,12 +25,7 @@
 //! execution modules.
 
 /// Stable provider identity used by server composition and SPI declarations.
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
-#[cfg(all(
-    feature = "mem-1-m07-hms-listing-observe",
-    not(feature = "test-controls")
-))]
+#[cfg(all(feature = "mem-1-m07-hms-listing-observe", not(novarocks_dev_controls)))]
 compile_error!("mem-1-m07-hms-listing-observe requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
@@ -38,7 +33,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
             "mem-1-m07-hms-listing-observe",
@@ -147,5 +142,12 @@ mod contract_revision;
 #[path = "../../../../vendor/iceberg-catalog-hms-0.11.0/src/table_projection.rs"]
 mod hms_table_projection_contract_tests;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod test_observation;
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

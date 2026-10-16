@@ -17,15 +17,12 @@
 
 //! Server-resolved Native transport capabilities and protocol adapters.
 
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
-
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
         ],
     )
@@ -40,14 +37,14 @@ pub mod backend_metrics;
 pub mod backend_readiness;
 pub mod backend_rpc_service;
 pub mod backend_task_execution;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub mod backend_test_support;
 pub mod catalog_prune_rpc;
 pub mod compiled_runtime_filter;
 pub mod compiled_scan_binding;
 pub mod compiled_writer_binding;
 pub mod connector_write_data_plane;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub mod connector_write_test_support;
 pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
@@ -120,20 +117,20 @@ pub mod runtime_filter_membership;
 pub mod runtime_filter_participant;
 pub mod runtime_filter_rpc;
 pub mod runtime_filter_terminal;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub mod runtime_filter_test_support;
 pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
 pub mod static_package_admission;
 pub mod task_execution_observation;
 pub mod task_protocol;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod task_protocol_fault;
 pub mod task_protocol_ingress;
 pub mod task_query_context_options;
 pub mod task_result_diagnostics;
 pub mod task_shared_facts;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub mod typed_connector_test_support;
 
 pub mod generated {
@@ -433,13 +430,20 @@ mod tests {
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod test_controls;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod test_observation_controls;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod backend_test_session;
 #[cfg(test)]
 mod root_metadata_origin_tests;
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

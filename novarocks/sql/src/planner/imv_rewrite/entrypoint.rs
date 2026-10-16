@@ -542,7 +542,7 @@ fn collect_column_id(column_id: ColumnId, max_id: &mut u32) {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;

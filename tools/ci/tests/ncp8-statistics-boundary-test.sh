@@ -49,6 +49,7 @@ write_fixture() {
   write_package "$root" "novarocks/native-adapter" "novarocks-native-adapter"
   write_package "$root" "novarocks/proto-models" "novarocks-proto-models"
   write_package "$root" "novarocks-server" "novarocks-server"
+  write_package "$root" "novarocks-server/library" "novarocks-server-application"
   write_package "$root" "datasketches" "datasketches"
   printf '\n[features]\ndefault = []\nhll = []\ntheta = []\n' >>"$root/datasketches/Cargo.toml"
 
@@ -68,6 +69,7 @@ members = [
   "novarocks/native-adapter",
   "novarocks/proto-models",
   "novarocks-server",
+  "novarocks-server/library",
   "datasketches",
 ]
 

@@ -111,7 +111,7 @@ struct TypedConnectorScanShared {
     /// lifecycle refuses a session without one.
     runtime_filter: RuntimeFilterSessionResolver,
     live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_observation: Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>>,
     /// This fragment's runtime-filter consumer contracts, by the filter id the
     /// scan carrier binds. Empty when the scan consumes no runtime filter.
@@ -182,7 +182,7 @@ fn materialize_output(
 ///
 /// It prints scheduling identity and nothing else: a marker must never carry a
 /// credential, a key metadata blob, or any part of a data value.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_page_source_marker(
     observation: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
     marker: &str,
@@ -221,7 +221,7 @@ impl TypedConnectorScanSource {
         output_schema: ChunkSchemaRef,
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
-        #[cfg(feature = "test-controls")] test_observation: Option<
+        #[cfg(novarocks_dev_controls)] test_observation: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
         stream_host: ScanStreamHost,
@@ -237,7 +237,7 @@ impl TypedConnectorScanSource {
             output_schema,
             runtime_filter,
             live_dynamic_filter_factory,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observation,
             stream_host,
         )
@@ -255,7 +255,7 @@ impl TypedConnectorScanSource {
         output_schema: ChunkSchemaRef,
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
-        #[cfg(feature = "test-controls")] test_observation: Option<
+        #[cfg(novarocks_dev_controls)] test_observation: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
         stream_host: ScanStreamHost,
@@ -268,7 +268,7 @@ impl TypedConnectorScanSource {
                 session,
                 runtime_filter,
                 live_dynamic_filter_factory,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 test_observation,
                 runtime_filter_contracts: BTreeMap::new(),
                 request,
@@ -294,7 +294,7 @@ impl TypedConnectorScanSource {
         output_schema: ChunkSchemaRef,
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
-        #[cfg(feature = "test-controls")] test_observation: Option<
+        #[cfg(novarocks_dev_controls)] test_observation: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
         stream_host: ScanStreamHost,
@@ -310,7 +310,7 @@ impl TypedConnectorScanSource {
             output_schema,
             runtime_filter,
             live_dynamic_filter_factory,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observation,
             stream_host,
         )
@@ -391,7 +391,7 @@ impl TypedConnectorScanSource {
                 session: self.shared.session.clone(),
                 runtime_filter: Arc::clone(&self.shared.runtime_filter),
                 live_dynamic_filter_factory: Arc::clone(&self.shared.live_dynamic_filter_factory),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 test_observation: self.shared.test_observation.clone(),
                 runtime_filter_contracts: self.shared.runtime_filter_contracts.clone(),
                 request: self.shared.request.clone(),
@@ -559,7 +559,7 @@ struct TypedSystemTableScanShared {
     session: ConnectorSession,
     request: ConnectorRequestContext,
     plan_node_id: i32,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_observation: Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>>,
     /// Ordered read slot ids. `slot_ids[i]` names page channel `i`.
     slot_ids: Vec<SlotId>,
@@ -606,7 +606,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         output_schema: ChunkSchemaRef,
-        #[cfg(feature = "test-controls")] test_observation: Option<
+        #[cfg(novarocks_dev_controls)] test_observation: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
         stream_runtime: tokio::runtime::Handle,
@@ -619,7 +619,7 @@ impl TypedConnectorSystemTableScanSource {
             plan_node_id,
             slot_ids,
             output_schema,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observation,
             stream_runtime,
         )
@@ -634,7 +634,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         output_schema: ChunkSchemaRef,
-        #[cfg(feature = "test-controls")] test_observation: Option<
+        #[cfg(novarocks_dev_controls)] test_observation: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
         stream_runtime: tokio::runtime::Handle,
@@ -646,7 +646,7 @@ impl TypedConnectorSystemTableScanSource {
                 session,
                 request,
                 plan_node_id,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 test_observation,
                 slot_ids,
                 output_schema,
@@ -665,7 +665,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         output_schema: ChunkSchemaRef,
-        #[cfg(feature = "test-controls")] test_observation: Option<
+        #[cfg(novarocks_dev_controls)] test_observation: Option<
             Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
         >,
         stream_runtime: tokio::runtime::Handle,
@@ -678,7 +678,7 @@ impl TypedConnectorSystemTableScanSource {
             plan_node_id,
             slot_ids,
             output_schema,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observation,
             stream_runtime,
         )
@@ -721,7 +721,7 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
             session: self.shared.session.clone(),
             request: self.shared.request.clone(),
             plan_node_id: self.shared.plan_node_id,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observation: self.shared.test_observation.clone(),
             slot_ids: self.shared.slot_ids.clone(),
             output_schema: Arc::clone(&self.shared.output_schema),

@@ -8,7 +8,7 @@ use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_proto_models as proto;
 
 /// Emits only after the exact result owner settled the read.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub fn emit_task_fetch_marker(
     controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     identity: TaskIdentity,
@@ -39,7 +39,7 @@ pub fn emit_task_fetch_marker(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-controls"))]
+#[cfg(any(test, novarocks_dev_controls))]
 fn should_emit_typed_fetch_marker(
     status: proto::novarocks::fetch_result_response::Status,
     packet_seq: i64,
@@ -54,7 +54,7 @@ fn should_emit_typed_fetch_marker(
     }
 }
 
-#[cfg(any(test, feature = "test-controls"))]
+#[cfg(any(test, novarocks_dev_controls))]
 fn typed_fetch_marker(
     identity: TaskIdentity,
     status: proto::novarocks::fetch_result_response::Status,

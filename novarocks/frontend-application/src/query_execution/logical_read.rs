@@ -31,7 +31,7 @@ pub(crate) trait LogicalReadLauncher: Send + Sync + 'static {
         read: PreparedLogicalRead,
         owner: WorkOwner,
         result_window: Option<novarocks_workload_control::ResultWindowAlias>,
-        #[cfg(feature = "test-controls")] observation: Option<
+        #[cfg(novarocks_dev_controls)] observation: Option<
             crate::preparation_diagnostics::StatementObservationHandle,
         >,
     ) -> QueryExecutionFuture;

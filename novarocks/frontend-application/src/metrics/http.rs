@@ -85,7 +85,7 @@ impl MetricsHttpServer {
         convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
         memory_authority: Arc<novarocks_memory::MemoryAuthority>,
         catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
-        #[cfg(feature = "test-controls")] statement_observation: Option<
+        #[cfg(novarocks_dev_controls)] statement_observation: Option<
             Arc<crate::preparation_diagnostics::StatementObservationOwner>,
         >,
         #[cfg(feature = "mem-1-m07-hms-listing-observe")] hms_listing_observation: Option<
@@ -127,8 +127,8 @@ impl MetricsHttpServer {
                         convergence_reader,
                         memory_authority,
                         catalog_activity,
-                        cfg!(feature = "test-controls"),
-                        #[cfg(feature = "test-controls")]
+                        cfg!(novarocks_dev_controls),
+                        #[cfg(novarocks_dev_controls)]
                         statement_observation,
                     );
                     #[cfg(feature = "mem-1-m07-hms-listing-observe")]

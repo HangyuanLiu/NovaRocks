@@ -23,7 +23,7 @@ pub mod registry;
 pub mod resolver;
 pub mod signature;
 
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 mod array_invocation_diagnostic_probe_owner;
 pub mod catalogue;
 

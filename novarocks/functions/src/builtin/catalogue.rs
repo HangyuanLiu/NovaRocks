@@ -5843,7 +5843,7 @@ pub(super) mod constant_binding_tests;
 /// Construct the actual private DS scalar definition for cross-crate runtime
 /// tests before public catalogue registration. No production caller enables
 /// this feature; binding, metadata and installed declarations keep one author.
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub fn ds_hll_scalar_private_test_catalog() -> EngineFunctionCatalog {
     let original = build_builtin_engine_function_catalog().unwrap();
     let (name, signatures) = registry::builtin_scalar_declarations()
@@ -6046,7 +6046,7 @@ pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
 
 /// Actual complete original declaration and original binding/metadata authors.
 /// This test-only factory enables no public registration or binding fallback.
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub fn percentile_raw_private_test_catalog() -> EngineFunctionCatalog {
     let (name, signatures) = registry::builtin_scalar_declarations()
         .into_iter()
@@ -6065,7 +6065,7 @@ pub fn percentile_raw_private_test_catalog() -> EngineFunctionCatalog {
 
 /// Private runtime test catalogue. Public production BY definitions retain
 /// AggregateV1 until the complete original invocation schedule is validated.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn by_window_private_test_catalog() -> EngineFunctionCatalog {
     let original = build_builtin_engine_function_catalog().unwrap();
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -6095,7 +6095,7 @@ pub fn by_window_private_test_catalog() -> EngineFunctionCatalog {
 
 /// Private Union capability for original full-domain binding/runtime probes.
 /// This attachment enables no public production registration.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn percentile_union_private_test_catalog() -> EngineFunctionCatalog {
     let original = build_builtin_engine_function_catalog().unwrap();
     let raw = original
@@ -6133,7 +6133,7 @@ pub fn percentile_union_private_test_catalog() -> EngineFunctionCatalog {
 
 /// Cross-crate transport probes borrow the REAL ARRAY dynamic declaration and
 /// resolver. This private catalogue is not a public supported capability.
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub fn array_projection_diagnostic_private_test_catalog() -> EngineFunctionCatalog {
     let (raw, resolver) = dynamic_definition_parts("__array_struct_subfield").unwrap();
     let declaration = FunctionBindingDeclaration::try_new(

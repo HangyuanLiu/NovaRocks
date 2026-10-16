@@ -586,7 +586,7 @@ impl Fixture {
             Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
             Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
             novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None,
             ),
         );

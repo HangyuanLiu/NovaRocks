@@ -110,7 +110,7 @@ use crate::fragment_request::NativeFragmentRequest;
 use crate::fragment_submission::compiled_fragment_sink_assignment;
 use crate::native_fragment_query::{NativeFragmentQueryRuntime, NativeFragmentRegistrationLease};
 use crate::root_result_session::{NativeRootResultSession, RootProducerPool};
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::task_protocol_fault as fault;
 use novarocks_local_program::LocalProgram;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
@@ -247,7 +247,7 @@ pub struct NativeTaskExecutionHost {
     /// decoder when absent, otherwise the compiled-package compiler. A task's
     /// carrier never selects it.
     compiled: Option<Arc<dyn CompiledPackageCompiler>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
 }
 
@@ -466,12 +466,12 @@ impl NativeTaskExecutionHost {
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
             compiled: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
         controls: Arc<crate::test_controls::NativeTestControls>,
@@ -724,7 +724,7 @@ impl NativeTaskExecutionHost {
                 query_options: &instance_input.query_options,
                 stop: task_stop.view(),
                 runtime_filters: &runtime_filters,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 observation_controls: self.queries.observation_controls(),
             },
         )
@@ -735,9 +735,9 @@ impl NativeTaskExecutionHost {
         let writers = bind_compiled_writers(
             &program,
             &CompiledWriteTask {
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 test_controls: self.test_controls.clone(),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 observation_controls: self.queries.observation_controls(),
                 backend_process_id: identity.backend_process_id(),
                 runtime: &typed_runtime,
@@ -859,7 +859,7 @@ impl NativeTaskExecutionHost {
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
             .with_result_identity(identity)
             .with_edge_gates(Arc::clone(&edges));
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(observations) = self.queries.observation_controls() {
             if let Some(observer) = observations
                 .observation_for("exchange-snapshot", execution)
@@ -896,7 +896,7 @@ impl NativeTaskExecutionHost {
             prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
         let exchange_retirement = dormant.take_exchange_retirement();
 
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         crate::task_execution_observation::emit_prepared_task_dop(
             self.queries.observation_controls().as_deref(),
             identity,
@@ -908,7 +908,7 @@ impl NativeTaskExecutionHost {
             root_channel.clone(),
         )?;
         if let Some(channel) = &root_channel {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             crate::task_execution_observation::emit_prepared_client_root(
                 self.queries.observation_controls().as_deref(),
                 identity,
@@ -1084,7 +1084,7 @@ impl NativeTaskExecutionHost {
         // delivery path; the cutover moved the work here and has to move the
         // evidence with it, or every case asserting it counts zero on a
         // cluster where splits are in fact being delivered.
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(sink) = self
             .queries
             .observation_controls()
@@ -1217,7 +1217,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             )));
         }
 
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.test_controls.as_ref() {
             crate::task_protocol_fault::hold_native_task_preparation(controls, identity)
                 .map_err(internal)?;
@@ -1320,9 +1320,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
             Some(typed_runtime.clone()),
             Arc::clone(self.execution_runtime.function_catalog()),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             self.test_controls.clone(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             self.queries.observation_controls(),
             &type_creation,
         )
@@ -1443,7 +1443,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             // send, so a producer cannot reach a destination that has not
             // acknowledged its own creation.
             .with_edge_gates(Arc::clone(&edges));
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(observations) = self.queries.observation_controls() {
             if let Some(observer) = observations
                 .observation_for("exchange-snapshot", execution)
@@ -1466,7 +1466,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .map_err(|error| preparation_failure_to_host(identity, &error))?;
         let exchange_retirement = dormant.take_exchange_retirement();
 
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         crate::task_execution_observation::emit_prepared_task_dop(
             self.queries.observation_controls().as_deref(),
             identity,
@@ -1479,7 +1479,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             root_channel.clone(),
         )?;
         if let Some(channel) = &root_channel {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             crate::task_execution_observation::emit_prepared_client_root(
                 self.queries.observation_controls().as_deref(),
                 identity,
@@ -1616,7 +1616,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // reportable as a typed rejection on this path, and the worker has no
         // way to report one. The failure itself is applied after the task
         // publishes RUNNING, so the subject is a task that started.
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let injected_execution_failure = if let Some(controls) = self.test_controls.as_ref() {
             fault::task_execution_failure_injected(controls, identity).map_err(internal)?
         } else {
@@ -1699,7 +1699,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             registration,
             reporter,
             completion,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             injected_execution_failure,
         });
         Ok(task)
@@ -1887,7 +1887,7 @@ struct PreparedNativeStart {
     registration: NativeFragmentRegistrationLease,
     reporter: TaskStatusReporter,
     completion: TaskCompletionSignal,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     injected_execution_failure: Option<crate::test_controls::NativeFaultClaim>,
 }
 
@@ -1982,7 +1982,7 @@ impl NativeRunnableTask {
             registration,
             reporter,
             completion,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             injected_execution_failure,
         } = prepared;
         if let Some(stand_down) = state.stand_down {
@@ -2005,7 +2005,7 @@ impl NativeRunnableTask {
         registration.into_running();
         // RUNNING precedes driver submission, including synchronous stop.
         reporter.running();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let running = if let Some(claim) =
             injected_execution_failure.filter(|claim| claim.cancellation().is_active())
         {
@@ -2016,7 +2016,7 @@ impl NativeRunnableTask {
         } else {
             dormant.start()
         };
-        #[cfg(not(feature = "test-controls"))]
+        #[cfg(not(novarocks_dev_controls))]
         let running = dormant.start();
         // Serialize the start with request(): a stop observed before this
         // lock was taken never starts work; a later stop sees this handle.
@@ -3926,7 +3926,7 @@ pub(super) mod tests {
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                 data_runtime,
                 Duration::from_millis(120_000),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None,
             ),
             novarocks_native_adapter::fragment_result_writer::native_result_writer(
@@ -7102,7 +7102,7 @@ pub(super) mod tests {
                 }),
                 Arc::clone(&counting) as Arc<dyn TaskExecutionHost>,
                 novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     None,
                 ),
             );
@@ -9750,7 +9750,7 @@ pub(super) mod tests {
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                     data_runtime,
                     Duration::from_millis(120_000),
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     None,
                 ),
                 novarocks_native_adapter::fragment_result_writer::native_result_writer(
@@ -10045,7 +10045,7 @@ pub(super) mod tests {
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                     data_runtime,
                     Duration::from_millis(120_000),
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     None,
                 ),
                 novarocks_native_adapter::fragment_result_writer::native_result_writer(

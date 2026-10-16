@@ -267,7 +267,7 @@ impl PureAggregateImplementation for ByOwner {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(super) fn private_window_definition_for_test(
     name: &str,
     declaration: FunctionBindingDeclaration,

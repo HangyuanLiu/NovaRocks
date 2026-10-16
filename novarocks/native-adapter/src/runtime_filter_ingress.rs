@@ -45,7 +45,7 @@ use crate::runtime_filter_rpc::{
     BackendNativeContributionRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     BackendRuntimeFilterEnvelopeIngress,
 };
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
 use novarocks_worker::runtime_filter::domain::{BackendIngressResult, BackendParticipantIdentity};
 
@@ -77,12 +77,12 @@ pub trait BackendRuntimeFilterParticipantAuthority: Send + Sync + 'static {
 /// The wire ingress every runtime-filter envelope arrives through.
 pub struct CompositeRuntimeFilterEnvelopeIngress {
     authorities: Vec<Arc<dyn BackendRuntimeFilterParticipantAuthority>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     controls: std::sync::OnceLock<Arc<crate::test_controls::NativeTestControls>>,
 }
 
 impl CompositeRuntimeFilterEnvelopeIngress {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn install_test_controls(
         &self,
         controls: Arc<crate::test_controls::NativeTestControls>,
@@ -94,14 +94,14 @@ impl CompositeRuntimeFilterEnvelopeIngress {
     pub fn new(authorities: Vec<Arc<dyn BackendRuntimeFilterParticipantAuthority>>) -> Arc<Self> {
         Arc::new(Self {
             authorities,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             controls: std::sync::OnceLock::new(),
         })
     }
 }
 
 impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngress {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
         self.controls.get().cloned()
     }
@@ -160,7 +160,7 @@ impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngre
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn arm_accepted_contribution_retry_rendezvous(
         &self,
         identity: BackendParticipantIdentity,

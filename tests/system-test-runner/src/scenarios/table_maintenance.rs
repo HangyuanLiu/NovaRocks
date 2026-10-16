@@ -69,17 +69,14 @@ impl Scenario for OptimizeTargetReplacement {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         ensure!(
             cluster_size == 3,
             "maintenance race requires native 1FE+3BE"
         );
-        let controlled = controlled_binary
-            .context("maintenance rendezvous requires an explicit test-controls artifact")?;
+        let controlled = binary;
         let mut intent = self
             .intent
             .lock()
@@ -89,10 +86,10 @@ impl Scenario for OptimizeTargetReplacement {
         let root = plan.reserve_transport("maintenance-rendezvous")?;
         let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
         let successor = plan.reserve_launch(RoleSlot::Frontend)?;
-        plan.authorize_ordinary_launch(&successor, ordinary_binary.to_path_buf())?;
+        plan.authorize_ordinary_launch(&successor, binary.to_path_buf())?;
         for index in 0..cluster_size {
             let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
-            plan.authorize_ordinary_launch(&backend, ordinary_binary.to_path_buf())?;
+            plan.authorize_ordinary_launch(&backend, binary.to_path_buf())?;
         }
         let mut statements: [SelectedStatement; 2] = std::array::from_fn(|_| SelectedStatement {
             sql: OPTIMIZE_SQL.to_owned(),

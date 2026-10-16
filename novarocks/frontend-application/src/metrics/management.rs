@@ -21,7 +21,7 @@ use std::sync::{Arc, Weak};
 use novarocks_memory::MemoryAuthority;
 
 use axum::extract::{Query, State};
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use axum::http::HeaderMap;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -33,7 +33,7 @@ use crate::workload_lifecycle::{
     FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingLifecycle,
     FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendWorkloadServingSnapshot,
 };
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use axum::routing::post;
 use novarocks_query_application::serving_admission::FrontendServingState;
 
@@ -46,7 +46,7 @@ struct FrontendManagementState {
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
     memory_authority: Arc<MemoryAuthority>,
     catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
 }
 
@@ -320,7 +320,7 @@ pub(crate) fn frontend_management_router_with_readers(
     memory_authority: Arc<MemoryAuthority>,
     catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
     debug_enabled: bool,
-    #[cfg(feature = "test-controls")] statement_observation: Option<
+    #[cfg(novarocks_dev_controls)] statement_observation: Option<
         Arc<crate::preparation_diagnostics::StatementObservationOwner>,
     >,
 ) -> Router {
@@ -330,7 +330,7 @@ pub(crate) fn frontend_management_router_with_readers(
         island_reader,
         memory_authority,
         catalog_activity,
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         statement_observation: statement_observation.clone(),
     };
     let router = Router::new()
@@ -341,7 +341,7 @@ pub(crate) fn frontend_management_router_with_readers(
         .route("/v1/frontend/state", get(frontend_state))
         .route("/v1/memory/authority", get(memory_authority_snapshot))
         .route("/v1/catalogs/activity", get(catalog_activity_snapshot));
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let router = if debug_enabled && statement_observation.is_some() && convergence_reader.is_some()
     {
         let convergence_reader = convergence_reader.expect("checked above");
@@ -362,7 +362,7 @@ pub(crate) fn frontend_management_router_with_readers(
     } else {
         router
     };
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let router = if statement_observation.is_some() {
         router
             .route(
@@ -383,7 +383,7 @@ pub(crate) fn frontend_management_router_with_readers(
     router.with_state(state)
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 async fn arm_statement_observation(
     State(state): State<FrontendManagementState>,
     headers: HeaderMap,
@@ -401,7 +401,7 @@ async fn arm_statement_observation(
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 async fn peek_statement_observation(
     State(state): State<FrontendManagementState>,
     headers: HeaderMap,
@@ -419,7 +419,7 @@ async fn peek_statement_observation(
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 async fn drain_statement_observation(
     State(state): State<FrontendManagementState>,
     headers: HeaderMap,
@@ -437,7 +437,7 @@ async fn drain_statement_observation(
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn preparation_diagnostic_authorized(
     owner: &crate::preparation_diagnostics::StatementObservationOwner,
     headers: &HeaderMap,
@@ -523,7 +523,7 @@ fn management_snapshot(state: &FrontendManagementState) -> FrontendManagementSna
     FrontendManagementSnapshot::compose(serving, state.island_reader.backend_island_snapshot())
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 async fn latest_lifecycle_convergence_snapshot(
     reader: Arc<dyn QueryLifecycleConvergenceReader>,
     owner: Arc<crate::preparation_diagnostics::StatementObservationOwner>,
@@ -632,7 +632,7 @@ mod tests {
             test_memory_authority(),
             None,
             debug_enabled,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
         )
     }
@@ -733,7 +733,7 @@ mod tests {
             test_memory_authority(),
             Some(Arc::downgrade(&owner)),
             false,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
         );
         assert_eq!(

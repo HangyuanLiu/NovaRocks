@@ -367,7 +367,7 @@ impl DriverTask {
         self.driver.fragment_instance_id()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn exchange_test_observer(
         &self,
     ) -> Option<Arc<dyn crate::runtime::exchange::TestEventObserver>> {

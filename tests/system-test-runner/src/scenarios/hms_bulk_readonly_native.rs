@@ -239,9 +239,14 @@ fn validate_index(manifest: &[u8]) -> Result<()> {
     Ok(())
 }
 impl HmsBulkReadonlyNative {
-    pub(crate) fn admit(path: &Path, server: &Path, base: &Path) -> Result<Self> {
+    pub(crate) fn admit(
+        path: &Path,
+        server: &Path,
+        base: &Path,
+        build: &crate::build_information::BuildInformation,
+    ) -> Result<Self> {
         let admitted =
-            crate::exact_native_admission::hms_native_admission::admit(path, server, base)?;
+            crate::exact_native_admission::hms_native_admission::admit(path, server, base, build)?;
         let (input, ready, manifest, root_oracle, admission) = admitted;
         let deadline = admission.deadline();
         input.normal.validate()?;
@@ -275,8 +280,8 @@ impl HmsBulkReadonlyNative {
         );
         ensure!(
             hash(&input.clean_source_revision, 40)
-                && input.clean_source_revision == novarocks_version::build_git_commit()
-                && input.clean_source_revision == novarocks_version::native_build_identity(),
+                && input.clean_source_revision == build.source_commit
+                && input.clean_source_revision == build.native_build_identity,
             "HMS actual runner build differs from admitted clean source"
         );
         for value in [
@@ -1398,9 +1403,7 @@ impl Scenario for HmsBulkReadonlyNative {
         launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         self.recheck_admission()?;
@@ -1419,9 +1422,7 @@ impl Scenario for HmsBulkReadonlyNative {
         );
         Ok(Some(
             super::exact_mysql_native_driver::variant_sessions::fixture_plan(
-                primary_binary,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 cluster_size,
                 original_deadline,
                 vec![super::exact_mysql_native_driver::variant_sessions::grant(

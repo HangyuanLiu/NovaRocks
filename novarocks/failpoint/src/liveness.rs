@@ -31,7 +31,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Nonblocking connection work retains one absolute deadline and cancellation.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub fn connect_until(
     path: &std::path::Path,
     deadline: Instant,
@@ -426,7 +426,7 @@ impl Drop for RunnerSession {
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 mod receiver {
     use super::*;
     use crate::scope::{CloseCause, ProcessBinding, SessionScope};
@@ -594,10 +594,10 @@ mod receiver {
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub use receiver::{PreparedRoleSession, RoleSessionOwner};
 
-#[cfg(all(test, feature = "test-controls"))]
+#[cfg(all(test, novarocks_dev_controls))]
 mod tests {
     use super::*;
     #[test]

@@ -28,10 +28,10 @@ separate compatibility spreadsheet.
 Pick suites by the engine area a change touches; do not run the whole corpus to
 verify one fix. `--suite all` excludes suites whose manifest declares `explicit_only`;
 these must be named. Ask
-`NOVAROCKS_BUILD_PROFILE=dev-opt cargo run --locked --profile dev-opt --target-dir target/normal --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- --list-suites` for the
+`cargo run --locked --profile dev --target-dir target --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- --list-suites` for the
 authoritative current list.
 
-列表不启动产品或建立会话。实际运行显式设置普通 `NOVAROCKS_BIN` 和受控 `NOVAROCKS_TEST_CONTROL_BIN`；两者及兼容性变体使用独立 target，可复用已有 owner 管理的缓存根，详见 [SQL 入口](../README.md) 和 [构建选择](../../../docs/guides/development/test-governance.md#构建选择与控制授权)。每个实际角色读取自己的 `--build-info`，保留已知/unknown 与实际退出；路径、profile、feature 编入都不是授权或发布认证。
+列表不启动产品或建立会话。规范入口先联合准备 workspace tests/bins，再直接运行已绑定的 SQL runner。实际运行仅显式设置主 `NOVAROCKS_BIN`，普通与有限控制步骤使用同一 dev 程序；主缓存属于当前 worktree 的 `target/`，兼容变体按需独立复制最终程序，详见 [SQL 入口](../README.md) 和 [构建选择](../../../docs/guides/development/test-governance.md#构建选择与控制授权)。每个实际角色读取自己的 `--build-info`，保留已知/unknown 与实际退出；路径、profile、feature 编入都不是授权或发布认证。
 
 | Suite | Engine area it exercises | Typical change entry | Extra requirement |
 |---|---|---|---|
@@ -121,7 +121,7 @@ A suite that restarts a frontend and lets it rediscover its own materialized
 views adopts the other worktrees' views too. Even without a restart, a suite's
 `DROP CATALOG` guard sees those foreign MV references and refuses cleanup.
 Those suites are listed in `ISOLATED_REST_CATALOG_SUITES`
-(`tests/sql/runner/src/lib.rs`). The runner starts private `rest` and `rest-mv` catalogs and
+(`tests/sql/runner/library/src/lib.rs`). The runner starts private `rest` and `rest-mv` catalogs and
 MinIO for them
 (`tests/cluster-harness/src/isolated_iceberg_rest.rs`), overriding
 `iceberg_rest_uri`, `iceberg_rest_warehouse`, `iceberg_rest_mv_uri`,

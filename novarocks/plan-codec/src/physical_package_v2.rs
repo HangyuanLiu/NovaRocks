@@ -34,7 +34,7 @@ mod definition_sources;
 mod encode;
 mod nodes;
 mod provider_sources;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub mod test_support;
 mod type_sources;
 mod type_views;

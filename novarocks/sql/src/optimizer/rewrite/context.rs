@@ -321,7 +321,7 @@ impl PureCompileControl for RewriteControl<'_> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn unbounded_rewrite_test_control() -> &'static dyn PureCompileControl {
     static CONTROL: std::sync::LazyLock<crate::compiler::SqlCompileControl> =
         std::sync::LazyLock::new(crate::compiler::SqlCompileControl::unbounded);

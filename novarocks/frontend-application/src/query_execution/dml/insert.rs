@@ -295,7 +295,7 @@ impl InsertEngine for DmlExecutionKernel {
             .map_err(|error| error.to_string())?;
         let connector_context = attempt_reservation.connector_request_context(
             connector_context,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             request.execution.test_statement_nomination(),
         )?;
 
@@ -379,7 +379,7 @@ impl InsertEngine for DmlExecutionKernel {
         crate::connector::validate_request_context(&connector_context)?;
         let connector_context = attempt_reservation.connector_request_context(
             connector_context,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             request.execution.test_statement_nomination(),
         )?;
         let prepared = iceberg_writer::prepare_iceberg_write_with_options(

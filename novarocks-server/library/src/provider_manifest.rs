@@ -1,0 +1,726 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Server-owned provider manifest and role-local factory projection.
+
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use anyhow::Context;
+use novarocks_connector_contract::{
+    PureProviderManifestEntry, PureProviderProgramCatalog, PureProviderProgramDefinition,
+};
+use novarocks_connector_iceberg::commit::write_stack::IcebergWriteRecipeCompiler;
+use novarocks_connector_iceberg::resources::IcebergMetadataResources;
+use novarocks_connector_iceberg::typed_read::codec::IcebergReadRecipeCompiler;
+use novarocks_connector_iceberg::{
+    IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
+};
+use novarocks_connector_paimon::role_binding::{
+    PaimonControlRoleBindingFactory, PaimonExecutionRoleBindingFactory, PaimonReadRecipeCompiler,
+};
+use novarocks_spi::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
+use novarocks_spi::connector::{
+    ConnectorCodecError, ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
+    ConnectorProviderId,
+};
+
+use crate::app_config::NovaRocksConfig;
+use crate::scan_io::ScanIoServices;
+use crate::static_plan::CompositionControl;
+
+type ContractBuilder = fn() -> Result<ProviderContractDefinition, ConnectorCodecError>;
+/// The product inputs shared by every registered role-local builder.
+/// Observation slots are inert until the role's exact session is authorized.
+struct ProviderFactoryInput<'a> {
+    config: &'a NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+    #[cfg(novarocks_dev_controls)]
+    test_slots: &'a crate::provider_test_slots::ProviderTestSlots,
+}
+
+type ControlFactoryBuilder =
+    fn(&ProviderFactoryInput<'_>) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>>;
+type ExecutionFactoryBuilder = fn(
+    &ProviderFactoryInput<'_>,
+    &ScanIoServices,
+) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>>;
+/// A provider's installed pure program ports, addressed by its sealed
+/// contract identity. They compile frozen facts only and bind no instance.
+type PureProgramBuilder =
+    fn(ConnectorProviderId) -> PureProviderProgramDefinition<ConnectorCodecError>;
+
+#[derive(Clone, Copy)]
+struct ProviderBuilderDefinition {
+    contract: ContractBuilder,
+    control: Option<ControlFactoryBuilder>,
+    execution: Option<ExecutionFactoryBuilder>,
+    pure: PureProgramBuilder,
+}
+
+struct SealedProviderBuilder {
+    provider_id: ConnectorProviderId,
+    control: ControlFactoryBuilder,
+    execution: ExecutionFactoryBuilder,
+    pure: PureProgramBuilder,
+}
+
+// Design: ADR-0139 (docs/adr/ADR-0139-sealed-active-provider-manifest.md)
+const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
+    ProviderBuilderDefinition {
+        contract: novarocks_connector_iceberg::iceberg_contract_definition,
+        control: Some(build_iceberg_control_factory),
+        execution: Some(build_iceberg_execution_factory),
+        pure: iceberg_pure_program,
+    },
+    ProviderBuilderDefinition {
+        contract: novarocks_connector_paimon::definition::paimon_contract_definition,
+        control: Some(build_paimon_control_factory),
+        execution: Some(build_paimon_execution_factory),
+        pure: paimon_pure_program,
+    },
+];
+
+/// One immutable provider contract registry paired with its role-local builders.
+///
+/// Sealing invokes only contract builders. Role builders are called later by
+/// the selected role projection, so FE never constructs BE credentials or
+/// execution resources and BE never constructs FE credentials or control
+/// resources.
+pub struct ServerProviderManifest {
+    contracts: SealedProviderRegistry,
+    builders: Arc<[SealedProviderBuilder]>,
+}
+
+impl ServerProviderManifest {
+    pub fn seal() -> anyhow::Result<Self> {
+        Self::seal_definitions(PROVIDER_BUILDERS)
+    }
+
+    fn seal_definitions(definitions: &[ProviderBuilderDefinition]) -> anyhow::Result<Self> {
+        let mut contracts = Vec::with_capacity(definitions.len());
+        let mut builders = Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            let contract = (definition.contract)().context("build provider contract")?;
+            let provider_id = contract.provider_id().clone();
+            let control = definition.control.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider `{}` has no FE control factory builder",
+                    provider_id.as_str()
+                )
+            })?;
+            let execution = definition.execution.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider `{}` has no BE execution factory builder",
+                    provider_id.as_str()
+                )
+            })?;
+            contracts.push(contract);
+            builders.push(SealedProviderBuilder {
+                provider_id,
+                control,
+                execution,
+                pure: definition.pure,
+            });
+        }
+
+        let contracts = SealedProviderRegistry::seal(contracts)
+            .map_err(|error| anyhow::anyhow!("seal server provider registry: {error}"))?;
+        builders.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
+        anyhow::ensure!(
+            contracts.definitions().len() == builders.len(),
+            "sealed provider contracts and builders disagree on provider count"
+        );
+        for (contract, builder) in contracts.definitions().iter().zip(&builders) {
+            anyhow::ensure!(
+                contract.provider_id() == &builder.provider_id,
+                "sealed provider contract and builder identities disagree"
+            );
+        }
+        Ok(Self {
+            contracts,
+            builders: Arc::from(builders),
+        })
+    }
+
+    pub const fn contracts(&self) -> &SealedProviderRegistry {
+        &self.contracts
+    }
+
+    pub fn compose_control_factories(
+        &self,
+        config: &NovaRocksConfig,
+        runtime: tokio::runtime::Handle,
+        #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
+    ) -> anyhow::Result<Vec<Arc<dyn ConnectorControlRoleBindingFactory>>> {
+        let input = ProviderFactoryInput {
+            config,
+            runtime,
+            #[cfg(novarocks_dev_controls)]
+            test_slots,
+        };
+        self.builders
+            .iter()
+            .map(|builder| {
+                let factory = (builder.control)(&input).with_context(|| {
+                    format!("compose `{}` FE factory", builder.provider_id.as_str())
+                })?;
+                validate_factory_identity(
+                    "FE control",
+                    &builder.provider_id,
+                    &factory.provider_id(),
+                )?;
+                Ok(factory)
+            })
+            .collect()
+    }
+
+    /// Composes the installed pure provider program catalogue.
+    ///
+    /// The manifest half comes from the sealed contracts alone: every
+    /// provider reads, and writes exactly when its contract declares a write
+    /// contract. The installed half is each provider's own pure ports, so a
+    /// provider whose ports disagree with its contract fails composition
+    /// instead of being admitted with a missing or extra facet. No runtime
+    /// instance, split or credential is bound.
+    pub fn compose_pure_program_catalog(
+        &self,
+    ) -> anyhow::Result<PureProviderProgramCatalog<ConnectorCodecError>> {
+        let manifest = self
+            .contracts
+            .definitions()
+            .iter()
+            .map(|contract| {
+                PureProviderManifestEntry::new(
+                    contract.provider_id().clone(),
+                    true,
+                    contract.write().is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let definitions = self
+            .builders
+            .iter()
+            .map(|builder| (builder.pure)(builder.provider_id.clone()))
+            .collect();
+        PureProviderProgramCatalog::try_new(&manifest, definitions, &CompositionControl)
+            .map_err(|error| anyhow::anyhow!("compose pure provider program catalogue: {error}"))
+    }
+
+    pub fn compose_execution_factories(
+        &self,
+        config: &NovaRocksConfig,
+        runtime: tokio::runtime::Handle,
+        scan_io: &ScanIoServices,
+        #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
+    ) -> anyhow::Result<Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
+        let input = ProviderFactoryInput {
+            config,
+            runtime,
+            #[cfg(novarocks_dev_controls)]
+            test_slots,
+        };
+        self.builders
+            .iter()
+            .map(|builder| {
+                let factory = (builder.execution)(&input, scan_io).with_context(|| {
+                    format!("compose `{}` BE factory", builder.provider_id.as_str())
+                })?;
+                validate_factory_identity(
+                    "BE execution",
+                    &builder.provider_id,
+                    &factory.provider_id(),
+                )?;
+                Ok(factory)
+            })
+            .collect()
+    }
+}
+
+fn validate_factory_identity(
+    role: &str,
+    contract_provider_id: &ConnectorProviderId,
+    factory_provider_id: &ConnectorProviderId,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        contract_provider_id == factory_provider_id,
+        "provider contract `{}` and {role} factory `{}` have different identities",
+        contract_provider_id.as_str(),
+        factory_provider_id.as_str()
+    );
+    Ok(())
+}
+
+fn build_iceberg_control_factory(
+    input: &ProviderFactoryInput<'_>,
+) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
+    let config = input.config;
+    let runtime = input.runtime.clone();
+    let metadata_binding =
+        crate::composition::compose_iceberg_metadata_access_template(config, runtime.clone())?;
+    let max_inflight = NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
+        .ok_or_else(|| anyhow::anyhow!("catalog materialization max inflight must be nonzero"))?;
+    let resources = IcebergMetadataResources::new(metadata_binding, runtime);
+    #[cfg(novarocks_dev_controls)]
+    let resources = resources.with_test_observation(input.test_slots.iceberg.clone());
+    let factory = IcebergControlRoleBindingFactory::new(resources, max_inflight);
+    #[cfg(all(novarocks_dev_controls, feature = "mem-1-m07-hms-listing-observe"))]
+    let factory = factory.with_hms_listing_observation_slot(input.test_slots.hms.clone());
+    Ok(Arc::new(factory))
+}
+
+fn build_iceberg_execution_factory(
+    input: &ProviderFactoryInput<'_>,
+    scan_io: &ScanIoServices,
+) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
+    let resources = crate::composition::compose_iceberg_execution_resources(
+        input.config,
+        input.runtime.clone(),
+        scan_io,
+    )?;
+    #[cfg(novarocks_dev_controls)]
+    input
+        .test_slots
+        .register_storage(resources.test_storage_authority_registry())
+        .map_err(anyhow::Error::msg)?;
+    #[cfg(novarocks_dev_controls)]
+    let resources = resources.with_test_observation(input.test_slots.iceberg.clone());
+    let options = iceberg_execution_reader_options(input.config);
+    Ok(Arc::new(IcebergExecutionRoleBindingFactory::new(
+        resources, options,
+    )))
+}
+
+fn iceberg_execution_reader_options(
+    config: &NovaRocksConfig,
+) -> novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions
+{
+    let mut options = novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget();
+    options.reader_options.coalesce_reads = config.runtime.io_coalesce_read_enable;
+    options.reader_options.coalesce_max_bytes = config.runtime.io_coalesce_read_max_buffer_size;
+    options.reader_options.coalesce_max_gap = config.runtime.io_coalesce_read_max_distance_size;
+    options
+}
+
+fn iceberg_pure_program(
+    provider: ConnectorProviderId,
+) -> PureProviderProgramDefinition<ConnectorCodecError> {
+    PureProviderProgramDefinition::new(
+        provider,
+        Some(Arc::new(IcebergReadRecipeCompiler)),
+        Some(Arc::new(IcebergWriteRecipeCompiler)),
+    )
+}
+
+fn paimon_pure_program(
+    provider: ConnectorProviderId,
+) -> PureProviderProgramDefinition<ConnectorCodecError> {
+    PureProviderProgramDefinition::new(provider, Some(Arc::new(PaimonReadRecipeCompiler)), None)
+}
+
+fn build_paimon_control_factory(
+    input: &ProviderFactoryInput<'_>,
+) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
+    let access = crate::composition::compose_paimon_control_access_factory(
+        input.config,
+        input.runtime.clone(),
+    )?;
+    Ok(Arc::new(PaimonControlRoleBindingFactory::new(
+        access,
+        input.runtime.clone(),
+    )))
+}
+
+fn build_paimon_execution_factory(
+    input: &ProviderFactoryInput<'_>,
+    scan_io: &ScanIoServices,
+) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
+    let access = crate::composition::compose_paimon_execution_access_factory(
+        input.config,
+        input.runtime.clone(),
+        scan_io,
+        #[cfg(novarocks_dev_controls)]
+        input.test_slots,
+    )?;
+    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(access)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use novarocks_spi::connector::provider::{
+        ConnectorCodecDeclaration, ProviderReadCodecDefinitions, ProviderReadContractDefinition,
+    };
+    use novarocks_spi::connector::{
+        CatalogProperties, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorControlRoleBinding, ConnectorExecutionRoleBinding, ConnectorMaterializationError,
+        MaterializationContext, NormalizedCatalogProperties,
+    };
+
+    use super::*;
+
+    static CONTROL_BUILDS: AtomicUsize = AtomicUsize::new(0);
+    static EXECUTION_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+    fn fixture_contract() -> Result<ProviderContractDefinition, ConnectorCodecError> {
+        contract("fixture")
+    }
+
+    fn duplicate_fixture_contract() -> Result<ProviderContractDefinition, ConnectorCodecError> {
+        contract("fixture")
+    }
+
+    fn contract(id: &str) -> Result<ProviderContractDefinition, ConnectorCodecError> {
+        let provider_id = ConnectorProviderId::parse(id).expect("fixture provider ID");
+        let declaration = |category| {
+            ConnectorCodecDeclaration::try_new(
+                provider_id.clone(),
+                category,
+                ConnectorCodecRevision::try_new(1).expect("revision"),
+                format!("fixture.{category:?}"),
+                b"fixture descriptor".as_slice(),
+            )
+        };
+        ProviderContractDefinition::read_only(
+            provider_id.clone(),
+            ProviderReadContractDefinition::new(ProviderReadCodecDefinitions::try_new(
+                declaration(ConnectorCodecCategory::ReadTable)?,
+                declaration(ConnectorCodecCategory::ReadView)?,
+                declaration(ConnectorCodecCategory::ReadColumn)?,
+                declaration(ConnectorCodecCategory::ReadSplit)?,
+            )?),
+        )
+    }
+
+    struct FixtureFactory {
+        provider_id: ConnectorProviderId,
+    }
+
+    impl ConnectorControlRoleBindingFactory for FixtureFactory {
+        fn provider_id(&self) -> ConnectorProviderId {
+            self.provider_id.clone()
+        }
+
+        fn normalize_and_validate(
+            &self,
+            _properties: CatalogProperties,
+        ) -> Result<NormalizedCatalogProperties, ConnectorMaterializationError> {
+            unreachable!("manifest projection never invokes provider behavior")
+        }
+
+        fn open_catalog(
+            &self,
+            _identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            unreachable!("manifest projection never invokes provider behavior")
+        }
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for FixtureFactory {
+        fn materialize(
+            &self,
+            _properties: NormalizedCatalogProperties,
+            _context: MaterializationContext,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<ConnectorControlRoleBinding, ConnectorMaterializationError>,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            unreachable!("manifest projection never invokes provider behavior")
+        }
+    }
+
+    impl ConnectorExecutionRoleBindingFactory for FixtureFactory {
+        fn provider_id(&self) -> ConnectorProviderId {
+            self.provider_id.clone()
+        }
+
+        fn bind(
+            &self,
+            _properties: &NormalizedCatalogProperties,
+        ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
+            unreachable!("manifest projection never invokes provider behavior")
+        }
+    }
+
+    fn drifted_control_factory(
+        _input: &ProviderFactoryInput<'_>,
+    ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
+        Ok(Arc::new(FixtureFactory {
+            provider_id: ConnectorProviderId::parse("other").expect("fixture provider ID"),
+        }))
+    }
+
+    fn fixture_control_factory(
+        _input: &ProviderFactoryInput<'_>,
+    ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
+        Ok(Arc::new(FixtureFactory {
+            provider_id: ConnectorProviderId::parse("fixture").expect("fixture provider ID"),
+        }))
+    }
+
+    fn fixture_execution_factory(
+        _input: &ProviderFactoryInput<'_>,
+        _scan_io: &ScanIoServices,
+    ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
+        Ok(Arc::new(FixtureFactory {
+            provider_id: ConnectorProviderId::parse("fixture").expect("fixture provider ID"),
+        }))
+    }
+
+    /// A fixture with no pure facet; these cases never compose a catalogue.
+    fn fixture_pure_program(
+        provider: ConnectorProviderId,
+    ) -> PureProviderProgramDefinition<ConnectorCodecError> {
+        PureProviderProgramDefinition::new(provider, None, None)
+    }
+
+    fn counted_control_factory(
+        input: &ProviderFactoryInput<'_>,
+    ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
+        CONTROL_BUILDS.fetch_add(1, Ordering::AcqRel);
+        fixture_control_factory(input)
+    }
+
+    fn counted_execution_factory(
+        input: &ProviderFactoryInput<'_>,
+        scan_io: &ScanIoServices,
+    ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
+        EXECUTION_BUILDS.fetch_add(1, Ordering::AcqRel);
+        fixture_execution_factory(input, scan_io)
+    }
+
+    #[test]
+    fn sealing_rejects_a_missing_role_factory() {
+        let error = ServerProviderManifest::seal_definitions(&[ProviderBuilderDefinition {
+            contract: fixture_contract,
+            control: Some(fixture_control_factory),
+            execution: None,
+            pure: fixture_pure_program,
+        }])
+        .err()
+        .expect("missing BE factory must fail")
+        .to_string();
+        assert!(error.contains("no BE execution factory builder"), "{error}");
+    }
+
+    #[test]
+    fn sealing_rejects_duplicate_provider_contracts() {
+        let error = ServerProviderManifest::seal_definitions(&[
+            ProviderBuilderDefinition {
+                contract: fixture_contract,
+                control: Some(fixture_control_factory),
+                execution: Some(fixture_execution_factory),
+                pure: fixture_pure_program,
+            },
+            ProviderBuilderDefinition {
+                contract: duplicate_fixture_contract,
+                control: Some(fixture_control_factory),
+                execution: Some(fixture_execution_factory),
+                pure: fixture_pure_program,
+            },
+        ])
+        .err()
+        .expect("duplicate contract must fail")
+        .to_string();
+        assert!(error.contains("registered more than once"), "{error}");
+    }
+
+    #[test]
+    fn role_projection_rejects_factory_identity_drift() {
+        let manifest = ServerProviderManifest::seal_definitions(&[ProviderBuilderDefinition {
+            contract: fixture_contract,
+            control: Some(drifted_control_factory),
+            execution: Some(fixture_execution_factory),
+            pure: fixture_pure_program,
+        }])
+        .expect("contract-only sealing must not invoke factories");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        #[cfg(novarocks_dev_controls)]
+        let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
+        let error = manifest
+            .compose_control_factories(
+                &NovaRocksConfig::default(),
+                runtime.handle().clone(),
+                #[cfg(novarocks_dev_controls)]
+                &test_slots,
+            )
+            .err()
+            .expect("identity drift must fail")
+            .to_string();
+        assert!(error.contains("different identities"), "{error}");
+    }
+
+    #[test]
+    fn role_projection_constructs_only_the_selected_role_resources() {
+        CONTROL_BUILDS.store(0, Ordering::Release);
+        EXECUTION_BUILDS.store(0, Ordering::Release);
+        let manifest = ServerProviderManifest::seal_definitions(&[ProviderBuilderDefinition {
+            contract: fixture_contract,
+            control: Some(counted_control_factory),
+            execution: Some(counted_execution_factory),
+            pure: fixture_pure_program,
+        }])
+        .expect("manifest");
+        assert_eq!(CONTROL_BUILDS.load(Ordering::Acquire), 0);
+        assert_eq!(EXECUTION_BUILDS.load(Ordering::Acquire), 0);
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        #[cfg(novarocks_dev_controls)]
+        let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
+        manifest
+            .compose_control_factories(
+                &NovaRocksConfig::default(),
+                runtime.handle().clone(),
+                #[cfg(novarocks_dev_controls)]
+                &test_slots,
+            )
+            .expect("FE projection");
+        assert_eq!(CONTROL_BUILDS.load(Ordering::Acquire), 1);
+        assert_eq!(EXECUTION_BUILDS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn native_carriers_and_both_role_projections_share_one_manifest() {
+        let manifest = ServerProviderManifest::seal().expect("server provider manifest");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        #[cfg(novarocks_dev_controls)]
+        let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
+        let config = NovaRocksConfig::default();
+        let contract_ids = manifest
+            .contracts()
+            .definitions()
+            .iter()
+            .map(|contract| contract.provider_id().as_str().to_owned())
+            .collect::<Vec<_>>();
+        let carrier_ids =
+            crate::native_compatibility::native_carrier_declarations(manifest.contracts())
+                .expect("native carriers")
+                .into_iter()
+                .map(|carrier| carrier.provider_id().to_string())
+                .collect::<Vec<_>>();
+        let control_ids = manifest
+            .compose_control_factories(
+                &config,
+                runtime.handle().clone(),
+                #[cfg(novarocks_dev_controls)]
+                &test_slots,
+            )
+            .expect("FE projection")
+            .into_iter()
+            .map(|factory| factory.provider_id().as_str().to_owned())
+            .collect::<Vec<_>>();
+        let scan_io =
+            crate::scan_io::ScanIoRuntime::start(&config.runtime).expect("scan I/O runtime");
+        let execution_ids = manifest
+            .compose_execution_factories(
+                &config,
+                runtime.handle().clone(),
+                &scan_io.services(),
+                #[cfg(novarocks_dev_controls)]
+                &test_slots,
+            )
+            .expect("BE projection")
+            .into_iter()
+            .map(|factory| factory.provider_id().as_str().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(contract_ids, vec!["iceberg", "paimon"]);
+        assert_eq!(carrier_ids, contract_ids);
+        assert_eq!(control_ids, contract_ids);
+        assert_eq!(execution_ids, contract_ids);
+        #[cfg(novarocks_dev_controls)]
+        {
+            // Building either role attaches inert slots, without activating a session.
+            test_slots
+                .iceberg
+                .activate(Vec::new())
+                .expect("role composition must not activate provider observations");
+            test_slots.iceberg.close();
+        }
+        runtime
+            .block_on(scan_io.shutdown())
+            .expect("drain BE scan I/O runtime");
+    }
+
+    #[test]
+    fn iceberg_execution_uses_composed_coalesce_policy() {
+        let mut config = NovaRocksConfig::default();
+        config.runtime.io_coalesce_read_enable = false;
+        config.runtime.io_coalesce_read_max_buffer_size = 2 * 1024 * 1024;
+        config.runtime.io_coalesce_read_max_distance_size = 16 * 1024;
+        let options = iceberg_execution_reader_options(&config);
+        assert!(!options.reader_options.coalesce_reads);
+        assert_eq!(options.reader_options.coalesce_max_bytes, 2 * 1024 * 1024);
+        assert_eq!(options.reader_options.coalesce_max_gap, 16 * 1024);
+    }
+
+    /// The Server manifest installs Iceberg read and write ports and the
+    /// read-only Paimon port, exactly the facets each sealed contract
+    /// declares.
+    #[test]
+    fn the_server_manifest_composes_its_pure_program_catalogue() {
+        let manifest = ServerProviderManifest::seal().expect("server provider manifest");
+        let catalog = manifest
+            .compose_pure_program_catalog()
+            .expect("pure provider program catalogue");
+        assert_eq!(catalog.provider_count(), 2);
+        let facets = manifest
+            .contracts()
+            .definitions()
+            .iter()
+            .map(|contract| {
+                (
+                    contract.provider_id().as_str().to_owned(),
+                    contract.write().is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facets,
+            vec![("iceberg".to_owned(), true), ("paimon".to_owned(), false)]
+        );
+    }
+
+    /// Installed ports that disagree with the sealed contract fail
+    /// composition rather than admitting a provider with a missing facet.
+    #[test]
+    fn pure_ports_that_disagree_with_their_contract_fail_composition() {
+        let manifest = ServerProviderManifest::seal_definitions(&[ProviderBuilderDefinition {
+            contract: fixture_contract,
+            control: Some(fixture_control_factory),
+            execution: Some(fixture_execution_factory),
+            pure: fixture_pure_program,
+        }])
+        .expect("manifest");
+        let error = manifest
+            .compose_pure_program_catalog()
+            .err()
+            .expect("a read contract without a pure read port must fail")
+            .to_string();
+        assert!(
+            error.contains("installed pure facets differ from the manifest"),
+            "{error}"
+        );
+    }
+}

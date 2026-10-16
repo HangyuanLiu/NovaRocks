@@ -673,7 +673,7 @@ fn local_catalog_table_from_planner(database: &str, planner: TableDef) -> Catalo
 /// Register one closed connector-read relation for an application behavior
 /// test. The fixture keeps the `TableDef` and scan-source construction inside
 /// SQL; callers supply only catalog-visible schema facts.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[doc(hidden)]
 pub fn register_test_connector_read_table(
     catalog: &mut PlannerMemoryCatalog,
@@ -697,11 +697,11 @@ pub fn register_test_connector_read_table(
 /// Test-only sealed local table facts for Core behavior tests that validate
 /// catalog-visible schema changes. The planner table and scan source remain
 /// private to SQL; callers cannot construct or inspect either raw type.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[doc(hidden)]
 pub struct SqlTestDeltaTableFacts(TableDef);
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[doc(hidden)]
 pub fn test_delta_table_facts(
     columns: Vec<ColumnDef>,
@@ -719,7 +719,7 @@ pub fn test_delta_table_facts(
     })
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 impl SqlTestDeltaTableFacts {
     #[doc(hidden)]
     pub fn columns(&self) -> &[ColumnDef] {

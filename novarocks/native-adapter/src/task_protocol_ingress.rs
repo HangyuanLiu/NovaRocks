@@ -69,7 +69,7 @@ use crate::task_protocol::{
     fetch_task_result, fetch_task_result_with_ownership, get_final_task_info,
     host_rejection_status, subscribe_task_status,
 };
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::task_protocol_fault as fault;
 use novarocks_worker::{
     AdmissionTicketObservation, RootResultRoute, StatusAdvance, TaskExecutionRegistry,
@@ -78,9 +78,9 @@ use novarocks_worker::{
 /// The wire adapter of one backend's task protocol owner.
 pub struct RegistryTaskExecutionIngress {
     registry: Arc<TaskExecutionRegistry>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: std::sync::OnceLock<Arc<crate::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observation_controls:
         std::sync::OnceLock<Arc<crate::test_observation_controls::NativeObservationControls>>,
     native_compatibility_id: NativeCompatibilityId,
@@ -120,16 +120,16 @@ impl RegistryTaskExecutionIngress {
         );
         Arc::new(Self {
             registry,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: std::sync::OnceLock::new(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: std::sync::OnceLock::new(),
             native_compatibility_id,
             static_package_admission,
         })
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn install_test_controls(
         &self,
         controls: Arc<crate::test_controls::NativeTestControls>,
@@ -139,7 +139,7 @@ impl RegistryTaskExecutionIngress {
             .map_err(|_| "Native ingress test controls were already installed".into())
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn install_observation_controls(
         &self,
         controls: Arc<crate::test_observation_controls::NativeObservationControls>,
@@ -195,7 +195,7 @@ impl RegistryTaskExecutionIngress {
                 })
             }
             DecodedOperation::CreateTask(decoded) => {
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 if let Some(controls) = self.test_controls.get() {
                     fault::create_task_before_worker_hold(
                         controls,
@@ -214,7 +214,7 @@ impl RegistryTaskExecutionIngress {
                 );
                 // Claimed after Worker took ownership. Installation and
                 // driver start are independent later status facts.
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 if let Some(controls) = self.test_controls.get() {
                     fault::create_task_ack_dropped(controls, identity, receipt.outcome())?;
                 }
@@ -235,7 +235,7 @@ impl RegistryTaskExecutionIngress {
                 // the acknowledgement body, as a genuine rejection has none, so
                 // the reverse order would leave the identity fault nothing to
                 // forge and silently consume its arming.
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 if let Some(controls) = self.test_controls.get() {
                     fault::create_task_receipt_foreign_task(
                         controls,
@@ -244,7 +244,7 @@ impl RegistryTaskExecutionIngress {
                         &mut encoded,
                     )?;
                 }
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 if let Some(controls) = self.test_controls.get() {
                     fault::create_task_rejected_after_apply(
                         controls,
@@ -262,7 +262,7 @@ impl RegistryTaskExecutionIngress {
                 // splits and sealed its plan node, and the receipt's watermark
                 // is where that fact lives. The request's payload would have to
                 // be decoded again to learn the same thing.
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 let terminal_nonempty = receipt.acknowledgement().is_some_and(|ack| {
                     ack.domains().iter().any(|domain| match domain {
                         TaskDomainReceipt::SplitAssignment { nodes, .. } => {
@@ -274,7 +274,7 @@ impl RegistryTaskExecutionIngress {
                         _ => false,
                     })
                 });
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 if let Some(controls) = self.test_controls.get() {
                     fault::task_update_terminal_ack_dropped(
                         controls,
@@ -298,7 +298,7 @@ impl RegistryTaskExecutionIngress {
                 // fault has to prevent the extension itself so the lease can
                 // run out. Dropping the answer afterwards is the other fault,
                 // and the frontend survives that one by resending.
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 if matches!(&neutral, UpdateQueryContext::RenewLease(_))
                     && if let Some(controls) = self.test_controls.get() {
                         fault::lease_renewal_stopped(controls, context)?
@@ -314,7 +314,7 @@ impl RegistryTaskExecutionIngress {
                     // Arm before the registry releases its creation gate. A
                     // create may already be waiting there, and must observe
                     // the runner-owned process-loss rendezvous when it wakes.
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     if let Some(controls) = self.test_controls.get() {
                         fault::arm_restart_after_establish_context(controls, context)?;
                     }
@@ -328,7 +328,7 @@ impl RegistryTaskExecutionIngress {
                         // establish open so the harness can replace this exact
                         // process, and an answer dropped afterwards would
                         // belong to a process that no longer exists.
-                        #[cfg(feature = "test-controls")]
+                        #[cfg(novarocks_dev_controls)]
                         if let Some(controls) = self.test_controls.get() {
                             fault::restart_after_establish_context(
                                 controls,
@@ -336,7 +336,7 @@ impl RegistryTaskExecutionIngress {
                                 receipt.outcome(),
                             )?;
                         }
-                        #[cfg(feature = "test-controls")]
+                        #[cfg(novarocks_dev_controls)]
                         if let Some(controls) = self.test_controls.get() {
                             fault::establish_context_ack_dropped(
                                 controls,
@@ -346,7 +346,7 @@ impl RegistryTaskExecutionIngress {
                         }
                     }
                     UpdateQueryContext::RenewLease(_) => {
-                        #[cfg(feature = "test-controls")]
+                        #[cfg(novarocks_dev_controls)]
                         if let Some(controls) = self.test_controls.get() {
                             fault::lease_renewal_ack_dropped(controls, context, receipt.outcome())?;
                         }
@@ -411,7 +411,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
         request: TaskResultReadRequest,
         ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
     ) -> Result<TaskResultRead, TaskResultReadError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         use crate::task_result_diagnostics::emit_task_fetch_marker;
         use novarocks_worker::result_buffer::{
             TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed,
@@ -443,7 +443,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
             {
                 let packet_sequence =
                     acknowledged.expect("an exact terminal replay carries its sequence");
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 emit_task_fetch_marker(
                     self.observation_controls.get().map(AsRef::as_ref),
                     identity,
@@ -456,7 +456,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                 return Ok(TaskResultRead::EndOfStream { packet_sequence });
             }
             RootResultRoute::AwaitTerminalControl => {
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 emit_task_fetch_marker(
                     self.observation_controls.get().map(AsRef::as_ref),
                     identity,
@@ -481,7 +481,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                     route = ?route,
                     "root result poll refused"
                 );
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 emit_task_fetch_marker(
                     self.observation_controls.get().map(AsRef::as_ref),
                     identity,
@@ -504,7 +504,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
             .await
             {
                 TryFetchTypedResult::Ready(result) => {
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     emit_task_fetch_marker(
                         self.observation_controls.get().map(AsRef::as_ref),
                         identity,
@@ -534,7 +534,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                     }
                     let packet_sequence =
                         acknowledged.expect("an acknowledged end carries its packet sequence");
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     emit_task_fetch_marker(
                         self.observation_controls.get().map(AsRef::as_ref),
                         identity,
@@ -553,7 +553,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                         .await?;
                     match &resolved {
                         TaskResultRead::AwaitTerminalControl => {
-                            #[cfg(feature = "test-controls")]
+                            #[cfg(novarocks_dev_controls)]
                             emit_task_fetch_marker(
                                 self.observation_controls.get().map(AsRef::as_ref),
                                 identity,
@@ -565,7 +565,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                             .map_err(TaskResultReadError::new)?;
                         }
                         TaskResultRead::Error { .. } => {
-                            #[cfg(feature = "test-controls")]
+                            #[cfg(novarocks_dev_controls)]
                             emit_task_fetch_marker(
                                 self.observation_controls.get().map(AsRef::as_ref),
                                 identity,
@@ -640,7 +640,7 @@ impl TaskObservationReader for RegistryTaskExecutionIngress {
 }
 
 impl TaskStatusSubscriptionReader for RegistryTaskExecutionIngress {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
         self.test_controls.get().cloned()
     }
@@ -703,7 +703,7 @@ impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
 
 #[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn with_registry_lock_for_test(
         &self,
         callback: &mut dyn FnMut() -> Result<(), tonic::Status>,
@@ -1018,7 +1018,7 @@ mod tests {
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
                 crate::task_execution_observation::backend_task_execution_ports(
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     None,
                 ),
             );

@@ -563,11 +563,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinSet;
 
-    #[cfg(all(
-        unix,
-        feature = "test-controls",
-        feature = "mem-1-m07-exact-mysql-write"
-    ))]
+    #[cfg(all(unix, novarocks_dev_controls, feature = "mem-1-m07-exact-mysql-write"))]
     mod authorization_tests {
         use super::*;
         use crate::{

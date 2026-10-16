@@ -3740,22 +3740,22 @@ impl From<&str> for SqlCompileError {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub use crate::planner::distributed::build::state_source_fixture::ordinary_union_source as ordinary_union_source_for_test;
 
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub use crate::planner::distributed::build::state_author_fixture::{
     OrdinaryStateObservation, ordinary_state_observe_for_test,
 };
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub use crate::planner::distributed::build::writer_state_fixture::{
     WriterStateSourceObservation, writer_state_observe_for_test, writer_state_source_for_test,
 };
 
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub use crate::planner::distributed::build::state_source_fixture::ordinary_extrema_constant_state_source_for_test;
 
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub use crate::planner::distributed::build::state_source_fixture::ordered_array_state_source_for_test;
 
 #[cfg(test)]

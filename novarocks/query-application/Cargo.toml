@@ -8,13 +8,10 @@ license.workspace = true
 workspace = true
 
 [features]
-normal-build = ["novarocks-failpoint?/normal-build"]
-test-controls = ["dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
-test-support = []
 mem-1-m07-exact-mysql-write = []
 
 [dependencies]
-novarocks-failpoint = { workspace = true, optional = true }
+novarocks-failpoint = { workspace = true }
 novarocks-type-contract.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
@@ -35,6 +32,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 novarocks-connector-contract.workspace = true
-novarocks-sql = { workspace = true, features = ["test-support"] }
+novarocks-sql = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

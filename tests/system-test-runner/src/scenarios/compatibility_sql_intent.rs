@@ -56,7 +56,7 @@ fn add(launch: &mut Launch, domain: &str, parameters: serde_json::Value) {
 pub(super) struct CompatibilityIntent(Mutex<Option<(Vec<SelectedStatement>, BTreeSet<usize>)>>);
 impl CompatibilityIntent {
     /// All paths are the actual scenario-selected artifacts. This helper never
-    /// substitutes the runner's base control binary for a compatibility build.
+    /// substitutes the runner's primary binary for a compatibility build.
     pub fn freeze(
         &self,
         frontend: &Path,
@@ -214,7 +214,7 @@ impl CompatibilityIntent {
 }
 fn authorize(plan: &mut ClusterTestSessionPlan, launch: &Launch, owner: &str) -> Result<()> {
     if launch.grants.is_empty() {
-        plan.authorize_inert_controlled_launch(
+        plan.authorize_uncontrolled_launch(
             &launch.reference,
             launch.binary.clone(),
             vec![
@@ -513,8 +513,13 @@ mod tests {
         let summaries = plan.planned_launch_summaries();
         let roles = summaries.as_array().unwrap();
         let fe = roles.iter().find(|role| role["role"] == "fe").unwrap();
-        assert_eq!(fe["inert_controlled"], true);
+        assert_eq!(fe["ordinary"], true);
         assert!(fe["grants"].as_array().unwrap().is_empty());
+        assert!(
+            roles
+                .iter()
+                .all(|role| role["binary"] == json!(artifact.path()))
+        );
         let be = roles.iter().find(|role| role["role"] == "be-0").unwrap();
         assert_eq!(be["grants"].as_array().unwrap().len(), 1);
     }
@@ -546,8 +551,10 @@ mod tests {
         assert_eq!(be2.len(), 2);
         assert_ne!(be2[0]["session_id"], be2[1]["session_id"]);
         assert!(be2[0]["grants"].as_array().unwrap().is_empty());
-        assert_eq!(be2[0]["inert_controlled"], true);
+        assert_eq!(be2[0]["ordinary"], true);
         assert_eq!(be2[1]["grants"].as_array().unwrap().len(), 1);
+        assert_eq!(be2[1]["ordinary"], false);
+        assert_eq!(be2[0]["binary"], json!(artifact.path()));
         assert_eq!(
             be2[1]["binary"],
             replacement.path().to_string_lossy().as_ref()

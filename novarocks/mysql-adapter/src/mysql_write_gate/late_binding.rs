@@ -41,7 +41,7 @@ struct HubState {
 
 /// One listener-owned slot. Per-connection aliases never allocate another scope.
 pub(crate) struct MysqlWriteGateHub {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     action_observation:
         Mutex<Option<Arc<crate::test_fixture_authorization::FixtureActionObservation>>>,
     frontend: FrontendProcessId,
@@ -80,7 +80,7 @@ fn hub_fail(state: &mut HubState, reason: GateFailure) -> io::Error {
     error(*state.failure.get_or_insert(earlier))
 }
 impl MysqlWriteGateHub {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn install_action_observation(
         &self,
         observation: Arc<crate::test_fixture_authorization::FixtureActionObservation>,
@@ -90,7 +90,7 @@ impl MysqlWriteGateHub {
             .lock()
             .expect("original fixture observation lock") = Some(observation);
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn observe_reached_cut(&self) {
         let reached = self
             .state
@@ -125,7 +125,7 @@ impl MysqlWriteGateHub {
             return Err(error(GateFailure::Deadline));
         }
         let hub = Arc::new(Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             action_observation: Mutex::new(None),
             frontend: actual_frontend,
             nonce,
@@ -693,7 +693,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for InitiallyRawMysqlWriter<W> {
             (_, Some(original)) => Pin::new(original).poll_write(cx, bytes),
             _ => Poll::Ready(Err(error(GateFailure::Transition))),
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         this.hub.observe_reached_cut();
         this.hub.propagate_scope_failure();
         result
@@ -712,7 +712,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for InitiallyRawMysqlWriter<W> {
             (_, Some(original)) => Pin::new(original).poll_write_vectored(cx, bytes),
             _ => Poll::Ready(Err(error(GateFailure::Transition))),
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         this.hub.observe_reached_cut();
         this.hub.propagate_scope_failure();
         result
@@ -736,7 +736,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for InitiallyRawMysqlWriter<W> {
             (_, Some(original)) => Pin::new(original).poll_flush(cx),
             _ => Poll::Ready(Err(error(GateFailure::Transition))),
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         this.hub.observe_reached_cut();
         this.hub.propagate_scope_failure();
         result
@@ -770,11 +770,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
     use tokio::task::JoinSet;
-    #[cfg(all(
-        unix,
-        feature = "test-controls",
-        feature = "mem-1-m07-exact-mysql-write"
-    ))]
+    #[cfg(all(unix, novarocks_dev_controls, feature = "mem-1-m07-exact-mysql-write"))]
     #[tokio::test]
     async fn explicit_grant_hit_is_the_actual_write_cut_and_not_fixture_construction() {
         use crate::test_fixture_authorization::{

@@ -58,7 +58,7 @@ pub struct FragmentPrepareContext {
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<RuntimeFilterSessionRef>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     exchange_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
     result_writer: Arc<dyn FragmentResultWriter>,
     root_result_session: Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>>,
@@ -1128,7 +1128,7 @@ impl Default for FragmentPrepareContext {
             runtime_filter: None,
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
             edge_gates: None,
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
@@ -1172,7 +1172,7 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter,
             exchange_transmitter,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
             result_writer,
             event_sink,
@@ -1204,7 +1204,7 @@ impl FragmentPrepareContext {
         self
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_exchange_test_observer(
         mut self,
         observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
@@ -1335,7 +1335,7 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter: None,
             exchange_transmitter,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
             result_writer,
             event_sink,
@@ -1829,7 +1829,7 @@ pub fn prepare_fragment(
             execution_runtime: context.execution_runtime.clone(),
             query_memory: context.query_memory.clone(),
             task_identity: context.result_identity,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: context.exchange_test_observer.clone(),
         })
         .map_err(|error| {

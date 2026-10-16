@@ -760,7 +760,7 @@ fn a_closed_authority_does_not_return_a_held_success_to_waiter() {
     });
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn debug_close_requires_exact_authority_identity() {
     let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
@@ -1268,7 +1268,7 @@ fn the_validity_margin_is_a_clamped_fraction_not_a_fixed_span() {
     );
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn session_authority_close_is_exact_once_and_observer_is_joined() {
     use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
@@ -1358,7 +1358,7 @@ fn session_authority_close_is_exact_once_and_observer_is_joined() {
     );
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn authority_control_parameters_for_test(
     action: &str,
     root: &std::path::Path,
@@ -1378,7 +1378,7 @@ fn authority_control_parameters_for_test(
     })
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn authority_close_session_for_cleanup_test() -> (
     tempfile::TempDir,
     novarocks_failpoint::liveness::RunnerSession,
@@ -1388,7 +1388,7 @@ fn authority_close_session_for_cleanup_test() -> (
     authority_control_session_for_test(&["observe", "close"])
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn authority_control_session_for_test(
     actions: &[&str],
 ) -> (
@@ -1436,7 +1436,7 @@ fn authority_control_session_for_test(
     (directory, runner, role, controls)
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn wait_for_authority_close_identity(directory: &std::path::Path) -> std::path::PathBuf {
     let path = directory.join("be-0.storage-authority-0.identity");
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1450,7 +1450,7 @@ fn wait_for_authority_close_identity(directory: &std::path::Path) -> std::path::
     path
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn natural_scope_end_with_poisoned_targets_still_cleans_identity_and_repeats_the_error() {
     let (directory, mut runner, mut role, controls) = authority_close_session_for_cleanup_test();
@@ -1505,7 +1505,7 @@ fn natural_scope_end_with_poisoned_targets_still_cleans_identity_and_repeats_the
     role.close_and_join().unwrap();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn observer_primary_and_identity_cleanup_failures_are_retained_after_the_filesystem_is_repaired() {
     let (directory, mut runner, mut role, controls) = authority_close_session_for_cleanup_test();
@@ -1552,7 +1552,7 @@ fn observer_primary_and_identity_cleanup_failures_are_retained_after_the_filesys
     role.close_and_join().unwrap();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn poisoned_join_bookkeeping_still_joins_the_real_observer_and_preserves_history() {
     let (directory, mut runner, mut role, controls) = authority_close_session_for_cleanup_test();
@@ -1575,7 +1575,7 @@ fn poisoned_join_bookkeeping_still_joins_the_real_observer_and_preserves_history
     role.close_and_join().unwrap();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn authority_identity_observation_cannot_close_and_ignores_unrelated_targets() {
     let (directory, mut runner, mut role, controls) =
@@ -1624,7 +1624,7 @@ fn authority_identity_observation_cannot_close_and_ignores_unrelated_targets() {
     role.close_and_join().unwrap();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn authority_close_permission_does_not_grant_identity_observation() {
     let (directory, mut runner, mut role, controls) =
@@ -1667,7 +1667,7 @@ fn authority_close_permission_does_not_grant_identity_observation() {
     role.close_and_join().unwrap();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn authority_target_intent_pins_full_generation_before_any_action_claim() {
     let (directory, mut runner, mut role, controls) =
@@ -1720,7 +1720,7 @@ fn authority_target_intent_pins_full_generation_before_any_action_claim() {
     role.close_and_join().unwrap();
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn authority_controls_reject_missing_or_conflicting_predeclared_intent_before_activation() {
     use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
