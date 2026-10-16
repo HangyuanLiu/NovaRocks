@@ -95,3 +95,80 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
         novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
     }
 }
+
+#[test]
+fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
+    for (ordinal, sql) in [
+        "SELECT map{}",
+        "SELECT map{}['a']",
+        "SELECT element_at(map{}, 'a')",
+        "SELECT m[p] FROM (SELECT map{} AS m, 'a' AS p) q",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([31; 16]).unwrap(),
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: None,
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            noop_constant_evaluator(),
+            crate::constant::test_constant_policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            SqlCompileControl::unbounded(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        let SqlCompileProgress::Complete(completed) = SqlCompiler::start(
+            request.try_into_completion().unwrap_or_else(|error| {
+                panic!("actual public completion failed for {sql}: {error:?}")
+            }),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap_or_else(|error| panic!("actual public compiler failed for {sql}: {error:?}")) else {
+            panic!("source-free query unexpectedly needs observations: {sql}");
+        };
+        let result = completed.plan().result_port().unwrap();
+        assert_eq!(result.fields.len(), 1, "{sql}");
+        let ty = &result.fields[0].ty;
+        if ordinal == 0 {
+            let DataType::Map(entries, _) = ty.data_type() else {
+                panic!("empty Map: {ty:?}");
+            };
+            let DataType::Struct(fields) = entries.data_type() else {
+                panic!("Map entries");
+            };
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].data_type(), &DataType::Null);
+            assert!(
+                !fields[0].is_nullable(),
+                "Map key contract remains non-null"
+            );
+            assert_eq!(fields[1].data_type(), &DataType::Null);
+            assert!(fields[1].is_nullable());
+        } else {
+            assert_eq!(ty.data_type(), &DataType::Null, "{sql}");
+            assert_eq!(ty.logical_type(), ValueLogicalType::Physical, "{sql}");
+            assert!(ty.nullable(), "empty lookup result: {sql}");
+        }
+        novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
+    }
+}

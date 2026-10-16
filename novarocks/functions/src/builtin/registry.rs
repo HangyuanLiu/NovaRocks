@@ -1438,6 +1438,22 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
+    // The frozen non-null Null key domain is uninhabited. Preserve this
+    // original Map and the independent evaluated probe, without key coercion.
+    add(
+        m,
+        "__map_element_at",
+        Signature::new(
+            vec![
+                TypeSpec::MapWithUninhabitedKey {
+                    map: "M",
+                    value: "V",
+                },
+                TypeSpec::AnyType,
+            ],
+            TypeSpec::Any("V"),
+        ),
+    );
     // __map_element_at(Map<K, V>, K) -> V
     add(
         m,

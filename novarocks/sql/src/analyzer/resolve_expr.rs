@@ -955,16 +955,20 @@ impl<'a> super::AnalyzerContext<'a> {
                         // alone cannot author the probe's nominal identity.
                         let key =
                             container_child_value_type_observed(&base.value_type, 0, self.control)?;
-                        let nullable = index_typed.value_type.nullable()
-                            || novarocks_functions::signed_integer_cast_can_produce_null(
-                                index_typed.value_type.data_type(),
-                                key.data_type(),
-                            );
-                        index_typed = self.cast_to_value_type(
-                            index_typed,
-                            super::helpers::with_nullability(key, nullable),
-                            index.span(),
-                        )?;
+                        if !novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
+                            &base.value_type,
+                        ) {
+                            let nullable = index_typed.value_type.nullable()
+                                || novarocks_functions::signed_integer_cast_can_produce_null(
+                                    index_typed.value_type.data_type(),
+                                    key.data_type(),
+                                );
+                            index_typed = self.cast_to_value_type(
+                                index_typed,
+                                super::helpers::with_nullability(key, nullable),
+                                index.span(),
+                            )?;
+                        }
                         fields[1].data_type().clone()
                     }
                     DataType::Struct(fields) => {

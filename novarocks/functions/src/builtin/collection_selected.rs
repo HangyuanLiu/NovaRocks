@@ -144,23 +144,30 @@ pub(super) fn validate_profile(
                 .value_type()
                 .child_type_at(1)
                 .ok_or_else(|| invalid("map element_at has no frozen semantic value"))?;
-            if !FunctionValueType::borrowed_value_domains_equal_observed(
-                key.value_type(),
-                key_semantic,
-                &mut observe,
-            )? || !FunctionValueType::borrowed_value_domains_equal_observed(
-                target.value_type(),
-                value_semantic,
-                &mut observe,
-            )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                key.data_type(),
-                fields[0].data_type(),
-                &mut observe,
-            )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                target.data_type(),
-                fields[1].data_type(),
-                &mut observe,
-            )? {
+            let independent_probe = super::map_lookup_core::has_uninhabited_map_key(map);
+            observe()?;
+            let key_matches = independent_probe
+                || (FunctionValueType::borrowed_value_domains_equal_observed(
+                    key.value_type(),
+                    key_semantic,
+                    &mut observe,
+                )? && novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                    key.data_type(),
+                    fields[0].data_type(),
+                    &mut observe,
+                )?);
+            if !key_matches
+                || !FunctionValueType::borrowed_value_domains_equal_observed(
+                    target.value_type(),
+                    value_semantic,
+                    &mut observe,
+                )?
+                || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                    target.data_type(),
+                    fields[1].data_type(),
+                    &mut observe,
+                )?
+            {
                 return Err(invalid(
                     "map element_at selected domains differ from its real key/value fields",
                 ));
