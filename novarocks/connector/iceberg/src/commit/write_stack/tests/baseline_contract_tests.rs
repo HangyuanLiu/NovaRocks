@@ -557,3 +557,88 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
         "abort must not publish metadata or any data/delete artifact"
     );
 }
+
+#[test]
+fn ordinary_equality_delete_sessions_apply_the_existing_table_shape_guards() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest;
+    use novarocks_spi::connector::{ConnectorErrorKind, ConnectorWriteFieldRequest};
+    for (version, partitioned, expected) in [
+        (
+            crate::iceberg::spec::FormatVersion::V1,
+            false,
+            Some("ADD EQUALITY DELETE requires an Iceberg v2 or v3 table"),
+        ),
+        (
+            crate::iceberg::spec::FormatVersion::V2,
+            true,
+            Some("ADD EQUALITY DELETE currently supports only unpartitioned iceberg tables"),
+        ),
+        (crate::iceberg::spec::FormatVersion::V2, false, None),
+    ] {
+        let lake = FrozenRewriteLake::new_version(version);
+        let table_name = if partitioned {
+            let schema = lake.table().metadata().current_schema().clone();
+            let spec = crate::iceberg::spec::PartitionSpec::builder(schema.clone())
+                .add_partition_field("id", "id", crate::iceberg::spec::Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap();
+            lake.executor.block_on(
+                crate::catalog::admission_test_support::create_static_fixture_table(
+                    &lake.runtime,
+                    lake.control.binding_key().incarnation,
+                    crate::catalog::CatalogNamespaceName::new("partition_db"),
+                    crate::iceberg::TableCreation::builder()
+                        .name("partitioned".into())
+                        .schema(schema.as_ref().clone())
+                        .partition_spec(spec.into_unbound())
+                        .format_version(version)
+                        .build(),
+                ),
+            );
+            "partition_db.partitioned"
+        } else {
+            "db.t"
+        };
+        let before = physical_bytes(lake._warehouse.path());
+        let context = request_context();
+        let result = lake.control.begin_write(ConnectorWriteBeginRequest {
+            table: Arc::from(table_name),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+            intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: ConnectorWriteInputRequest::EqualityDelete {
+                equality_fields: vec![
+                    ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("id", DataType::Int64, false),
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    )
+                    .unwrap(),
+                ],
+            },
+            base: None,
+            flavor: ConnectorWriteSessionFlavor::Ordinary,
+            context: context.clone(),
+        });
+        match result {
+            Err(error) => {
+                let expected = expected.unwrap_or_else(|| panic!("valid equality delete: {error}"));
+                assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+                assert_eq!(error.message(), expected);
+            }
+            Ok(session) => {
+                lake.control
+                    .abort_write(ConnectorWriteSessionAbortRequest {
+                        commit: session.commit_handle(),
+                        context,
+                    })
+                    .unwrap();
+                assert!(
+                    expected.is_none(),
+                    "unsupported equality-delete session was admitted: {expected:?}"
+                );
+            }
+        }
+        assert_eq!(physical_bytes(lake._warehouse.path()), before);
+    }
+}

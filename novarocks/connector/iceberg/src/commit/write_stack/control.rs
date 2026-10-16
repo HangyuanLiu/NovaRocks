@@ -2252,21 +2252,29 @@ impl IcebergWriteSessionControl {
         if staged.is_none() {
             crate::commit::validation::ensure_iceberg_write_supported_from_metadata(&metadata)
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
-            // INSERT uses this ordinary data session instead of the legacy
-            // prepare_write call. Reuse its intent/ref policy after the existing
-            // generic support gate; other session flavors and input families
-            // retain their independent admission contracts.
+            // Ordinary INSERT and ADD EQUALITY DELETE use this session instead
+            // of the separate preparation call. Reuse their existing policies;
+            // other input families and session flavors retain their own gates.
             if matches!(request.flavor, ConnectorWriteSessionFlavor::Ordinary)
                 && request.purpose == ConnectorWriteAdmissionPurpose::OrdinaryDml
-                && matches!(request.input, ConnectorWriteInputRequest::Data { .. })
             {
-                let target_fqn = format!("{}.{}", self.key.instance_id.as_str(), request.table);
-                if let Some(denied) = crate::commit::write_preparation::insert_intent_support_denial(
-                    &metadata,
-                    request.intent,
-                    request.target_ref.as_str(),
-                    &target_fqn,
-                ) {
+                let denied = match &request.input {
+                    ConnectorWriteInputRequest::Data { .. } => {
+                        let target_fqn =
+                            format!("{}.{}", self.key.instance_id.as_str(), request.table);
+                        crate::commit::write_preparation::insert_intent_support_denial(
+                            &metadata,
+                            request.intent,
+                            request.target_ref.as_str(),
+                            &target_fqn,
+                        )
+                    }
+                    ConnectorWriteInputRequest::EqualityDelete { .. } => {
+                        crate::commit::write_preparation::equality_delete_support_denial(&metadata)
+                    }
+                    _ => None,
+                };
+                if let Some(denied) = denied {
                     return Err(denied);
                 }
             }
