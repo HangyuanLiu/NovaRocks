@@ -1007,6 +1007,7 @@ fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture
             "before-requirement-check-hold-for-concurrent-shell",
         )?;
         let query = spawn_sql(context, expire(CATALOG, &table));
+        let mut branch_append_forwarded = None;
         let phase = (|| -> Result<(Value, Option<i64>)> {
             guard.wait_until_entered(context.deadline())?;
             match case {
@@ -1035,12 +1036,22 @@ fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture
                         context,
                         &catalog_sql(fixture, "publication_branch_writer", 30_000),
                     )?;
+                    let append_before =
+                        control.mutation_counts("ns", &table).table_commit_forwarded;
                     sql(
                         context,
                         &format!(
                             "INSERT INTO publication_branch_writer.ns.{table}.branch_dev2 VALUES (99)"
                         ),
                     )?;
+                    let append_forwarded =
+                        control.mutation_counts("ns", &table).table_commit_forwarded
+                            - append_before;
+                    ensure!(
+                        append_forwarded == 1,
+                        "external branch append was not forwarded once"
+                    );
+                    branch_append_forwarded = Some(append_forwarded);
                 }
                 "lost_tag" => set_ref(
                     fixture,
@@ -1070,7 +1081,7 @@ fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture
             context,
             &format!("{case}-result.json"),
             &json!({"after":after,"sql_result":format!("{outcome:?}"),
-            "forwarded":forwarded,"candidate":candidate,"source":source}),
+            "forwarded":forwarded,"branch_append_forwarded":branch_append_forwarded,"candidate":candidate,"source":source}),
         )?;
         match case {
             "ref_move" => {
@@ -1113,9 +1124,11 @@ fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture
             }
             "new_branch" => {
                 outcome.context("expiry failed with a new external branch")?;
+                let append_forwarded = branch_append_forwarded
+                    .context("external branch append forwarding was not observed")?;
                 ensure!(
-                    forwarded == 1,
-                    "new branch race unexpectedly replayed expiry"
+                    forwarded == append_forwarded + 1,
+                    "new branch race did not forward expiry exactly once in addition to its external append"
                 );
                 let branch = branch.context("external branch snapshot absent")?;
                 ensure!(
@@ -1310,68 +1323,225 @@ fn local_expiry_serialization(
         &catalog_sql(fixture, "publication_unknown", EVIDENCE_MS),
     )?;
     let unknown_count = control.mutation_counts("ns", table).table_commit_forwarded;
-    let mut guard = control.arm_next(
-        "table-commit",
-        "before-requirement-check-hold-for-concurrent-shell",
-    )?;
+    let service_table = format!("ns.{table}");
+    let mut hold = fixture.service().arm(&service_table)?;
     let query = spawn_sql(context, expire("publication_unknown", table));
-    let phase = guard.wait_until_entered(context.deadline());
-    // Preserve all cleanup paths if the hold was not reached; otherwise join
-    // while held so Unknown is proven before publishing the local ref.
-    if let Err(error) = phase {
-        return finish_proxy(context, "unknown-window", guard, Err::<(), _>(error), query)
-            .map(|_| ());
-    }
-    let original_sql = joined(query);
-    let phase = (|| -> Result<()> {
-        require_unknown(
-            original_sql
-                .as_ref()
-                .map_err(|error| anyhow::anyhow!("{error:#}"))?,
-        )?;
-        sql(
-            context,
-            &format!(
-                "ALTER TABLE publication_unknown.ns.{table} CREATE TAG after_unknown AS OF VERSION {candidate}"
-            ),
-        )?;
-        let tagged = table_metadata(fixture, table)?;
+    let phase = (|| -> Result<Value> {
+        hold.wait_until_held(context.deadline())?;
+        let events = hold
+            .trace()?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let held = events
+            .iter()
+            .filter(|event| event["table"] == service_table && event["event"] == "hold-reached")
+            .collect::<Vec<_>>();
         ensure!(
-            tagged["refs"]["after_unknown"]["snapshot-id"] == candidate,
-            "same-catalog ref did not publish after Unknown released the lock"
+            held.len() == 1,
+            "Unknown window has no unique original Java hold"
         );
-        save(context, "unknown-window-before-release.json", &tagged)
+        Ok((*held[0]).clone())
     })();
-    let release = guard.release();
-    let early_trace = save(context, "unknown-window-trace.json", &guard.trace());
-    let exit = guard.finish();
-    let trace = match &exit {
-        Ok(evidence) => save(context, "unknown-window-trace.json", evidence.trace()),
-        Err(_) => early_trace,
-    };
+    let original_identity = phase.as_ref().ok().cloned();
+    let finished = finish_service(
+        context,
+        "unknown-window-service",
+        &mut hold,
+        phase,
+        query,
+        true,
+        |outcome| {
+            require_unknown(outcome)?;
+            ensure!(
+                format!("{:#}", outcome.as_ref().unwrap_err()).contains("[CommitUnknown]"),
+                "Unknown window SQL lost the canonical CommitUnknown code"
+            );
+            sql(
+                context,
+                &format!(
+                    "ALTER TABLE publication_unknown.ns.{table} CREATE TAG after_unknown AS OF VERSION {candidate}"
+                ),
+            )?;
+            let tagged = table_metadata(fixture, table)?;
+            ensure!(
+                tagged["refs"]["after_unknown"]["snapshot-id"] == candidate,
+                "same-catalog ref did not publish after Unknown released the lock"
+            );
+            save(context, "unknown-window-before-release.json", &tagged)
+        },
+    );
+    // The original wrapper's exit is only the first Java CAS attempt. The
+    // same HTTP handler may refresh and retry the unchanged updates after it.
+    // Bind that successor to the held table/thread and its own commit ID;
+    // metadata loss alone cannot prove its actual exit.
+    let retry = (|| -> Result<Value> {
+        let original = original_identity
+            .as_ref()
+            .context("Unknown window never acquired an original Java identity")?;
+        let thread = original["thread"].as_str().context("held thread missing")?;
+        let commit = original["commit_id"]
+            .as_str()
+            .context("held commit ID missing")?;
+        let arm = original["arm_id"].as_str().context("held arm ID missing")?;
+        ensure!(
+            !thread.is_empty() && !commit.is_empty() && !arm.is_empty(),
+            "original Java hold identity is empty"
+        );
+        loop {
+            let events = hold
+                .trace()?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let own = |event: &&Value| {
+                event["table"] == service_table
+                    && event["thread"] == thread
+                    && event["commit_id"] == commit
+                    && event["arm_id"] == arm
+            };
+            let conflict = events
+                .iter()
+                .filter(|event| own(event))
+                .find(|event| event["event"] == "delegate-commit-conflict");
+            let exited = events
+                .iter()
+                .filter(|event| own(event))
+                .find(|event| event["event"] == "commit-method-exited");
+            if let Some(exited) = exited {
+                let conflict = conflict.context(
+                    "original Java method exited without the expected tag-induced conflict",
+                )?;
+                let conflict_sequence = conflict["sequence"]
+                    .as_u64()
+                    .context("conflict sequence missing")?;
+                let exit_sequence = exited["sequence"]
+                    .as_u64()
+                    .context("original exit sequence missing")?;
+                ensure!(
+                    conflict_sequence < exit_sequence,
+                    "original Java exit preceded its conflict"
+                );
+                let successors = events
+                    .iter()
+                    .filter(|event| {
+                        event["table"] == service_table
+                            && event["thread"] == thread
+                            && event["arm_id"] == ""
+                            && event["commit_id"] != commit
+                            && event["event"] == "requirements-passed-before-persistent-commit"
+                            && event["sequence"]
+                                .as_u64()
+                                .is_some_and(|sequence| sequence > exit_sequence)
+                    })
+                    .collect::<Vec<_>>();
+                ensure!(
+                    successors.len() <= 1,
+                    "Unknown window has multiple Java retry identities"
+                );
+                if let Some(successor) = successors.first() {
+                    let retry_commit = successor["commit_id"]
+                        .as_str()
+                        .context("retry commit ID missing")?;
+                    ensure!(!retry_commit.is_empty(), "retry commit ID is empty");
+                    let entered = successor["sequence"]
+                        .as_u64()
+                        .context("retry sequence missing")?;
+                    let refresh = events.iter().find(|event| {
+                        event["table"] == service_table
+                            && event["thread"] == thread
+                            && event["event"] == "refresh"
+                            && event["sequence"].as_u64().is_some_and(|sequence| {
+                                sequence > exit_sequence && sequence < entered
+                            })
+                    });
+                    ensure!(
+                        refresh.is_some(),
+                        "Java retry did not refresh after original actual exit"
+                    );
+                    let successor_events = events
+                        .iter()
+                        .filter(|event| {
+                            event["table"] == service_table
+                                && event["thread"] == thread
+                                && event["arm_id"] == ""
+                                && event["commit_id"] == retry_commit
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(retry_exit) = successor_events
+                        .iter()
+                        .find(|event| event["event"] == "commit-method-exited")
+                    {
+                        let started = successor_events
+                            .iter()
+                            .find(|event| event["event"] == "delegate-commit-start")
+                            .context("Java retry actually exited without delegate start")?;
+                        let success = successor_events
+                            .iter()
+                            .find(|event| event["event"] == "delegate-commit-success")
+                            .context("Java retry actually exited without success")?;
+                        let start_sequence = started["sequence"]
+                            .as_u64()
+                            .context("retry start sequence missing")?;
+                        let success_sequence = success["sequence"]
+                            .as_u64()
+                            .context("retry success sequence missing")?;
+                        let retry_exit_sequence = retry_exit["sequence"]
+                            .as_u64()
+                            .context("retry exit sequence missing")?;
+                        ensure!(
+                            entered < start_sequence
+                                && start_sequence < success_sequence
+                                && success_sequence < retry_exit_sequence,
+                            "Java retry actual exit did not follow its successful delegate"
+                        );
+                        return Ok(
+                            json!({"original":original,"original_conflict":conflict,"original_exit":exited,
+                            "refresh":refresh,"retry_entered":successor,"retry_start":started,"retry_success":success,"retry_exit":retry_exit}),
+                        );
+                    }
+                }
+            }
+            ensure!(
+                Instant::now() < context.deadline(),
+                "Unknown window Java retry actual exit was not observed"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    })();
+    // Capture the final trace even when the lifecycle proof or SQL inspection
+    // failed; finish_service already attempted release/join/original exit.
+    let trace = hold.trace().and_then(|trace| {
+        fs::write(
+            context.scenario_root().join("unknown-window-trace.ndjson"),
+            trace,
+        )?;
+        Ok(())
+    });
     let after = table_metadata(fixture, table);
+    let forwarded = control.mutation_counts("ns", table).table_commit_forwarded - unknown_count;
     let receipt = save(
         context,
         "unknown-window-result.json",
         &json!({
-            "statement":format!("{original_sql:?}"),"phase_error":failure(&phase),
-            "release_error":failure(&release),"proxy_actual_exit_error":failure(&exit),
+            "service_actors":format!("{finished:?}"),"service_error":failure(&finished),
+            "retry":retry.as_ref().ok(),"retry_error":failure(&retry),
             "after":after.as_ref().ok(),"candidate":candidate,"manifest_list":list,
-            "sql_actor_actual_exit":true,"sql_actor_join_succeeded":original_sql.is_ok(),"guarantee":"local serialization ends at Unknown; late application remains possible"
+            "forwarded":forwarded,
+            "sql_actor_actual_exit":true,"original_and_retry_actual_exit":retry.is_ok(),
+            "guarantee":"local serialization ends at Unknown; late application remains possible"
         }),
     );
     aggregate(&[
-        ("phase", failure(&phase)),
-        ("release", failure(&release)),
-        ("join", failure(&original_sql)),
-        ("proxy actual exit", failure(&exit)),
+        ("service release/join/original exit", failure(&finished)),
+        ("retry actual exit", failure(&retry)),
         ("trace", failure(&trace)),
         ("metadata", failure(&after)),
         ("receipt", failure(&receipt)),
     ])?;
     let after = after?;
     ensure!(
-        control.mutation_counts("ns", table).table_commit_forwarded == unknown_count + 2,
+        forwarded == 2,
         "Unknown expiry or the following local tag was replayed"
     );
     ensure!(

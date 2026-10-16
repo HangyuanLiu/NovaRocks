@@ -133,7 +133,15 @@ pub fn lower_ref_action(
             }
             let snapshot_id = match snapshot_id.or_else(|| metadata.current_snapshot_id()) {
                 Some(snapshot_id) if metadata.snapshot_by_id(snapshot_id).is_some() => snapshot_id,
-                _ => {
+                Some(snapshot_id) => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        format!(
+                            "Iceberg ref create requires an existing snapshot; snapshot {snapshot_id} was not found"
+                        ),
+                    ));
+                }
+                None => {
                     return Err(ConnectorError::new(
                         ConnectorErrorKind::NotFound,
                         "Iceberg ref create requires an existing snapshot",
