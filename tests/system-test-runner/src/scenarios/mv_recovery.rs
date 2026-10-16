@@ -1157,7 +1157,17 @@ impl Scenario for MvLegacyInterpretationRebuild {
         if property(&resumed, "SettledEffects")? != "1" {
             bail!("old-format MV did not settle the old FE incarnation");
         }
-        context.action("old L must reject a refresh before any publication");
+        let management_metadata = capture_empty_management_snapshot(
+            context,
+            &rest_uri,
+            "ns",
+            "orders_mv",
+            "before-rejected-refresh",
+        )?;
+        let management_snapshot = management_metadata["current-snapshot-id"]
+            .as_i64()
+            .context("empty management snapshot has no Current ID")?;
+        context.action("old L must reject a refresh without a data publication");
         let error = conn
             .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
             .expect_err("old nonzero big-endian L must fail closed")
@@ -1167,7 +1177,18 @@ impl Scenario for MvLegacyInterpretationRebuild {
         {
             bail!("old L refresh failed for another reason: {error}");
         }
-        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 0)?;
+        assert_rest_snapshot_unchanged(context, &rest_uri, "ns", "orders_mv", management_snapshot)?;
+        let after_rejection = capture_empty_management_snapshot(
+            context,
+            &rest_uri,
+            "ns",
+            "orders_mv",
+            "after-rejected-refresh",
+        )?;
+        ensure!(
+            after_rejection["snapshots"] == management_metadata["snapshots"],
+            "old-L rejection changed the management snapshot facts"
+        );
 
         execute(
             context,
@@ -2193,6 +2214,55 @@ fn protobuf_varint(input: &[u8], offset: &mut usize) -> Result<u64> {
         }
     }
     bail!("L protobuf varint exceeds 64 bits")
+}
+
+// Capture the real registration snapshot, never a guessed publication count.
+fn capture_empty_management_snapshot(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+    phase: &str,
+) -> Result<serde_json::Value> {
+    use super::mv_uea7_documents::wire::Graph;
+
+    let metadata = super::mv_uea7_documents::load_metadata(context, rest_uri, namespace, table)?;
+    fs::write(
+        context
+            .scenario_root()
+            .join(format!("old-l-{phase}-metadata.json")),
+        serde_json::to_vec_pretty(&metadata)?,
+    )?;
+    let graph = Graph::from_metadata(&metadata)?;
+    ensure!(
+        graph.snapshots.len() == 1,
+        "empty management target must have exactly its registration snapshot"
+    );
+    let (snapshot_id, publication) = &graph.snapshots[0];
+    ensure!(
+        graph.current == Some(*snapshot_id)
+            && metadata["refs"]["main"]["snapshot-id"].as_i64() == Some(*snapshot_id)
+            && publication.is_none(),
+        "empty management snapshot is not exact Current/main without P"
+    );
+    let snapshot = metadata["snapshots"]
+        .as_array()
+        .and_then(|snapshots| snapshots.first())
+        .context("empty management target has no raw snapshot")?;
+    let summary = snapshot["summary"]
+        .as_object()
+        .context("empty management snapshot has no summary")?;
+    ensure!(
+        summary.get("operation").and_then(serde_json::Value::as_str) == Some("append"),
+        "first management snapshot must be an empty append"
+    );
+    for key in ["total-data-files", "total-delete-files", "total-records"] {
+        ensure!(
+            summary.get(key).and_then(serde_json::Value::as_str) == Some("0"),
+            "empty management snapshot {key} is not exactly zero"
+        );
+    }
+    Ok(metadata)
 }
 
 fn assert_rest_snapshot_count(
