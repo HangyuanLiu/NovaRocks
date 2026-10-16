@@ -1238,3 +1238,60 @@ fn artifactless_preparation_stop_preserves_original_typed_reason() {
         ConnectorMutationFailureKind::Cancelled
     );
 }
+
+fn freeze_uuid_fixture(
+    requirements: Vec<TableRequirement>,
+) -> crate::iceberg::Result<FrozenRequest> {
+    let base = fixture(FormatVersion::V2);
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    freeze_existing_change(
+        TableIdent::from_strs(["db", "t"]).unwrap(),
+        "main",
+        &base,
+        "s3://bucket/table/metadata/base.json",
+        RequestShape::MetadataOnly,
+        AttemptToken::new(token(), 0),
+        PreparedChange {
+            requirements,
+            updates: vec![TableUpdate::RemoveProperties {
+                removals: vec!["k".into()],
+            }],
+        },
+        &artifactless_context(&stop),
+    )
+}
+
+#[test]
+fn artifactless_freeze_keeps_exactly_one_equal_caller_uuid() {
+    let request = freeze_uuid_fixture(vec![TableRequirement::UuidMatch { uuid: uuid() }]).unwrap();
+    assert_eq!(
+        request.identifier(),
+        &TableIdent::from_strs(["db", "t"]).unwrap()
+    );
+    assert_eq!(
+        request.requirements(),
+        &[TableRequirement::UuidMatch { uuid: uuid() }]
+    );
+    assert!(request.artifacts().attempt_owned().is_empty());
+}
+
+#[test]
+fn artifactless_freeze_rejects_a_foreign_caller_uuid_before_publication() {
+    let error = freeze_uuid_fixture(vec![TableRequirement::UuidMatch {
+        uuid: Uuid::from_bytes([2; 16]),
+    }])
+    .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::iceberg::ErrorKind::CatalogCommitConflicts
+    );
+}
+
+#[test]
+fn artifactless_freeze_rejects_create_requirements_for_an_existing_table() {
+    let error = freeze_uuid_fixture(vec![TableRequirement::NotExist]).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::iceberg::ErrorKind::CatalogCommitConflicts
+    );
+}

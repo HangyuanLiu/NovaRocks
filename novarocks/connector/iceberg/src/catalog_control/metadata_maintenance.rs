@@ -1392,7 +1392,15 @@ mod tests {
         executor: &tokio::runtime::Runtime,
         adapter: &IcebergMetadataMaintenanceAdapter,
     ) -> crate::iceberg::table::Table {
-        use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+        create_local_table_with_version(executor, adapter, crate::iceberg::spec::FormatVersion::V2)
+    }
+
+    fn create_local_table_with_version(
+        executor: &tokio::runtime::Runtime,
+        adapter: &IcebergMetadataMaintenanceAdapter,
+        version: crate::iceberg::spec::FormatVersion,
+    ) -> crate::iceberg::table::Table {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
         use crate::iceberg::{NamespaceIdent, TableCreation};
 
         executor.block_on(async {
@@ -1429,7 +1437,7 @@ mod tests {
                     creation: TableCreation::builder()
                         .name("t".into())
                         .schema(schema)
-                        .format_version(FormatVersion::V2)
+                        .format_version(version)
                         .build(),
                     no_op_if_exists: false,
                 },
@@ -1689,6 +1697,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v3_empty_maintenance_is_noop_without_publication_or_artifacts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (executor, _warehouse, base, key) = adapter();
+        let table = create_local_table_with_version(
+            &executor,
+            &base,
+            crate::iceberg::spec::FormatVersion::V3,
+        );
+        let location = novarocks_fs::FsLocation::parse(table.metadata().location()).unwrap();
+        let before = inventory_without_private_artifacts(std::path::Path::new(location.path()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let actual = recorded_adapter(
+            &base,
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let lease = real_maintenance_lease(actual);
+        for expire in [false, true] {
+            let plan = lease
+                .plan_maintenance(local_planning_request(&key, expire))
+                .unwrap();
+            let outcome = lease
+                .execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap(),
+                )
+                .unwrap();
+            let ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt,
+                finalization: ExternalMutationFinalization::Complete,
+            } = outcome
+            else {
+                panic!("empty V3 must be a complete no-op")
+            };
+            assert_eq!(
+                receipt.summary(),
+                ConnectorMetadataMaintenanceReceiptSummary::default()
+            );
+            assert_eq!(
+                inventory_without_private_artifacts(std::path::Path::new(location.path())),
+                before
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn v3_expiry_publishes_one_source_uuid_and_keeps_exactly_the_original_head() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (executor, _warehouse, base, key) = adapter();
+        let table = create_local_table_with_version(
+            &executor,
+            &base,
+            crate::iceberg::spec::FormatVersion::V3,
+        );
+        append_local_file(&executor, &base, table.identifier(), "first");
+        append_local_file(&executor, &base, table.identifier(), "second");
+        let loaded = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
+        let head = loaded.metadata().current_snapshot_id().unwrap();
+        let uuid = loaded.metadata().uuid();
+        assert_eq!(loaded.metadata().snapshots().len(), 2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let actual = recorded_adapter(
+            &base,
+            Arc::new(move |requirements, _| {
+                assert_eq!(seen.fetch_add(1, Ordering::SeqCst), 0);
+                assert_eq!(
+                    requirements
+                        .iter()
+                        .filter_map(|r| {
+                            if let crate::iceberg::TableRequirement::UuidMatch { uuid } = r {
+                                Some(*uuid)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    vec![uuid]
+                );
+            }),
+        );
+        let lease = real_maintenance_lease(actual);
+        let plan = lease
+            .plan_maintenance(local_planning_request(&key, true))
+            .unwrap();
+        let outcome = lease
+            .execute(ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap())
+            .unwrap();
+        let ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        } = outcome
+        else {
+            panic!("V3 expiry must commit")
+        };
+        assert_eq!(receipt.summary().affected_versions, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let after = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
+        assert_eq!(
+            after.metadata().format_version(),
+            crate::iceberg::spec::FormatVersion::V3
+        );
+        assert_eq!(after.metadata().current_snapshot_id(), Some(head));
+        assert_eq!(
+            after
+                .metadata()
+                .snapshots()
+                .map(|snapshot| snapshot.snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![head]
+        );
+    }
+
     fn recorded_adapter(
         adapter: &IcebergMetadataMaintenanceAdapter,
         recorder: Arc<
@@ -1797,6 +1933,7 @@ mod tests {
         let table = create_local_table(&executor, &base);
         append_local_file(&executor, &base, table.identifier(), "first");
         append_local_file(&executor, &base, table.identifier(), "second");
+        let source_uuid = table.metadata().uuid();
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let catalog = competing_adapter(&base);
@@ -1804,7 +1941,20 @@ mod tests {
         let ident = table.identifier().clone();
         let adapter = recorded_adapter(
             &base,
-            Arc::new(move |_, updates| {
+            Arc::new(move |requirements, updates| {
+                assert_eq!(
+                    requirements
+                        .iter()
+                        .filter_map(|r| {
+                            if let crate::iceberg::TableRequirement::UuidMatch { uuid } = r {
+                                Some(*uuid)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    vec![source_uuid]
+                );
                 assert!(updates.iter().any(|update|matches!(update,crate::iceberg::TableUpdate::RemoveSnapshots{snapshot_ids} if snapshot_ids.len()==1)));
                 assert_eq!(seen.fetch_add(1, Ordering::SeqCst), 0);
                 foreign_properties(
@@ -1871,6 +2021,7 @@ mod tests {
         let table = create_local_table(&executor, &base);
         append_local_file(&executor, &base, table.identifier(), "first");
         append_local_file(&executor, &base, table.identifier(), "second");
+        let source_uuid = table.metadata().uuid();
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -1881,6 +2032,19 @@ mod tests {
         let adapter = recorded_adapter(
             &base,
             Arc::new(move |requirements, updates| {
+                assert_eq!(
+                    requirements
+                        .iter()
+                        .filter_map(|r| {
+                            if let crate::iceberg::TableRequirement::UuidMatch { uuid } = r {
+                                Some(*uuid)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    vec![source_uuid]
+                );
                 observed
                     .lock()
                     .unwrap()

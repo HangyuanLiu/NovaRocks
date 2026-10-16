@@ -25,6 +25,7 @@ use novarocks_types::naming::normalize_identifier;
 
 #[cfg(test)]
 use crate::catalog::CatalogNamespaceName;
+#[cfg(test)]
 use crate::catalog::CatalogTableName;
 #[cfg(test)]
 use crate::catalog::error::CatalogOutcome;
@@ -193,12 +194,21 @@ pub(crate) fn create_view(
     comment: Option<&str>,
     replace: bool,
     extra_properties: &[(String, String)],
-) -> Result<CatalogOutcome<CatalogTableName>, String> {
+) -> Result<CatalogOutcome<crate::catalog::transaction::CommitProof>, String> {
     let (namespace_ident, ident) = view_ident(namespace, view)?;
     let (definition, properties) =
         prepare_definition(columns, definition, comment, extra_properties)?;
     let owner = Arc::clone(runtime.novarocks_catalog());
 
+    let target = CatalogTableName::from_identifier(&ident);
+    let operation = if replace {
+        crate::catalog::admission::CatalogOperation::ReplaceView
+    } else {
+        crate::catalog::admission::CatalogOperation::CreateView
+    };
+    if let Err(reason) = owner.admit_operation(&operation, &target.into()) {
+        return Ok(CatalogOutcome::Unsupported(reason));
+    }
     if replace {
         let target = CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         let current = runtime
@@ -219,10 +229,10 @@ pub(crate) fn create_view(
             Ok(replace) => replace,
             Err(message) => return Ok(locally_refused(message)),
         };
-        return runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.replace_view(replace).await });
+        return publish_view_fixture(
+            runtime,
+            crate::catalog::catalog_request::CatalogPublicationRequest::ReplaceView(replace),
+        );
     }
 
     let creation = match ViewCreate::validate(ident.name.clone(), definition, properties) {
@@ -230,15 +240,18 @@ pub(crate) fn create_view(
         Err(message) => return Ok(locally_refused(message)),
     };
     let namespace = CatalogNamespaceName::new(namespace_ident.to_url_string());
-    runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { owner.create_view(namespace, creation).await })
+    publish_view_fixture(
+        runtime,
+        crate::catalog::catalog_request::CatalogPublicationRequest::CreateView {
+            namespace,
+            creation,
+        },
+    )
 }
 
 /// A view mutation refused before dispatch is known not to have committed.
 #[cfg(test)]
-fn locally_refused(message: String) -> CatalogOutcome<CatalogTableName> {
+fn locally_refused(message: String) -> CatalogOutcome<crate::catalog::transaction::CommitProof> {
     CatalogOutcome::uncommitted(
         novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
         message,
@@ -292,14 +305,35 @@ pub(crate) fn drop_view(
     runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
-) -> Result<CatalogOutcome<CatalogTableName>, String> {
+) -> Result<CatalogOutcome<crate::catalog::transaction::CommitProof>, String> {
     let (_, ident) = view_ident(namespace, view)?;
-    let owner = Arc::clone(runtime.novarocks_catalog());
     let target = CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
-    runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { owner.drop_view(target).await })
+    if let Err(reason) = runtime.novarocks_catalog().admit_operation(
+        &crate::catalog::admission::CatalogOperation::DropView,
+        &target.clone().into(),
+    ) {
+        return Ok(CatalogOutcome::Unsupported(reason));
+    }
+    publish_view_fixture(
+        runtime,
+        crate::catalog::catalog_request::CatalogPublicationRequest::DropView(target),
+    )
+}
+
+#[cfg(test)]
+fn publish_view_fixture(
+    runtime: &IcebergMetadataContext,
+    request: crate::catalog::catalog_request::CatalogPublicationRequest,
+) -> Result<CatalogOutcome<crate::catalog::transaction::CommitProof>, String> {
+    let publication = runtime.clone();
+    runtime.resources().catalog_runtime().block_on(async move {
+        crate::catalog::admission_test_support::publish_catalog_fixture(
+            &publication,
+            novarocks_spi::connector::ProviderBindingEpoch::from_bytes([68; 16]),
+            request,
+        )
+        .await
+    })
 }
 
 /// Whether the view exists.
@@ -598,7 +632,7 @@ mod tests {
     fn hadoop_reports_unsupported_rather_than_answering_view_questions() {
         let (_executor, _warehouse, runtime) = hadoop_runtime();
         let assert_unsupported_outcome =
-            |result: Result<CatalogOutcome<CatalogTableName>, String>| {
+            |result: Result<CatalogOutcome<crate::catalog::transaction::CommitProof>, String>| {
                 let outcome = result.expect("a view mutation reaches the owner");
                 assert!(
                     matches!(outcome, CatalogOutcome::Unsupported(_)),
@@ -850,7 +884,9 @@ mod tests {
             }
         }
 
-        fn refused_as_invalid(outcome: Result<CatalogOutcome<CatalogTableName>, String>) -> String {
+        fn refused_as_invalid(
+            outcome: Result<CatalogOutcome<crate::catalog::transaction::CommitProof>, String>,
+        ) -> String {
             match outcome.expect("the refusal is an outcome") {
                 CatalogOutcome::KnownUncommitted { failure } => {
                     assert_eq!(failure.kind(), Kind::InvalidRequest);

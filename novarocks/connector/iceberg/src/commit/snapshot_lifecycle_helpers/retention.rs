@@ -321,6 +321,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cutoff_retains_the_full_main_chain_when_count_covers_it() {
+        let metadata = graph(HashMap::new(), vec![("main", 3, branch())]);
+        let plan = RetentionPlan::compute(&metadata, 10000, Some(i64::MAX), Some(20)).unwrap();
+        assert_eq!(removed(&plan), vec![4, 5, 6]);
+        assert_eq!(
+            plan.protected_snapshots,
+            std::collections::BTreeSet::from([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn no_refs_under_an_explicit_cutoff_has_no_implicit_main_protection() {
+        let metadata = graph(HashMap::new(), vec![]);
+        let plan = RetentionPlan::compute(&metadata, 10000, Some(i64::MAX), Some(20)).unwrap();
+        assert_eq!(removed(&plan), vec![1, 2, 3, 4, 5, 6]);
+        assert!(plan.protected_snapshots.is_empty());
+        assert!(plan.requirements.is_empty());
+    }
+
+    #[test]
     fn default_age_keeps_recent_history_instead_of_only_the_head() {
         let metadata = graph(HashMap::new(), vec![("main", 3, branch())]);
         let plan = RetentionPlan::compute(&metadata, 10000, None, None).unwrap();

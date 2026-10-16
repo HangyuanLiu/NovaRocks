@@ -19,9 +19,8 @@
 //!
 //! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 //!
-//! Every concrete implementation owns an `Arc<dyn iceberg::Catalog>`. Shared
-//! reads and single-frontier mutation mechanisms live here once; each owner
-//! selects which post-dispatch errors may prove a definite rejection.
+//! Hadoop and HMS share bounded catalog reads. Publication is owned by
+//! their prepared mechanisms and cannot be invoked through this delegate.
 //!
 use std::sync::Arc;
 
@@ -32,12 +31,8 @@ use novarocks_types::naming::normalize_identifier;
 
 use crate::iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-#[cfg(test)]
-use super::CatalogDropTableReceipt;
-use super::error::{CatalogCommitEvidence, CatalogOutcome, map_read_error};
+use super::error::map_read_error;
 use super::{CatalogNamespaceName, CatalogTableName};
-#[cfg(test)]
-use novarocks_spi::connector::{ConnectorMutationFailureKind, ExternalMutationEffect};
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
@@ -64,7 +59,6 @@ pub(super) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
     names
 }
 
-/// An owner-selected rule for accepting dispatched-error proof.
 /// Delegation onto one concrete catalog client.
 #[derive(Debug)]
 pub(super) struct CatalogDelegate {
@@ -225,137 +219,5 @@ impl CatalogDelegate {
             .load_table(&ident)
             .await
             .map_err(|error| map_read_error(&error))
-    }
-
-    // ---- Direct mutations ----------------------------------------------
-
-    #[cfg(test)]
-    pub(super) async fn create_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        let ident = match namespace_ident(&namespace) {
-            Ok(ident) => ident,
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                );
-            }
-        };
-        match self
-            .client
-            .create_namespace(&ident, std::collections::HashMap::new())
-            .await
-        {
-            Ok(_) => CatalogOutcome::committed(namespace, ExternalMutationEffect::Applied),
-            Err(error) => self.classify(&error, || {
-                CatalogCommitEvidence::for_target(namespace.namespace.clone())
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn drop_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        let ident = match namespace_ident(&namespace) {
-            Ok(ident) => ident,
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                );
-            }
-        };
-        match self.client.drop_namespace(&ident).await {
-            Ok(()) => CatalogOutcome::committed(namespace, ExternalMutationEffect::Applied),
-            Err(error) => self.classify(&error, || {
-                CatalogCommitEvidence::for_target(namespace.namespace.clone())
-            }),
-        }
-    }
-
-    /// Drop a table, capturing its exact object identity first.
-    ///
-    /// The identity has to be read before the drop because it is unreadable
-    /// after, and post-commit cleanup may only ever act on exact identity —
-    /// never on a path prefix. A table that cannot be loaded still gets
-    /// dropped; the receipt simply carries no cleanup facts, which correctly
-    /// leaves nothing eligible for deletion.
-    #[cfg(test)]
-    pub(super) async fn drop_table(
-        &self,
-        table: CatalogTableName,
-    ) -> CatalogOutcome<CatalogDropTableReceipt> {
-        let ident = match table_ident(&table) {
-            Ok(ident) => ident,
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                );
-            }
-        };
-        let receipt = match self.client.load_table(&ident).await {
-            Ok(loaded) => CatalogDropTableReceipt {
-                table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
-                table_location: Some(Arc::from(loaded.metadata().location())),
-                metadata_location: loaded.metadata_location().map(Arc::from),
-                last_updated_ms: loaded.metadata().last_updated_ms(),
-            },
-            Err(_) => CatalogDropTableReceipt {
-                table_uuid: None,
-                table_location: None,
-                metadata_location: None,
-                last_updated_ms: 0,
-            },
-        };
-        match self.client.drop_table(&ident).await {
-            Ok(()) => CatalogOutcome::committed(receipt, ExternalMutationEffect::Applied),
-            Err(error) => self.classify(&error, || {
-                CatalogCommitEvidence::for_target(table.canonical())
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn register_table(
-        &self,
-        table: CatalogTableName,
-        metadata_location: Arc<str>,
-    ) -> CatalogOutcome<CatalogTableName> {
-        let ident = match table_ident(&table) {
-            Ok(ident) => ident,
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                );
-            }
-        };
-        match self
-            .client
-            .register_table(&ident, metadata_location.to_string())
-            .await
-        {
-            Ok(_) => CatalogOutcome::committed(table, ExternalMutationEffect::Applied),
-            Err(error) => self.classify(&error, || {
-                CatalogCommitEvidence::for_target(table.canonical())
-                    .with_metadata_location(metadata_location.clone())
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    fn classify<T>(
-        &self,
-        error: &crate::iceberg::Error,
-        evidence: impl FnOnce() -> CatalogCommitEvidence,
-    ) -> CatalogOutcome<T> {
-        // REST failures carry typed evidence, which the shared judgment reads
-        // first (L14).
-        super::error::classify_dispatched_error(error, evidence)
     }
 }

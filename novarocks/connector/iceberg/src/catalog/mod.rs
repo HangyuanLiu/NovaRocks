@@ -310,34 +310,6 @@ pub(crate) enum ConditionalCreateVerdict {
     Foreign,
 }
 
-/// What a staged create produced, keeping every dispatch distinction the
-/// underlying protocol makes.
-///
-/// The arms mirror the REST client's typed staged-create result rather than
-/// collapsing it: `Conflict` is a definite server rejection, `KnownUncommitted`
-/// proves the request never went out, and `CommitUnknown` means it may have.
-/// Flattening these is how a lost response becomes a duplicate publication.
-#[cfg(test)]
-pub(crate) enum StagedCreateStart {
-    Staged {
-        /// The table response must not select a FileIO before a vended
-        /// delegation, when present, has entered the query-attempt collector.
-        table: crate::loaded_table::IcebergLoadedTableMaterialization,
-        initialization_updates: Vec<crate::iceberg::TableUpdate>,
-        /// Response-local vended material.  It is intentionally not part of
-        /// the table or staged-write payload; the caller must hand it to the
-        /// query-attempt lease owner or refuse the operation.
-        access_delegation: crate::loaded_table::IcebergAccessDelegation,
-    },
-    Conflict(String),
-    /// Proven not applied: never dispatched, or rejected before publication
-    /// (D13). The failure keeps its kind.
-    KnownUncommitted(ConnectorMutationFailure),
-    CommitUnknown(String),
-    /// This catalog has no staged-create protocol. Proven zero side effect.
-    Unsupported(CatalogUnsupported),
-}
-
 pub(crate) struct StagedCreateMaterial {
     pub table: crate::loaded_table::IcebergLoadedTableMaterialization,
     pub initialization_updates: Vec<crate::iceberg::TableUpdate>,
@@ -751,63 +723,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     // ---- B. Direct mutations -------------------------------------------
 
-    /// Create a view. A catalog without views answers `Unsupported`.
-    #[cfg(test)]
-    async fn create_view(
-        &self,
-        namespace: CatalogNamespaceName,
-        _creation: view_request::ViewCreate,
-    ) -> CatalogOutcome<CatalogTableName> {
-        CatalogOutcome::unsupported(format!(
-            "{} Iceberg catalog does not support views (namespace {})",
-            self.implementation_name(),
-            namespace.namespace
-        ))
-    }
-
-    /// Replace a view's definition; the replacement freezes the view UUID.
-    #[cfg(test)]
-    async fn replace_view(
-        &self,
-        replace: view_request::ValidatedViewReplace,
-    ) -> CatalogOutcome<CatalogTableName> {
-        CatalogOutcome::unsupported(format!(
-            "{} Iceberg catalog does not support views ({})",
-            self.implementation_name(),
-            replace.ident()
-        ))
-    }
-
-    /// Drop a view.
-    #[cfg(test)]
-    async fn drop_view(&self, view: CatalogTableName) -> CatalogOutcome<CatalogTableName> {
-        CatalogOutcome::unsupported(format!(
-            "{} Iceberg catalog does not support views ({view})",
-            self.implementation_name()
-        ))
-    }
-
-    #[cfg(test)]
-
-    async fn create_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName>;
-
-    #[cfg(test)]
-
-    async fn drop_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName>;
-
-    /// Drop a table from the catalog.
-    ///
-    /// This removes catalog visibility only. Object deletion is the filesystem
-    /// owner's job and may only proceed on `KnownCommitted`; see ADR-0118.
-    #[cfg(test)]
-    async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
-
     /// Admit an already committed write without another external mutation.
     /// Supported write protocols publish their own pointer. Unsupported
     /// catalogs still refuse; this boundary grants no registration authority.
@@ -816,19 +731,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         table: CatalogTableName,
         metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName>;
-
-    /// Create an invisible target for a staged publication.
-    ///
-    /// The staged table is not reachable through the catalog until it is
-    /// committed, which is what makes a CTAS absent-or-complete. A catalog with
-    /// no such protocol answers `Unsupported`, and never by creating a visible
-    /// empty table to fill in afterwards.
-    #[cfg(test)]
-    async fn stage_create_table(
-        &self,
-        namespace: CatalogNamespaceName,
-        creation: crate::iceberg::TableCreation,
-    ) -> StagedCreateStart;
 
     /// Stage a conditional create against storage, without publishing it.
     ///

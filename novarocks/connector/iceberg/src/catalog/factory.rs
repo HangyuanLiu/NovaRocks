@@ -181,6 +181,29 @@ mod tests {
                 },
             )
             .expect("freeze local create before any I/O");
+        publish_fixture(owner, request, operation_id).await
+    }
+
+    async fn namespace_fixture(
+        owner: Arc<dyn NovaRocksCatalog>,
+    ) -> CatalogOutcome<super::super::transaction::CommitProof> {
+        let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
+        let request = super::super::catalog_request::CatalogPublicationRequest::CreateNamespace {
+            namespace: CatalogNamespaceName::new("db"),
+            properties: Default::default(),
+            no_op_if_exists: false,
+        }
+        .freeze(operation_id.to_bytes())
+        .unwrap();
+        publish_fixture(owner, request, operation_id).await
+    }
+
+    async fn publish_fixture(
+        owner: Arc<dyn NovaRocksCatalog>,
+        request: super::super::catalog_request::FrozenCatalogPublication,
+        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    ) -> CatalogOutcome<super::super::transaction::CommitProof> {
+        use novarocks_spi::connector::*;
         let runtime = tokio::runtime::Handle::current();
         let context = ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -333,9 +356,7 @@ mod tests {
             .await
             .expect("catalog");
         assert!(matches!(
-            catalog
-                .create_namespace(CatalogNamespaceName::new("db"))
-                .await,
+            namespace_fixture(Arc::clone(&catalog)).await,
             CatalogOutcome::KnownCommitted { .. }
         ));
 
@@ -366,9 +387,7 @@ mod tests {
             .await
             .expect("catalog");
         assert!(matches!(
-            catalog
-                .create_namespace(CatalogNamespaceName::new("db"))
-                .await,
+            namespace_fixture(Arc::clone(&catalog)).await,
             CatalogOutcome::KnownCommitted { .. }
         ));
 
@@ -406,9 +425,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            catalog
-                .create_namespace(CatalogNamespaceName::new("db"))
-                .await,
+            namespace_fixture(Arc::clone(&catalog)).await,
             CatalogOutcome::KnownCommitted { .. }
         ));
         assert!(matches!(
@@ -811,20 +828,24 @@ mod tests {
         )
         .unwrap();
         let owner = adopted(&configuration).await.unwrap();
-        assert!(matches!(
+        for (operation, target) in [
+            (
+                super::super::admission::CatalogOperation::CreateNamespace,
+                CatalogNamespaceName::new("db").into(),
+            ),
+            (
+                super::super::admission::CatalogOperation::DropNamespace,
+                CatalogNamespaceName::new("db").into(),
+            ),
+            (
+                super::super::admission::CatalogOperation::DropTable,
+                CatalogTableName::new("db", "t").into(),
+            ),
+        ] {
             owner
-                .create_namespace(CatalogNamespaceName::new("db"))
-                .await,
-            CatalogOutcome::Unsupported(_)
-        ));
-        assert!(matches!(
-            owner.drop_namespace(CatalogNamespaceName::new("db")).await,
-            CatalogOutcome::Unsupported(_)
-        ));
-        assert!(matches!(
-            owner.drop_table(CatalogTableName::new("db", "t")).await,
-            CatalogOutcome::Unsupported(_)
-        ));
+                .admit_operation(&operation, &target)
+                .expect_err("HMS mutation must be refused before metastore I/O");
+        }
         assert!(matches!(
             owner
                 .anchor_written_metadata(

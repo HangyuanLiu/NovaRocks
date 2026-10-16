@@ -24,9 +24,8 @@ use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::error::{CatalogOutcome, CatalogUnsupported};
 use super::{
-    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, ConditionalCreateAttempt,
-    ConditionalCreateEvidence, ConditionalCreateReceipt, ConditionalCreateRequest,
-    ConditionalCreateVerdict, NovaRocksCatalog,
+    CatalogNamespaceName, CatalogTableName, ConditionalCreateAttempt, ConditionalCreateEvidence,
+    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
 type FrozenRecorder =
@@ -231,31 +230,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
         })
     }
 
-    #[cfg(test)]
-    async fn create_view(
-        &self,
-        namespace: super::CatalogNamespaceName,
-        creation: super::view_request::ViewCreate,
-    ) -> CatalogOutcome<super::CatalogTableName> {
-        self.inner.create_view(namespace, creation).await
-    }
-
-    #[cfg(test)]
-    async fn replace_view(
-        &self,
-        replace: super::view_request::ValidatedViewReplace,
-    ) -> CatalogOutcome<super::CatalogTableName> {
-        self.inner.replace_view(replace).await
-    }
-
-    #[cfg(test)]
-    async fn drop_view(
-        &self,
-        view: super::CatalogTableName,
-    ) -> CatalogOutcome<super::CatalogTableName> {
-        self.inner.drop_view(view).await
-    }
-
     fn implementation_name(&self) -> &'static str {
         "admitted-test-owner"
     }
@@ -342,27 +316,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner.load_view(view).await
     }
 
-    async fn create_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.inner.create_namespace(_namespace).await
-    }
-
-    async fn drop_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.inner.drop_namespace(_namespace).await
-    }
-
-    async fn drop_table(
-        &self,
-        _table: CatalogTableName,
-    ) -> CatalogOutcome<CatalogDropTableReceipt> {
-        self.inner.drop_table(_table).await
-    }
-
     async fn anchor_written_metadata(
         &self,
         _table: CatalogTableName,
@@ -371,14 +324,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner
             .anchor_written_metadata(_table, _metadata_location)
             .await
-    }
-
-    async fn stage_create_table(
-        &self,
-        _namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::TableCreation,
-    ) -> super::StagedCreateStart {
-        self.inner.stage_create_table(_namespace, _creation).await
     }
 
     async fn prepare_conditional_create(
@@ -543,6 +488,31 @@ pub(crate) async fn publish_catalog(
     context: novarocks_spi::connector::ConnectorRequestContext,
     read_binding: crate::access_binding::IcebergReadBinding,
 ) -> super::error::CatalogOutcome<super::transaction::CommitProof> {
+    publish_catalog_with_document(
+        owner,
+        request,
+        operation_id,
+        generation,
+        context,
+        read_binding,
+    )
+    .await
+    .0
+}
+
+/// Retain the actual publication response for invisible staged tables. The
+/// same journal and prepared owner decide the outcome before the document is read.
+pub(crate) async fn publish_catalog_with_document(
+    owner: Arc<dyn NovaRocksCatalog>,
+    request: super::catalog_request::FrozenCatalogPublication,
+    operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    read_binding: crate::access_binding::IcebergReadBinding,
+) -> (
+    super::error::CatalogOutcome<super::transaction::CommitProof>,
+    Option<Vec<u8>>,
+) {
     use novarocks_spi::connector::*;
     owner.bind_publication_generation(generation).unwrap();
     let evidence = ExternalMutationEvidence::try_new(
@@ -570,6 +540,8 @@ pub(crate) async fn publish_catalog(
             context.clone(),
         )
         .unwrap();
+    let document = super::catalog_request::CatalogResponseDocument::default();
+    let response = document.clone();
     let policy = owner.evidence_policy();
     let entry = journal
         .publish_once(
@@ -582,7 +554,7 @@ pub(crate) async fn publish_catalog(
                         descriptor,
                         generation,
                         preparation,
-                        Default::default(),
+                        response,
                         read_binding,
                     )
                     .await
@@ -590,7 +562,7 @@ pub(crate) async fn publish_catalog(
         )
         .await
         .unwrap();
-    journal.commit_outcome(entry)
+    (journal.commit_outcome(entry), document.take())
 }
 
 /// Ordinary local fixture setup uses the same frozen publication mechanisms

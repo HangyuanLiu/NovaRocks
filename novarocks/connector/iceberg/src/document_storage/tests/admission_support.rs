@@ -13,9 +13,9 @@ use novarocks_spi::connector::ConnectorError;
 
 use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
 use crate::catalog::{
-    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
-    ConditionalCreateAttempt, ConditionalCreateEvidence, ConditionalCreateReceipt,
-    ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog, StagedCreateStart,
+    CatalogNamespaceName, CatalogTableName, CatalogTablePage, ConditionalCreateAttempt,
+    ConditionalCreateEvidence, ConditionalCreateReceipt, ConditionalCreateRequest,
+    ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
 #[derive(Debug)]
@@ -191,40 +191,11 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         self.read()
     }
 
-    async fn create_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.mutation()
-    }
-
-    async fn drop_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.mutation()
-    }
-
-    async fn drop_table(
-        &self,
-        _table: CatalogTableName,
-    ) -> CatalogOutcome<CatalogDropTableReceipt> {
-        self.mutation()
-    }
-
     async fn anchor_written_metadata(
         &self,
         _table: CatalogTableName,
         _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
-        self.mutation()
-    }
-
-    async fn stage_create_table(
-        &self,
-        _namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::TableCreation,
-    ) -> StagedCreateStart {
         self.mutation()
     }
 

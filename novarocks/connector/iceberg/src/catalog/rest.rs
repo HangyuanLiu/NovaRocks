@@ -27,11 +27,7 @@ use novarocks_spi::connector::{
     ConnectorListingCollector,
 };
 
-#[cfg(test)]
-use super::CatalogDropTableReceipt;
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
-#[cfg(test)]
-use super::delegate::CatalogDelegate;
 use super::error::CatalogOutcome;
 use super::{
     CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
@@ -41,13 +37,9 @@ use super::{
 use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::loaded_table::{IcebergAccessDelegation, IcebergLoadedTable, parse_rest_delegation};
-#[cfg(test)]
-use crate::rest_protocol::adapter::RestTransitionalAdapter;
 use crate::rest_protocol::boundary::sanitize_upstream_error;
 use crate::rest_protocol::endpoints::RestEndpoints;
 use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot};
-#[cfg(test)]
-use crate::rest_protocol::evidence::{RestEvidence, StageVerdict};
 
 /// A REST Iceberg catalog.
 ///
@@ -63,8 +55,6 @@ pub(super) struct NovaRocksRestCatalog {
     /// adapter, whose mutation failures carry typed evidence.
     evidence_policy: super::publication::CatalogEvidencePolicy,
     listing: Arc<super::listing_admission::ListingAdmission>,
-    #[cfg(test)]
-    delegate: CatalogDelegate,
     /// NovaRocks requests sharing the upstream client's one session (L27).
     endpoints: Arc<RestEndpoints>,
     warehouse: Option<Arc<str>>,
@@ -85,13 +75,9 @@ impl NovaRocksRestCatalog {
         warehouse: Option<Arc<str>>,
         access_delegation: RestAccessDelegationMode,
     ) -> Self {
-        #[cfg(test)]
-        let adapter = Arc::new(RestTransitionalAdapter::new(Arc::clone(&endpoints)));
         Self {
             evidence_policy: Default::default(),
             listing: Default::default(),
-            #[cfg(test)]
-            delegate: CatalogDelegate::new(adapter.clone()),
             endpoints,
             warehouse,
             access_delegation,
@@ -1003,46 +989,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         Ok(loaded)
     }
 
-    #[cfg(test)]
-
-    async fn create_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateNamespace,
-            &namespace.clone().into(),
-        ) {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.create_namespace(namespace).await
-    }
-
-    #[cfg(test)]
-
-    async fn drop_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::DropNamespace, &namespace.clone().into())
-        {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.drop_namespace(namespace).await
-    }
-
-    #[cfg(test)]
-
-    async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::DropTable, &table.clone().into())
-        {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.drop_table(table).await
-    }
-
     async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,
@@ -1060,157 +1006,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             table,
             novarocks_spi::connector::ExternalMutationEffect::NoOp,
         )
-    }
-
-    #[cfg(test)]
-
-    async fn stage_create_table(
-        &self,
-        namespace: CatalogNamespaceName,
-        creation: crate::iceberg::TableCreation,
-    ) -> super::StagedCreateStart {
-        let target = CatalogTableName::new(Arc::clone(&namespace.namespace), creation.name.clone());
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
-            &target.into(),
-        ) {
-            return super::StagedCreateStart::Unsupported(reason);
-        }
-
-        let creation = with_explicit_format_version(creation);
-        let ident = match super::delegate::namespace_ident(&namespace) {
-            Ok(ident) => ident,
-            Err(error) => {
-                return super::StagedCreateStart::KnownUncommitted(
-                    novarocks_spi::connector::ConnectorMutationFailure::new(
-                        novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                        error.to_string(),
-                    ),
-                );
-            }
-        };
-        let table_ident = crate::iceberg::TableIdent::new(ident.clone(), creation.name.clone());
-        let request = crate::rest_protocol::wire::CreateTableRequest {
-            name: creation.name,
-            location: creation.location,
-            schema: creation.schema,
-            partition_spec: creation.partition_spec,
-            write_order: creation.sort_order,
-            stage_create: Some(true),
-            properties: creation.properties,
-        };
-        let outcome = self.endpoints.stage_create(&ident, request).await;
-        let document = outcome.document;
-        match outcome.evidence.into_stage_verdict() {
-            StageVerdict::Staged { .. } => {}
-            StageVerdict::Conflict(failure) => {
-                return super::StagedCreateStart::Conflict(failure.message().to_string());
-            }
-            StageVerdict::KnownUncommitted(failure) => {
-                return super::StagedCreateStart::KnownUncommitted(failure);
-            }
-            StageVerdict::CommitUnknown { failure, .. } => {
-                return super::StagedCreateStart::CommitUnknown(failure.message().to_string());
-            }
-        }
-        // Attributed: from here on the stage may have side effects, so every
-        // failure is an unknown outcome (L19).
-        let unknown = |message: &str| super::StagedCreateStart::CommitUnknown(message.to_string());
-        let Some(response) = document.and_then(|document| {
-            serde_json::from_slice::<crate::rest_protocol::wire::LoadTableResult>(&document).ok()
-        }) else {
-            return unknown("REST stage-create response could not be decoded");
-        };
-        // The first commit restates the server's staged metadata exactly.
-        let initialization_updates =
-            match crate::commit::staging::staged_create_updates(&response.metadata) {
-                Ok(updates) => updates,
-                Err(_) => {
-                    return unknown("REST stage-create response has invalid initial metadata");
-                }
-            };
-        let (frozen, delegation) = crate::rest_protocol::deferred::FrozenLoadTable::from_response(
-            table_ident,
-            response,
-            self.endpoints.runtime().clone(),
-        );
-        let staged = match self.access_delegation {
-            RestAccessDelegationMode::Static => {
-                let Some(file_io) = self.endpoints.static_file_io() else {
-                    return unknown("REST static generation has no storage factory");
-                };
-                match frozen.materialize(file_io) {
-                    Ok(table) => (
-                        crate::loaded_table::IcebergLoadedTableMaterialization::Materialized(table),
-                        IcebergAccessDelegation::static_binding(),
-                    ),
-                    Err(_) => return unknown("REST staged table could not be materialized"),
-                }
-            }
-            RestAccessDelegationMode::Vended => match parse_rest_delegation(delegation) {
-                Ok(access_delegation) => (
-                    crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(frozen),
-                    access_delegation,
-                ),
-                Err(error) => return unknown(&error.to_string()),
-            },
-        };
-        super::StagedCreateStart::Staged {
-            table: staged.0,
-            initialization_updates,
-            access_delegation: staged.1,
-        }
-    }
-
-    #[cfg(test)]
-    async fn create_view(
-        &self,
-        namespace: CatalogNamespaceName,
-        creation: super::view_request::ViewCreate,
-    ) -> CatalogOutcome<CatalogTableName> {
-        let target = CatalogTableName::new(Arc::clone(&namespace.namespace), creation.name());
-        let ident = match super::delegate::namespace_ident(&namespace) {
-            Ok(ident) => ident,
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                );
-            }
-        };
-        let outcome = self.endpoints.create_view(&ident, creation).await;
-        view_outcome(outcome.evidence, target)
-    }
-
-    #[cfg(test)]
-    async fn replace_view(
-        &self,
-        replace: super::view_request::ValidatedViewReplace,
-    ) -> CatalogOutcome<CatalogTableName> {
-        let target = CatalogTableName::from_identifier(replace.ident());
-        let outcome = self
-            .endpoints
-            .replace_view(
-                &replace,
-                &AttributionExpectation::replace_view(replace.uuid()),
-            )
-            .await;
-        view_outcome(outcome.evidence, target)
-    }
-
-    #[cfg(test)]
-    async fn drop_view(&self, view: CatalogTableName) -> CatalogOutcome<CatalogTableName> {
-        let ident = match super::delegate::table_ident(&view) {
-            Ok(ident) => ident,
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                );
-            }
-        };
-        let outcome = self.endpoints.drop_view(&ident).await;
-        view_outcome(outcome.evidence, view)
     }
 
     #[cfg(test)]
@@ -1243,59 +1038,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             novarocks_spi::connector::ConnectorErrorKind::Unsupported,
             "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
         ))
-    }
-}
-
-/// The owner outcome of a view mutation's evidence.
-#[cfg(test)]
-fn view_outcome(
-    evidence: RestEvidence,
-    target: CatalogTableName,
-) -> CatalogOutcome<CatalogTableName> {
-    let evidence_target = target.canonical();
-    match evidence.into_catalog_outcome(super::error::CatalogCommitEvidence::for_target(
-        evidence_target,
-    )) {
-        CatalogOutcome::KnownCommitted {
-            effect,
-            finalization,
-            ..
-        } => CatalogOutcome::KnownCommitted {
-            effect,
-            receipt: target,
-            finalization,
-        },
-        CatalogOutcome::Unsupported(reason) => CatalogOutcome::Unsupported(reason),
-        CatalogOutcome::KnownUncommitted { failure } => {
-            CatalogOutcome::KnownUncommitted { failure }
-        }
-        CatalogOutcome::CommitUnknown { failure, evidence } => {
-            CatalogOutcome::CommitUnknown { failure, evidence }
-        }
-    }
-}
-
-/// Spell the format version into the table properties.
-///
-/// A REST catalog needs it stated explicitly; a filesystem catalog reads it off
-/// the creation itself. That difference is this implementation's to know, which
-/// is why it used to be a catalog-kind comparison at the call site and is not
-/// any more.
-#[cfg(test)]
-fn with_explicit_format_version(
-    creation: crate::iceberg::TableCreation,
-) -> crate::iceberg::TableCreation {
-    if creation.properties.contains_key("format-version") {
-        return creation;
-    }
-    let mut properties = creation.properties.clone();
-    properties.insert(
-        "format-version".to_string(),
-        (creation.format_version as u8).to_string(),
-    );
-    crate::iceberg::TableCreation {
-        properties,
-        ..creation
     }
 }
 
@@ -1835,7 +1577,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                catalog.delegate.listing.available_positions(),
+                catalog.listing.available_positions(),
                 super::super::listing_admission::LISTING_CONCURRENCY
             );
         }
@@ -2301,8 +2043,7 @@ mod evidence_tests {
     use super::NovaRocksRestCatalog;
     use crate::catalog::error::CatalogOutcome;
     use crate::catalog::{
-        CatalogNamespaceName, CatalogTableName, NovaRocksCatalog, StagedCreateStart,
-        StagedPublicationExpectation,
+        CatalogNamespaceName, CatalogTableName, NovaRocksCatalog, StagedPublicationExpectation,
     };
     use crate::catalog_runtime::RestAccessDelegationMode;
     use crate::commit::model::{
@@ -2328,6 +2069,42 @@ mod evidence_tests {
             Some(Arc::from("s3://warehouse")),
             RestAccessDelegationMode::Vended,
         )
+    }
+
+    async fn publish_catalog_request(
+        owner: NovaRocksRestCatalog,
+        request: crate::catalog::catalog_request::CatalogPublicationRequest,
+    ) -> (
+        CatalogOutcome<crate::catalog::transaction::CommitProof>,
+        Option<Vec<u8>>,
+    ) {
+        use novarocks_spi::connector::*;
+        let operation = ConnectorMutationOperationId::new();
+        let request = request.freeze(operation.to_bytes()).unwrap();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            ConnectorStopOwner::new().view(),
+            64 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+        )
+        .for_request(context.clone());
+        crate::catalog::admission_test_support::publish_catalog_with_document(
+            Arc::new(owner),
+            request,
+            operation,
+            ProviderBindingEpoch::from_bytes([66; 16]),
+            context,
+            binding,
+        )
+        .await
     }
 
     fn scripted(method: &str, path: &str, reply: Reply) -> TestServer {
@@ -2450,7 +2227,7 @@ mod evidence_tests {
     }
 
     #[tokio::test]
-    async fn delegate_ddl_reads_typed_evidence_through_the_adapter() {
+    async fn catalog_ddl_uses_the_prepared_owner_and_typed_evidence() {
         let namespace = || CatalogNamespaceName::new("db");
         for (status, expected) in [
             (409, "already exists"),
@@ -2458,8 +2235,21 @@ mod evidence_tests {
             (404, "unknown"),
             (400, "unknown"),
         ] {
-            let server = scripted("POST", "/v1/namespaces", Reply::status(status));
-            let outcome = owner(&server).await.create_namespace(namespace()).await;
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("GET", "/v1/namespaces/db", Reply::status(404))
+                    .on("POST", "/v1/namespaces", Reply::status(status)),
+            );
+            let (outcome, _) = publish_catalog_request(
+                owner(&server).await,
+                crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                    namespace: namespace(),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
             match (expected, &outcome) {
                 ("already exists", CatalogOutcome::KnownUncommitted { failure }) => {
                     assert_eq!(failure.kind(), Kind::AlreadyExists)
@@ -2488,10 +2278,16 @@ mod evidence_tests {
                     .on("GET", "/v1/config", Reply::config(&[], &[], None))
                     .on("DELETE", "/v1/namespaces/db/tables/t", reply),
             );
-            let outcome = owner(&server)
-                .await
-                .drop_table(CatalogTableName::new("db", "t"))
-                .await;
+            let (outcome, _) = publish_catalog_request(
+                owner(&server).await,
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
+                    table: CatalogTableName::new("db", "t"),
+                    no_op_if_missing: false,
+                    purge: false,
+                    capture: None,
+                },
+            )
+            .await;
             assert_eq!(
                 matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
                 applied,
@@ -2506,10 +2302,13 @@ mod evidence_tests {
     #[tokio::test]
     async fn view_owner_methods_report_d13_outcomes() {
         let server = scripted("DELETE", "/v1/namespaces/db/views/v", Reply::status(404));
-        let outcome = owner(&server)
-            .await
-            .drop_view(CatalogTableName::new("db", "v"))
-            .await;
+        let (outcome, _) = publish_catalog_request(
+            owner(&server).await,
+            crate::catalog::catalog_request::CatalogPublicationRequest::DropView(
+                CatalogTableName::new("db", "v"),
+            ),
+        )
+        .await;
         assert!(
             matches!(outcome, CatalogOutcome::CommitUnknown { .. }),
             "{outcome:?}"
@@ -2590,33 +2389,63 @@ mod evidence_tests {
             (Reply::bytes(200, b"<html/>".to_vec()), "unknown"),
             (Reply::json(200, &staged_response()), "staged"),
         ] {
-            let server = scripted("POST", "/v1/namespaces/db/tables", reply);
-            let start = owner(&server)
-                .await
-                .stage_create_table(CatalogNamespaceName::new("db"), creation())
-                .await;
-            match (expected, start) {
-                ("uncommitted", StagedCreateStart::KnownUncommitted(failure)) => {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db",
+                        Reply::json(
+                            200,
+                            &serde_json::json!({"namespace":["db"],"properties":{}}),
+                        ),
+                    )
+                    .on("POST", "/v1/namespaces/db/tables", reply),
+            );
+            let (outcome, document) = publish_catalog_request(
+                owner(&server).await,
+                crate::catalog::catalog_request::CatalogPublicationRequest::StageCreate {
+                    namespace: CatalogNamespaceName::new("db"),
+                    creation: creation(),
+                },
+            )
+            .await;
+            match (expected, outcome) {
+                ("uncommitted", CatalogOutcome::KnownUncommitted { failure }) => {
                     assert_eq!(failure.kind(), Kind::Unauthenticated)
                 }
-                ("conflict", StagedCreateStart::Conflict(_)) => {}
-                ("unknown", StagedCreateStart::CommitUnknown(_)) => {}
-                (
-                    "staged",
-                    StagedCreateStart::Staged {
-                        table,
-                        initialization_updates,
-                        access_delegation,
-                    },
-                ) => {
-                    assert!(matches!(
-                        table,
-                        crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(_)
-                    ));
-                    assert!(!initialization_updates.is_empty());
-                    assert!(access_delegation.into_vended_lease_seed().is_some());
+                ("conflict", CatalogOutcome::KnownUncommitted { failure }) => {
+                    assert_eq!(failure.kind(), Kind::AlreadyExists)
                 }
-                (expected, _) => panic!("expected {expected}"),
+                ("unknown", CatalogOutcome::CommitUnknown { .. }) => {}
+                ("staged", CatalogOutcome::KnownCommitted { receipt, .. }) => {
+                    assert!(receipt.metadata_location.is_none());
+                    let response: crate::rest_protocol::wire::LoadTableResult =
+                        serde_json::from_slice(&document.unwrap()).unwrap();
+                    assert!(response.metadata_location.is_none());
+                    assert_eq!(
+                        receipt.table_uuid.as_deref(),
+                        Some(response.metadata.uuid().to_string().as_str())
+                    );
+                    assert!(
+                        !crate::commit::staging::staged_create_updates(&response.metadata)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let (_, delegation) =
+                        crate::rest_protocol::deferred::FrozenLoadTable::from_response(
+                            crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                            response,
+                            crate::iceberg::Runtime::try_current().unwrap(),
+                        );
+                    assert!(
+                        crate::loaded_table::parse_rest_delegation(delegation)
+                            .unwrap()
+                            .into_vended_lease_seed()
+                            .is_some()
+                    );
+                }
+                (expected, outcome) => panic!("expected {expected}, got {outcome:?}"),
             }
             let stages = server.requests_to("POST", "/v1/namespaces/db/tables");
             assert_eq!(stages.len(), 1);

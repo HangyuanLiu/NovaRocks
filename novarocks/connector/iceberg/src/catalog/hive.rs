@@ -24,8 +24,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
-#[cfg(test)]
-use super::CatalogDropTableReceipt;
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
@@ -313,37 +311,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         Err(super::views_unsupported("load_view"))
     }
 
-    #[cfg(test)]
-
-    async fn create_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        CatalogOutcome::Unsupported(
-            self.refuse_operation(CatalogOperation::CreateNamespace, _namespace),
-        )
-    }
-
-    #[cfg(test)]
-
-    async fn drop_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        CatalogOutcome::Unsupported(
-            self.refuse_operation(CatalogOperation::DropNamespace, _namespace),
-        )
-    }
-
-    #[cfg(test)]
-
-    async fn drop_table(
-        &self,
-        _table: CatalogTableName,
-    ) -> CatalogOutcome<CatalogDropTableReceipt> {
-        CatalogOutcome::Unsupported(self.refuse_operation(CatalogOperation::DropTable, _table))
-    }
-
     async fn anchor_written_metadata(
         &self,
         _table: CatalogTableName,
@@ -352,19 +319,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         CatalogOutcome::Unsupported(
             self.refuse_operation(CatalogOperation::AnchorWrittenMetadata, _table),
         )
-    }
-
-    #[cfg(test)]
-
-    async fn stage_create_table(
-        &self,
-        _namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::TableCreation,
-    ) -> super::StagedCreateStart {
-        super::StagedCreateStart::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
-            CatalogTableName::new(Arc::clone(&_namespace.namespace), _creation.name),
-        ))
     }
 
     #[cfg(test)]

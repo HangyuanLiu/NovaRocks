@@ -24,6 +24,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
+#[cfg(test)]
+use super::ConditionalCreateFacts;
 use super::admission::{
     CatalogAdmission, CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogInitiation,
     CatalogOperation,
@@ -34,8 +36,6 @@ use super::{
     CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
     ConditionalCreateVerdict, NovaRocksCatalog,
 };
-#[cfg(test)]
-use super::{CatalogDropTableReceipt, ConditionalCreateFacts};
 #[cfg(test)]
 use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 
@@ -627,46 +627,6 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         Err(super::views_unsupported("load_view"))
     }
 
-    #[cfg(test)]
-
-    async fn create_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateNamespace,
-            &namespace.clone().into(),
-        ) {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.create_namespace(namespace).await
-    }
-
-    #[cfg(test)]
-
-    async fn drop_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::DropNamespace, &namespace.clone().into())
-        {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.drop_namespace(namespace).await
-    }
-
-    #[cfg(test)]
-
-    async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::DropTable, &table.clone().into())
-        {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.drop_table(table).await
-    }
-
     async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,
@@ -684,21 +644,6 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             table,
             novarocks_spi::connector::ExternalMutationEffect::NoOp,
         )
-    }
-
-    /// Prepare the conditional metadata write that makes this table exist.
-    ///
-    /// Local only: it builds metadata and sends nothing, which is what lets the
-    /// caller freeze publication evidence before the attempt is dispatched.
-    #[cfg(test)]
-    async fn stage_create_table(
-        &self,
-        _namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::TableCreation,
-    ) -> super::StagedCreateStart {
-        super::StagedCreateStart::Unsupported(CatalogUnsupported::new(
-            "Hadoop Iceberg catalog has no staged-create protocol",
-        ))
     }
 
     #[cfg(test)]
