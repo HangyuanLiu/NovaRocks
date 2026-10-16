@@ -572,11 +572,26 @@ pub(crate) async fn publish_catalog_fixture(
     generation: novarocks_spi::connector::ProviderBindingEpoch,
     request: super::catalog_request::CatalogPublicationRequest,
 ) -> super::error::CatalogOutcome<super::transaction::CommitProof> {
+    publish_catalog_fixture_with_owner(
+        Arc::clone(runtime.novarocks_catalog()),
+        runtime.resources().planning_binding().clone(),
+        generation,
+        request,
+    )
+    .await
+}
+
+/// Fixture publication retains the exact semantic owner and original binding.
+pub(crate) async fn publish_catalog_fixture_with_owner(
+    owner: Arc<dyn NovaRocksCatalog>,
+    binding: crate::access_binding::IcebergReadBinding,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
+    request: super::catalog_request::CatalogPublicationRequest,
+) -> super::error::CatalogOutcome<super::transaction::CommitProof> {
     use novarocks_spi::connector::{
         ConnectorMutationOperationId, ConnectorRequestContext, ConnectorStopOwner,
     };
     let operation_id = ConnectorMutationOperationId::new();
-    let owner = Arc::clone(runtime.novarocks_catalog());
     let frozen = match request {
         super::catalog_request::CatalogPublicationRequest::CreateTable {
             namespace,
@@ -601,10 +616,7 @@ pub(crate) async fn publish_catalog_fixture(
         4 * 1024 * 1024,
     )
     .unwrap();
-    let binding = runtime
-        .resources()
-        .planning_binding()
-        .for_request(context.clone());
+    let binding = binding.for_request(context.clone());
     publish_catalog(owner, frozen, operation_id, generation, context, binding).await
 }
 
@@ -612,6 +624,20 @@ pub(crate) async fn publish_catalog_fixture(
 /// requires static materialization; a vended result cannot silently enter it.
 pub(crate) async fn load_static_fixture_table(
     runtime: &crate::metadata_context::IcebergMetadataContext,
+    ident: &crate::iceberg::TableIdent,
+) -> crate::iceberg::table::Table {
+    load_static_fixture_table_with_owner(
+        Arc::clone(runtime.novarocks_catalog()),
+        runtime.resources().planning_binding().clone(),
+        ident,
+    )
+    .await
+}
+
+/// Static materialization is explicit even for a read-only SDK fixture seam.
+pub(crate) async fn load_static_fixture_table_with_owner(
+    owner: Arc<dyn NovaRocksCatalog>,
+    binding: crate::access_binding::IcebergReadBinding,
     ident: &crate::iceberg::TableIdent,
 ) -> crate::iceberg::table::Table {
     use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
@@ -622,11 +648,10 @@ pub(crate) async fn load_static_fixture_table(
         4 * 1024 * 1024,
     )
     .unwrap();
-    runtime
-        .novarocks_catalog()
+    owner
         .load_table_for_read(
             super::CatalogTableName::from_identifier(ident),
-            runtime.resources().planning_binding().for_request(context),
+            binding.for_request(context),
         )
         .await
         .expect("read fixture through its catalog owner")
@@ -644,13 +669,32 @@ pub(crate) async fn create_static_fixture_table(
     namespace: super::CatalogNamespaceName,
     creation: crate::iceberg::TableCreation,
 ) -> crate::iceberg::table::Table {
+    create_static_fixture_table_with_owner(
+        Arc::clone(runtime.novarocks_catalog()),
+        runtime.resources().planning_binding().clone(),
+        generation,
+        namespace,
+        creation,
+    )
+    .await
+}
+
+/// Ordinary setup grants mutation only through an actual frozen owner request.
+pub(crate) async fn create_static_fixture_table_with_owner(
+    owner: Arc<dyn NovaRocksCatalog>,
+    binding: crate::access_binding::IcebergReadBinding,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
+    namespace: super::CatalogNamespaceName,
+    creation: crate::iceberg::TableCreation,
+) -> crate::iceberg::table::Table {
     use super::catalog_request::CatalogPublicationRequest;
     let ident = crate::iceberg::TableIdent::new(
         super::delegate::namespace_ident(&namespace).unwrap(),
         creation.name.clone(),
     );
-    let outcome = publish_catalog_fixture(
-        runtime,
+    let outcome = publish_catalog_fixture_with_owner(
+        Arc::clone(&owner),
+        binding.clone(),
         generation,
         CatalogPublicationRequest::CreateNamespace {
             namespace: namespace.clone(),
@@ -663,8 +707,9 @@ pub(crate) async fn create_static_fixture_table(
         matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
         "{outcome:?}"
     );
-    let outcome = publish_catalog_fixture(
-        runtime,
+    let outcome = publish_catalog_fixture_with_owner(
+        Arc::clone(&owner),
+        binding.clone(),
         generation,
         CatalogPublicationRequest::CreateTable {
             namespace,
@@ -677,5 +722,5 @@ pub(crate) async fn create_static_fixture_table(
         matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
         "{outcome:?}"
     );
-    load_static_fixture_table(runtime, &ident).await
+    load_static_fixture_table_with_owner(owner, binding, &ident).await
 }

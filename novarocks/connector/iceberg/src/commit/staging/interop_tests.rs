@@ -2133,8 +2133,14 @@ async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
             None,
         )
         .await;
-    assert!(
-        matches!(outcome, CatalogOutcome::KnownUncommitted { failure } if failure.kind() == ConnectorMutationFailureKind::Conflict)
+    let CatalogOutcome::KnownUncommitted { failure } = outcome else {
+        panic!("the stale incarnation must be rejected");
+    };
+    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
+    // Preserve the exact wire-status oracle separately from the typed verdict.
+    assert_eq!(
+        failure.message(),
+        "REST catalog rejected the request with HTTP 409"
     );
     let after = java.load(&ident).await.unwrap();
     assert_eq!(after.metadata_location, before.metadata_location);

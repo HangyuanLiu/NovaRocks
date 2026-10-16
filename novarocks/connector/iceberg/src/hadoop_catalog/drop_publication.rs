@@ -202,7 +202,7 @@ mod tests {
             ));
             let namespace = NamespaceIdent::new("db".into());
             let table = catalog
-                .create_table(&namespace, super::super::tests::test_creation("t"))
+                .create_fixture_table(&namespace, super::super::tests::test_creation("t"))
                 .await
                 .unwrap();
             let ident = table.identifier().clone();

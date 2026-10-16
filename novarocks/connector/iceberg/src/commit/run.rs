@@ -186,7 +186,6 @@ mod application_document_publication_trace_tests {
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::{DataType, Field};
-    use async_trait::async_trait;
     use bytes::Bytes;
     use novarocks_spi::connector::write_stack::session::{
         ConnectorWriteBeginRequest, ConnectorWriteControl, ConnectorWriteFinishPublication,
@@ -230,8 +229,7 @@ mod application_document_publication_trace_tests {
     };
     use crate::iceberg::table::Table;
     use crate::iceberg::{
-        Catalog, Namespace, NamespaceIdent, TableCreation, TableIdent, TableRequirement,
-        TableUpdate,
+        Catalog, NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate,
     };
     use uuid::Uuid;
 
@@ -304,104 +302,9 @@ mod application_document_publication_trace_tests {
         }
     }
 
-    #[async_trait]
-    impl Catalog for RecordingCatalog {
-        async fn list_namespaces(
-            &self,
-            parent: Option<&NamespaceIdent>,
-        ) -> crate::iceberg::Result<Vec<NamespaceIdent>> {
-            self.inner.list_namespaces(parent).await
-        }
-
-        async fn create_namespace(
-            &self,
-            namespace: &NamespaceIdent,
-            properties: HashMap<String, String>,
-        ) -> crate::iceberg::Result<Namespace> {
-            self.inner.create_namespace(namespace, properties).await
-        }
-
-        async fn get_namespace(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<Namespace> {
-            self.inner.get_namespace(namespace).await
-        }
-
-        async fn namespace_exists(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<bool> {
-            self.inner.namespace_exists(namespace).await
-        }
-
-        async fn update_namespace(
-            &self,
-            namespace: &NamespaceIdent,
-            properties: HashMap<String, String>,
-        ) -> crate::iceberg::Result<()> {
-            self.inner.update_namespace(namespace, properties).await
-        }
-
-        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> crate::iceberg::Result<()> {
-            self.inner.drop_namespace(namespace).await
-        }
-
-        async fn list_tables(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<Vec<TableIdent>> {
-            self.inner.list_tables(namespace).await
-        }
-
-        async fn create_table(
-            &self,
-            namespace: &NamespaceIdent,
-            creation: TableCreation,
-        ) -> crate::iceberg::Result<Table> {
-            self.inner.create_table(namespace, creation).await
-        }
-
+    impl RecordingCatalog {
         async fn load_table(&self, table: &TableIdent) -> crate::iceberg::Result<Table> {
             self.inner.load_table(table).await
-        }
-
-        async fn drop_table(&self, table: &TableIdent) -> crate::iceberg::Result<()> {
-            self.inner.drop_table(table).await
-        }
-
-        async fn purge_table(&self, table: &TableIdent) -> crate::iceberg::Result<()> {
-            self.inner.purge_table(table).await
-        }
-
-        async fn table_exists(&self, table: &TableIdent) -> crate::iceberg::Result<bool> {
-            self.inner.table_exists(table).await
-        }
-
-        async fn rename_table(
-            &self,
-            src: &TableIdent,
-            dest: &TableIdent,
-        ) -> crate::iceberg::Result<()> {
-            self.inner.rename_table(src, dest).await
-        }
-
-        async fn register_table(
-            &self,
-            table: &TableIdent,
-            metadata_location: String,
-        ) -> crate::iceberg::Result<Table> {
-            self.inner.register_table(table, metadata_location).await
-        }
-
-        async fn update_table(
-            &self,
-            _commit: crate::iceberg::TableCommit,
-        ) -> crate::iceberg::Result<Table> {
-            Err(crate::iceberg::Error::new(
-                crate::iceberg::ErrorKind::FeatureUnsupported,
-                "Fixture publication must use the frozen prepared owner",
-            ))
         }
     }
 
@@ -534,11 +437,6 @@ mod application_document_publication_trace_tests {
             ),
         );
         let inner: Arc<dyn Catalog> = concrete.clone();
-        let namespace = NamespaceIdent::new("db".to_string());
-        inner
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .expect("create namespace");
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -547,38 +445,6 @@ mod application_document_publication_trace_tests {
             ))])
             .build()
             .expect("schema");
-        let table = inner
-            .create_table(
-                &namespace,
-                TableCreation::builder()
-                    .name("t".to_string())
-                    .schema(schema)
-                    .properties(HashMap::from([
-                        (
-                            crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
-                            "mv".to_string(),
-                        ),
-                        (
-                            crate::document_storage::observation::MANAGED_OWNER_PROPERTY
-                                .to_string(),
-                            "deployment".to_string(),
-                        ),
-                        (
-                            crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY
-                                .to_string(),
-                            "writer".to_string(),
-                        ),
-                        (
-                            crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
-                            "false".to_string(),
-                        ),
-                        ("write.row-lineage".to_string(), row_lineage.to_string()),
-                    ]))
-                    .format_version(format_version)
-                    .build(),
-            )
-            .await
-            .expect("create table");
         let catalog = RecordingCatalog::new(inner);
         let descriptor = novarocks_spi::connector::ConnectorInstanceDescriptor {
             provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
@@ -621,6 +487,37 @@ mod application_document_publication_trace_tests {
                 owner,
             ),
         );
+        let table = crate::catalog::admission_test_support::create_static_fixture_table(
+            &runtime,
+            incarnation,
+            crate::catalog::CatalogNamespaceName::new("db"),
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema)
+                .properties(HashMap::from([
+                    (
+                        crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
+                        "mv".to_string(),
+                    ),
+                    (
+                        crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+                        "deployment".to_string(),
+                    ),
+                    (
+                        crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY
+                            .to_string(),
+                        "writer".to_string(),
+                    ),
+                    (
+                        crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+                        "false".to_string(),
+                    ),
+                    ("write.row-lineage".to_string(), row_lineage.to_string()),
+                ]))
+                .format_version(format_version)
+                .build(),
+        )
+        .await;
         let provider = crate::metadata::IcebergMetadata::new(descriptor, incarnation, runtime);
         Fixture {
             catalog,

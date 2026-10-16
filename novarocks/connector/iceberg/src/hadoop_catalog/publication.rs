@@ -346,7 +346,7 @@ mod tests {
         let catalog = Arc::new(super::super::tests::test_catalog(location));
         let namespace = NamespaceIdent::new("db".into());
         let table = catalog
-            .create_table(&namespace, super::super::tests::test_creation("t"))
+            .create_fixture_table(&namespace, super::super::tests::test_creation("t"))
             .await
             .unwrap();
         let operation =

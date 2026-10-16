@@ -533,7 +533,7 @@ fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -594,10 +594,6 @@ mod tests {
         let owner =
             crate::catalog::factory::NovaRocksCatalogFactory::adopt_hadoop_for_test(concrete);
         let namespace = NamespaceIdent::new("db".to_string());
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .expect("create namespace");
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -606,17 +602,18 @@ mod tests {
             ))])
             .build()
             .expect("build schema");
-        catalog
-            .create_table(
-                &namespace,
-                TableCreation::builder()
-                    .name("t".to_string())
-                    .schema(schema)
-                    .format_version(format_version)
-                    .build(),
-            )
-            .await
-            .expect("create table");
+        crate::catalog::admission_test_support::create_static_fixture_table_with_owner(
+            Arc::clone(&owner),
+            binding.clone(),
+            novarocks_spi::connector::ProviderBindingEpoch::from_bytes([0x66; 16]),
+            crate::catalog::CatalogNamespaceName::new("db"),
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema)
+                .format_version(format_version)
+                .build(),
+        )
+        .await;
         LocalTableFixture {
             catalog,
             owner,

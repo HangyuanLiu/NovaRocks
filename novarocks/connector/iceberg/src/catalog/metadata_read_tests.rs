@@ -358,7 +358,7 @@ async fn default_hadoop_path_uses_real_request_bound_metadata_without_a_validato
         ),
     );
     let created = client
-        .create_table(
+        .create_fixture_table(
             &NamespaceIdent::new("db".into()),
             TableCreation::builder()
                 .name("t".to_string())
