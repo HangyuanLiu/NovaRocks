@@ -29,7 +29,7 @@ use novarocks_parser::ast::{
     Statement,
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -370,6 +370,41 @@ fn marker_actions(meta: &QueryMeta) -> Vec<&'static str> {
     actions
 }
 
+fn observation_attempt_slots(meta: &QueryMeta) -> Result<Vec<Option<u64>>> {
+    let Some(attempts) = &meta.native_observation_attempts else {
+        return Ok(vec![None]);
+    };
+    ensure!(
+        !attempts.is_empty(),
+        "native_observation_attempts must not be empty"
+    );
+    let mut seen = BTreeSet::new();
+    for &attempt in attempts {
+        ensure!(
+            attempt > 0 && seen.insert(attempt),
+            "native_observation_attempts ordinals must be positive and unique"
+        );
+    }
+    Ok(attempts.iter().copied().map(Some).collect())
+}
+
+fn native_observation_grants(
+    action: &str,
+    root: &Path,
+    backend_index: usize,
+    run_token: &str,
+    target: &RoleLaunchReference,
+    attempt: Option<u64>,
+) -> (Value, Value) {
+    let mut bind = json!({"action":format!("bind-{action}"),"root":root,"backend_index":backend_index,"statement_run_token":run_token,"target_session_id":target.session_id,"target_process_receipt":target.process_receipt});
+    let mut observe = json!({"action":action,"root":root,"backend_index":backend_index,"statement_run_token":run_token,"target_session_id":target.session_id,"max_events":16384});
+    if let Some(attempt) = attempt {
+        bind["attempt_id"] = json!(attempt);
+        observe["attempt_id"] = json!(attempt);
+    }
+    (bind, observe)
+}
+
 pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
     inputs
         .iter()
@@ -382,6 +417,7 @@ pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
                 || step.meta.query_lifecycle_fault.is_some()
                 || !step.meta.query_lifecycle_faults.is_empty()
                 || step.meta.query_lifecycle_structured_assertion.is_some()
+                || step.meta.native_observation_attempts.is_some()
                 || step.meta.imv_stateless_rebuild.is_some()
                 || step.meta.imv_accelerator_wipe_restart.is_some()
                 || step
@@ -620,6 +656,11 @@ pub(crate) fn build(
                     "retired terminal snapshot fault has no current product owner"
                 );
                 let observations = marker_actions(meta);
+                let observation_attempts = observation_attempt_slots(meta)?;
+                ensure!(
+                    meta.native_observation_attempts.is_none() || !observations.is_empty(),
+                    "native_observation_attempts requires a selected Native observation marker"
+                );
                 let needs_nomination = !faults.is_empty()
                     || !observations.is_empty()
                     || meta.query_lifecycle_structured_assertion.is_some();
@@ -684,16 +725,22 @@ pub(crate) fn build(
                                     generation[&RoleSlot::Backend(index)],
                                 );
                                 let target = refs[&be_key].reference.clone();
-                                add(
-                                    refs.get_mut(&fe_key).unwrap(),
-                                    "native-observation",
-                                    json!({"action":format!("bind-{action}"),"root":transport,"backend_index":index,"statement_run_token":submission.run_token,"target_session_id":target.session_id,"target_process_receipt":target.process_receipt}),
-                                );
-                                add(
-                                    refs.get_mut(&be_key).unwrap(),
-                                    "native-observation",
-                                    json!({"action":action,"root":transport,"backend_index":index,"statement_run_token":submission.run_token,"target_session_id":target.session_id,"max_events":16384}),
-                                );
+                                for &attempt in &observation_attempts {
+                                    let (bind, observe) = native_observation_grants(
+                                        action,
+                                        &transport,
+                                        index,
+                                        &submission.run_token,
+                                        &target,
+                                        attempt,
+                                    );
+                                    add(refs.get_mut(&fe_key).unwrap(), "native-observation", bind);
+                                    add(
+                                        refs.get_mut(&be_key).unwrap(),
+                                        "native-observation",
+                                        observe,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1134,6 +1181,112 @@ mod tests {
             targets
                 .iter()
                 .all(|target| target.validate_sql("SELECT 1").is_err())
+        );
+    }
+    #[test]
+    fn native_observation_grant_pairs_share_exact_target_and_attempt_paths() {
+        let root = Path::new("/selected/native-observations");
+        for index in 0..3 {
+            let target = RoleLaunchReference {
+                session_id: format!("be-{index}-original"),
+                process_receipt: PathBuf::from(format!("/selected/be-{index}.process.json")),
+            };
+            for attempt in [None, Some(1), Some(2)] {
+                let (bind, observe) = native_observation_grants(
+                    "grpc-fragment",
+                    root,
+                    index,
+                    "selected-submission",
+                    &target,
+                    attempt,
+                );
+                for key in [
+                    "root",
+                    "backend_index",
+                    "statement_run_token",
+                    "target_session_id",
+                    "attempt_id",
+                ] {
+                    assert_eq!(bind.get(key), observe.get(key), "{key}");
+                }
+                assert_eq!(bind.get("attempt_id").and_then(Value::as_u64), attempt);
+                assert_eq!(
+                    bind["target_process_receipt"],
+                    json!(target.process_receipt)
+                );
+                assert_eq!(bind["action"], "bind-grpc-fragment");
+                assert_eq!(observe["action"], "grpc-fragment");
+                assert_eq!(observe["max_events"], 16384);
+            }
+        }
+    }
+
+    #[test]
+    fn recovering_kill_case_predeclares_only_its_finite_observation_slots() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input = inputs(vec![step(
+            1,
+            "SELECT COUNT(*) FROM t WHERE sleep(delay_s)",
+            QueryMeta {
+                kill_be_after_be_log_contains: Some(KillBeAfterBeLogDirective {
+                    be_index: 1,
+                    pattern: "NOVAROCKS_TASK_CREATE_APPLIED".into(),
+                }),
+                native_observation_attempts: Some(vec![1, 2]),
+                ..Default::default()
+            },
+        )]);
+        let (plan, execution) = plan(&input, file.path()).unwrap();
+        let step = execution.step("selected", "one", 1).unwrap();
+        assert!(
+            step.native_faults.is_empty(),
+            "physical kill must not mint Native fault grants"
+        );
+        assert_eq!(
+            step.submissions.len(),
+            2,
+            "client transient submissions stay independent"
+        );
+        for launch in plan.planned_launch_summaries().as_array().unwrap() {
+            let grants = launch["grants"].as_array().unwrap();
+            assert!(grants.iter().all(|grant| grant["domain"] != "native"));
+            let observations = grants
+                .iter()
+                .filter(|grant| grant["domain"] == "native-observation")
+                .count();
+            assert_eq!(observations, if launch["role"] == "fe" { 12 } else { 4 });
+        }
+    }
+
+    #[test]
+    fn native_observation_slot_validation_preserves_default_and_rejects_invalid_intent() {
+        assert_eq!(
+            observation_attempt_slots(&QueryMeta::default()).unwrap(),
+            vec![None]
+        );
+        for attempts in [vec![], vec![0], vec![1, 1]] {
+            assert!(
+                observation_attempt_slots(&QueryMeta {
+                    native_observation_attempts: Some(attempts),
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input = inputs(vec![step(
+            1,
+            "SELECT 1",
+            QueryMeta {
+                native_observation_attempts: Some(vec![1, 2]),
+                ..Default::default()
+            },
+        )]);
+        assert!(
+            plan(&input, file.path())
+                .unwrap_err()
+                .to_string()
+                .contains("requires a selected Native observation marker")
         );
     }
 }

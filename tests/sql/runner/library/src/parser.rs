@@ -73,7 +73,24 @@ pub fn detect_case_dbs(raw_content: &str, variables: &HashMap<String, String>) -
 }
 
 pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> {
-    let captures = meta_re.captures(line.trim())?;
+    let captures = match meta_re.captures(line.trim()) {
+        Some(captures) => captures,
+        None => {
+            // The legacy metadata regex skips empty values. This explicit
+            // finite declaration must reach its validator even when empty.
+            let body = line
+                .trim()
+                .strip_prefix("--")?
+                .trim_start()
+                .strip_prefix('@')?;
+            let (key, value) = body.split_once('=')?;
+            return (key
+                .trim()
+                .eq_ignore_ascii_case("native_observation_attempts")
+                && value.trim().is_empty())
+            .then(|| ("native_observation_attempts".into(), String::new()));
+        }
+    };
     let key = captures.get(1)?.as_str().to_lowercase();
     let value = captures.get(2)?.as_str().trim().to_string();
     Some((key, value))
@@ -671,6 +688,28 @@ fn parse_meta_with_sql_error_descriptors(
                 }
                 meta.mv_rest_document_graph = Some(raw_value);
             }
+            "native_observation_attempts" => {
+                if meta.native_observation_attempts.is_some() {
+                    bail!(
+                        "@native_observation_attempts must be declared only once per metadata scope"
+                    );
+                }
+                let mut attempts = Vec::new();
+                let mut seen = BTreeSet::new();
+                for ordinal in raw_value.split(',') {
+                    let ordinal = ordinal.trim();
+                    let attempt = ordinal.parse::<u64>().with_context(|| {
+                        format!("@native_observation_attempts requires a nonempty list of positive u64 ordinals; invalid ordinal {ordinal:?}")
+                    })?;
+                    if attempt == 0 || !seen.insert(attempt) {
+                        bail!(
+                            "@native_observation_attempts ordinals must be positive and unique: {attempt}"
+                        );
+                    }
+                    attempts.push(attempt);
+                }
+                meta.native_observation_attempts = Some(attempts);
+            }
             "be_log_contains" => {
                 meta.be_log_contains.push(raw_value);
             }
@@ -1018,6 +1057,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .mv_rest_document_graph
             .clone()
             .or_else(|| base.mv_rest_document_graph.clone()),
+        native_observation_attempts: override_meta
+            .native_observation_attempts
+            .clone()
+            .or_else(|| base.native_observation_attempts.clone()),
         be_log_contains: if override_meta.be_log_contains.is_empty() {
             base.be_log_contains.clone()
         } else {
@@ -2695,5 +2738,62 @@ mod opt5_directive_tests {
         let merged = merge_meta(&parsed, &QueryMeta::default());
         assert_eq!(merged.tags, parsed.tags);
         assert!(merged.imv_accelerator_wipe_restart.is_none());
+    }
+    #[test]
+    fn native_observation_attempts_parse_and_inherit_explicit_finite_slots() {
+        let re = meta_re();
+        let base = parse_meta(&["-- @native_observation_attempts=1, 2".into()], &re).unwrap();
+        assert_eq!(base.native_observation_attempts, Some(vec![1, 2]));
+        let default = QueryMeta::default();
+        assert_eq!(
+            merge_meta(&base, &default).native_observation_attempts,
+            Some(vec![1, 2])
+        );
+        let replacement = parse_meta(&["-- @native_observation_attempts=2,4".into()], &re).unwrap();
+        assert_eq!(
+            merge_meta(&base, &replacement).native_observation_attempts,
+            Some(vec![2, 4])
+        );
+        assert!(
+            parse_meta(&[], &re)
+                .unwrap()
+                .native_observation_attempts
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_observation_attempts_reject_malformed_or_repeated_declarations() {
+        let re = meta_re();
+        for value in [
+            "",
+            " ",
+            "0",
+            "1,0",
+            "1,1",
+            "1,",
+            ",1",
+            "1,,2",
+            "-1",
+            "one",
+            "18446744073709551616",
+        ] {
+            let error =
+                parse_meta(&[format!("-- @native_observation_attempts={value}")], &re).unwrap_err();
+            assert!(
+                error.to_string().contains("native_observation_attempts"),
+                "{value:?}: {error:#}"
+            );
+        }
+        assert!(
+            parse_meta(
+                &[
+                    "-- @native_observation_attempts=1".into(),
+                    "-- @native_observation_attempts=2".into()
+                ],
+                &re
+            )
+            .is_err()
+        );
     }
 }
