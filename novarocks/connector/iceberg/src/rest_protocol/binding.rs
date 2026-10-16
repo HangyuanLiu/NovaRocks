@@ -137,8 +137,7 @@ impl fmt::Debug for SessionBinding {
 }
 
 impl SessionBinding {
-    /// Validates the merged configuration upstream hands `catalog_session`
-    /// and captures the binding from it.
+    /// Validate the owner's merged configuration before publishing its binding.
     ///
     /// Server-sent `token`, `credential` or authentication-class headers fail
     /// establishment (L5); server-sent protocol headers are left out (L26).
@@ -161,7 +160,7 @@ impl SessionBinding {
             if is_authentication_header(name) {
                 return Err(BindingFailure::InvalidServerConfig);
             }
-            // Upstream validated every `header.*` before this callback.
+            // Validate merged headers before the session binding becomes visible.
             let name =
                 HeaderName::from_str(name).map_err(|_| BindingFailure::InvalidServerConfig)?;
             let value =
@@ -235,11 +234,14 @@ impl SessionBinding {
     ) -> Result<(), BindingFailure> {
         if let Some(endpoints) = &endpoints {
             for endpoint in endpoints {
+                // Advertised paths are opaque capability templates, including
+                // relative or absolute OAuth examples. They never select a
+                // request destination; known routes are matched exactly below.
                 let (method, path) = endpoint
                     .split_once(' ')
                     .ok_or(BindingFailure::InvalidServerConfig)?;
                 if reqwest::Method::from_bytes(method.as_bytes()).is_err()
-                    || !path.starts_with('/')
+                    || path.is_empty()
                     || path.contains(' ')
                 {
                     return Err(BindingFailure::InvalidServerConfig);

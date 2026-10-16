@@ -300,6 +300,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advertised_paths_are_opaque_capabilities_and_do_not_select_request_destinations() {
+        use super::super::http::RestHttpClient;
+        use super::super::test_server::{FrontendFixture, Reply, Script, TestServer};
+        let advertised = [
+            "POST v1/oauth/tokens",
+            "POST https://auth-server.com/token",
+            "GET v1/config",
+            "HEAD /v1/{prefix}/namespaces/{namespace}",
+        ];
+        let server = TestServer::start(
+            Script::new()
+                .on(
+                    "GET",
+                    "/v1/config",
+                    Reply::config(&[], &[], Some(&advertised)),
+                )
+                .on("HEAD", "/v1/namespaces/db", Reply::bytes(200, Vec::new())),
+        );
+        let fixture = FrontendFixture::new(
+            &[("uri", &server.url())],
+            None,
+            RestHttpClient::new().unwrap(),
+        )
+        .await;
+        let binding = fixture.ensure_session().await.unwrap();
+        assert_eq!(binding.uri(), server.url());
+        assert_eq!(binding.advertised_endpoints().unwrap(), advertised);
+        assert!(
+            fixture
+                .endpoints
+                .namespace_exists(&crate::iceberg::NamespaceIdent::new("db".into()))
+                .await
+                .unwrap()
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(server.count("GET", "/v1/config"), 1);
+        assert_eq!(server.count("HEAD", "/v1/namespaces/db"), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_advertised_endpoints_refuse_the_session_before_catalog_requests() {
+        use super::super::http::RestHttpClient;
+        use super::super::test_server::{FrontendFixture, Reply, Script, TestServer};
+        for malformed in ["GET", "GET ", " /v1", "GET  /v1", "GET /v1 extra", ""] {
+            let server = TestServer::start(Script::new().on(
+                "GET",
+                "/v1/config",
+                Reply::config(&[], &[], Some(&[malformed])),
+            ));
+            let fixture = FrontendFixture::new(
+                &[("uri", &server.url())],
+                None,
+                RestHttpClient::new().unwrap(),
+            )
+            .await;
+            assert_eq!(
+                fixture.ensure_session().await.unwrap_err().step,
+                BindingFailure::InvalidServerConfig
+            );
+            assert_eq!(server.requests().len(), 1, "{malformed:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn optional_capability_and_headers_do_not_change_configuration_authority() {
         use super::super::http::RestHttpClient;
         use super::super::test_server::{FrontendFixture, Reply, Script, TestServer};
