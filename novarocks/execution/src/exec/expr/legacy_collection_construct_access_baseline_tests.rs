@@ -329,3 +329,22 @@ fn map_null_keys_are_rejected_and_value_key_type_mismatch_remains_explicit() {
         "map key type mismatch: Utf8 vs Int32"
     );
 }
+
+#[test]
+fn original_map_null_values_keep_null_array_storage_for_hits_misses_and_null_maps() {
+    let source = map(
+        Arc::new(Int32Array::from(vec![1, 1, 1])),
+        Arc::new(NullArray::new(3)),
+        vec![0, 1, 2, 3, 3],
+        Some(vec![true, true, false, true]),
+    );
+    let result = lookup(
+        vec![source, Arc::new(Int32Array::from(vec![1, 2, 1, 1]))],
+        Some(DataType::Null),
+    )
+    .unwrap();
+    assert_eq!(result.data_type(), &DataType::Null);
+    assert_eq!(result.len(), 4);
+    assert_eq!(result.logical_null_count(), 4);
+    assert!(result.to_data().nulls().is_none());
+}

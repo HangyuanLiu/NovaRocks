@@ -349,3 +349,39 @@ fn collection_every_actual_compile_checkpoint_preserves_three_causes_and_ordinar
         }
     }
 }
+
+#[test]
+fn map_lookup_null_values_support_original_and_compact_row_mappings() {
+    let source_map = map(
+        Arc::new(Int32Array::from(vec![1, 1, 1, 1])),
+        Arc::new(arrow_array::NullArray::new(4)),
+        vec![0, 1, 2, 3, 3, 4],
+        Some(vec![true, true, false, true, true]),
+    );
+    let key: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 1, 1, 1]));
+    let scalar: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+    let rows = [0, 1, 2, 4];
+    for selection in [Selection::all(5), Selection::try_sparse(5, &rows).unwrap()] {
+        for key_argument in [
+            EvaluatedArgument::Column(&key),
+            EvaluatedArgument::Scalar(&scalar),
+        ] {
+            let prepared = prepared(
+                Operation::MapLookup,
+                &[source(&source_map), source(&key)],
+                crate::binding_test_control(),
+            )
+            .unwrap();
+            let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
+            let args = [EvaluatedArgument::Column(&source_map), key_argument];
+            let result = kernel
+                .evaluate(selection, &args, &Control::default())
+                .unwrap();
+            assert!(result.errors().is_empty());
+            assert_eq!(result.values().data_type(), &DataType::Null);
+            assert_eq!(result.values().len(), selection.len());
+            assert_eq!(result.values().logical_null_count(), selection.len());
+            assert!(result.values().to_data().nulls().is_none());
+        }
+    }
+}

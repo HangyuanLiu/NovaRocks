@@ -360,6 +360,11 @@ pub fn lookup_observed<E>(
     Ok(out)
 }
 fn apply_indices_nulls(out: &ArrayRef, indices: &UInt32Array) -> ArrayRef {
+    // NullArray already represents NULL at every position and cannot carry a
+    // physical validity buffer. The lookup still ran before this storage repair.
+    if out.data_type() == &DataType::Null {
+        return out.clone();
+    }
     let Some(idx_nulls) = indices.nulls() else {
         return out.clone();
     };

@@ -115,11 +115,6 @@ pub(super) fn validate_profile(
             }
         }
         Operation::MapLookup => {
-            if target.data_type() == &DataType::Null {
-                return Err(invalid(
-                    "__map_element_at has no installed Null result profile: original nullable-index overlay panics",
-                ));
-            }
             let [map, key] = args.as_ref() else {
                 return Err(invalid(
                     "map element_at has exactly two selected value arguments",

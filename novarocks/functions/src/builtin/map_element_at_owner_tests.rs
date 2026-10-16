@@ -159,7 +159,7 @@ fn map_lookup_real_public_arity_and_nullable_result_match_original_binding() {
 }
 
 #[test]
-fn map_lookup_null_result_profile_is_named_refusal_for_both_source_nullabilities() {
+fn map_lookup_null_result_profile_preserves_its_exact_type_for_both_source_nullabilities() {
     for nullable in [false, true] {
         let fields = vec![
             Arc::new(Field::new("key", DataType::Int32, false)),
@@ -176,20 +176,14 @@ fn map_lookup_null_result_profile_is_named_refusal_for_both_source_nullabilities
             ),
             nullable,
         );
-        let error = prepared_for_test(
+        let prepared = prepared_for_test(
             "__map_element_at",
             &[map, FunctionValueType::new(DataType::Int32, nullable)],
         )
-        .err()
         .unwrap();
-        match error {
-            FunctionSpecializationFailure::Kernel(crate::KernelFailure::InvalidProgram(
-                message,
-            )) => assert_eq!(
-                message.message(),
-                "__map_element_at has no installed Null result profile: original nullable-index overlay panics"
-            ),
-            other => panic!("unexpected Null-result refusal: {other:?}"),
-        }
+        assert_eq!(
+            prepared.contract().result_type(),
+            &FunctionValueType::new(DataType::Null, true)
+        );
     }
 }

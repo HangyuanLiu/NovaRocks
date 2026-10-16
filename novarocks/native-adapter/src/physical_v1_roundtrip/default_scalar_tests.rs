@@ -2213,3 +2213,108 @@ fn default_real_sql_union_of_json_and_typed_variant_null_completes() {
         assert!(!owner.plan().fragments().is_empty(), "{sql}");
     }
 }
+
+#[test]
+fn default_real_sql_map_null_values_keep_valid_null_storage() {
+    use novarocks_physical_plan::ScanReadBudget;
+    use novarocks_sql::compiler::*;
+    for sql in [
+        "SELECT map{1:NULL}[1]",
+        "SELECT map{1:NULL}[2]",
+        "SELECT element_at(map{1:NULL}, 1)",
+    ] {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([98; 16]).unwrap(),
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: None,
+                current_database: "fixture".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    enable_materialized_view_rewrite: Some(false),
+                    enable_common_subexpr_reuse: Some(false),
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            catalog.snapshot(),
+            noop_constant_evaluator(),
+            policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: 64,
+                max_batch_bytes: 1 << 20,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+        .try_into_completion()
+        .unwrap();
+        let owner = SqlCompiler::start(request, &control)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .into_plan();
+        let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+            owner.plan(),
+            &catalog,
+            &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+            false,
+            compile_control(),
+        )
+        .unwrap();
+        let mut lookups = 0;
+        for source in &encoded.fragments {
+            let fragment = owner
+                .plan()
+                .fragments()
+                .values()
+                .find(|fragment| fragment.id().get() == source.fragment_id)
+                .unwrap();
+            if !fragment.expressions().iter().any(|(_, expression)| {
+                matches!(&expression.kind, novarocks_physical_plan::ExprKind::FunctionCall { function, .. }
+                    if function.function_id.as_str().contains("map_element_at"))
+            }) {
+                continue;
+            }
+            let mut arena = ExprArena::default();
+            decode_node(
+                source,
+                source.root.as_ref().unwrap(),
+                &mut arena,
+                &NativePlanDecodeContext::default(),
+            )
+            .unwrap();
+            let mut index = 0;
+            while let Some(node) = arena.node(novarocks_execution::exec::expr::ExprId(index)) {
+                if matches!(node, novarocks_execution::exec::expr::ExprNode::FunctionCall {
+                    kind: novarocks_execution::exec::expr::function::FunctionKind::Map(name), ..
+                } if name.ends_with("element_at"))
+                {
+                    let value = arena
+                        .eval(
+                            novarocks_execution::exec::expr::ExprId(index),
+                            &empty_input(),
+                        )
+                        .unwrap();
+                    assert_eq!(value.data_type(), &DataType::Null, "{sql}");
+                    assert_eq!(value.len(), 1, "{sql}");
+                    assert_eq!(value.logical_null_count(), 1, "{sql}");
+                    assert!(value.to_data().nulls().is_none(), "{sql}");
+                    lookups += 1;
+                }
+                index += 1;
+            }
+        }
+        assert_eq!(lookups, 1, "{sql}");
+    }
+}
