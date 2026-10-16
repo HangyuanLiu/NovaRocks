@@ -587,7 +587,7 @@ fn try_rewrite_candidate(
                                 return Ok(None);
                             }
                         };
-                        // SUM used for scalar COUNT may produce successful
+                        // SUM used for COUNT may produce successful
                         // NULL before COALESCE. Only its selected owner can
                         // author that temporary column's complete value type.
                         if !item.needs_coalesce
@@ -677,7 +677,7 @@ fn try_rewrite_candidate(
                             children: vec![child_group],
                         }));
                     }
-                    // Scalar COUNT rollup: wrap with COALESCE(sum, 0).
+                    // COUNT rollup: restore its exact visible type with COALESCE.
                     let agg_group = memo.new_group(MExpr {
                         id: memo.next_expr_id(),
                         op: agg_op,

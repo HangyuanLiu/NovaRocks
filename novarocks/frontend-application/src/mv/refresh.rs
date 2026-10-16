@@ -37,7 +37,7 @@ use novarocks_mv_application::product::{
 use novarocks_mv_application::publication::{
     MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent,
 };
-use novarocks_mv_application::service::MvProductService;
+use novarocks_mv_application::service::MvKeyedProductService;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorInstanceId, ConnectorProviderBindingKey,
@@ -55,7 +55,7 @@ pub(super) struct FrontendMvRefreshDependencies {
 }
 
 pub(super) fn execute(
-    product: &MvProductService,
+    product: &MvKeyedProductService,
     dependencies: &FrontendMvRefreshDependencies,
     refresh: PreparedMvRefresh,
     context: ConnectorRequestContext,
@@ -284,21 +284,23 @@ fn execute_data(
             error,
         ));
     }
-    bind_publication_documents(
-        planning,
-        &intent,
-        admitted,
-        authority.session(),
-        authority.row_count(),
-        &context,
-    )?;
-    // Past this point the commit may have happened, so the publication owns an
-    // outcome it must report. Marking it here rather than at admission keeps a
-    // statement that failed before the provider call from leaving the target
-    // unsettled over an effect nobody attempted.
-    admitted
-        .mark_dispatched(intent.publication_id())
-        .map_err(invalid)?;
+    let documents = authority
+        .logical_rows_after_write(admitted.previous_logical_rows(), &context)
+        .map_err(|error| invalid(error.to_string()))
+        .and_then(|rows| bind_publication_documents(&intent, admitted, authority.session(), rows))
+        // Only after every pre-commit fact has been built does the admission
+        // take responsibility for a possibly dispatched external effect.
+        .and_then(|()| {
+            admitted
+                .mark_dispatched(intent.publication_id())
+                .map_err(invalid)
+        });
+    if let Err(error) = documents {
+        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
+            authority.session(), &context,
+        );
+        return Err(error);
+    }
     // Every publication commits, so there is no second route out of here. A
     // window that materialized nothing commits an empty write, which is what
     // advances the watermark P records; the `NoOp` effect that used to fall
@@ -330,8 +332,6 @@ fn execute_data(
         .publication_version()
         .snapshot_id()
         .ok_or_else(|| invalid("MV publication completed without a snapshot ID"))?;
-    let storage_rows = u64::try_from(committed.resulting_row_count())
-        .map_err(|_| invalid("MV publication committed a negative row count"))?;
     Ok(FrontendKnownCommittedPublication {
         install: PublishedProjectionInstall {
             activation: Arc::clone(&dependencies.provider_activation),
@@ -339,7 +339,6 @@ fn execute_data(
             table,
             context,
             snapshot_id,
-            storage_rows,
         },
         published,
         #[cfg(feature = "test-controls")]
@@ -349,69 +348,30 @@ fn execute_data(
 
 /// Bind the exact publication document this write promised when it opened.
 ///
-/// The session opened with a declaration and no payload because P states what
-/// the write produced, and that only became true when the writers closed.
+/// The session opened with a declaration and no payload because P states the
+/// post-write logical cardinality, which requires the completed write effect
+/// and the admitted prior publication.
 /// Building P here and binding it before finish is what makes the document and
 /// the rows it describes one commit rather than two.
 fn bind_publication_documents(
-    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     intent: &MvRefreshPublicationIntent,
     admitted: &crate::mv::domain::staged_create::AdmittedMvDataPublication,
     session: &crate::query_execution::write_session::ConnectorWriteSession,
-    logical_result_rows: u64,
-    context: &ConnectorRequestContext,
+    logical_result_rows: Option<u64>,
 ) -> Result<(), MvApplicationError> {
     let declaration = session
         .pending_publication_declaration()
         .map_err(|error| invalid(error.to_string()))?;
     let documents = admitted
-        .publication_document_set(
-            intent.publication_id(),
-            novarocks_mv_application::persistence::publication_facts::MvPublicationResult {
-                kind: publication_kind(intent),
-                logical_result_rows,
-            },
-        )
+        .publication_document_set(intent.publication_id(), logical_result_rows)
         .map_err(invalid)?;
-    let document_lease = planning
-        .derive_document_storage_lease()
-        .map_err(|error| unavailable(error.to_string()))?;
-    let prepared = document_lease
-        .prepare_documents(
-            novarocks_spi::connector::document_storage::ConnectorPrepareDocumentsRequest::try_new(
-                declaration.admission().clone(),
-                documents,
-                context.clone(),
-            )
-            .map_err(|error| invalid(error.to_string()))?,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
-    let publication =
-        novarocks_spi::connector::document_storage::ConnectorDocumentPublicationIntent::try_new(
-            &declaration,
-            prepared,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
+    let publication = novarocks_spi::connector::KeyedPublicationIntent {
+        declaration,
+        documents,
+    };
     session
-        .bind_application_document_publication(publication)
-        .map_err(|error| invalid(error.to_string()))
-}
-
-/// What kind of publication P records. A partition replacement is a
-/// repartition whichever technique carried its rows.
-fn publication_kind(
-    intent: &MvRefreshPublicationIntent,
-) -> novarocks_mv_application::persistence::codec::PublicationKind {
-    use novarocks_mv_application::persistence::codec::PublicationKind;
-    use novarocks_mv_application::publication::MvRefreshPublicationTechnique;
-    if intent.partition_spec_replacement().is_some() {
-        return PublicationKind::Repartition;
-    }
-    match intent.technique() {
-        MvRefreshPublicationTechnique::Full => PublicationKind::FullRefresh,
-        MvRefreshPublicationTechnique::Incremental => PublicationKind::IncrementalRefresh,
-        MvRefreshPublicationTechnique::MetadataOnly => PublicationKind::MetadataOnlyRefresh,
-    }
+        .bind_keyed_document_publication(publication)
+        .map_err(|e| invalid(e.to_string()))
 }
 
 /// The one commit authority of one MV data write.
@@ -521,10 +481,12 @@ fn execute_metadata_only(
             error,
         ));
     }
-    // A metadata-only publication produced no logical result rows. P says so
-    // rather than repeating the target's own row count, which the receipt
-    // reports and the projection reads.
-    let outcome = bind_publication_documents(planning, &intent, admitted, &session, 0, &context)
+    // No data changes: preserve the admitted target's logical cardinality.
+    // The empty write is still projected through its exact provider session.
+    let outcome = session
+        .logical_rows_after_empty_publication(admitted.previous_logical_rows(), &context)
+        .map_err(|error| invalid(error.to_string()))
+        .and_then(|rows| bind_publication_documents(&intent, admitted, &session, rows))
         .and_then(|()| {
             // Past this point the commit may have happened, so the publication
             // owns an outcome it must report.
@@ -561,8 +523,6 @@ fn execute_metadata_only(
         .publication_version()
         .snapshot_id()
         .ok_or_else(|| invalid("MV metadata-only publication completed without a snapshot ID"))?;
-    let storage_rows = u64::try_from(committed.resulting_row_count())
-        .map_err(|_| invalid("MV metadata-only publication committed a negative row count"))?;
     Ok(FrontendKnownCommittedPublication {
         install: PublishedProjectionInstall {
             activation: Arc::clone(&dependencies.provider_activation),
@@ -570,7 +530,6 @@ fn execute_metadata_only(
             table,
             context,
             snapshot_id,
-            storage_rows,
         },
         published,
         #[cfg(feature = "test-controls")]
@@ -600,7 +559,6 @@ struct PublishedProjectionInstall {
     table: ConnectorTableIdentity,
     context: ConnectorRequestContext,
     snapshot_id: i64,
-    storage_rows: u64,
 }
 
 impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
@@ -634,7 +592,6 @@ impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
                 &install.planning,
                 &install.table,
                 install.snapshot_id,
-                install.storage_rows,
                 *attempt.as_uuid(),
                 &install.context,
             )

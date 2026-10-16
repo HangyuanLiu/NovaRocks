@@ -17,9 +17,9 @@
 
 -- @sequential=true
 -- @tags=mv,iceberg,rest,minio,storage-contract,configuration
--- Each configuration statement commits exactly one C replacement. The
--- runner reads the real REST graph and counts target mutations at each step;
--- the single published P must keep its exact D/L references and snapshot.
+-- Configuration statements commit main-conditioned C slot changes. The
+-- runner checks the actual REST graph and exact publication references;
+-- ordinary table properties must also reobserve keyed Current successfully.
 
 -- query 1
 -- @skip_result_check=true
@@ -57,7 +57,7 @@ INSERT INTO mvcfg_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 5
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=0,slot-changes=0
 SET CATALOG mvcfg_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_config
@@ -68,12 +68,12 @@ AS SELECT k, v FROM fact;
 
 -- query 6
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=0
 REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
 
 -- query 7
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=3
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=1,table-commits=3
 ALTER MATERIALIZED VIEW mv_config PAUSE REFRESH;
 
 -- query 8
@@ -83,7 +83,7 @@ SHOW MATERIALIZED VIEWS;
 
 -- query 9
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=4
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=2,table-commits=4
 ALTER MATERIALIZED VIEW mv_config SET REFRESH ASYNC ON CHANGE;
 
 -- query 10
@@ -94,12 +94,12 @@ SHOW MATERIALIZED VIEWS;
 
 -- query 11
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=5
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=3,table-commits=5
 ALTER MATERIALIZED VIEW mv_config SET REFRESH DEFERRED MANUAL;
 
 -- query 12
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=6
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=4,table-commits=6
 ALTER MATERIALIZED VIEW mv_config RESUME REFRESH;
 
 -- query 13
@@ -117,7 +117,7 @@ SHOW MATERIALIZED VIEWS;
 -- A later publication observes the revised C but still uses the same D/L/P
 -- dependencies. Its metadata-only snapshot must preserve the final policy.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,table-commits=7
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=7
 REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
 
 -- query 16
@@ -127,6 +127,28 @@ REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
 SHOW MATERIALIZED VIEWS;
 
 -- query 17
+-- A metadata-only user property update must not require a legacy package.
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=8
+ALTER MATERIALIZED VIEW mv_config SET TBLPROPERTIES ("read.split.target-size" = "16777216");
+
+-- query 18
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=3,slot-changes=4,table-commits=9
+REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
+
+-- query 19
+-- @result_contains=east
+-- @result_contains=10
+SELECT k, v FROM mv_config ORDER BY k, v;
+
+-- query 20
+-- @result_contains=mv_config
+-- @result_contains=MANUAL
+-- @result_contains=false
+SHOW MATERIALIZED VIEWS;
+
+-- query 21
 -- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG mvcfg_${uuid0};

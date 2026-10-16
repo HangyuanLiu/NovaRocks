@@ -40,7 +40,7 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, TableMaintenanceEngine, TableMaintenanceService,
 };
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::{
     maintenance::{
@@ -48,7 +48,7 @@ use novarocks_mv_application::{
         MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MvBackgroundEngineError,
         MvBackgroundEngineErrorKind, MvMaintenanceRuntime, OptimizeDurableOutcome,
     },
-    service::MvProductService,
+    service::MvKeyedProductService,
 };
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
@@ -63,7 +63,7 @@ pub(crate) struct FrontendMaintenanceWorkerDependencies {
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     pub(crate) table_maintenance_service: Arc<dyn TableMaintenanceService>,
     pub(crate) connector_control: Arc<dyn ConnectorControlRegistry>,
-    pub(crate) product_service: Arc<MvProductService>,
+    pub(crate) product_service: Arc<MvKeyedProductService>,
     pub(crate) root_admission: RootAdmissionHandle,
     pub(crate) coordinator_config: MaintenanceCoordinatorConfig,
     pub(crate) attempt_timeout: Duration,
@@ -178,7 +178,7 @@ impl FrontendMaintenanceWorker {
 
     fn run_definition(
         &self,
-        definition: StoredMvProjection,
+        definition: StoredKeyedMvProjection,
         now_ms: i64,
         pass: &mut FrontendMaintenancePassReport,
     ) {
@@ -341,7 +341,7 @@ struct TableMaintenanceAutomaticRunner {
     service: Arc<dyn TableMaintenanceService>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     readiness: Arc<MvReadinessPort>,
-    product_service: Arc<MvProductService>,
+    product_service: Arc<MvKeyedProductService>,
     target: MaintenanceTarget,
     context: AutomaticMaintenanceContext,
     /// Captured where the worker thread is spawned, because the thread itself
@@ -358,8 +358,6 @@ struct PreparedAutomaticAction {
     operation_uuid: uuid::Uuid,
     scope: novarocks_mv_application::management::EffectScope,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    retained_statistics:
-        Option<novarocks_mv_application::persistence::projection::MvOutputStatistics>,
 }
 
 impl TableMaintenanceAutomaticRunner {
@@ -370,14 +368,7 @@ impl TableMaintenanceAutomaticRunner {
         &self,
         scope: novarocks_mv_application::management::EffectScope,
     ) -> Result<PreparedAutomaticAction, MvBackgroundEngineError> {
-        use novarocks_mv_application::management::{
-            AutomaticMaintenanceEffect, EffectIdentity, ManagedMvTarget,
-        };
-        use novarocks_mv_application::persistence::projection::MvPublicationState;
-        use novarocks_spi::connector::document_storage::{
-            ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-            ConnectorDocumentStorageLimits,
-        };
+        use novarocks_mv_application::management::{AutomaticMaintenanceEffect, EffectIdentity};
         use novarocks_spi::connector::{
             ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity,
             ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector,
@@ -452,52 +443,39 @@ impl TableMaintenanceAutomaticRunner {
         let document_lease = control
             .derive_document_storage_lease()
             .map_err(|error| automatic_pre_dispatch_error(error.to_string()))?;
-        let observe = |observation_context| {
-            let request = ConnectorDocumentObservationRequest::try_new(
-                document_lease.owner().clone(),
-                document_lease.catalog_handle().clone(),
-                table.clone(),
-                binding.object_id.clone(),
-                ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
-                observation_context,
-            )
-            .map_err(|error| automatic_pre_dispatch_error(error.to_string()))?;
-            novarocks_mv_application::persistence::documents::observe_current_management_document_set(
-                &document_lease,
-                request,
-                novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
-            )
-            .map(|observed| observed.into_parts())
-            .map_err(|error| automatic_pre_dispatch_error(error.to_string()))
-        };
         let entrance = self
             .product_service
             .management_entrance()
             .ok_or_else(|| automatic_pre_dispatch_error("MV management entrance is unavailable"))?;
-        let (first_observation, first_documents) = observe(context.clone())?;
-        if entrance.close_on_current_incarnation_mismatch(&first_observation) {
-            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
-            return Err(automatic_pre_dispatch_error(
-                "MV Current marker names another process incarnation; management is closed",
-            ));
-        }
+        let observe = |observation_context| {
+            let request = crate::mv::domain::staged_create::keyed_request(
+                &document_lease,
+                table.clone(),
+                binding.object_id.clone(),
+                observation_context,
+            );
+            self.readiness
+                .candidate_reader()
+                .observe_current(&document_lease, request.clone())
+                .map_err(automatic_pre_dispatch_error)?;
+            let (observed,_,_)=entrance.observe_keyed_admission(&document_lease,request,novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default()).map_err(|e|automatic_pre_dispatch_error(e.to_string()))?;
+            Ok::<_, MvBackgroundEngineError>(observed)
+        };
+        let first_documents = observe(context.clone())?;
         let dependencies = first_documents.management_dependencies(control.control_runtime_id());
         if dependencies
             != ready
                 .projection
                 .facts
                 .management_dependencies(control.control_runtime_id())
-            || first_documents.configuration() != ready.projection.facts.configuration()
+            || &first_documents.configuration != ready.projection.facts.configuration()
         {
             return Err(automatic_stale_policy_error(
                 "MV maintenance policy observation is stale",
             ));
         }
         let operation_uuid = uuid::Uuid::now_v7();
-        let managed_target =
-            ManagedMvTarget::from_observation(&first_observation).map_err(|error| {
-                automatic_pre_dispatch_error(format!("name MV maintenance target: {error:?}"))
-            })?;
+        let managed_target = first_documents.management_target.clone();
         let management = entrance
             .acquire_automatic_maintenance(
                 AutomaticMaintenanceEffect::new(
@@ -525,45 +503,24 @@ impl TableMaintenanceAutomaticRunner {
             })?;
         let after_wait = context.clone().after_external_effect();
         let rebound = capture(after_wait.clone())?;
-        let (observation, documents) = observe(after_wait)?;
-        if entrance.close_on_current_incarnation_mismatch(&observation) {
-            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
-            return Err(automatic_pre_dispatch_error(
-                "MV Current marker names another process incarnation; management is closed",
-            ));
-        }
+        let documents = observe(after_wait)?;
         if rebound.metadata.identity != table
             || rebound.object_id != binding.object_id
-            || observation.object_id() != &binding.object_id
-            || observation.marker().owner() != entrance.owner().as_str()
-            || observation.marker().incarnation() != entrance.incarnation().as_str()
+            || documents.view.object_id != binding.object_id
+            || documents.deployment_owner != *entrance.owner()
+            || documents.process_incarnation != *entrance.incarnation()
         {
             return Err(automatic_pre_dispatch_error(
                 "MV maintenance target or owner changed during admission",
             ));
         }
         if documents.management_dependencies(control.control_runtime_id()) != dependencies
-            || documents.configuration() != first_documents.configuration()
+            || &documents.configuration != &first_documents.configuration
         {
             return Err(automatic_stale_policy_error(
                 "MV maintenance documents changed during admission",
             ));
         }
-        let retained_statistics = match ready.projection.facts.publication() {
-            MvPublicationState::Published(published) => published.storage_rows().map(|rows| {
-                novarocks_mv_application::persistence::projection::MvOutputStatistics {
-                    object_id: ready
-                        .projection
-                        .facts
-                        .source_revision()
-                        .target_object_id
-                        .clone(),
-                    output_version: published.output_version().clone(),
-                    storage_rows: rows,
-                }
-            }),
-            MvPublicationState::NeverPublished => None,
-        };
         Ok(PreparedAutomaticAction {
             entrance,
             management,
@@ -573,7 +530,6 @@ impl TableMaintenanceAutomaticRunner {
             operation_uuid,
             scope,
             context,
-            retained_statistics,
         })
     }
 }
@@ -622,7 +578,6 @@ impl PreparedAutomaticAction {
                 self.catalog_handle,
                 self.product_target,
                 self.operation_uuid,
-                self.retained_statistics,
                 self.context.after_external_effect(),
             )
             .map_err(|error| {
@@ -810,7 +765,7 @@ impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
     }
 }
 
-fn canonical_target(projection: &StoredMvProjection) -> Option<MaintenanceTarget> {
+fn canonical_target(projection: &StoredKeyedMvProjection) -> Option<MaintenanceTarget> {
     let target = projection.facts.target();
     Some(MaintenanceTarget {
         catalog: target.catalog()?.to_owned(),
@@ -831,8 +786,8 @@ fn now_unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::management::EffectDisposition;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_table_maintenance::runtime::MaintenanceJobState;
 
@@ -882,7 +837,7 @@ mod tests {
 
     #[test]
     fn maintenance_target_uses_projection_target_not_source_occurrences() {
-        let projection = StoredMvProjection {
+        let projection = StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(
                 MvTarget::from_parts(Some("target_catalog"), "target_namespace", "target_mv"),

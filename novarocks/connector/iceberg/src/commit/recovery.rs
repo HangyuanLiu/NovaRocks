@@ -55,6 +55,7 @@ enum Shape {
     SnapshotProducing,
     MetadataOnly,
     RefRetention,
+    DocumentExpiry,
     Create,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -178,6 +179,7 @@ impl FrozenPublicationFacts {
             RequestShape::SnapshotProducing => Shape::SnapshotProducing,
             RequestShape::MetadataOnly => Shape::MetadataOnly,
             RequestShape::RefRetention => Shape::RefRetention,
+            RequestShape::DocumentExpiry => Shape::DocumentExpiry,
             RequestShape::Create => Shape::Create,
         };
         if &self.namespace != identifier.namespace.as_ref()
@@ -267,6 +269,7 @@ impl FrozenPublicationFacts {
                 RequestShape::SnapshotProducing => Shape::SnapshotProducing,
                 RequestShape::MetadataOnly => Shape::MetadataOnly,
                 RequestShape::RefRetention => Shape::RefRetention,
+                RequestShape::DocumentExpiry => Shape::DocumentExpiry,
                 RequestShape::Create => Shape::Create,
             },
             namespace: request.identifier().namespace.as_ref().to_vec(),
@@ -300,7 +303,10 @@ impl FrozenPublicationFacts {
                 Base::Existing {
                     metadata_location, ..
                 },
-                Shape::SnapshotProducing | Shape::MetadataOnly | Shape::RefRetention,
+                Shape::SnapshotProducing
+                | Shape::MetadataOnly
+                | Shape::RefRetention
+                | Shape::DocumentExpiry,
             ) if !metadata_location.is_empty() => {}
             (Base::Create { location, .. }, Shape::Create) if !location.is_empty() => {}
             _ => {
@@ -491,6 +497,115 @@ mod tests {
                 .unwrap()
                 .get("base_facts")
                 .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod document_expiry_recovery_tests {
+    use super::*;
+    use crate::commit::model::{
+        Dependency, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts, TableTarget,
+    };
+    use crate::commit::overwrite::preparer_tests::Fixture;
+    use crate::commit::staging::{PreparedChange, StagingBase, StagingEngine};
+    use crate::iceberg::spec::FormatVersion;
+    use crate::iceberg::{TableIdent, TableUpdate};
+    use novarocks_spi::connector::ConnectorWriteOperationId;
+
+    #[tokio::test]
+    async fn document_expiry_recovery_roundtrips_and_keeps_exact_identity() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let identifier = TableIdent::from_strs(["db", "t"]).unwrap();
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: identifier.clone(),
+                uuid: Some(metadata.uuid()),
+            },
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges::default(),
+            dependencies: vec![Dependency::NoReadDependency],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::DocumentExpiry,
+            summary: Default::default(),
+            token: fixture.operation.token(),
+        })
+        .unwrap();
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let location = format!(
+            "file://{}/full.metadata.json",
+            fixture.directory.path().display()
+        );
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: metadata.clone(),
+                metadata_location: location.clone(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        engine
+            .stage_change(PreparedChange {
+                requirements: vec![],
+                updates: vec![TableUpdate::RemoveProperties {
+                    removals: vec![format!("novarocks.doc.v2.rev.{}", "0".repeat(64))],
+                }],
+            })
+            .unwrap();
+        let request = engine.freeze(&[]).unwrap();
+        let facts = FrozenPublicationFacts::from_request(&request, &fixture.operation).unwrap();
+        let encoded = serde_json::to_vec(&facts).unwrap();
+        let decoded: FrozenPublicationFacts = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, facts);
+        assert_eq!(decoded.shape, Shape::DocumentExpiry);
+        assert_eq!(decoded.published_snapshot_id, None);
+        assert!(matches!(
+            &decoded.base,
+            Base::Existing { uuid, parent_snapshot_id: None, metadata_location }
+                if *uuid == metadata.uuid() && metadata_location == &location
+        ));
+        decoded.validate(fixture.operation.token()).unwrap();
+        decoded.validate_no_session_data().unwrap();
+        decoded
+            .validate_existing_target(
+                fixture.operation.token(),
+                &identifier,
+                metadata.uuid(),
+                "main",
+                RequestShape::DocumentExpiry,
+            )
+            .unwrap();
+        assert!(
+            decoded
+                .validate_existing_target(
+                    fixture.operation.token(),
+                    &identifier,
+                    metadata.uuid(),
+                    "main",
+                    RequestShape::SnapshotProducing,
+                )
+                .is_err()
+        );
+        assert!(
+            decoded
+                .validate_existing_target(
+                    fixture.operation.token(),
+                    &TableIdent::from_strs(["db", "other"]).unwrap(),
+                    metadata.uuid(),
+                    "main",
+                    RequestShape::DocumentExpiry,
+                )
+                .is_err()
+        );
+        assert!(
+            decoded
+                .validate(OperationToken::from_write(
+                    ConnectorWriteOperationId::from_bytes([9; 16],)
+                ))
+                .is_err()
         );
     }
 }

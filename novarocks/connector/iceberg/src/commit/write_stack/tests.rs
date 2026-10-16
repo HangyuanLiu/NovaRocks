@@ -67,7 +67,7 @@ use crate::commit::write_stack::domain::{
 };
 use crate::commit::write_stack::flavor::{
     IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, plan_copy_on_write_branches,
-    plan_distributed_rewrite_branches, plan_managed_publication_branches, plan_ordinary_branches,
+    plan_distributed_rewrite_branches, plan_document_publication_branches, plan_ordinary_branches,
     plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
@@ -80,16 +80,16 @@ use crate::commit::write_stack::planning::{
 use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRuntime};
 use crate::commit::write_stack::test_support::{
     binding, copy_on_write_input_shape, copy_on_write_match_contract, data_branch_plan,
-    data_input_shape, delete_branch_plan, delete_input_shape, dv_artifact,
+    data_input_shape, delete_branch_plan, delete_input_shape, document_publication_facts,
+    document_publication_facts_with_shape, document_publication_flavor, dv_artifact,
     equality_delete_input_shape, equality_delete_recipe, merge_on_read_input_shape, merge_target,
-    parquet_ref, publication_facts, publication_facts_with_shape, publication_flavor,
-    publication_id, sample_metrics, sample_partition, session_material, table_facts,
+    parquet_ref, sample_metrics, sample_partition, session_material, table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
 use crate::position_delete::{FILE_PATH_COLUMN, POS_COLUMN};
 
-fn request_context() -> ConnectorRequestContext {
+pub(super) fn request_context() -> ConnectorRequestContext {
     ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
         novarocks_spi::connector::ConnectorStopOwner::new().view(),
@@ -1004,7 +1004,6 @@ fn flavor_session(
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             table: table_facts(),
             base_version_digest: None,
-            publication: plan.publication,
             document_publication: plan.document_publication,
             staged_metadata: None,
             rewrite_inputs: plan.rewrite_inputs,
@@ -1176,7 +1175,6 @@ fn cow_handle(branches: &[IcebergCowBranchInput]) -> IcebergCommitHandle {
         crate::commit::write_stack::domain::IcebergSessionFacts {
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             base_version_digest: None,
-            publication: None,
             document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
@@ -1743,7 +1741,6 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             table: table_facts(),
             base_version_digest: None,
-            publication: None,
             document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
@@ -2207,7 +2204,6 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
         crate::commit::write_stack::domain::IcebergSessionFacts {
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             base_version_digest: None,
-            publication: None,
             document_publication: None,
             staged_metadata: None,
             rewrite_inputs: vec![
@@ -2294,9 +2290,9 @@ fn a_managed_publication_carries_its_technique_and_disposition_into_finish() {
             CommitOpKind::FastAppend,
         ),
     ] {
-        let plan = plan_managed_publication_branches(
+        let plan = plan_document_publication_branches(
             &session_material(data_input_shape()),
-            publication_facts(
+            document_publication_facts(
                 technique,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ),
@@ -2304,8 +2300,9 @@ fn a_managed_publication_carries_its_technique_and_disposition_into_finish() {
         .expect("plan a managed publication");
         let (handle, _) = flavor_session(plan);
         let publication = handle
-            .publication()
-            .expect("publication facts reach finish");
+            .document_publication()
+            .expect("document declaration reaches finish")
+            .declaration();
         assert_eq!(publication.technique(), technique);
         assert_eq!(
             publication.empty_input(),
@@ -2347,11 +2344,10 @@ fn an_atomic_repartition_writes_under_the_prospective_spec_and_swaps_on_the_curr
             purpose: ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             table: session_table.clone(),
             base_version_digest: None,
-            publication: Some(publication_facts(
+            document_publication: Some(document_publication_facts(
                 ConnectorManagedPublicationTechnique::Full,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             )),
-            document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
             copy_on_write: Vec::new(),
@@ -2384,9 +2380,9 @@ fn a_change_stream_publication_seals_the_branches_a_row_mutation_needs() {
     // wholesale republication seals left it nowhere to send a delete, and the
     // refresh could only ever append.
     let adapter = adapter("publication_mutation", 7);
-    let plan = plan_managed_publication_branches(
+    let plan = plan_document_publication_branches(
         &session_material(merge_on_read_input_shape()),
-        publication_facts_with_shape(
+        document_publication_facts_with_shape(
             ConnectorManagedPublicationTechnique::Incremental,
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ConnectorManagedPublicationShape::RowMutation,
@@ -2396,7 +2392,7 @@ fn a_change_stream_publication_seals_the_branches_a_row_mutation_needs() {
     // It stays one publication: the commit is still decided by the publication
     // facts, not by a second row-mutation flavor.
     assert_eq!(plan.flavor, IcebergWriteFlavor::ManagedPublication);
-    assert!(plan.publication.is_some());
+    assert!(plan.document_publication.is_some());
 
     let (handle, targets) = flavor_session(plan);
     assert_eq!(handle.expected_targets(), vec![ordinal(0), ordinal(1)]);
@@ -2430,9 +2426,9 @@ fn an_insert_only_publication_seals_one_routed_data_branch() {
     // change-stream compile requires every branch to declare which effects it
     // accepts, and that shape seals an unrouted branch.
     let adapter = adapter("publication_insert_only", 11);
-    let plan = plan_managed_publication_branches(
+    let plan = plan_document_publication_branches(
         &session_material(data_input_shape()),
-        publication_facts_with_shape(
+        document_publication_facts_with_shape(
             ConnectorManagedPublicationTechnique::Incremental,
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ConnectorManagedPublicationShape::InsertOnlyChangeStream,
@@ -2462,9 +2458,9 @@ fn an_insert_only_publication_commits_as_an_append() {
     // It seals no delete branch, so there is no artifact retiring a prior row
     // version and a plain append is the whole commit.
     let (handle, _) = flavor_session(
-        plan_managed_publication_branches(
+        plan_document_publication_branches(
             &session_material(data_input_shape()),
-            publication_facts_with_shape(
+            document_publication_facts_with_shape(
                 ConnectorManagedPublicationTechnique::Incremental,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
                 ConnectorManagedPublicationShape::InsertOnlyChangeStream,
@@ -2479,9 +2475,9 @@ fn an_insert_only_publication_commits_as_an_append() {
 fn a_full_refresh_is_refused_as_an_insert_only_change_stream() {
     // A full refresh republishes every row, so it has no change stream to
     // apply -- the same reason the row-mutation shape refuses it.
-    let error = plan_managed_publication_branches(
+    let error = plan_document_publication_branches(
         &session_material(data_input_shape()),
-        publication_facts_with_shape(
+        document_publication_facts_with_shape(
             ConnectorManagedPublicationTechnique::Full,
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ConnectorManagedPublicationShape::InsertOnlyChangeStream,
@@ -2502,9 +2498,9 @@ fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
     // dropping the deletion vector that retires the before-image, leaving both
     // versions of the row live.
     let (delta, _) = flavor_session(
-        plan_managed_publication_branches(
+        plan_document_publication_branches(
             &session_material(merge_on_read_input_shape()),
-            publication_facts_with_shape(
+            document_publication_facts_with_shape(
                 ConnectorManagedPublicationTechnique::Incremental,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
                 ConnectorManagedPublicationShape::RowMutation,
@@ -2535,9 +2531,9 @@ fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
         ),
     ] {
         let (handle, _) = flavor_session(
-            plan_managed_publication_branches(
+            plan_document_publication_branches(
                 &session_material(data_input_shape()),
-                publication_facts_with_shape(
+                document_publication_facts_with_shape(
                     technique,
                     ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
                     shape,
@@ -2553,9 +2549,9 @@ fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
 fn a_full_refresh_cannot_apply_a_change_stream() {
     // A full refresh replaces every live row, so nothing it publishes has a
     // prior version for a change event to supersede.
-    let error = plan_managed_publication_branches(
+    let error = plan_document_publication_branches(
         &session_material(merge_on_read_input_shape()),
-        publication_facts_with_shape(
+        document_publication_facts_with_shape(
             ConnectorManagedPublicationTechnique::Full,
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ConnectorManagedPublicationShape::RowMutation,
@@ -2572,9 +2568,9 @@ fn a_full_refresh_cannot_apply_a_change_stream() {
     // A copy-on-write change stream is refused for a sharper reason: it seals
     // only a data branch, so its publication would resolve to a plain append and
     // publish every after-image while the before-images stayed live.
-    let error = plan_managed_publication_branches(
+    let error = plan_document_publication_branches(
         &session_material(copy_on_write_input_shape()),
-        publication_facts_with_shape(
+        document_publication_facts_with_shape(
             ConnectorManagedPublicationTechnique::Incremental,
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ConnectorManagedPublicationShape::RowMutation,
@@ -2598,7 +2594,7 @@ fn a_change_stream_publication_freezes_the_old_deletes_it_supersedes() {
     // skipped the freeze would stage an artifact that silently dropped them.
     let signed = merge_on_read_input_shape();
     assert!(session_freezes_old_deletes(
-        &publication_flavor(
+        &document_publication_flavor(
             ConnectorManagedPublicationTechnique::Incremental,
             ConnectorManagedPublicationShape::RowMutation,
         ),
@@ -2607,14 +2603,14 @@ fn a_change_stream_publication_freezes_the_old_deletes_it_supersedes() {
     // A wholesale republication seals no delete branch, so it has nothing to
     // supersede and must not pay for the read.
     assert!(!session_freezes_old_deletes(
-        &publication_flavor(
+        &document_publication_flavor(
             ConnectorManagedPublicationTechnique::Full,
             ConnectorManagedPublicationShape::Data,
         ),
         &data_input_shape(),
     ));
     assert!(!session_freezes_old_deletes(
-        &publication_flavor(
+        &document_publication_flavor(
             ConnectorManagedPublicationTechnique::Incremental,
             ConnectorManagedPublicationShape::RowMutation,
         ),
@@ -2691,9 +2687,9 @@ fn only_a_managed_publication_projects_the_committed_row_count() {
     );
 
     let (publication, _) = flavor_session(
-        plan_managed_publication_branches(
+        plan_document_publication_branches(
             &session_material(data_input_shape()),
-            publication_facts(
+            document_publication_facts(
                 ConnectorManagedPublicationTechnique::Full,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ),
@@ -2706,82 +2702,173 @@ fn only_a_managed_publication_projects_the_committed_row_count() {
 }
 
 #[test]
-fn a_managed_publication_stamps_its_publication_id_onto_the_snapshot_it_commits() {
-    // The publication fence fast-forwards a staged refresh only after reading
-    // `MV_PUBLICATION_ID_PROP` back off the staging snapshot's own summary
-    // (`catalog_control::catalog_mutation` -> `snapshot_matches_publication_marker`).
-    // Before the session retained the publication id, its commit wrote only the
-    // write-session marker, so every refresh it published was a snapshot the
-    // fence could never claim -- and silently, because nothing before the fence
-    // looks for the property.
+fn a_document_publication_prepares_exact_keyed_records_closure_and_session_marker() {
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorDocumentFormat, ConnectorDocumentVersion, ConnectorSnapshotRecord,
+        KeyedPublication,
+    };
     let (handle, _) = flavor_session(
-        plan_managed_publication_branches(
+        plan_document_publication_branches(
             &session_material(data_input_shape()),
-            publication_facts(
+            document_publication_facts(
                 ConnectorManagedPublicationTechnique::Full,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ),
         )
-        .expect("plan a managed publication"),
+        .expect("plan a document publication"),
     );
-    let properties = crate::commit::write_stack::control::session_snapshot_properties(&handle, 9)
-        .expect("build the commit's snapshot properties");
-
-    // The reconciliation marker stays: an unknown outcome still has to be
-    // adjudicable.
+    let make = |name, version, refs, content: &'static [u8]| {
+        ConnectorDocumentVersion::try_new(
+            "novarocks.test",
+            name,
+            ConnectorDocumentFormat::try_new("novarocks.test", name, version).unwrap(),
+            refs,
+            Bytes::from_static(content),
+        )
+        .unwrap()
+    };
+    let definition = make("definition", 1, vec![], b"definition");
+    let interpretation = make(
+        "interpretation",
+        2,
+        vec![("definition".into(), definition.identity())],
+        b"layout",
+    );
+    let binding = make(
+        "binding",
+        1,
+        vec![
+            ("definition".into(), definition.identity()),
+            ("interpretation".into(), interpretation.identity()),
+        ],
+        b"binding",
+    );
+    let documents = KeyedPublication {
+        versions: vec![definition.clone(), interpretation.clone(), binding.clone()],
+        roots: BTreeMap::from([("novarocks.test".into(), binding.identity())]),
+        records: vec![ConnectorSnapshotRecord {
+            owner: "novarocks.test".into(),
+            name: "publication".into(),
+            binding: Some(binding.identity()),
+            payload: Bytes::from_static(b"result"),
+        }],
+        ..Default::default()
+    };
+    let prepared = crate::document_storage::keyed::write::publication_updates(
+        &super::test_support::staged_table_metadata(),
+        &documents,
+    )
+    .expect("prepare record and its complete binding closure");
+    let record_key = "novarocks.doc.v2.record.novarocks.test~publication";
+    let expected_record = format!("2.{}.cmVzdWx0", binding.identity().to_hex());
     assert_eq!(
-        properties
-            .get(crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
-            .map(String::as_str),
-        Some(handle.session_id().to_string().as_str())
+        prepared.summary,
+        BTreeMap::from([(record_key.to_string(), expected_record.clone())])
     );
-
-    let snapshot = crate::iceberg::spec::Snapshot::builder()
-        .with_snapshot_id(300)
-        .with_sequence_number(1)
-        .with_timestamp_ms(1)
-        .with_manifest_list("file:/tmp/manifest-list.avro".to_string())
-        .with_summary(crate::iceberg::spec::Summary {
-            operation: crate::iceberg::spec::Operation::Overwrite,
-            additional_properties: properties.clone().into_iter().collect(),
-        })
-        .with_schema_id(0)
-        .build();
+    handle
+        .bind_document_records(prepared.summary.clone())
+        .expect("bind exact record bytes");
+    assert_eq!(
+        handle.document_records().unwrap(),
+        Some(prepared.summary.clone())
+    );
+    let mut different = prepared.summary.clone();
+    different.insert(
+        record_key.into(),
+        format!("2.{}.bmV4dA", binding.identity().to_hex()),
+    );
     assert!(
-        crate::commit::snapshot_matches_publication_marker(
-            &snapshot,
-            &crate::commit::MvPublicationSnapshotMarker {
-                publication_id: publication_id(),
-            },
-        ),
-        "the fence must be able to claim the snapshot this commit creates"
+        handle.bind_document_records(different).is_err(),
+        "one session cannot substitute another record payload"
     );
-
-    // The provenance rides along on the same snapshot, seeded with the rows
-    // this write staged; the commit action refines it to `total-records`.
-    let provenance = crate::commit::MvPublicationProvenanceV2::from_snapshot_summary(&snapshot)
-        .expect("decode the provenance")
-        .expect("a publication snapshot carries provenance");
-    assert_eq!(provenance.publication_id, publication_id());
-    assert_eq!(provenance.technique, crate::commit::RefreshTechnique::Full);
-    assert_eq!(provenance.rows, 9);
-
-    // An ordinary write carries no publication facts at all: the id belongs to
-    // the one session that publishes under it.
+    let updates = prepared
+        .updates
+        .iter()
+        .filter_map(|update| match update {
+            crate::iceberg::TableUpdate::SetProperties { updates } => Some(updates),
+            _ => None,
+        })
+        .flat_map(|updates| updates.iter())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        updates.len(),
+        4,
+        "three complete versions plus the binding root"
+    );
+    assert_eq!(
+        updates
+            .get(&"novarocks.doc.v2.root.novarocks.test".to_string())
+            .map(|v| v.as_str()),
+        Some(binding.identity().to_hex().as_str())
+    );
+    for (version, content, refs) in [
+        (&definition, "ZGVmaW5pdGlvbg", serde_json::json!([])),
+        (
+            &interpretation,
+            "bGF5b3V0",
+            serde_json::json!([
+                {"rel": "definition", "id": definition.identity().to_hex()}
+            ]),
+        ),
+        (
+            &binding,
+            "YmluZGluZw",
+            serde_json::json!([
+                {"rel": "definition", "id": definition.identity().to_hex()},
+                {"rel": "interpretation", "id": interpretation.identity().to_hex()}
+            ]),
+        ),
+    ] {
+        let key = format!("novarocks.doc.v2.rev.{}", version.identity().to_hex());
+        let envelope: serde_json::Value = serde_json::from_str(
+            updates
+                .get(&key)
+                .expect("every closure version is retained"),
+        )
+        .unwrap();
+        assert_eq!(envelope["id"], version.identity().to_hex());
+        assert_eq!(envelope["name"], version.name());
+        assert_eq!(envelope["content"], content);
+        assert_eq!(envelope["refs"], refs);
+    }
+    let properties = crate::commit::write_stack::control::session_snapshot_properties(&handle)
+        .expect("prepare session marker");
+    assert_eq!(
+        properties,
+        BTreeMap::from([(
+            crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY.to_string(),
+            handle.session_id().to_string(),
+        )])
+    );
+    // This unit test covers frozen preparation. Actual atomic snapshot+closure
+    // publication is exercised by commit::run::keyed_session_tests.
+    let mut snapshot_properties = properties;
+    snapshot_properties.extend(prepared.summary);
+    assert_eq!(snapshot_properties.get(record_key), Some(&expected_record));
+    assert!(!snapshot_properties.contains_key("novarocks.mv.publication.v2"));
+    assert!(!snapshot_properties.contains_key("novarocks.mv.publication_id"));
     let (append, _) = flavor_session(
         plan_ordinary_branches(
             IcebergWriteFlavor::Append,
             &session_material(data_input_shape()),
         )
-        .expect("plan an ordinary append"),
+        .expect("ordinary append"),
+    );
+    assert!(append.document_publication().is_none());
+    assert!(append.document_records().unwrap().is_none());
+    assert!(
+        append
+            .bind_document_records(BTreeMap::from([(record_key.to_string(), expected_record)]))
+            .is_err()
     );
     assert_eq!(
-        crate::commit::write_stack::control::session_snapshot_properties(&append, 9)
-            .expect("build the commit's snapshot properties")
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec![crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY]
+        crate::commit::write_stack::control::session_snapshot_properties(&append).unwrap(),
+        BTreeMap::from([(
+            crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY.to_string(),
+            append.session_id().to_string(),
+        )])
     );
 }
 
@@ -2804,9 +2891,9 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
 
     let publication = |empty_input| {
         flavor_session(
-            plan_managed_publication_branches(
+            plan_document_publication_branches(
                 &session_material(data_input_shape()),
-                publication_facts(ConnectorManagedPublicationTechnique::Full, empty_input),
+                document_publication_facts(ConnectorManagedPublicationTechnique::Full, empty_input),
             )
             .expect("plan a managed publication"),
         )
@@ -2866,7 +2953,7 @@ fn _assert_error_is_send_sync(error: ConnectorError) -> impl Send + Sync {
 ///
 /// That is the point: any code path that reaches the catalog fails loudly here,
 /// so a test that succeeds against it has demonstrably not reached one.
-fn unreachable_rest_runtime() -> (
+pub(super) fn unreachable_rest_runtime() -> (
     tokio::runtime::Runtime,
     Arc<crate::metadata_context::IcebergMetadataContext>,
 ) {
@@ -3505,108 +3592,31 @@ fn document_publication_for_refusal(
     runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
     incarnation: ProviderBindingEpoch,
     catalog_handle: CatalogHandle,
+    technique: ConnectorManagedPublicationTechnique,
 ) -> (
     ConnectorWriteSessionFlavor,
     novarocks_spi::connector::ConnectorWriteBaseVersion,
 ) {
     use novarocks_spi::connector::{
-        CatalogProperties, ConnectorControlBinding, ConnectorControlPlanningLease,
-        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
-        ConnectorDocumentPublicationDeclaration, ConnectorDocumentStorageBinding,
-        ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorTableIdentity,
-        ConnectorTableObjectId, ConnectorWriteBaseVersion, LakePublicationId,
+        ConnectorTableIdentity, ConnectorTableObjectId, ConnectorWriteBaseVersion,
     };
-    let admitted_runtime = Arc::new(
-        crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
-            runtime.control_state().clone(),
-            runtime.resources().clone(),
-            crate::catalog::admission_test_support::all_admitted(Arc::clone(
-                runtime.novarocks_catalog(),
-            )),
-        ),
-    );
-    let provider = Arc::new(crate::metadata::IcebergMetadata::new(
-        descriptor("unit"),
-        incarnation,
-        Arc::clone(&admitted_runtime),
-    ));
-    let storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
-        descriptor("unit"),
-        incarnation,
-        admitted_runtime,
-    ));
-    let documents = ConnectorDocumentStorageBinding::try_new(
-        descriptor("unit"),
-        incarnation,
-        Some(storage.clone()),
-        Some(storage),
-    )
-    .expect("document binding");
-    let binding = ConnectorControlBinding::try_new(
-        descriptor("unit"),
-        incarnation,
-        provider.clone(),
-        provider.clone(),
-        Arc::new(crate::provider_binding::IcebergInstanceDistribution::new(
-            descriptor("unit"),
-            incarnation,
-        )),
-        Some(provider),
-    )
-    .and_then(|binding| {
-        binding.with_catalog_properties(
-            CatalogProperties::new(
-                catalog_handle.clone(),
-                descriptor("unit").provider_id,
-                1,
-                Vec::new(),
-                Vec::new(),
-            )
-            .expect("properties"),
-        )
-    })
-    .and_then(|binding| binding.try_with_document_storage(Some(documents)))
-    .expect("control binding");
-    let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {})
-        .derive_document_storage_lease()
-        .expect("document lease");
-    let publication_id = LakePublicationId::new_v7();
-    let object_id = ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"table-object"))
-        .expect("object id");
-    let admission = lease
-        .admit_management(
-            ConnectorDocumentManagementAdmissionRequest::try_new(
-                ConnectorProviderBindingKey {
-                    instance_id: descriptor("unit").instance_id.clone(),
-                    incarnation,
-                },
-                catalog_handle,
-                ConnectorMutationOperationId::from_bytes(publication_id.to_bytes()),
-                ConnectorTableIdentity {
-                    instance_id: descriptor("unit").instance_id,
-                    namespace: Arc::from("db"),
-                    table: Arc::from("staged"),
-                },
-                Some(object_id.clone()),
-                ConnectorDocumentManagementOperation::Publication,
-                request_context(),
-            )
-            .expect("admission request"),
-        )
-        .expect("test owner admission");
     let base =
         ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"test-base")).expect("base");
-    let declaration = ConnectorDocumentPublicationDeclaration::try_new(
-        publication_id,
-        admission,
-        object_id,
+    let declaration = super::test_support::admitted_document_publication_declaration(
+        runtime,
+        incarnation,
+        catalog_handle,
+        ConnectorTableIdentity {
+            instance_id: descriptor("unit").instance_id,
+            namespace: Arc::from("db"),
+            table: Arc::from("staged"),
+        },
+        ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"table-object"))
+            .expect("object id"),
         base.clone(),
-        ConnectorManagedPublicationTechnique::Full,
+        technique,
         ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-        None,
-        None,
-    )
-    .expect("declaration");
+    );
     (
         ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
             declaration,
@@ -3660,13 +3670,6 @@ fn all_write_admission_requests(
             "staged create",
             ConnectorWriteSessionFlavor::StagedCreate(staged.clone()),
         ),
-        (
-            "managed publication",
-            publication_flavor(
-                ConnectorManagedPublicationTechnique::Full,
-                ConnectorManagedPublicationShape::Data,
-            ),
-        ),
         ("row mutation", ConnectorWriteSessionFlavor::RowMutation),
         (
             "copy on write",
@@ -3694,11 +3697,29 @@ fn all_write_admission_requests(
         request.flavor = flavor;
         requests.push((name.to_string(), request));
     }
-    let (flavor, base) = document_publication_for_refusal(runtime, incarnation, catalog_handle);
-    let mut request = ordinary(ConnectorWriteIntent::Overwrite);
-    request.flavor = flavor;
-    request.base = Some(base);
-    requests.push(("document publication".to_string(), request));
+    for (name, technique, intent) in [
+        (
+            "full document publication",
+            ConnectorManagedPublicationTechnique::Full,
+            ConnectorWriteIntent::Overwrite,
+        ),
+        (
+            "incremental document publication",
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorWriteIntent::Append,
+        ),
+    ] {
+        let (flavor, base) = document_publication_for_refusal(
+            runtime,
+            incarnation,
+            catalog_handle.clone(),
+            technique,
+        );
+        let mut request = ordinary(intent);
+        request.flavor = flavor;
+        request.base = Some(base);
+        requests.push((name.to_string(), request));
+    }
     requests
 }
 
@@ -3756,7 +3777,7 @@ fn assert_write_admission_refused_without_io(
         );
         let message = if kind == "hadoop" {
             match name.as_str() {
-                "managed publication" | "document publication" => {
+                "full document publication" | "incremental document publication" => {
                     "application-document management requires an Iceberg REST catalog"
                 }
                 "staged create" => "staged-create protocol",
@@ -3945,21 +3966,61 @@ impl FrozenRewriteLake {
             target_ref: prep.target_ref().clone(),
             intent: prep.intent(),
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                fields: prep
-                    .input()
-                    .fields()
-                    .iter()
-                    .map(|b| {
-                        novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
-                            b.field().clone(),
-                            b.execution_type()
-                                .expect("rewrite field declaration")
-                                .clone(),
-                        )
-                        .expect("frozen writer declaration")
-                    })
-                    .collect(),
+            input: {
+                use novarocks_spi::connector::{
+                    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+                    ConnectorWriteInputRequest,
+                };
+                let fields = |bindings: &[ConnectorWriteFieldBinding]| {
+                    bindings
+                        .iter()
+                        .map(|binding| {
+                            ConnectorWriteFieldRequest::try_new_typed(
+                                binding.field().clone(),
+                                binding
+                                    .execution_type()
+                                    .expect("rewrite field declaration")
+                                    .clone(),
+                            )
+                            .expect("frozen writer declaration")
+                        })
+                        .collect()
+                };
+                // Preserve the actual provider preparation, as FE does. In
+                // particular, delete artifacts are not ordinary data fields.
+                match prep.input() {
+                    ConnectorWriteInputShape::Data { fields: input } => {
+                        ConnectorWriteInputRequest::Data {
+                            fields: fields(input),
+                        }
+                    }
+                    ConnectorWriteInputShape::RowLineage {
+                        data_fields,
+                        row_identity_fields,
+                    } => ConnectorWriteInputRequest::RowLineage {
+                        data_fields: fields(data_fields),
+                        row_identity_fields: fields(row_identity_fields),
+                    },
+                    ConnectorWriteInputShape::PositionDelete {
+                        identity_fields,
+                        partition_source_fields,
+                    } => ConnectorWriteInputRequest::PositionDelete {
+                        identity_fields: fields(identity_fields),
+                        partition_source_fields: fields(partition_source_fields),
+                    },
+                    ConnectorWriteInputShape::DeletionVector {
+                        identity_fields,
+                        partition_source_fields,
+                    } => ConnectorWriteInputRequest::DeletionVector {
+                        identity_fields: fields(identity_fields),
+                        partition_source_fields: fields(partition_source_fields),
+                    },
+                    ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
+                        ConnectorWriteInputRequest::EqualityDelete {
+                            equality_fields: fields(equality_fields),
+                        }
+                    }
+                }
             },
             base: None,
             flavor: ConnectorWriteSessionFlavor::DistributedRewrite {
@@ -4457,6 +4518,147 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
     let plan = lake.plan(true);
     assert_eq!(plan.cohorts().len(), 2);
     assert_eq!(lake.inventory(), before);
+    // The real planner freezes file_path/pos artifact identities. Enter C1
+    // using that exact preparation, rather than testing only its read splits.
+    // These requests must never gain ordinary scan-metadata alias authority.
+    let source_snapshot = lake.table().metadata().current_snapshot_id();
+    for case in 0..11 {
+        let mut request = lake.request(&plan);
+        let novarocks_spi::connector::ConnectorWriteInputRequest::DeletionVector {
+            identity_fields,
+            ..
+        } = &mut request.input
+        else {
+            panic!("frozen position-delete preparation")
+        };
+        match case {
+            0 => {
+                identity_fields.pop();
+            }
+            1 => {
+                identity_fields[0] =
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("_file", DataType::Utf8, false),
+                        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                    )
+                    .unwrap();
+            }
+            2 => identity_fields.swap(0, 1),
+            3 | 4 => {
+                let data_type = if case == 3 {
+                    DataType::Int32
+                } else {
+                    DataType::Int64
+                };
+                let nullable = case == 4;
+                identity_fields[1] =
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("pos", data_type.clone(), nullable),
+                        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+                    )
+                    .unwrap();
+            }
+            5 => request.flavor = ConnectorWriteSessionFlavor::Ordinary,
+            6 => {
+                request.input = novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                    fields: Vec::new(),
+                }
+            }
+            7..=10 => {
+                let content = plan
+                    .frozen()
+                    .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+                    .unwrap();
+                let mut content = content.as_ref().clone();
+                let mut owner = lake.control.binding_key().clone();
+                match case {
+                    7 => content.artifact.table_uuid = "replaced".into(),
+                    8 => content.artifact.target_ref = "another".into(),
+                    9 => content.artifact.base_snapshot_id = None,
+                    10 => owner.instance_id = ConnectorInstanceId::parse("foreign").unwrap(),
+                    _ => unreachable!(),
+                }
+                request.flavor = ConnectorWriteSessionFlavor::DistributedRewrite {
+                    shape: plan.shape(),
+                    frozen: ConnectorProcessLocalPayload::new(owner, Arc::new(content)),
+                };
+            }
+            _ => unreachable!(),
+        }
+        let error = lake.control.begin_write(request).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if matches!(case, 8 | 10) {
+                ConnectorErrorKind::Internal
+            } else {
+                ConnectorErrorKind::InvalidRequest
+            },
+            "case {case}: {error}"
+        );
+        assert_eq!(
+            lake.inventory(),
+            before,
+            "rejected begin {case} wrote an artifact"
+        );
+        assert_eq!(
+            lake.table().metadata().current_snapshot_id(),
+            source_snapshot
+        );
+    }
+    let writer = lake.control.begin_write(lake.request(&plan)).unwrap();
+    assert_eq!(writer.targets().len(), plan.cohorts().len());
+    for target in writer.targets() {
+        assert_eq!(
+            lake.adapter
+                .writer_handle(target.handle())
+                .unwrap()
+                .branch(),
+            IcebergWriteBranch::DeletionVector
+        );
+        let ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } = target.input()
+        else {
+            panic!("position-delete writer lost its artifact input")
+        };
+        assert!(partition_source_fields.is_empty());
+        assert_eq!(identity_fields.len(), 2);
+        for (binding, (name, data_type)) in identity_fields
+            .iter()
+            .zip([("file_path", DataType::Utf8), ("pos", DataType::Int64)])
+        {
+            assert_eq!(binding.field(), &Field::new(name, data_type.clone(), false));
+            assert_eq!(
+                binding.execution_type().unwrap(),
+                &novarocks_type_contract::FunctionValueType::new(data_type, false)
+            );
+        }
+    }
+    assert_eq!(
+        lake.inventory(),
+        before,
+        "C1 begin must not write artifacts"
+    );
+    let aborted = lake
+        .control
+        .abort_write(
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest {
+                commit: writer.commit_handle(),
+                context: request_context(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        aborted,
+        ConnectorWriteAbortOutcome::KnownUncommitted { .. }
+    ));
+    drop(writer);
+    assert_eq!(lake.inventory(), before);
+    assert_eq!(
+        lake.table().metadata().current_snapshot_id(),
+        source_snapshot
+    );
     let descriptor = descriptor("rewrite-local");
     let catalog = CatalogHandle::new(
         descriptor.instance_id.clone(),
@@ -4570,5 +4772,543 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
     assert!(
         weak.upgrade().is_none(),
         "read and split scopes must release content after their actual exit"
+    );
+}
+
+fn project_prepared_managed_rows(
+    technique: ConnectorManagedPublicationTechnique,
+    shape: ConnectorManagedPublicationShape,
+    merge_targets: Vec<IcebergOldDeleteMergeTarget>,
+    entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
+) -> Result<Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>, ConnectorError>
+{
+    let mut material =
+        session_material(if shape == ConnectorManagedPublicationShape::RowMutation {
+            merge_on_read_input_shape()
+        } else {
+            data_input_shape()
+        });
+    material.merge_targets = merge_targets;
+    let (handle, targets) = flavor_session(plan_document_publication_branches(
+        &material,
+        document_publication_facts_with_shape(
+            technique,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            shape,
+        ),
+    )?);
+    let handle = handle.with_frozen_delete_merge_targets(
+        targets
+            .iter()
+            .filter(|target| target.branch().writes_deletes())
+            .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
+            .collect(),
+    )?;
+    let expected = handle.expected_targets();
+    let adapter = adapter("unit", 1);
+    let commit = adapter.wrap_commit_handle(handle);
+    // Accepted input rows are deliberately unrelated to the artifact counts.
+    let prepared = ConnectorPreparedWriteSet::try_new(
+        u64::MAX,
+        entries
+            .into_iter()
+            .map(|(ordinal, fragment)| (ordinal, adapter.wrap_commit_fragment(fragment)))
+            .collect(),
+        &expected,
+    )?;
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        ProviderBindingEpoch::new(),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        runtime,
+    );
+    let result = control.prepared_logical_row_change(&commit, &prepared, &request_context());
+    assert!(matches!(
+        adapter.commit_handle(&commit)?.state()?,
+        IcebergWriteSessionState::Active
+    ));
+    result
+}
+
+fn logical_data_fragment(path: &str, rows: u64) -> IcebergCommitFragment {
+    IcebergCommitFragment::data_file(
+        IcebergDataFileArtifact::try_new(
+            path.into(),
+            IcebergFileFormat::Parquet,
+            sample_partition(),
+            sample_metrics(rows, 4096),
+            None,
+        )
+        .unwrap(),
+    )
+}
+
+fn logical_dv_fragment(
+    path: &str,
+    data: &str,
+    cardinality: u64,
+    offset: i64,
+    merged: Vec<EntryIdentity>,
+) -> IcebergCommitFragment {
+    IcebergCommitFragment::deletion_vector(
+        crate::commit::write_stack::domain::IcebergDeletionVectorArtifact::try_new(
+            path.into(),
+            sample_partition(),
+            sample_metrics(cardinality, 4096),
+            data.into(),
+            crate::commit::write_stack::domain::IcebergContentRange::try_new(offset, 64).unwrap(),
+            cardinality,
+            merged,
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn managed_prepared_logical_rows_distinguish_replacement_append_and_empty_delta() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteRowChange::{Delta, Replace};
+    for (technique, expected) in [
+        (ConnectorManagedPublicationTechnique::Full, Replace(12)),
+        (
+            ConnectorManagedPublicationTechnique::Incremental,
+            Delta {
+                inserted: 12,
+                deleted: 0,
+            },
+        ),
+    ] {
+        assert_eq!(
+            project_prepared_managed_rows(
+                technique,
+                ConnectorManagedPublicationShape::Data,
+                vec![],
+                vec![
+                    (ordinal(0), logical_data_fragment("s3://b/new-a.parquet", 5)),
+                    (ordinal(0), logical_data_fragment("s3://b/new-b.parquet", 7)),
+                ]
+            )
+            .unwrap(),
+            Some(expected)
+        );
+    }
+    for (technique, shape, expected) in [
+        (
+            ConnectorManagedPublicationTechnique::Full,
+            ConnectorManagedPublicationShape::Data,
+            Replace(0),
+        ),
+        (
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            Delta {
+                inserted: 0,
+                deleted: 0,
+            },
+        ),
+        (
+            ConnectorManagedPublicationTechnique::MetadataOnly,
+            ConnectorManagedPublicationShape::Data,
+            Delta {
+                inserted: 0,
+                deleted: 0,
+            },
+        ),
+    ] {
+        assert_eq!(
+            project_prepared_managed_rows(technique, shape, vec![], vec![]).unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn managed_prepared_logical_rows_count_only_touched_dv_net_changes() {
+    use super::test_support::puffin_ref;
+    use novarocks_spi::connector::write_stack::ConnectorWriteRowChange::Delta;
+    let a = "s3://b/wh/db/t/data/a.parquet";
+    let b = "s3://b/wh/db/t/data/b.parquet";
+    let old_a = puffin_ref("s3://b/old.puffin", Some(a), 4096, 2, 4, 64).unwrap();
+    // This untouched file's deletes must neither be subtracted nor cause None.
+    let untouched = puffin_ref("s3://b/old.puffin", Some(b), 4096, 0, 100, 64).unwrap();
+    for (new_count, expected_deleted) in [(2, 0), (5, 3)] {
+        assert_eq!(
+            project_prepared_managed_rows(
+                ConnectorManagedPublicationTechnique::Incremental,
+                ConnectorManagedPublicationShape::RowMutation,
+                vec![
+                    merge_target(a, 100, vec![old_a.clone()]),
+                    merge_target(b, 100, vec![untouched.clone()])
+                ],
+                vec![
+                    (
+                        ordinal(0),
+                        logical_data_fragment("s3://b/new-data.parquet", 5)
+                    ),
+                    (
+                        ordinal(1),
+                        logical_dv_fragment(
+                            "s3://b/new.puffin",
+                            a,
+                            new_count,
+                            4,
+                            vec![old_a.entry_identity()]
+                        )
+                    ),
+                ],
+            )
+            .unwrap(),
+            Some(Delta {
+                inserted: 5,
+                deleted: expected_deleted
+            })
+        );
+    }
+    assert_eq!(
+        project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![merge_target(a, 100, vec![])],
+            vec![(
+                ordinal(1),
+                logical_dv_fragment("s3://b/first.puffin", a, 5, 4, vec![])
+            )],
+        )
+        .unwrap(),
+        Some(Delta {
+            inserted: 0,
+            deleted: 5
+        })
+    );
+    let old_b = puffin_ref("s3://b/old.puffin", Some(b), 4096, 4, 100, 64).unwrap();
+    assert_eq!(
+        project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![
+                merge_target(a, 100, vec![old_a.clone()]),
+                merge_target(b, 100, vec![old_b.clone()])
+            ],
+            vec![
+                (
+                    ordinal(1),
+                    logical_dv_fragment(
+                        "s3://b/new-shared.puffin",
+                        a,
+                        5,
+                        4,
+                        vec![old_a.entry_identity()]
+                    )
+                ),
+                (
+                    ordinal(1),
+                    logical_dv_fragment(
+                        "s3://b/new-shared.puffin",
+                        b,
+                        6,
+                        100,
+                        vec![old_b.entry_identity()]
+                    )
+                ),
+            ],
+        )
+        .unwrap(),
+        Some(Delta {
+            inserted: 0,
+            deleted: 5
+        })
+    );
+}
+
+#[test]
+fn managed_prepared_logical_rows_leave_unprovable_old_cardinality_unknown() {
+    use super::test_support::puffin_ref;
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    for references in [
+        vec![puffin_ref("s3://b/old.puffin", Some(data), 4096, 0, 4, 64).unwrap()],
+        vec![parquet_ref("s3://b/old.parquet", Some(data), 4096, 2).unwrap()],
+        vec![parquet_ref("s3://b/shared.parquet", None, 4096, 20).unwrap()],
+    ] {
+        let merged = references
+            .iter()
+            .map(|reference| reference.entry_identity())
+            .collect();
+        assert_eq!(
+            project_prepared_managed_rows(
+                ConnectorManagedPublicationTechnique::Incremental,
+                ConnectorManagedPublicationShape::RowMutation,
+                vec![merge_target(data, 100, references)],
+                vec![(
+                    ordinal(1),
+                    logical_dv_fragment("s3://b/new.puffin", data, 5, 4, merged)
+                )],
+            )
+            .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn managed_prepared_logical_rows_reject_duplicate_and_mismatched_delete_proofs() {
+    use super::test_support::puffin_ref;
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    let old = puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64).unwrap();
+    let project = |entries| {
+        project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![merge_target(data, 100, vec![old.clone()])],
+            entries,
+        )
+    };
+    let missing = project(vec![(
+        ordinal(1),
+        logical_dv_fragment("s3://b/new.puffin", data, 5, 4, vec![]),
+    )])
+    .unwrap_err();
+    assert!(missing.message().contains("merged 0 old references"));
+    let duplicate = project(vec![
+        (
+            ordinal(1),
+            logical_dv_fragment("s3://b/new.puffin", data, 5, 4, vec![old.entry_identity()]),
+        ),
+        (
+            ordinal(1),
+            logical_dv_fragment(
+                "s3://b/another.puffin",
+                data,
+                5,
+                4,
+                vec![old.entry_identity()],
+            ),
+        ),
+    ])
+    .unwrap_err();
+    assert!(
+        duplicate
+            .message()
+            .contains("more than one delete artifact")
+    );
+    let foreign = project(vec![(
+        ordinal(1),
+        logical_dv_fragment("s3://b/new.puffin", "s3://b/foreign.parquet", 5, 4, vec![]),
+    )])
+    .unwrap_err();
+    assert!(foreign.message().contains("never routed"));
+}
+
+#[test]
+fn managed_prepared_logical_rows_reject_impossible_cardinality_and_checked_overflow() {
+    use super::test_support::puffin_ref;
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    for (old_count, new_count, rows, expected) in [
+        (5, 3, 100, "lost frozen deleted rows"),
+        (2, 6, 5, "exceeds its frozen data-file row count"),
+        (
+            6,
+            5,
+            5,
+            "frozen deletion vector exceeds its data-file row count",
+        ),
+    ] {
+        let old = puffin_ref("s3://b/old.puffin", Some(data), 4096, old_count, 4, 64).unwrap();
+        let error = project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![merge_target(data, rows, vec![old.clone()])],
+            vec![(
+                ordinal(1),
+                logical_dv_fragment(
+                    "s3://b/new.puffin",
+                    data,
+                    new_count,
+                    4,
+                    vec![old.entry_identity()],
+                ),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.message().contains(expected), "{error}");
+    }
+    let old_refs = vec![
+        puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64).unwrap(),
+        puffin_ref("s3://b/old.puffin", Some(data), 4096, 3, 100, 64).unwrap(),
+    ];
+    let merged = old_refs
+        .iter()
+        .map(|reference| reference.entry_identity())
+        .collect();
+    let duplicate_old = project_prepared_managed_rows(
+        ConnectorManagedPublicationTechnique::Incremental,
+        ConnectorManagedPublicationShape::RowMutation,
+        vec![merge_target(data, 100, old_refs)],
+        vec![(
+            ordinal(1),
+            logical_dv_fragment("s3://b/new.puffin", data, 5, 4, merged),
+        )],
+    )
+    .unwrap_err();
+    assert!(
+        duplicate_old
+            .message()
+            .contains("more than one deletion vector")
+    );
+    let error = project_prepared_managed_rows(
+        ConnectorManagedPublicationTechnique::Full,
+        ConnectorManagedPublicationShape::Data,
+        vec![],
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|name| {
+                (
+                    ordinal(0),
+                    logical_data_fragment(&format!("s3://b/{name}.parquet"), i64::MAX as u64),
+                )
+            })
+            .collect(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("logical insertion count overflowed")
+    );
+}
+
+#[test]
+fn prepared_logical_rows_require_exact_adapter_and_live_context_and_exclude_ordinary_dml() {
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        ProviderBindingEpoch::new(),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        runtime,
+    );
+    let (ordinary, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .unwrap(),
+    );
+    let adapter = adapter("unit", 1);
+    let commit = adapter.wrap_commit_handle(ordinary);
+    let empty = ConnectorPreparedWriteSet::try_new(99, vec![], &[ordinal(0)]).unwrap();
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&commit, &empty, &request_context())
+            .unwrap(),
+        None
+    );
+    let (other, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .unwrap(),
+    );
+    let foreign_adapter = self::adapter("unit", 2);
+    let foreign = foreign_adapter.wrap_commit_handle(other);
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&foreign, &empty, &request_context())
+            .unwrap_err()
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    let foreign_fragment = ConnectorPreparedWriteSet::try_new(
+        1,
+        vec![(
+            ordinal(0),
+            foreign_adapter.wrap_commit_fragment(data_fragment("s3://b/foreign.parquet")),
+        )],
+        &[ordinal(0)],
+    )
+    .unwrap();
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&commit, &foreign_fragment, &request_context())
+            .unwrap_err()
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let cancelled = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        stop.view(),
+        65536,
+        1048576,
+    )
+    .unwrap();
+    stop.request_stop();
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&commit, &empty, &cancelled)
+            .unwrap_err()
+            .kind(),
+        ConnectorErrorKind::Cancelled
+    );
+}
+
+#[test]
+fn logical_row_merge_facts_must_match_the_one_sealed_reference_owner() {
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    let mut material = session_material(merge_on_read_input_shape());
+    material.merge_targets = vec![merge_target(
+        data,
+        100,
+        vec![
+            super::test_support::puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64)
+                .unwrap(),
+        ],
+    )];
+    let make = || {
+        flavor_session(
+            plan_document_publication_branches(
+                &material,
+                document_publication_facts_with_shape(
+                    ConnectorManagedPublicationTechnique::Incremental,
+                    ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+                    ConnectorManagedPublicationShape::RowMutation,
+                ),
+            )
+            .unwrap(),
+        )
+    };
+    let (handle, _) = make();
+    let mismatched = BTreeMap::from([(
+        ordinal(1),
+        BTreeMap::from([(data.to_owned(), merge_target(data, 100, vec![]))]),
+    )]);
+    assert!(
+        handle
+            .with_frozen_delete_merge_targets(mismatched)
+            .unwrap_err()
+            .message()
+            .contains("sealed old-delete identities")
+    );
+    let (handle, targets) = make();
+    let facts = targets
+        .iter()
+        .filter(|target| target.branch().writes_deletes())
+        .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
+        .collect::<BTreeMap<_, _>>();
+    let handle = handle
+        .with_frozen_delete_merge_targets(facts.clone())
+        .unwrap();
+    assert!(
+        handle
+            .with_frozen_delete_merge_targets(facts)
+            .unwrap_err()
+            .message()
+            .contains("one managed publication owner")
     );
 }

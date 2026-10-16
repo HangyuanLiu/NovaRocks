@@ -48,7 +48,6 @@ use novarocks_catalog_application::{CatalogAttachmentRepository, CatalogAttachme
 use novarocks_mv_application::dependency::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks_mv_application::repository::MvRepository;
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
 use novarocks_mv_application::state_store_repository::key::{

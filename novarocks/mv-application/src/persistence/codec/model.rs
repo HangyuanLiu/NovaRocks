@@ -24,7 +24,7 @@
 use crate::persistence::identity::{
     AggregateIdentity, ApplyKeyIdentity, BranchIdentity, ComputationIdentity, DocumentRevision,
     FieldIdentity, NativeDataVersion, ObjectIdentity, OutputIdentity, PartitionSpecVersion,
-    PublicationIdentity, SchemaVersion, StateSlotIdentity,
+    SchemaVersion, StateSlotIdentity,
 };
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
@@ -359,30 +359,10 @@ impl PhysicalFieldLogicalIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublicationDocument {
-    /// Time the publication facts were frozen, not provider commit completion.
-    pub publication_prepared_at_ms: u64,
-    pub publication_id: PublicationIdentity,
-    pub definition_revision: DocumentRevision,
-    pub interpretation_revision: DocumentRevision,
-    /// Ordered by relation occurrence, retaining repeated physical objects.
-    pub inputs: Vec<PublicationInput>,
-    pub output: PublicationOutput,
-    pub kind: PublicationKind,
-    pub statistics: PublicationStatistics,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationInput {
     pub relation_occurrence_id: u32,
     pub object_id: ObjectIdentity,
     pub native_data_version: NativeDataVersion,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublicationOutput {
-    pub object_id: ObjectIdentity,
-    pub empty_result: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

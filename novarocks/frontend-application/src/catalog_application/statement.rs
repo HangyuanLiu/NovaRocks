@@ -706,6 +706,7 @@ pub(crate) fn execute_drop_table_statement(
     match crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         context.connector_control(),
         context.mv_storage_observation(),
+        context.mv_readiness(),
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::DropTable,
     ) {

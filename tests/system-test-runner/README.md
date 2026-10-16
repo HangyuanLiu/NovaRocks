@@ -226,6 +226,27 @@ range/planning输入准备与校验见保留的 [range fixture](../benchmarks/ue
 
 MV 旧场景及独立 oracle 保留，禁止扩展旧屏障/CALL/directive。7B3 唯一承接非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交和管理接续；7B4 承接 spine SUM/COUNT、聚合状态、聚合冷恢复与后续刷新；7B5 承接 V/S 身份、发现/CREATE/DROP、REST 路由和实际 materialized S/fallback；7B11 同格式切换承接 `mv_recovery.rs` / `mv_uea7_storage.rs` 的 document graph 与 shared-document-revisions。替代保护实际通过后逐项退出，最后消费者退出再删共享载体；G2 不新建启动期缓存缺失或通用擦除接口。
 
+### MV documents (explicit)
+
+The explicit MV document stages are `mv/document-expiry-channel`,
+`mv/document-consistent-read`, and `mv/document-keyed-writes`. They require private
+REST/S3/Spark fixtures and native 1FE+3BE. The expiry and consistent-read stages
+also require the matching test-controls FE artifact, with finite target/token
+authorizations created by the scenario. They are excluded from `--list-default`.
+Choose the original deadline before launch; the consistent-read stage performs
+300 source commits plus 300 ordinary refreshes and can use `--timeout-secs 1800`.
+
+These stages independently parse the frozen inline wire protocol; they do not
+call product document codecs. Every external mutation retains before/request/
+HTTP-status/response/after files in a new `document-evidence` subdirectory. Spark
+retains its exact SQL, command locators, stdout/stderr and process exit. The
+private recording REST proxy retains method/path/query only, forwards request
+and response bodies unchanged, and distinguishes ordinary `snapshots=refs`
+loads from the Full expiry load. Scenario evidence records inline property and
+snapshot-record byte counts and historical interpretation diagnostics. A unit
+or registry pass does not replace running these native stages on the integrated
+candidate.
+
 ### Catalog publication (explicit)
 
 The `catalog-publication/*` scenarios require the local publication Java image

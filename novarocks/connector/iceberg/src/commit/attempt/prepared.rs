@@ -32,6 +32,22 @@ use std::sync::Arc;
 #[async_trait]
 pub(crate) trait PublicationPreparer: Send + Sync + 'static {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase>;
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
+        if mode != crate::catalog::SnapshotLoading::All {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Publication preparer has no refs-scoped metadata load",
+            ));
+        }
+        self.load_target(attempt).await
+    }
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        None
+    }
     fn preflight_recovery(
         &self,
         request: &FrozenRequest,
@@ -73,14 +89,23 @@ impl CatalogPublisher {
 #[async_trait]
 impl PublicationPreparer for CatalogPublisher {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        self.load_target_with_snapshots(attempt, crate::catalog::SnapshotLoading::All)
+            .await
+    }
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
         attempt.check_active()?;
         self.admit()
             .map_err(|failure| Error::new(ErrorKind::FeatureUnsupported, failure.0.message()))?;
         let loaded = self
             .catalog
-            .load_commit_base(
+            .load_commit_base_with_snapshots(
                 crate::catalog::CatalogTableName::from_identifier(&self.ident),
                 attempt.file_io().clone(),
+                mode,
             )
             .await;
         attempt.check_active()?;
@@ -138,6 +163,47 @@ impl PublicationPreparer for CatalogPublisher {
                 generation,
                 preparation,
             )
+            .await
+    }
+}
+
+/// Expiry freezes the full observation used to select snapshots and documents.
+/// Its dispatch still belongs to the ordinary prepared publication and journal.
+pub(crate) struct PinnedExpiryPreparer {
+    pub inner: Arc<dyn PublicationPreparer>,
+    pub base: StagingBase,
+}
+
+#[async_trait]
+impl PublicationPreparer for PinnedExpiryPreparer {
+    async fn load_target(&self, _attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Pinned expiry cannot reload its base",
+        ))
+    }
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        Some(self.base.clone())
+    }
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()> {
+        self.inner.preflight_recovery(request, operation)
+    }
+    fn evidence_policy(&self) -> CatalogEvidencePolicy {
+        self.inner.evidence_policy()
+    }
+    async fn prepare_dispatch(
+        self: Arc<Self>,
+        request: FrozenRequest,
+        descriptor: PublicationDescriptor,
+        generation: ProviderBindingEpoch,
+        preparation: ConnectorRequestContext,
+    ) -> PreparationResult<PreparedPublication> {
+        Arc::clone(&self.inner)
+            .prepare_dispatch(request, descriptor, generation, preparation)
             .await
     }
 }

@@ -348,6 +348,7 @@ pub struct MvTargetReadAdmission {
     pub full: QueryScanMaterialization,
     pub affected_partitions: QueryScanMaterialization,
     pub target_table_uuid: String,
+    pub target_object_id: novarocks_spi::connector::ConnectorTableObjectId,
     pub frozen_snapshot_id: Option<i64>,
 }
 

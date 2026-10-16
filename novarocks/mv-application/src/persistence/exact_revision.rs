@@ -152,7 +152,7 @@ fn encode_connector_fact(
     )
 }
 
-fn encode_fact_parts(
+pub(crate) fn encode_fact_parts(
     provider: &str,
     format_name: &str,
     version: u16,
@@ -184,14 +184,14 @@ fn encode_fact_parts(
     Ok(encoded)
 }
 
-struct DecodedFact {
-    provider: String,
-    format: String,
-    version: u16,
-    value: Vec<u8>,
+pub(crate) struct DecodedFact {
+    pub(crate) provider: String,
+    pub(crate) format: String,
+    pub(crate) version: u16,
+    pub(crate) value: Vec<u8>,
 }
 
-fn decode_fact(encoded: &[u8]) -> Result<DecodedFact, ConnectorError> {
+pub(crate) fn decode_fact(encoded: &[u8]) -> Result<DecodedFact, ConnectorError> {
     if !encoded.starts_with(FACT_ENVELOPE_MAGIC) {
         return corrupt("persisted exact revision fact has an unknown envelope");
     }

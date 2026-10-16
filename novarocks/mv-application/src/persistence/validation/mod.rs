@@ -24,15 +24,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::persistence::codec::{
     ApplyKeyKind, ConfigurationDocument, DefinitionDocument, ExpressionKind,
     INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY, InterpretationDocument,
-    PhysicalFieldLogicalIdentity, PublicationDocument, RefreshPolicy, StateRole,
-    TargetPartitionTransform, internal_retraction_count_aggregate_identity,
+    PhysicalFieldLogicalIdentity, RefreshPolicy, StateRole, TargetPartitionTransform,
+    internal_retraction_count_aggregate_identity,
 };
 use crate::persistence::identity::{
     ComputationIdentity, DocumentRevision, FieldIdentity, ObjectIdentity,
 };
 
-pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
-pub const DEFAULT_MAX_DOCUMENT_SET_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_DOCUMENT_SET_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_DECODE_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_DOCUMENT_ITEMS: usize = 4096;
 pub const DEFAULT_MAX_STRUCTURE_DEPTH: usize = 64;
@@ -666,32 +666,6 @@ fn validate_retraction_count_owner(
     Ok(())
 }
 
-pub fn validate_publication(document: &PublicationDocument) -> Result<(), ValidationError> {
-    validate_timestamp(
-        document.publication_prepared_at_ms,
-        "publication.publication_prepared_at_ms",
-    )?;
-    if document.inputs.is_empty() {
-        return Err(ValidationError::new(
-            "publication.inputs",
-            "at least one actual input occurrence is required",
-        ));
-    }
-    let mut occurrences = BTreeSet::new();
-    for input in &document.inputs {
-        if !occurrences.insert(input.relation_occurrence_id) {
-            return Err(ValidationError::new(
-                "publication.inputs",
-                format!(
-                    "duplicate input occurrence {}",
-                    input.relation_occurrence_id
-                ),
-            ));
-        }
-    }
-    enforce_item_budget("publication", document.inputs.len())
-}
-
 pub fn validate_configuration(document: &ConfigurationDocument) -> Result<(), ValidationError> {
     match document.refresh_policy {
         RefreshPolicy::AsyncInterval
@@ -785,87 +759,6 @@ pub fn validate_definition_interpretation(
                 ));
             }
         }
-    }
-    Ok(())
-}
-
-/// Validates the immutable reference graph without reading Current catalog
-/// state. Live-object rebinding is a separate caller-owned pure projection.
-pub fn validate_document_set(
-    definition: &DefinitionDocument,
-    definition_revision: DocumentRevision,
-    interpretation: &InterpretationDocument,
-    interpretation_revision: DocumentRevision,
-    publication: &PublicationDocument,
-) -> Result<(), ValidationError> {
-    validate_definition_interpretation(definition, definition_revision, interpretation)?;
-    validate_publication(publication)?;
-    if publication.definition_revision != definition_revision {
-        return Err(ValidationError::new(
-            "publication.definition_revision",
-            "does not reference the supplied definition document",
-        ));
-    }
-    if publication.interpretation_revision != interpretation_revision {
-        return Err(ValidationError::new(
-            "publication.interpretation_revision",
-            "does not reference the supplied interpretation document",
-        ));
-    }
-
-    let definition_occurrences = definition
-        .relation_occurrences
-        .iter()
-        .map(|value| (value.occurrence_id, value))
-        .collect::<BTreeMap<_, _>>();
-    let published_occurrences = publication
-        .inputs
-        .iter()
-        .map(|value| value.relation_occurrence_id)
-        .collect::<BTreeSet<_>>();
-    let expected_occurrences = definition_occurrences
-        .keys()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if published_occurrences != expected_occurrences {
-        return Err(ValidationError::new(
-            "publication.inputs",
-            "must contain every and only actual definition occurrence",
-        ));
-    }
-    if publication
-        .inputs
-        .iter()
-        .map(|value| value.relation_occurrence_id)
-        .ne(definition
-            .relation_occurrences
-            .iter()
-            .map(|value| value.occurrence_id))
-    {
-        return Err(ValidationError::new(
-            "publication.inputs",
-            "must preserve definition occurrence order",
-        ));
-    }
-    for input in &publication.inputs {
-        let Some(relation) = definition_occurrences.get(&input.relation_occurrence_id) else {
-            return Err(ValidationError::new(
-                "publication.inputs",
-                "publication references an unknown relation occurrence",
-            ));
-        };
-        if input.object_id != relation.object_id {
-            return Err(ValidationError::new(
-                "publication.inputs.object_id",
-                "same-name object replacement is not the bound source object",
-            ));
-        }
-    }
-    if publication.output.object_id != interpretation.target.object_id {
-        return Err(ValidationError::new(
-            "publication.output.object_id",
-            "does not match the interpretation target object",
-        ));
     }
     Ok(())
 }

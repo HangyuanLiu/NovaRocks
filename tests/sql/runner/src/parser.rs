@@ -2002,6 +2002,16 @@ mod opt5_directive_tests {
     }
 
     #[test]
+    fn parse_meta_collects_keyed_document_graph_expectations() {
+        let lines=vec!["-- @mv_rest_document_graph=ns.mv,publications=2,slot-changes=4,logical-rows=1,total-records=2,delete-files-min=1".to_string()];
+        let meta = parse_meta(&lines, &meta_re()).unwrap();
+        let directive = meta.mv_rest_document_graph.as_deref().unwrap();
+        let graph = crate::mv_rest_document_graph::parse_expectation(directive).unwrap();
+        assert_eq!(graph.publications, 2);
+        assert_eq!(graph.slot_changes, 4);
+    }
+
+    #[test]
     fn parse_meta_collects_mv_resume_management() {
         let re = meta_re();
         let lines = vec![

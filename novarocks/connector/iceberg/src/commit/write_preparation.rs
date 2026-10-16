@@ -85,12 +85,15 @@ pub(crate) fn prepare_write(
             format!("decode admitted Iceberg write metadata: {error}"),
         )
     })?;
+    let managed = match crate::document_storage::keyed::view::management_marker(&metadata) {
+        Ok(marker) => marker.is_some(),
+        Err(error) => {
+            return Ok(ConnectorWritePreparationOutcome::Denied(
+                crate::document_storage::observation::keyed_read_error(error),
+            ));
+        }
+    };
     if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml) {
-        let managed = match crate::document_storage::observation::managed_marker(&metadata) {
-            Ok(_) => true,
-            Err(error) if error.kind() == ConnectorErrorKind::NotFound => false,
-            Err(error) => return Ok(ConnectorWritePreparationOutcome::Denied(error)),
-        };
         if managed
             || metadata
                 .properties()
@@ -370,6 +373,63 @@ fn bind_write_input(
                 )?,
             }
         }
+    })
+}
+
+/// Re-author the canonical artifact relation only after begin_write validated
+/// the retained position-delete rewrite's target, UUID, base and operation.
+/// Ordinary row identities keep the strict scan-metadata declaration path.
+pub(crate) fn freeze_position_delete_rewrite_input(
+    metadata: &TableMetadata,
+    input: &ConnectorWriteInputRequest,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorWriteInputRequest, ConnectorError> {
+    let ConnectorWriteInputRequest::DeletionVector {
+        identity_fields,
+        partition_source_fields,
+    } = input
+    else {
+        return Err(invalid_write_activation(
+            "position-delete rewrite requires a deletion-vector artifact input",
+        ));
+    };
+    crate::metadata::with_pure_schema_creation(context, |creation| {
+        let declaration = crate::distributed_rewrite::delete_artifact_execution_schema(creation)
+            .map_err(crate::metadata::metadata_creation_error)?;
+        let fields = declaration.schema().fields();
+        if identity_fields.len() != fields.len()
+            || identity_fields
+                .iter()
+                .zip(fields)
+                .any(|(source, expected)| source.field().name() != expected.name())
+        {
+            return Err(invalid_write_activation(
+                "position-delete rewrite identity differs from its canonical artifact schema",
+            ));
+        }
+        let mut authored = creation
+            .reserve(fields.len())
+            .map_err(crate::metadata::metadata_creation_error)?;
+        for (ordinal, field) in fields.iter().enumerate() {
+            creation
+                .work(1)
+                .map_err(crate::metadata::metadata_creation_error)?;
+            authored.push(ConnectorWriteFieldRequest::try_new_typed(
+                field.as_ref().clone(),
+                declaration
+                    .binding(ordinal)
+                    .expect("provider artifact schema covers every identity field")
+                    .clone(),
+            )?);
+        }
+        Ok(ConnectorWriteInputRequest::DeletionVector {
+            identity_fields: authored,
+            partition_source_fields: exact_partition_source_write_fields(
+                metadata,
+                partition_source_fields,
+                creation,
+            )?,
+        })
     })
 }
 
@@ -1682,22 +1742,34 @@ mod tests {
     }
 
     #[test]
-    fn application_managed_marker_denies_ordinary_dml_but_allows_refresh() {
+    fn keyed_management_slot_denies_ordinary_dml_but_allows_refresh() {
         let owner = owner();
-        let metadata = metadata_with_properties(HashMap::from([
-            (
-                crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
-                "mv".to_string(),
-            ),
-            (
-                crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
-                "deployment".to_string(),
-            ),
-            (
-                crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
-                "writer".to_string(),
-            ),
-        ]));
+        let slot =
+            novarocks_spi::connector::ConnectorSlotName::try_new("novarocks.storage", "management")
+                .unwrap();
+        let mut content = Vec::new();
+        for value in ["materialized-view", "deployment", "writer"] {
+            content.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            content.extend_from_slice(value.as_bytes());
+        }
+        let documents = novarocks_spi::connector::KeyedCreate {
+            slots: std::collections::BTreeMap::from([(
+                slot,
+                novarocks_spi::connector::ConnectorSlotValue {
+                    format: novarocks_spi::connector::ConnectorDocumentFormat::try_new(
+                        "novarocks.mv",
+                        "management",
+                        1,
+                    )
+                    .unwrap(),
+                    content: bytes::Bytes::from(content),
+                },
+            )]),
+            ..Default::default()
+        };
+        let metadata = metadata_with_properties(
+            crate::document_storage::keyed::write::create_properties(&documents).unwrap(),
+        );
         let payload = table_payload(Some(table_info(&metadata)));
 
         let denied = expect_denied(
@@ -1727,10 +1799,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_application_managed_marker_fails_closed() {
+    fn legacy_managed_marker_refuses_all_writes() {
         let owner = owner();
         let metadata = metadata_with_properties(HashMap::from([(
-            crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+            "novarocks.managed.owner".to_string(),
             "deployment".to_string(),
         )]));
         let payload = table_payload(Some(table_info(&metadata)));
@@ -1746,7 +1818,20 @@ mod tests {
             )
             .expect("partial managed marker outcome"),
         );
-        assert_eq!(denied.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
+        assert!(denied.message().contains("only DROP TABLE is supported"));
+        let denied = expect_denied(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+                ),
+                &owner,
+            )
+            .unwrap(),
+        );
+        assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
     }
 
     #[test]

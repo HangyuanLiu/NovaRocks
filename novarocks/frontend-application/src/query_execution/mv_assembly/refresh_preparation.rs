@@ -75,7 +75,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_mv_application::product::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
@@ -214,7 +214,7 @@ pub(crate) fn freeze_statement_refresh_rewrite_context(
 /// A branch UNION's representative layout is its first branch.
 pub(crate) fn frozen_refresh_aggregate_analysis(
     source: &IcebergMvCorePorts,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     query: &novarocks_parser::ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<
@@ -764,7 +764,7 @@ fn retained_target_field_id_by_name(
 /// Reparse D's immutable effective SQL under its own frozen resolution context.
 /// The session that happens to issue the statement never resolves these names.
 fn canonical_mv_select_query(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
 ) -> Result<novarocks_parser::ast::Query, String> {
     let effective_sql = projection.facts.definition().query.effective_sql.clone();
     canonical_mv_select_query_from_source(projection, &effective_sql)
@@ -773,7 +773,7 @@ fn canonical_mv_select_query(
 /// Same canonical resolution, applied to the SQL an occurrence-aware rebind
 /// produced for this attempt. The rebind never changes name resolution.
 fn canonical_mv_select_query_from_source(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     effective_sql: &str,
 ) -> Result<novarocks_parser::ast::Query, String> {
     let resolution = &projection.facts.definition().query.resolution;
@@ -1181,7 +1181,7 @@ fn frontend_refresh_publication_intent(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     admitted: &crate::mv::domain::staged_create::AdmittedMvPublication,
     select_sql: &str,
     base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
@@ -1219,7 +1219,7 @@ fn frontend_refresh_publication_intent(
 fn pin_contract_bases(
     source: &IcebergMvCorePorts,
     contract: &RefreshPlanContract,
-    projection: &novarocks_mv_application::persistence::projection::StoredMvProjection,
+    projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     what: &str,

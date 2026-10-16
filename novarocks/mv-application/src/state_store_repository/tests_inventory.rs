@@ -16,12 +16,10 @@
 // under the License.
 
 use super::StateStoreMvRepository;
-use super::tests_definition::{projection_request, repository, target};
+use super::keyed::LoadedKeyedMvProjection;
+use super::tests_definition::{projection_facts, repository, target};
 use crate::persistence::validation::PersistenceDecodeBudget;
-use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionInventoryBound, MvRepository,
-    MvRepositoryErrorKind, ReplaceMvProjectionRequest,
-};
+use crate::repository::{MvProjectionInventoryBound, MvRepositoryErrorKind};
 use novarocks_state_store_api::{
     AttemptSupervisor, Key, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
     StateStoreError, StateStoreLimits, StoreIdentity, WriteAttempt, WriteTransaction,
@@ -214,11 +212,12 @@ async fn recorded_repository() -> (Arc<RecordingStore>, Arc<StateStoreMvReposito
     (store, repository)
 }
 
-async fn seed(repository: &StateStoreMvRepository, name: &str) -> LoadedMvProjection {
+async fn seed(repository: &StateStoreMvRepository, name: &str) -> LoadedKeyedMvProjection {
     repository
-        .create_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            projection_request(name, name.as_bytes(), 1, "base"),
+            projection_facts(name, name.as_bytes(), 1, "base"),
+            None,
         )
         .await
         .expect("seed canonical projection")
@@ -232,12 +231,15 @@ async fn inventory_reads_one_snapshot_in_single_record_pages_and_returns_thin_id
     store.reset();
     let mut exact = bound();
     exact.entries = 2;
-    let inventory = repository.list_projection_inventory(exact).await.unwrap();
+    let inventory = repository
+        .list_keyed_projection_inventory(exact)
+        .await
+        .unwrap();
     store.assert_scan_closed(2);
     assert_eq!(inventory.len(), 2);
     for (entry, loaded) in inventory.iter().zip([&first, &second]) {
         assert_eq!(entry.mv_id, loaded.projection.mv_id);
-        assert_eq!(&entry.target, loaded.projection.facts.target());
+        assert_eq!(entry.target, loaded.projection.facts.target());
         assert_eq!(
             &entry.object_id,
             &loaded.projection.facts.source_revision().target_object_id
@@ -246,7 +248,7 @@ async fn inventory_reads_one_snapshot_in_single_record_pages_and_returns_thin_id
     // Snapshot locators do not serve as a cached projection/version read.
     assert_eq!(
         repository
-            .find_by_target_bounded(&target("first"), exact)
+            .find_keyed_by_target_bounded(&target("first"), exact)
             .await
             .unwrap(),
         Some(first),
@@ -263,7 +265,7 @@ async fn inventory_entry_refusal_closes_the_snapshot_without_reading_the_third_p
     let mut tiny = bound();
     tiny.entries = 1;
     let error = repository
-        .list_projection_inventory(tiny)
+        .list_keyed_projection_inventory(tiny)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
@@ -280,7 +282,7 @@ async fn inventory_snapshot_byte_refusal_closes_before_reading_the_next_page() {
     let mut tiny = bound();
     tiny.snapshot_bytes = 1;
     let error = repository
-        .list_projection_inventory(tiny)
+        .list_keyed_projection_inventory(tiny)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
@@ -296,7 +298,7 @@ async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_inser
     store.reset();
     let (reached, resume) = store.pause_next_page();
     let scanner = Arc::clone(&repository);
-    let task = tokio::spawn(async move { scanner.list_projection_inventory(bound()).await });
+    let task = tokio::spawn(async move { scanner.list_keyed_projection_inventory(bound()).await });
     tokio::time::timeout(Duration::from_secs(5), reached)
         .await
         .expect("first snapshot page must be reached")
@@ -309,14 +311,13 @@ async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_inser
             .expect("concurrent mutation repository");
     seed(&mutator, "inserted").await;
     mutator
-        .delete_projection(
-            Uuid::now_v7(),
-            DeleteMvProjectionRequest {
-                mv_id: removed.projection.mv_id,
-                expected_version: removed.version.clone(),
-                expected_source_revision: removed.projection.facts.source_revision().clone(),
-            },
-        )
+        .delete_keyed_projection(Uuid::now_v7(), {
+            let mut expected = removed.clone();
+            expected.version = (removed.version.clone()).clone();
+            expected.projection.facts.source =
+                (removed.projection.facts.source_revision().clone()).clone();
+            expected
+        })
         .await
         .expect("delete after snapshot was fixed");
     resume.send(()).expect("release snapshot");
@@ -336,14 +337,14 @@ async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_inser
     assert_eq!(inventory[1].target, target("removed"));
     assert!(
         repository
-            .find_by_target_bounded(&target("removed"), bound())
+            .find_keyed_by_target_bounded(&target("removed"), bound())
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         repository
-            .find_by_target_bounded(&target("inserted"), bound())
+            .find_keyed_by_target_bounded(&target("inserted"), bound())
             .await
             .unwrap()
             .is_some()
@@ -370,7 +371,7 @@ async fn inventory_raw_and_decode_refusals_abort_without_following_the_continuat
         (
             document,
             MvRepositoryErrorKind::Corruption,
-            "encoded document",
+            "keyed MV cache document exceeds decode bound",
         ),
         (
             workspace,
@@ -380,7 +381,7 @@ async fn inventory_raw_and_decode_refusals_abort_without_following_the_continuat
     ] {
         store.reset();
         let error = repository
-            .list_projection_inventory(tiny)
+            .list_keyed_projection_inventory(tiny)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), kind);
@@ -393,28 +394,32 @@ async fn inventory_raw_and_decode_refusals_abort_without_following_the_continuat
 async fn bounded_target_lookup_returns_the_current_exact_version_after_replacement() {
     let (_, repository) = recorded_repository().await;
     let created = seed(&repository, "first").await;
-    let inventory = repository.list_projection_inventory(bound()).await.unwrap();
+    let inventory = repository
+        .list_keyed_projection_inventory(bound())
+        .await
+        .unwrap();
     let replacement = repository
-        .replace_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            ReplaceMvProjectionRequest {
-                mv_id: created.projection.mv_id,
-                expected_version: created.version.clone(),
-                projection: projection_request("first", b"first", 2, "changed-base"),
-            },
+            projection_facts("first", b"first", 2, "changed-base"),
+            Some({
+                let mut expected = created.clone();
+                expected.version = (created.version.clone()).clone();
+                expected
+            }),
         )
         .await
         .expect("replace the scanned target");
     assert_ne!(created.version, replacement.version);
     let fresh = repository
-        .find_by_target_bounded(&inventory[0].target, bound())
+        .find_keyed_by_target_bounded(&inventory[0].target, bound())
         .await
         .unwrap()
         .expect("fresh target");
     assert_eq!(fresh, replacement);
     assert_eq!(
         repository
-            .find_by_target(&inventory[0].target)
+            .find_keyed_by_target(&inventory[0].target, PersistenceDecodeBudget::default())
             .await
             .unwrap(),
         Some(fresh),
@@ -442,30 +447,28 @@ async fn bounded_dependencies_preserve_the_exact_classification_and_sort_oracle(
     use crate::dependency::MvDependencyObjectType;
     let (store, repository) = recorded_repository().await;
     repository
-        .create_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            projection_request("renamed_base", b"base-orders", 1, "other"),
+            projection_facts("renamed_base", b"base-orders", 1, "other"),
+            None,
         )
         .await
         .unwrap();
     let downstream = repository
-        .create_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            projection_request("downstream", b"downstream", 2, "orders"),
+            projection_facts("downstream", b"downstream", 2, "orders"),
+            None,
         )
         .await
         .unwrap();
     let oracle = repository
-        .list_dependencies_by_downstream(downstream.projection.mv_id)
+        .list_keyed_dependencies_by_downstream(&downstream)
         .await
         .unwrap();
     store.reset();
     let rows = repository
-        .list_dependencies_by_downstream_bounded(
-            downstream.projection.mv_id,
-            &downstream.version,
-            dependency_bound(),
-        )
+        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
         .await
         .unwrap();
     assert_eq!(rows, oracle);
@@ -551,11 +554,7 @@ async fn bounded_dependencies_refuse_before_retaining_or_following_an_over_budge
     ] {
         store.reset();
         let error = repository
-            .list_dependencies_by_downstream_bounded(
-                downstream.projection.mv_id,
-                &downstream.version,
-                tiny,
-            )
+            .list_keyed_dependencies_by_downstream_bounded(&downstream, tiny)
             .await
             .unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
@@ -572,11 +571,7 @@ async fn bounded_dependencies_refuse_an_incomplete_classification_inventory() {
     tiny.inventory.entries = 1;
     store.reset();
     let error = repository
-        .list_dependencies_by_downstream_bounded(
-            downstream.projection.mv_id,
-            &downstream.version,
-            tiny,
-        )
+        .list_keyed_dependencies_by_downstream_bounded(&downstream, tiny)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
@@ -588,34 +583,27 @@ async fn bounded_dependencies_require_the_fresh_exact_downstream_version() {
     let (store, repository) = recorded_repository().await;
     let downstream = seed(&repository, "downstream").await;
     let replaced = repository
-        .replace_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            ReplaceMvProjectionRequest {
-                mv_id: downstream.projection.mv_id,
-                expected_version: downstream.version.clone(),
-                projection: projection_request("downstream", b"downstream", 2, "changed"),
-            },
+            projection_facts("downstream", b"downstream", 2, "changed"),
+            Some({
+                let mut expected = downstream.clone();
+                expected.version = (downstream.version.clone()).clone();
+                expected
+            }),
         )
         .await
         .unwrap();
     store.reset();
     let error = repository
-        .list_dependencies_by_downstream_bounded(
-            downstream.projection.mv_id,
-            &downstream.version,
-            dependency_bound(),
-        )
+        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert_dependency_scan_closed(&store, 0);
     assert_eq!(
         repository
-            .list_dependencies_by_downstream_bounded(
-                replaced.projection.mv_id,
-                &replaced.version,
-                dependency_bound()
-            )
+            .list_keyed_dependencies_by_downstream_bounded(&replaced, dependency_bound())
             .await
             .unwrap()[0]
             .upstream
@@ -629,16 +617,18 @@ async fn bounded_dependency_index_and_classification_share_the_first_read_snapsh
     use crate::dependency::MvDependencyObjectType;
     let (store, repository) = recorded_repository().await;
     let upstream = repository
-        .create_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            projection_request("orders", b"base-orders", 1, "other"),
+            projection_facts("orders", b"base-orders", 1, "other"),
+            None,
         )
         .await
         .unwrap();
     let downstream = repository
-        .create_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            projection_request("downstream", b"downstream", 2, "orders"),
+            projection_facts("downstream", b"downstream", 2, "orders"),
+            None,
         )
         .await
         .unwrap();
@@ -648,23 +638,21 @@ async fn bounded_dependency_index_and_classification_share_the_first_read_snapsh
     store.reset();
     let (observed, resume) = store.pause_next_page();
     let reader = repository.clone();
-    let version = downstream.version.clone();
-    let mv_id = downstream.projection.mv_id;
+    let captured = downstream.clone();
     let running = tokio::spawn(async move {
         reader
-            .list_dependencies_by_downstream_bounded(mv_id, &version, dependency_bound())
+            .list_keyed_dependencies_by_downstream_bounded(&captured, dependency_bound())
             .await
     });
     observed.await.unwrap();
     mutator
-        .delete_projection(
-            Uuid::now_v7(),
-            DeleteMvProjectionRequest {
-                mv_id: upstream.projection.mv_id,
-                expected_version: upstream.version,
-                expected_source_revision: upstream.projection.facts.source_revision().clone(),
-            },
-        )
+        .delete_keyed_projection(Uuid::now_v7(), {
+            let mut expected = upstream.clone();
+            expected.version = (upstream.version).clone();
+            expected.projection.facts.source =
+                (upstream.projection.facts.source_revision().clone()).clone();
+            expected
+        })
         .await
         .unwrap();
     resume.send(()).unwrap();
@@ -675,7 +663,7 @@ async fn bounded_dependency_index_and_classification_share_the_first_read_snapsh
     );
     assert_dependency_scan_closed(&store, 4);
     let rows = repository
-        .list_dependencies_by_downstream_bounded(mv_id, &downstream.version, dependency_bound())
+        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
         .await
         .unwrap();
     assert!(
@@ -689,10 +677,11 @@ async fn bounded_dependencies_reject_a_missing_canonical_occurrence_before_class
     use novarocks_state_store_api::{CommitOutcome, Precondition};
     let (store, repository) = recorded_repository().await;
     let downstream = seed(&repository, "downstream").await;
-    let canonical = crate::persistence::dependency::projection_dependencies(
-        downstream.projection.mv_id,
-        &downstream.projection.facts,
-    );
+    // Read the real current index before removing one canonical occurrence.
+    let canonical = repository
+        .list_keyed_dependencies_by_downstream(&downstream)
+        .await
+        .unwrap();
     let row = &canonical[0];
     let key = super::key::dependency_by_downstream_key(
         row.downstream_mv_id,
@@ -713,11 +702,7 @@ async fn bounded_dependencies_reject_a_missing_canonical_occurrence_before_class
     assert!(matches!(write.commit().await, CommitOutcome::Committed(_)));
     store.reset();
     let error = repository
-        .list_dependencies_by_downstream_bounded(
-            downstream.projection.mv_id,
-            &downstream.version,
-            dependency_bound(),
-        )
+        .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::Corruption);
@@ -737,11 +722,7 @@ async fn bounded_dependency_range_or_close_failures_never_publish_partial_facts(
         store.reset();
         *store.fault.lock().unwrap() = Some(fault);
         let error = repository
-            .list_dependencies_by_downstream_bounded(
-                downstream.projection.mv_id,
-                &downstream.version,
-                dependency_bound(),
-            )
+            .list_keyed_dependencies_by_downstream_bounded(&downstream, dependency_bound())
             .await
             .unwrap_err();
         assert!(error.to_string().contains(message), "{error}");

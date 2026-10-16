@@ -75,7 +75,13 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             target_planning_lease.clone(),
             connector_context,
         )?;
-    validate_target_snapshot(&target, &rewrite.mv_definition, &target_binding)?;
+    validate_target_snapshot(
+        &target,
+        &rewrite.mv_definition,
+        &target_binding,
+        ports.management_entrance()?.as_ref(),
+        connector_context,
+    )?;
     if target_binding.table_uuid() != rewrite.target_table_uuid {
         return Err(
             "EXPLAIN REFRESH target UUID differs from its rewrite context"

@@ -310,16 +310,6 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             .load_table_for_request(&target.namespace, &target.table, &request.context)
             .map_err(unavailable)?;
         let table = physical.table;
-        if let Some(retention) = request.operation().document_retention()
-            && (retention.target().namespace.as_ref() != target.namespace
-                || retention.target().table.as_ref() != target.table
-                || retention.expected_object_id().as_bytes().as_ref()
-                    != table.metadata().uuid().to_string().as_bytes())
-        {
-            return Err(invalid(
-                "Iceberg cleanup document retention does not match the exact table object",
-            ));
-        }
         let older_than_ms = request.operation().older_than_ms();
         // A ref retirement is a separate GC phase. Once a Catalog ref is
         // removed, the live set used by object discovery is stale by
@@ -349,10 +339,6 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                     .planning_binding()
                     .for_request(request.context.clone());
                 let scan_binding = binding.clone();
-                let document_roots = request
-                    .operation()
-                    .document_retention()
-                    .map(|retention| retention.graph().roots().to_vec());
                 let scanned = self
                     .runtime
                     .resources()
@@ -362,7 +348,6 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                             &table_for_scan,
                             older_than_ms,
                             &scan_binding,
-                            document_roots.as_deref(),
                             MAX_RECORDS,
                         )
                         .await
@@ -1387,12 +1372,12 @@ mod tests {
         let root = std::path::PathBuf::from(location.path());
         let old_orphan = root.join("data/partition=1/old-orphan.parquet");
         let changed_orphan = root.join("data/partition=1/changed-orphan.parquet");
-        let old_sidecar = root.join("metadata/novarocks-documents/v1/unlinked.bin");
-        let retained_sidecar = root.join("metadata/novarocks-documents/v1/retained.bin");
+        let old_metadata_orphan = root.join("metadata/scratch/unlinked.bin");
+        let retained_live_data = root.join("data/partition=1/retained.parquet");
         let young_orphan = root.join("data/partition=1/young-orphan.parquet");
         fs::create_dir_all(old_orphan.parent().expect("data parent")).expect("create data path");
-        fs::create_dir_all(old_sidecar.parent().expect("sidecar parent"))
-            .expect("create sidecar path");
+        fs::create_dir_all(old_metadata_orphan.parent().expect("metadata parent"))
+            .expect("create metadata path");
         fs::write(&young_orphan, b"young orphan").expect("write young orphan");
         let old_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1403,8 +1388,8 @@ mod tests {
         for orphan in [
             &old_orphan,
             &changed_orphan,
-            &old_sidecar,
-            &retained_sidecar,
+            &old_metadata_orphan,
+            &retained_live_data,
         ] {
             fs::write(orphan, b"old orphan").expect("write old orphan");
             File::options()
@@ -1414,85 +1399,6 @@ mod tests {
                 .set_times(FileTimes::new().set_modified(old_time))
                 .expect("age old orphan");
         }
-        let retained_content = b"old orphan";
-        let retained_manifest = crate::document_storage::envelope::IcebergDocumentManifestV1 {
-            version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
-            documents: vec![crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
-                version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
-                owner: "novarocks.mv".to_string(),
-                name: "definition".to_string(),
-                format_owner: "novarocks.mv".to_string(),
-                format_name: "definition".to_string(),
-                format_version: 1,
-                revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
-                    retained_content,
-                )
-                .to_bytes(),
-                encoded_len: retained_content.len() as u64,
-                references: Vec::new(),
-                attachment:
-                    crate::document_storage::envelope::IcebergDocumentAttachmentV1::TableMetadata,
-                carrier: crate::document_storage::envelope::IcebergDocumentCarrierV1::Deferred {
-                    location: format!(
-                        "{}/metadata/novarocks-documents/v1/retained.bin",
-                        table.metadata().location().trim_end_matches('/')
-                    ),
-                },
-            }],
-        };
-        let encoded_manifest =
-            crate::document_storage::codec::encode_document_manifest(&retained_manifest)
-                .expect("encode retained document manifest");
-        let preparation = context();
-        let operation = crate::commit::model::OperationToken::from_mutation(
-            novarocks_spi::connector::ConnectorMutationOperationId::new(),
-        );
-        let request = crate::commit::staging::freeze_existing_change(
-            table.identifier().clone(),
-            "main",
-            table.metadata(),
-            table.metadata_location().unwrap(),
-            crate::commit::model::RequestShape::MetadataOnly,
-            crate::commit::model::AttemptToken::new(operation, 0),
-            crate::commit::staging::PreparedChange {
-                requirements: Vec::new(),
-                updates: vec![TableUpdate::SetProperties {
-                    updates: HashMap::from([(
-                        crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-                        String::from_utf8(encoded_manifest.to_vec()).expect("UTF-8 manifest"),
-                    )]),
-                }],
-            },
-            &preparation,
-        )
-        .unwrap();
-        let outcome = executor.block_on(crate::catalog::admission_test_support::publish_frozen(
-            Arc::clone(runtime.novarocks_catalog()),
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
-                instance_id: ConnectorInstanceId::parse("cleanup-test").unwrap(),
-            },
-            ProviderBindingEpoch::from_bytes([4; 16]),
-            request,
-            crate::catalog::admission::CatalogOperation::AlterProperties,
-            preparation,
-            None,
-        ));
-        assert!(
-            matches!(
-                outcome,
-                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
-            ),
-            "{outcome:?}"
-        );
-        let cutoff = SystemTime::now() - Duration::from_secs(60 * 60);
-        let older_than_ms = i64::try_from(
-            cutoff
-                .duration_since(UNIX_EPOCH)
-                .expect("cutoff follows epoch")
-                .as_millis(),
-        )
-        .expect("cutoff fits i64");
         let instance_id = ConnectorInstanceId::parse("cleanup-test").expect("instance");
         let key = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
@@ -1506,6 +1412,50 @@ mod tests {
             key.incarnation,
             Arc::clone(&runtime),
         );
+        // Keep one mature physical data file live through an actual current
+        // snapshot. Inline application documents have no sidecar to protect.
+        executor
+            .block_on(crate::commit::run::append_snapshot_for_test(
+                metadata.clone(),
+                table.clone(),
+                vec![crate::commit::WrittenFile {
+                    path: format!(
+                        "{}/data/partition=1/retained.parquet",
+                        table.metadata().location().trim_end_matches('/')
+                    ),
+                    format: crate::iceberg::spec::DataFileFormat::Parquet,
+                    content: crate::iceberg::spec::DataContentType::Data,
+                    partition_values: crate::iceberg::spec::Struct::empty(),
+                    partition_spec_id: table.metadata().default_partition_spec_id(),
+                    record_count: 3,
+                    file_size_in_bytes: 10,
+                    split_offsets: Vec::new(),
+                    column_sizes: HashMap::new(),
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    nan_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
+                    key_metadata: None,
+                    referenced_data_file: None,
+                    equality_ids: None,
+                    first_row_id: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                    cardinality: None,
+                }],
+                "main".into(),
+                std::collections::BTreeMap::new(),
+            ))
+            .expect("publish actual live data manifest");
+        let cutoff = SystemTime::now() - Duration::from_secs(60 * 60);
+        let older_than_ms = i64::try_from(
+            cutoff
+                .duration_since(UNIX_EPOCH)
+                .expect("cutoff follows epoch")
+                .as_millis(),
+        )
+        .expect("cutoff fits i64");
         let loaded = metadata
             .load_table(
                 ConnectorTableRequest {
@@ -1542,10 +1492,13 @@ mod tests {
             .expect("plan exact cleanup");
         assert_eq!(plan.summary().candidate_count(), 3);
         assert!(old_orphan.exists(), "planning must not delete an object");
-        assert!(old_sidecar.exists(), "planning must not delete a sidecar");
         assert!(
-            retained_sidecar.exists(),
-            "planning must retain an attached sidecar"
+            old_metadata_orphan.exists(),
+            "planning must not delete a metadata orphan"
+        );
+        assert!(
+            retained_live_data.exists(),
+            "planning must retain live data"
         );
         let page = adapter
             .read_candidate_page(
@@ -1598,13 +1551,13 @@ mod tests {
         );
         assert!(!old_orphan.exists(), "mature orphan must be deleted");
         assert!(
-            !old_sidecar.exists(),
-            "unlinked mature sidecar must be deleted"
+            !old_metadata_orphan.exists(),
+            "unlinked mature metadata object must be deleted"
         );
         assert!(young_orphan.exists(), "young orphan must be retained");
         assert!(
-            retained_sidecar.exists(),
-            "attached mature sidecar must be retained"
+            retained_live_data.exists(),
+            "mature data referenced by the current snapshot must be retained"
         );
         assert!(
             changed_orphan.exists(),

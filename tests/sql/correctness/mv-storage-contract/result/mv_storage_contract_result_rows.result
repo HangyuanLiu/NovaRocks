@@ -1,0 +1,17 @@
+-- query 9
+k	v
+west	20
+
+-- query 13
+k	v
+north	30
+west	20
+
+-- query 16
+k	v
+north	30
+west	20
+
+-- query 20
+row_count
+0

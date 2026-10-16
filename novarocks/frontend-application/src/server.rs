@@ -35,7 +35,7 @@ use crate::capabilities as core_capabilities;
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
-use novarocks_mv_application::service::MvProductService;
+use novarocks_mv_application::service::MvKeyedProductService;
 use novarocks_mysql_adapter::{MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings};
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::cancellation::QueryCancellationReason;
@@ -186,7 +186,7 @@ struct FrontendRoleProducts {
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
     /// The role graph owns the sole MV process product.
-    mv_product_service: Arc<MvProductService>,
+    mv_product_service: Arc<MvKeyedProductService>,
     mv_service: Arc<crate::mv::FrontendMvProductAdapter>,
     maintenance_ports: core_capabilities::MaintenanceCommandPorts,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -398,18 +398,23 @@ async fn build_frontend_role_products(
             .expect("UUIDv7 process incarnation is a valid management identity"),
         ),
     );
-    let mv_product_service = Arc::new(MvProductService::new_with_management_continuation(
-        host.mv_scheduler_config(),
-        mv_repository,
-        Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
-        mv_management_entrance,
-        host.mv_remote_effect_policy(),
-    ));
+    let mv_product_service = Arc::new(
+        MvKeyedProductService::new_with_keyed_management_continuation(
+            host.mv_scheduler_config(),
+            mv_repository,
+            Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
+            mv_management_entrance,
+            host.mv_remote_effect_policy(),
+        ),
+    );
     let mv_readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
         mv_product_service
-            .readiness_service()
+            .keyed_readiness_service()
             .expect("serving MV product must own readiness state"),
         tokio::runtime::Handle::current(),
+        mv_product_service
+            .management_entrance()
+            .expect("serving MV product owns management entrance"),
     );
     #[cfg(feature = "test-controls")]
     let mv_readiness = match &host.test_session {
@@ -492,6 +497,7 @@ async fn build_frontend_role_products(
         Arc::clone(&connector_control),
         Arc::clone(&typed_connector_control),
         Arc::clone(&mv_storage_observation),
+        Arc::clone(&mv_readiness),
         query_execution.clone(),
         Arc::clone(&maintenance_service),
         Handle::current(),
@@ -660,6 +666,7 @@ fn build_frontend_query_session_factory_from_role_products(
         core_capabilities::IcebergRefCommandPorts::new(
             Arc::clone(&connector_control),
             Arc::clone(&mv_storage_observation),
+            Arc::clone(&mv_readiness),
         ),
     );
     let mv_command_executor =
@@ -706,6 +713,7 @@ fn build_frontend_query_session_factory_from_role_products(
         typed_connector_control,
         unified_statistics,
         mv_storage_observation,
+        Arc::clone(&mv_readiness),
         query_execution.clone(),
         Handle::current(),
         host.lake_publication_runtime_policy(),
@@ -1903,7 +1911,10 @@ mod tests {
             products.mv_service.product_service(),
         ));
         assert!(
-            products.mv_product_service.readiness_service().is_some(),
+            products
+                .mv_product_service
+                .keyed_readiness_service()
+                .is_some(),
             "serving role product must retain the readiness state injected into its adapters"
         );
 

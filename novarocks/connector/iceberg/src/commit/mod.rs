@@ -50,6 +50,7 @@ mod row_mutation_preparation;
 #[cfg(test)]
 pub(crate) mod run;
 mod selected_rewrite;
+pub(crate) mod slot_change;
 pub mod snapshot_lifecycle_helpers;
 pub(crate) mod staging;
 pub mod statistics;
@@ -67,8 +68,8 @@ pub mod write_stack;
 
 pub(crate) use equality_delete_writer::write_equality_delete_file;
 pub use mv_provenance::{
-    MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP,
-    MvPublicationProvenanceV2, ProvenanceBase, RefreshTechnique, waterline_hash_for,
+    MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MvPublicationProvenanceV2,
+    ProvenanceBase, RefreshTechnique,
 };
 pub use mv_refresh_ref::{
     MV_PUBLICATION_ID_PROP, MV_PUBLICATION_STAGING_REF_PREFIX, MvPublicationSnapshotMarker,

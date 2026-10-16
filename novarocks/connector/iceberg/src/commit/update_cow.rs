@@ -228,7 +228,7 @@ impl crate::commit::staging::Preparer for CowUpdatePreparer {
             .collect::<Vec<_>>();
         let mut summary =
             super::overwrite::snapshot_file_summary(&intent.changes().added, &removed_entries)?;
-        super::overwrite::set_visible_rows_after_removal(view, &removed_entries, &mut summary)?;
+        super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
         let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
         let mut manifests = super::overwrite::write_live_entry_groups(
             view,

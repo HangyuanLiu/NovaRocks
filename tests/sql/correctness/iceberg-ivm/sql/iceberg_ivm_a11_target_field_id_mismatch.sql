@@ -99,10 +99,10 @@ printf 'SPARK_SQL_OK\n'
 INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (4, 'US', 400);
 
 -- query 8
--- Refresh must fail because the target's metadata generation changed.
--- This also catches the dropped visible column without depending on a
--- field-specific diagnostic after an external table rewrite.
--- @expect_error=MV runtime target metadata is not from the exact document generation
+-- DROP COLUMN changes the target schema version while canonical L is unchanged.
+-- Renewing the Current metadata read generation must not rebind L's schema.
+-- Reject that exact schema-version mismatch before physical field binding.
+-- @expect_error=MV runtime target schema version is not from the exact document generation
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 9

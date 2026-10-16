@@ -575,6 +575,23 @@ pub trait ConnectorReadMetadata: Send + Sync {
         reference: Option<&str>,
     ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError>;
 
+    /// Freeze the complete MV target at its admitted object and snapshot.
+    /// A missing snapshot is not permission to select another version. `None`
+    /// requires the target to remain empty. This is separate from historical
+    /// table reads so providers can use their current-ref observation scope.
+    fn get_mv_target_handle(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _object_id: &crate::connector::ConnectorTableObjectId,
+        _snapshot_id: Option<i64>,
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support frozen MV target reads",
+        ))
+    }
+
     /// Adopt a provider-frozen source without reopening or widening it.
     /// The installed provider must validate its source owner and observation.
     fn adopt_frozen_source(

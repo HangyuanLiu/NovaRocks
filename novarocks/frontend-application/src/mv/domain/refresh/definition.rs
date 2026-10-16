@@ -21,14 +21,14 @@ use sha2::{Digest, Sha256};
 
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 /// Loads the persisted definition for one normalized Iceberg MV target.
 pub fn load_iceberg_mv_definition_by_target(
     readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
-) -> Result<StoredMvProjection, String> {
+) -> Result<StoredKeyedMvProjection, String> {
     #[cfg(test)]
     record_definition_load();
     readiness

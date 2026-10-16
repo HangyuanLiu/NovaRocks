@@ -305,6 +305,23 @@ impl IcebergMetadataContext {
             .map_err(|(_, message)| message)
     }
 
+    /// Load a selected snapshot scope without reusing complete metadata for
+    /// refs-only observations, or caching refs-only responses as full loads.
+    pub(crate) fn load_table_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, String> {
+        if snapshots == crate::catalog::SnapshotLoading::All {
+            return self.load_table(namespace, table);
+        }
+        let namespace = normalize_identifier(namespace)?;
+        let table = normalize_identifier(table)?;
+        self.observe_table_classified_with_snapshots(&namespace, &table, None, None, snapshots)
+            .map_err(|(_, message)| message)
+    }
+
     /// Load one table for an admitted request. A vended response is immediately
     /// rebound to this request's storage resolver and is never cached.
     pub(crate) fn load_table_for_request(
@@ -322,16 +339,26 @@ impl IcebergMetadataContext {
         .map_err(|(_, message)| message)
     }
 
-    /// Observe a mutation admission frontier without reusing planning caches.
-    /// Keep the original deadline, stop view and credential collector for this attempt.
-    pub(crate) fn observe_table_for_request(
+    /// Load an explicit REST snapshot scope without allowing a partial
+    /// observation into the complete-metadata caches.
+    pub(crate) fn load_table_for_request_with_snapshots(
         &self,
         namespace: &str,
         table: &str,
         request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
     ) -> Result<IcebergPhysicalTable, String> {
-        self.observe_table_classified_for_request(namespace, table, request_context)
-            .map_err(|(_, message)| message)
+        match snapshots {
+            crate::catalog::SnapshotLoading::All => {
+                self.load_table_for_request(namespace, table, request_context)
+            }
+            crate::catalog::SnapshotLoading::Refs => self.observe_table_for_request_with_snapshots(
+                namespace,
+                table,
+                request_context,
+                snapshots,
+            ),
+        }
     }
 
     /// Probe the UUID, wait in the logical catalog's domain, then establish a
@@ -349,9 +376,32 @@ impl IcebergMetadataContext {
         ),
         novarocks_spi::connector::ConnectorError,
     > {
+        self.coordinate_table_for_request_with_snapshots(
+            namespace,
+            table,
+            request,
+            crate::catalog::SnapshotLoading::All,
+        )
+    }
+
+    pub(crate) fn coordinate_table_for_request_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<
+        (
+            crate::catalog::table_coordination::IcebergTableCoordinationGuard,
+            IcebergPhysicalTable,
+        ),
+        novarocks_spi::connector::ConnectorError,
+    > {
         use novarocks_spi::connector::ConnectorError;
         let observed = self
-            .observe_table_classified_for_request(namespace, table, request)
+            .observe_table_classified_for_request_with_snapshots(
+                namespace, table, request, snapshots,
+            )
             .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
         let uuid = observed.table.metadata().uuid();
         let coordination = Arc::clone(self.table_coordination());
@@ -368,7 +418,9 @@ impl IcebergMetadataContext {
             })
             .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unavailable, message))??;
         let fresh = self
-            .observe_table_classified_for_request(namespace, table, request)
+            .observe_table_classified_for_request_with_snapshots(
+                namespace, table, request, snapshots,
+            )
             .map_err(|(kind, message)| {
                 if kind == ConnectorErrorKind::NotFound {
                     ConnectorError::table_object_binding(
@@ -388,24 +440,72 @@ impl IcebergMetadataContext {
         Ok((guard, fresh))
     }
 
+    /// Observe a mutation admission frontier without reusing planning caches.
+    /// Keep the original deadline, stop view and credential collector for this attempt.
+    pub(crate) fn observe_table_for_request(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, String> {
+        self.observe_table_for_request_with_snapshots(
+            namespace,
+            table,
+            request_context,
+            crate::catalog::SnapshotLoading::All,
+        )
+    }
+
+    pub(crate) fn observe_table_for_request_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, String> {
+        self.observe_table_classified_for_request_with_snapshots(
+            namespace,
+            table,
+            request_context,
+            snapshots,
+        )
+        .map_err(|(_, message)| message)
+    }
+
     pub(crate) fn observe_table_classified_for_request(
         &self,
         namespace: &str,
         table: &str,
         request_context: &ConnectorRequestContext,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
-        ConnectorOperationControl::check_active(request_context)
-            .map_err(|error| (error.kind(), error.to_string()))?;
+        self.observe_table_classified_for_request_with_snapshots(
+            namespace,
+            table,
+            request_context,
+            crate::catalog::SnapshotLoading::All,
+        )
+    }
+
+    pub(crate) fn observe_table_classified_for_request_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        let control_error =
+            |error: novarocks_spi::connector::ConnectorError| (error.kind(), error.to_string());
+        ConnectorOperationControl::check_active(request_context).map_err(control_error)?;
         let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
         let table = normalize_identifier(table).map_err(invalid_request)?;
-        let loaded = self.observe_table_classified(
+        let loaded = self.observe_table_classified_with_snapshots(
             &namespace,
             &table,
             request_context.vended_credential_lease_collection(),
             Some(request_context),
+            snapshots,
         )?;
-        ConnectorOperationControl::check_active(request_context)
-            .map_err(|error| (error.kind(), error.to_string()))?;
+        ConnectorOperationControl::check_active(request_context).map_err(control_error)?;
         let renewal = loaded.attempt_access_if_vended();
         let binding = self
             .resources
@@ -416,7 +516,7 @@ impl IcebergMetadataContext {
             binding,
             self.resources.catalog_runtime().iceberg_runtime().clone(),
         )
-        .map_err(|error| (error.kind(), error.to_string()))?;
+        .map_err(control_error)?;
         if let Some(renewal) = renewal {
             scoped = scoped.with_attempt_access(renewal);
         }
@@ -774,6 +874,23 @@ impl IcebergMetadataContext {
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.observe_table_classified_with_snapshots(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+            crate::catalog::SnapshotLoading::All,
+        )
+    }
+
+    fn observe_table_classified_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
         let ident = TableIdent::from_strs([namespace, table])
             .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
         let owner = Arc::clone(self.novarocks_catalog());
@@ -789,8 +906,12 @@ impl IcebergMetadataContext {
             .catalog_runtime()
             .block_on(async move {
                 match read_binding {
-                    Some(binding) => owner.load_table_for_read(target, binding).await,
-                    None => owner.load_table(target).await,
+                    Some(binding) => {
+                        owner
+                            .load_table_for_read_with_snapshots(target, binding, snapshots)
+                            .await
+                    }
+                    None => owner.load_table_with_snapshots(target, snapshots).await,
                 }
             })
             .map_err(unavailable)?
@@ -854,7 +975,7 @@ impl IcebergMetadataContext {
         // FileIO. Only its resource-free facts may enter the request cache;
         // the complete table may enter the generation cache only without a
         // request binding.
-        if request_context.is_none() {
+        if request_context.is_none() && snapshots == crate::catalog::SnapshotLoading::All {
             self.control_state
                 .physical_table_cache()
                 .insert(&namespace, &table, physical.clone())

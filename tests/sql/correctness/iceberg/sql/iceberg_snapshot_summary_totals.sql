@@ -62,12 +62,13 @@ FROM (
 DELETE FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} WHERE id = 1;
 
 -- query 7
--- Delete snapshot carries the decremented total-records + engine-name.
-SELECT total_records_is_2, has_engine_name
+-- A v3 DELETE adds a DV and preserves the three physical data-file records.
+-- The two visible rows are distinct from the snapshot summary total-records.
+SELECT total_records_is_3, has_engine_name
 FROM (
   SELECT
     committed_at,
-    summary['total-records'] = '2'          AS total_records_is_2,
+    summary['total-records'] = '3'          AS total_records_is_3,
     summary['engine-name'] IS NOT NULL      AS has_engine_name
   FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
   ORDER BY committed_at DESC

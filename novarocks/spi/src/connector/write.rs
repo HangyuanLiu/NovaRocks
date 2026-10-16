@@ -35,23 +35,17 @@ use super::{
     CatalogProperties, ConnectorCommittedVersion, ConnectorControlRuntimeId, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorMutationFailure,
     ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
-    ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationFamily,
-    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
-    MvExactPartitionField, MvExactPartitionTransform,
+    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
+    ExternalMutationFinalization, LakePublicationFamily, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, MvExactPartitionField, MvExactPartitionTransform,
 };
 
 pub const MAX_CONNECTOR_WRITE_RECEIPT_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES;
 pub const MAX_CONNECTOR_WRITE_COHORTS: usize = 4096;
-pub const MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES: usize = 64 * 1024;
-pub const MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTIES: usize = 64;
-pub const MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTY_BYTES: usize = 64 * 1024;
-pub const MAX_CONNECTOR_MANAGED_DESCRIPTOR_TOTAL_BYTES: usize = 256 * 1024;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS: usize = 4096;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES: usize = 4096;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES: usize = 16_384;
-pub const MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS: usize = 4096;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
 const CONNECTOR_WRITE_COHORT_SET_DOMAIN: &[u8] = b"novarocks.connector-write-cohort-set.v1\0";
@@ -59,22 +53,6 @@ const CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-observation.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement-id.v1\0";
-
-/// Provider-owned base-table provenance for a managed publication.
-///
-/// The distributed writer carries these value facts as part of its immutable
-/// publication intent. Only the provider that owns the on-lake provenance may
-/// render the opaque object identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorStagedPublicationBaseFact {
-    /// Which mention of `table` this is, as the definition recorded it. Two
-    /// mentions of one table are two inputs read at their own points.
-    pub occurrence_id: u32,
-    pub table: Arc<str>,
-    pub object_id: ConnectorTableObjectId,
-    pub from_version: Option<i64>,
-    pub to_version: i64,
-}
 
 /// Resolved per-fragment bounds for evidence returned by a distributed write.
 ///
@@ -892,7 +870,7 @@ impl ConnectorManagedPartitionSpecReplacement {
         &self.fields
     }
 
-    fn validate_for_operation(
+    pub(crate) fn validate_for_operation(
         &self,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<(), ConnectorError> {
@@ -1309,304 +1287,10 @@ fn managed_partition_transform_from_wire(
     Ok(transform)
 }
 
-/// Opaque, canonical application descriptor properties carried in the same
-/// managed publication as the data and partition changes. SPI validates only
-/// the carrier framing; property meaning remains frontend-owned.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorManagedDescriptorProperties {
-    entries: Vec<(Arc<str>, Arc<str>)>,
-    digest: [u8; 32],
-}
-
-impl ConnectorManagedDescriptorProperties {
-    pub fn try_new(entries: Vec<(Arc<str>, Arc<str>)>) -> Result<Self, ConnectorError> {
-        if entries.is_empty() || entries.len() > MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTIES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "managed descriptor properties must be non-empty and within the item bound",
-            ));
-        }
-        let mut total = 0usize;
-        let mut previous: Option<&str> = None;
-        let mut hasher = Sha256::new();
-        hasher.update(b"novarocks.connector-managed-descriptor-properties.v1\0");
-        for (key, value) in &entries {
-            if key.is_empty()
-                || value.is_empty()
-                || key.len() > MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTY_BYTES
-                || value.len() > MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTY_BYTES
-                || previous.is_some_and(|previous| previous >= key.as_ref())
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "managed descriptor properties must be canonical, non-empty, and unique",
-                ));
-            }
-            total = total
-                .checked_add(key.len() + value.len() + 16)
-                .ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "managed descriptor properties exceed their byte bound",
-                    )
-                })?;
-            if total > MAX_CONNECTOR_MANAGED_DESCRIPTOR_TOTAL_BYTES {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "managed descriptor properties exceed their byte bound",
-                ));
-            }
-            digest_bytes(&mut hasher, key.as_bytes());
-            digest_bytes(&mut hasher, value.as_bytes());
-            previous = Some(key.as_ref());
-        }
-        Ok(Self {
-            entries,
-            digest: hasher.finalize().into(),
-        })
-    }
-
-    pub fn entries(&self) -> &[(Arc<str>, Arc<str>)] {
-        &self.entries
-    }
-
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-}
-
-/// Exact target source facts bound into a managed publication intent.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorManagedPublicationTarget {
-    object_id: super::ConnectorTableObjectId,
-    expected_snapshot_id: Option<i64>,
-}
-
-impl ConnectorManagedPublicationTarget {
-    pub fn try_new(
-        object_id: super::ConnectorTableObjectId,
-        expected_snapshot_id: Option<i64>,
-    ) -> Result<Self, ConnectorError> {
-        if expected_snapshot_id.is_some_and(|snapshot| snapshot < 0) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "managed publication target snapshot must not be negative",
-            ));
-        }
-        Ok(Self {
-            object_id,
-            expected_snapshot_id,
-        })
-    }
-
-    pub const fn object_id(&self) -> &super::ConnectorTableObjectId {
-        &self.object_id
-    }
-
-    pub const fn expected_snapshot_id(&self) -> Option<i64> {
-        self.expected_snapshot_id
-    }
-}
-
-/// Bounded application facts that a provider may encode as its own managed
-/// publication provenance. The publication identity, exact target facts and
-/// opaque descriptor carrier are all signed into the same intent.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorManagedPublicationIntent {
-    publication_id: LakePublicationId,
-    target: ConnectorManagedPublicationTarget,
-    technique: ConnectorManagedPublicationTechnique,
-    bases: Vec<ConnectorStagedPublicationBaseFact>,
-    definition_fingerprint: Arc<str>,
-    empty_input: ConnectorManagedPublicationEmptyInputDisposition,
-    partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
-    expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
-    descriptor_properties: ConnectorManagedDescriptorProperties,
-}
-
-impl ConnectorManagedPublicationIntent {
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        publication_id: LakePublicationId,
-        target: ConnectorManagedPublicationTarget,
-        technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<ConnectorStagedPublicationBaseFact>,
-        definition_fingerprint: impl Into<Arc<str>>,
-        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
-        descriptor_properties: ConnectorManagedDescriptorProperties,
-    ) -> Result<Self, ConnectorError> {
-        Self::try_new_inner(
-            publication_id,
-            target,
-            technique,
-            bases,
-            definition_fingerprint.into(),
-            empty_input,
-            None,
-            None,
-            descriptor_properties,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new_with_partition_spec_replacement(
-        publication_id: LakePublicationId,
-        target: ConnectorManagedPublicationTarget,
-        technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<ConnectorStagedPublicationBaseFact>,
-        definition_fingerprint: impl Into<Arc<str>>,
-        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
-        partition_spec_replacement: ConnectorManagedPartitionSpecReplacement,
-        expected_committed_partitioning: ConnectorCommittedPartitioning,
-        descriptor_properties: ConnectorManagedDescriptorProperties,
-    ) -> Result<Self, ConnectorError> {
-        Self::try_new_inner(
-            publication_id,
-            target,
-            technique,
-            bases,
-            definition_fingerprint.into(),
-            empty_input,
-            Some(partition_spec_replacement),
-            Some(expected_committed_partitioning),
-            descriptor_properties,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn try_new_inner(
-        publication_id: LakePublicationId,
-        target: ConnectorManagedPublicationTarget,
-        technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<ConnectorStagedPublicationBaseFact>,
-        definition_fingerprint: Arc<str>,
-        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
-        partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
-        expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
-        descriptor_properties: ConnectorManagedDescriptorProperties,
-    ) -> Result<Self, ConnectorError> {
-        if definition_fingerprint.is_empty()
-            || bases.is_empty()
-            || bases.len() > MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS
-            || definition_fingerprint.len() > MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES
-            || bases.iter().any(|base| {
-                base.table.is_empty()
-                    || base.to_version < 0
-                    || base.from_version.is_some_and(|version| version < 0)
-            })
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector managed publication intent is invalid or exceeds its bounds",
-            ));
-        }
-        let mut tables = BTreeSet::new();
-        let mut object_ids = HashSet::new();
-        if bases.iter().any(|base| {
-            !tables.insert(base.table.as_ref()) || !object_ids.insert(base.object_id.clone())
-        }) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector managed publication intent has duplicate base identities",
-            ));
-        }
-        if partition_spec_replacement.is_some()
-            && (technique != ConnectorManagedPublicationTechnique::Full
-                || empty_input
-                    != ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite)
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector managed partition replacement requires a full publication that commits empty input",
-            ));
-        }
-        if partition_spec_replacement.is_some() != expected_committed_partitioning.is_some() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "managed partition replacement must carry its exact preview partitioning",
-            ));
-        }
-        if let Some(partitioning) = &expected_committed_partitioning {
-            partitioning.validate()?;
-        }
-        Ok(Self {
-            publication_id,
-            target,
-            technique,
-            bases,
-            definition_fingerprint,
-            empty_input,
-            partition_spec_replacement,
-            expected_committed_partitioning,
-            descriptor_properties,
-        })
-    }
-
-    pub const fn publication_id(&self) -> LakePublicationId {
-        self.publication_id
-    }
-    pub const fn target(&self) -> &ConnectorManagedPublicationTarget {
-        &self.target
-    }
-    pub const fn technique(&self) -> ConnectorManagedPublicationTechnique {
-        self.technique
-    }
-    pub fn bases(&self) -> &[ConnectorStagedPublicationBaseFact] {
-        &self.bases
-    }
-    pub fn definition_fingerprint(&self) -> &str {
-        self.definition_fingerprint.as_ref()
-    }
-    pub const fn empty_input(&self) -> ConnectorManagedPublicationEmptyInputDisposition {
-        self.empty_input
-    }
-    pub fn partition_spec_replacement(&self) -> Option<&ConnectorManagedPartitionSpecReplacement> {
-        self.partition_spec_replacement.as_ref()
-    }
-    pub fn expected_committed_partitioning(&self) -> Option<&ConnectorCommittedPartitioning> {
-        self.expected_committed_partitioning.as_ref()
-    }
-    pub const fn descriptor_properties(&self) -> &ConnectorManagedDescriptorProperties {
-        &self.descriptor_properties
-    }
-
-    fn validate_for_operation(
-        &self,
-        operation_id: ConnectorWriteOperationId,
-    ) -> Result<(), ConnectorError> {
-        if operation_id.to_bytes() != self.publication_id.to_bytes() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "managed publication must use its LakePublicationId as the write operation ID",
-            ));
-        }
-        if let Some(replacement) = &self.partition_spec_replacement {
-            replacement.validate_for_operation(operation_id)?;
-        }
-        if let Some(partitioning) = &self.expected_committed_partitioning {
-            partitioning.validate()?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorWriteActivationIntent {
     Ordinary,
     Publication(LakePublicationFamily),
-    ManagedPublication(ConnectorManagedPublicationIntent),
-}
-
-impl ConnectorWriteActivationIntent {
-    fn validate_for_operation(
-        &self,
-        operation_id: ConnectorWriteOperationId,
-    ) -> Result<(), ConnectorError> {
-        match self {
-            Self::Ordinary | Self::Publication(_) => Ok(()),
-            Self::ManagedPublication(intent) => intent.validate_for_operation(operation_id),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1622,7 +1306,6 @@ impl ConnectorWriteActivationRequest {
         &self,
         owner: &ConnectorProviderBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
-        self.intent.validate_for_operation(self.operation_id)?;
         self.source.validate(owner, self.operation_id)
     }
 }
@@ -2740,41 +2423,13 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::*;
-    use crate::connector::{ConnectorInstanceId, ConnectorTableObjectId, ProviderBindingEpoch};
+    use crate::connector::{ConnectorInstanceId, ProviderBindingEpoch};
 
     fn key() -> ConnectorProviderBindingKey {
         ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("unit").expect("instance ID"),
             incarnation: ProviderBindingEpoch::new(),
         }
-    }
-
-    fn base_facts() -> Vec<super::ConnectorStagedPublicationBaseFact> {
-        vec![super::ConnectorStagedPublicationBaseFact {
-            occurrence_id: 0,
-            table: Arc::from("db.base"),
-            object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"base-uuid"))
-                .expect("bounded base object ID"),
-            from_version: Some(10),
-            to_version: 11,
-        }]
-    }
-
-    fn managed_target() -> ConnectorManagedPublicationTarget {
-        ConnectorManagedPublicationTarget::try_new(
-            ConnectorTableObjectId::try_new(Bytes::from_static(b"target-uuid"))
-                .expect("bounded target object ID"),
-            Some(42),
-        )
-        .expect("managed target")
-    }
-
-    fn descriptor_properties() -> ConnectorManagedDescriptorProperties {
-        ConnectorManagedDescriptorProperties::try_new(vec![(
-            Arc::from("novarocks.mv.descriptor.v3"),
-            Arc::from("canonical"),
-        )])
-        .expect("canonical descriptor properties")
     }
 
     fn partition_fields() -> Vec<ConnectorManagedPartitionField> {
@@ -2977,186 +2632,6 @@ mod tests {
             replacement
                 .validate_for_operation(ConnectorWriteOperationId::new())
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn managed_partition_replacement_is_signed_with_the_publication_identity() {
-        let publication_id = LakePublicationId::new_v7();
-        let ordinary = ConnectorManagedPublicationIntent::try_new(
-            publication_id,
-            managed_target(),
-            ConnectorManagedPublicationTechnique::Full,
-            base_facts(),
-            "definition",
-            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-            descriptor_properties(),
-        )
-        .expect("ordinary managed publication");
-        assert_eq!(ordinary.publication_id(), publication_id);
-        assert!(ordinary.partition_spec_replacement().is_none());
-
-        let operation_id = ConnectorWriteOperationId::from(publication_id);
-        let prior =
-            ConnectorManagedPartitionSpecObservation::try_from_fields(3, &partition_fields())
-                .expect("prior observation");
-        assert_ne!(
-            prior,
-            ConnectorManagedPartitionSpecObservation::try_from_fields(4, &partition_fields())
-                .expect("same layout under another prior spec")
-        );
-        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
-            operation_id,
-            prior,
-            vec![
-                ConnectorManagedPartitionField::try_new(
-                    7,
-                    0,
-                    ConnectorManagedPartitionTransform::Month,
-                )
-                .unwrap(),
-            ],
-        )
-        .expect("replacement");
-        let repartition =
-            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
-                publication_id,
-                managed_target(),
-                ConnectorManagedPublicationTechnique::Full,
-                base_facts(),
-                "definition",
-                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-                replacement,
-                ConnectorCommittedPartitioning::try_new(4, committed_partition_fields()).unwrap(),
-                descriptor_properties(),
-            )
-            .expect("repartition intent");
-        assert_eq!(
-            repartition
-                .partition_spec_replacement()
-                .expect("repartition intent carries its replacement")
-                .operation_id(),
-            operation_id
-        );
-        repartition
-            .validate_for_operation(operation_id)
-            .expect("replacement operation is signed");
-        assert!(
-            repartition
-                .validate_for_operation(ConnectorWriteOperationId::new())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn managed_descriptor_properties_require_canonical_bounded_unique_entries() {
-        assert!(
-            ConnectorManagedDescriptorProperties::try_new(vec![
-                (Arc::from("b"), Arc::from("value")),
-                (Arc::from("a"), Arc::from("value")),
-            ])
-            .is_err()
-        );
-        assert!(
-            ConnectorManagedDescriptorProperties::try_new(vec![
-                (Arc::from("a"), Arc::from("value")),
-                (Arc::from("a"), Arc::from("other")),
-            ])
-            .is_err()
-        );
-        assert!(
-            ConnectorManagedDescriptorProperties::try_new(vec![(
-                Arc::from("a"),
-                Arc::from("x".repeat(MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTY_BYTES + 1)),
-            )])
-            .is_err()
-        );
-
-        let properties = descriptor_properties();
-        assert_eq!(properties.entries().len(), 1);
-        assert_ne!(properties.digest(), [0; 32]);
-    }
-
-    #[test]
-    fn managed_publication_hides_opaque_base_identity_bytes_from_debug() {
-        let publication_id = LakePublicationId::new_v7();
-        let ordinary = ConnectorManagedPublicationIntent::try_new(
-            publication_id,
-            managed_target(),
-            ConnectorManagedPublicationTechnique::Full,
-            base_facts(),
-            "definition",
-            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-            descriptor_properties(),
-        )
-        .expect("managed publication");
-        assert!(
-            !format!("{:?}", ordinary.bases()[0].object_id).contains("base-uuid"),
-            "managed publication must not expose a provider-owned identity through Debug"
-        );
-
-        let mut replacement_facts = base_facts();
-        replacement_facts[0].object_id =
-            ConnectorTableObjectId::try_new(Bytes::from_static(b"replacement-object"))
-                .expect("bounded replacement object ID");
-        let replacement = ConnectorManagedPublicationIntent::try_new(
-            publication_id,
-            managed_target(),
-            ConnectorManagedPublicationTechnique::Full,
-            replacement_facts,
-            "definition",
-            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-            descriptor_properties(),
-        )
-        .expect("replacement managed publication");
-
-        assert_ne!(
-            ordinary.bases()[0].object_id,
-            replacement.bases()[0].object_id
-        );
-        assert!(
-            !format!("{:?}", replacement.bases()[0].object_id).contains("replacement-object"),
-            "a replaced base identity must stay redacted too"
-        );
-    }
-
-    #[test]
-    fn managed_partition_replacement_rejects_non_atomic_publication_modes() {
-        let publication_id = LakePublicationId::new_v7();
-        let operation_id = ConnectorWriteOperationId::from(publication_id);
-        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
-            operation_id,
-            ConnectorManagedPartitionSpecObservation::try_from_fields(0, &[]).unwrap(),
-            partition_fields(),
-        )
-        .unwrap();
-        assert!(
-            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
-                publication_id,
-                managed_target(),
-                ConnectorManagedPublicationTechnique::Incremental,
-                base_facts(),
-                "definition",
-                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-                replacement.clone(),
-                ConnectorCommittedPartitioning::try_new(4, committed_partition_fields()).unwrap(),
-                descriptor_properties(),
-            )
-            .is_err()
-        );
-        assert!(
-            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
-                publication_id,
-                managed_target(),
-                ConnectorManagedPublicationTechnique::Full,
-                base_facts(),
-                "definition",
-                ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
-                replacement,
-                ConnectorCommittedPartitioning::try_new(4, committed_partition_fields()).unwrap(),
-                descriptor_properties(),
-            )
-            .is_err()
         );
     }
 

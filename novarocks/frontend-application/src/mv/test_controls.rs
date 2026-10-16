@@ -37,6 +37,11 @@ struct Target {
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
     Wipe,
+    DocumentExpiry {
+        target: Target,
+        token: String,
+        directory: Option<PathBuf>,
+    },
     Observe {
         target: Target,
         level: String,
@@ -97,6 +102,54 @@ impl MvRewriteStatementTarget {
             nominated_statement,
             run_token,
         })
+    }
+}
+
+/// One finite expiry attempt. Its optional barrier location comes only from
+/// the launch grant; SQL arguments cannot nominate a filesystem location.
+pub(crate) struct DocumentExpiryClaim {
+    claim: ActionClaim,
+    token: String,
+    directory: Option<PathBuf>,
+}
+impl DocumentExpiryClaim {
+    /// Called only after the exact full-load remove set has been planned.
+    pub(crate) fn after_planning(
+        &mut self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), String> {
+        let trigger = self
+            .directory
+            .as_ref()
+            .map(|directory| directory.join("mv-document-expiry-planned.trigger"));
+        if let Some(trigger) = trigger.as_ref().filter(|trigger| trigger.exists()) {
+            let contents = std::fs::read_to_string(trigger)
+                .map_err(|error| format!("read authorized MV document expiry trigger: {error}"))?;
+            if contents != format!("token={}\n", self.token) {
+                return Err("MV document expiry trigger does not match its finite grant".into());
+            }
+        }
+        self.ensure_active(context)?;
+        self.claim.record_hit().map_err(|error| error.to_string())?;
+        eprintln!("NOVAROCKS_MV_DOCUMENT_EXPIRY_PLANNED token={}", self.token);
+        if let Some(trigger) = trigger {
+            wait_release(&self.claim, &trigger, Duration::from_secs(30), || {
+                context.is_cancelled() || Instant::now() >= context.deadline()
+            })?;
+        }
+        self.ensure_active(context)
+    }
+    fn ensure_active(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), String> {
+        if !self.claim.cancellation().is_active() {
+            return Err("MV document expiry authorization is closed".into());
+        }
+        if context.is_cancelled() || Instant::now() >= context.deadline() {
+            return Err("MV document expiry request was cancelled or its deadline elapsed".into());
+        }
+        Ok(())
     }
 }
 
@@ -280,6 +333,36 @@ impl MvTestControls {
             "MV test action has no active unclaimed authorization for this FE launch and target"
                 .into(),
         )
+    }
+
+    pub(crate) fn claim_document_expiry(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        mv: &str,
+        token: &str,
+    ) -> Result<DocumentExpiryClaim, String> {
+        for action in &self.actions {
+            let Action::DocumentExpiry {
+                target,
+                token: expected,
+                directory,
+            } = &action.action
+            else {
+                continue;
+            };
+            if expected != token || !target.matches(catalog, namespace, mv) {
+                continue;
+            }
+            if let Ok(claim) = action.grant.claim_once(self.process) {
+                return Ok(DocumentExpiryClaim {
+                    claim,
+                    token: token.into(),
+                    directory: directory.clone(),
+                });
+            }
+        }
+        Err("MV document expiry has no active unclaimed authorization for this FE launch, target and token".into())
     }
 
     pub(crate) fn recovery(
@@ -515,6 +598,18 @@ fn same_selection(left: &Action, right: &Action) -> bool {
     match (left, right) {
         (Action::Wipe, Action::Wipe) => true,
         (
+            Action::DocumentExpiry {
+                target: a,
+                token: x,
+                ..
+            },
+            Action::DocumentExpiry {
+                target: b,
+                token: y,
+                ..
+            },
+        ) => a == b && x == y,
+        (
             Action::Observe {
                 target: a,
                 level: x,
@@ -577,6 +672,7 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
     let allowed: &[&str] = match action {
         "accelerator-wipe" => &["action", "family"],
         "document-observation" => &["action", "catalog", "namespace", "mv", "level"],
+        "document-expiry" => &["action", "catalog", "namespace", "mv", "token", "directory"],
         "recovery-hold" => &[
             "action",
             "catalog",
@@ -635,6 +731,21 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
         mv: text("mv")?.into(),
     };
     Ok(match action {
+        "document-expiry" => {
+            let token = text("token")?;
+            if token.contains(['\n', '\r']) {
+                return Err("MV document expiry token contains a line break".into());
+            }
+            Action::DocumentExpiry {
+                target,
+                token: token.into(),
+                directory: if object.contains_key("directory") {
+                    Some(directory()?)
+                } else {
+                    None
+                },
+            }
+        }
         "document-observation" => {
             let level = text("level")?;
             if !matches!(level, "baseline" | "package" | "provenance") {
@@ -1589,6 +1700,203 @@ pub(crate) mod tests {
             1
         );
         assert!(hold.exists(), "replay consumed a second action");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    fn expiry_grant(token: &str) -> Value {
+        json!({"action":"document-expiry","catalog":"ice","namespace":"sales","mv":"orders","token":token})
+    }
+    fn expiry_context() -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(2),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            1024,
+            4096,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn document_expiry_selection_includes_token_and_claim_is_not_renewable() {
+        let session = TestSession::new(
+            vec![expiry_grant("a"), expiry_grant("b")],
+            SessionRole::Fe,
+            3000,
+        );
+        let controls = session.controls().unwrap();
+        for (catalog, namespace, mv, token) in [
+            ("other", "sales", "orders", "a"),
+            ("ice", "other", "orders", "a"),
+            ("ice", "sales", "other", "a"),
+            ("ice", "sales", "orders", "wrong"),
+        ] {
+            assert!(
+                controls
+                    .claim_document_expiry(catalog, namespace, mv, token)
+                    .is_err()
+            );
+        }
+        assert!(session.role.scope().observations().is_empty());
+        let mut a = controls
+            .claim_document_expiry("ice", "sales", "orders", "a")
+            .unwrap();
+        let b = controls
+            .claim_document_expiry("ice", "sales", "orders", "b")
+            .unwrap();
+        assert_eq!(
+            session
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "hit")
+                .count(),
+            0
+        );
+        a.after_planning(&expiry_context()).unwrap();
+        drop((a, b));
+        let rebuilt = session.controls().unwrap();
+        for token in ["a", "b"] {
+            assert!(
+                rebuilt
+                    .claim_document_expiry("ice", "sales", "orders", token)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            session
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "claimed")
+                .count(),
+            2
+        );
+        assert_eq!(
+            session
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "hit")
+                .count(),
+            1
+        );
+        let duplicate = TestSession::new(
+            vec![expiry_grant("a"), expiry_grant("a")],
+            SessionRole::Fe,
+            3000,
+        );
+        assert!(duplicate.controls().is_err());
+    }
+    #[test]
+    fn document_expiry_rejects_malformed_grants_and_closed_launches() {
+        for value in [
+            json!({"action":"document-expiry","catalog":"ice","namespace":"sales","mv":"orders"}),
+            json!({"action":"document-expiry","catalog":"ice","namespace":"sales","mv":"orders","token":"a","directory":"relative"}),
+            json!({"action":"document-expiry","catalog":"ice","namespace":"sales","mv":"orders","token":"a","keep_last":2}),
+            json!({"action":"document-expiry","catalog":"ice","namespace":"sales","mv":"orders","token":"a\nb"}),
+        ] {
+            assert!(parse_action(&value).is_err());
+        }
+        let mut session = TestSession::new(
+            vec![expiry_grant("a"), expiry_grant("b")],
+            SessionRole::Fe,
+            3000,
+        );
+        let controls = session.controls().unwrap();
+        let mut claim = controls
+            .claim_document_expiry("ice", "sales", "orders", "a")
+            .unwrap();
+        session.close();
+        assert!(
+            controls
+                .claim_document_expiry("ice", "sales", "orders", "b")
+                .is_err()
+        );
+        assert!(claim.after_planning(&expiry_context()).is_err());
+        assert_eq!(
+            session
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "hit")
+                .count(),
+            0
+        );
+    }
+    #[test]
+    fn document_expiry_planned_barrier_precedes_dispatch_and_requires_exact_token() {
+        let directory = std::env::temp_dir().join(format!("nrmvexpiry-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        let trigger = directory.join("mv-document-expiry-planned.trigger");
+        std::fs::write(&trigger, "token=wrong\n").unwrap();
+        let mut grant = expiry_grant("a");
+        grant["directory"] = json!(directory);
+        let mut session = TestSession::new(vec![grant], SessionRole::Fe, 3000);
+        let controls = session.controls().unwrap();
+        let mut claim = controls
+            .claim_document_expiry("ice", "sales", "orders", "a")
+            .unwrap();
+        assert!(
+            claim
+                .after_planning(&expiry_context())
+                .unwrap_err()
+                .contains("finite grant")
+        );
+        assert_eq!(
+            session
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "hit")
+                .count(),
+            0
+        );
+        // A malformed arm is not a successful planned event. The same claimed
+        // attempt can proceed only when the operator corrects its exact arm.
+        std::fs::write(&trigger, "token=a\n").unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = claim.after_planning(&expiry_context());
+            let _ = send.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !session
+            .role
+            .scope()
+            .observations()
+            .iter()
+            .any(|e| e.event == "hit")
+            && !worker.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let planned = session
+            .role
+            .scope()
+            .observations()
+            .iter()
+            .any(|e| e.event == "hit");
+        let held = matches!(
+            receive.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        let release = std::fs::remove_file(&trigger);
+        let result = receive.recv_timeout(Duration::from_millis(300));
+        if result.is_err() {
+            session.close();
+        }
+        let joined = worker.join();
+        release.unwrap();
+        assert!(joined.is_ok());
+        assert!(
+            planned && held,
+            "dispatch became possible before release of the planned barrier"
+        );
+        result.unwrap().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -15,27 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Freezing one MV publication document from the facts a refresh actually has.
-//!
-//! P is written in two moments, because its facts become true in two moments.
-//! Its input watermark is known before the write runs -- it is exactly the set
-//! of source revisions the refresh pinned -- while its result is known only
-//! after the writers close. Freezing the watermark first and completing it with
-//! the executed result keeps each half sourced from the moment that can state
-//! it, and leaves the output data version to the provider, which binds it at
-//! the commit itself.
-
-use std::collections::BTreeMap;
-
-use crate::persistence::codec::{
-    DefinitionDocument, InterpretationDocument, PublicationDocument, PublicationInput,
-    PublicationKind, PublicationOutput, PublicationStatistics,
-};
+//! Freeze the exact occurrence watermark and the result carried by compact P.
+use crate::persistence::codec::{DefinitionDocument, PublicationInput};
 use crate::persistence::definition::MvAcceleratorSourceRevision;
 use crate::persistence::exact_revision::persist_exact_connector_revision;
 use crate::persistence::identity::PublicationIdentity;
-use crate::persistence::validation::validate_publication;
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, LakePublicationId};
+use std::collections::BTreeMap;
 
 /// One refresh's complete input watermark, in D's own occurrence order.
 ///
@@ -108,67 +94,33 @@ impl MvPublicationInputs {
     }
 }
 
-/// What one executed refresh write produced, before its commit is attempted.
-///
-/// These are the writers' own accepted facts, not the provider's: the commit
-/// has not happened yet, and the output data version it will mint is the
-/// provider's to attach.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MvPublicationResult {
-    pub kind: PublicationKind,
-    pub logical_result_rows: u64,
-}
-
-/// Complete P from its frozen watermark and the write's executed result.
-pub fn freeze_publication_document(
-    source_revision: &MvAcceleratorSourceRevision,
-    interpretation: &InterpretationDocument,
+/// Freeze the actual layout-1 publication facts and exact occurrence watermark.
+pub fn freeze_keyed_publication_document(
+    source: &MvAcceleratorSourceRevision,
     publication_id: LakePublicationId,
     inputs: &MvPublicationInputs,
-    result: MvPublicationResult,
+    logical_result_rows: Option<u64>,
     prepared_at_ms: u64,
-) -> Result<PublicationDocument, String> {
-    let document = PublicationDocument {
+) -> Result<crate::persistence::codec::keyed::KeyedPublicationDocument, String> {
+    if prepared_at_ms > i64::MAX as u64 {
+        return Err("publication frozen timestamp exceeds i64".into());
+    }
+    Ok(crate::persistence::codec::keyed::KeyedPublicationDocument {
         publication_prepared_at_ms: prepared_at_ms,
         publication_id: PublicationIdentity::try_new(publication_id.to_bytes().to_vec())
-            .map_err(|error| format!("build the MV publication identity: {error}"))?,
-        definition_revision: source_revision.definition_revision,
-        interpretation_revision: source_revision.interpretation_revision,
+            .map_err(|e| e.to_string())?,
+        definition_revision: source.definition_revision,
+        interpretation_revision: source.interpretation_revision,
         inputs: inputs.inputs.clone(),
-        output: PublicationOutput {
-            object_id: interpretation.target.object_id.clone(),
-            empty_result: result.logical_result_rows == 0,
-        },
-        kind: result.kind,
-        statistics: PublicationStatistics {
-            logical_result_rows: Some(result.logical_result_rows),
-            // The rows a refresh consumed are not a fact any writer reports;
-            // recording an output count here would be an invention.
-            processed_input_rows: None,
-        },
-    };
-    validate_publication(&document)
-        .map_err(|error| format!("frozen MV publication document is invalid: {error}"))?;
-    Ok(document)
+        logical_result_rows,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::documents::publication_document_set;
-    use crate::persistence::test_support::sample_projection;
-    use crate::product::MvTarget;
     use bytes::Bytes;
-    use novarocks_spi::connector::{
-        ConnectorProviderId, ConnectorTableObjectId, LakePublicationId,
-    };
-
-    /// The fixture definition is a self-join: two occurrences of one physical
-    /// object, which is precisely what a table-name-keyed watermark loses.
-    fn projection() -> crate::persistence::projection::MvDocumentProjection {
-        sample_projection(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(1))
-    }
-
+    use novarocks_spi::connector::{ConnectorProviderId, ConnectorTableObjectId};
     fn revision(object_value: u8, snapshot_id: i64) -> ConnectorExactSemanticRevision {
         let object = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&[object_value]))
             .expect("source object");
@@ -188,8 +140,8 @@ mod tests {
 
     #[test]
     fn a_self_join_records_one_input_per_occurrence() {
-        let projection = projection();
-        let inputs = MvPublicationInputs::freeze(projection.definition(), &pinned_at_binding())
+        let fixture = crate::persistence::test_support::MvDocumentFixture::new();
+        let inputs = MvPublicationInputs::freeze(&fixture.definition, &pinned_at_binding())
             .expect("every occurrence is pinned");
 
         assert_eq!(
@@ -206,9 +158,9 @@ mod tests {
 
     #[test]
     fn an_unpinned_occurrence_fails_closed() {
-        let projection = projection();
+        let fixture = crate::persistence::test_support::MvDocumentFixture::new();
         let error = MvPublicationInputs::freeze(
-            projection.definition(),
+            &fixture.definition,
             &BTreeMap::from([(7, revision(11, 9))]),
         )
         .expect_err("a partial watermark cannot describe this refresh");
@@ -221,9 +173,9 @@ mod tests {
 
     #[test]
     fn an_occurrence_read_at_another_object_fails_closed() {
-        let projection = projection();
+        let fixture = crate::persistence::test_support::MvDocumentFixture::new();
         let error = MvPublicationInputs::freeze(
-            projection.definition(),
+            &fixture.definition,
             &BTreeMap::from([(7, revision(11, 9)), (8, revision(12, 9))]),
         )
         .expect_err("a refresh that read elsewhere is not a refresh of this definition");
@@ -234,55 +186,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_frozen_publication_completes_its_own_document_set() {
-        let projection = projection();
-        let inputs = MvPublicationInputs::freeze(projection.definition(), &pinned_at_binding())
-            .expect("every occurrence is pinned");
-        let source_revision = projection.source_revision();
-        let publication = freeze_publication_document(
-            &source_revision,
-            projection.interpretation(),
-            LakePublicationId::try_from_uuid(uuid::Uuid::now_v7()).expect("publication id"),
+    fn frozen_roundtrip(
+        rows: Option<u64>,
+    ) -> crate::persistence::codec::keyed::KeyedPublicationDocument {
+        use crate::persistence::codec::keyed::{
+            decode_publication_payload, encode_publication_payload,
+        };
+        let facts = crate::persistence::test_support::KeyedProjectionFixture::new(
+            crate::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
+            Some(1),
+        )
+        .build()
+        .unwrap();
+        let inputs = MvPublicationInputs::freeze(facts.definition(), &pinned_at_binding()).unwrap();
+        let frozen = freeze_keyed_publication_document(
+            facts.source_revision(),
+            LakePublicationId::try_from_uuid(uuid::Uuid::now_v7()).unwrap(),
             &inputs,
-            MvPublicationResult {
-                kind: PublicationKind::FullRefresh,
-                logical_result_rows: 3,
-            },
+            rows,
             1_700_000_020_000,
         )
-        .expect("the frozen publication is valid");
-
-        assert_eq!(publication.statistics.logical_result_rows, Some(3));
-        assert!(!publication.output.empty_result);
-        publication_document_set(
-            projection.definition(),
-            projection.interpretation(),
-            &publication,
+        .unwrap();
+        let encoded = encode_publication_payload(
+            &frozen,
+            facts.definition(),
+            &facts.versions().binding_document,
         )
-        .expect("P references the exact D/L it was frozen against");
+        .unwrap();
+        let decoded = decode_publication_payload(
+            &encoded,
+            facts.definition(),
+            facts.source_revision().definition_revision,
+            facts.source_revision().interpretation_revision,
+            &facts.versions().binding_document,
+        )
+        .unwrap();
+        assert_eq!(decoded, frozen);
+        decoded
+    }
+
+    #[test]
+    fn a_frozen_publication_completes_its_own_document_set() {
+        let publication = frozen_roundtrip(Some(3));
+        assert_eq!(publication.logical_result_rows, Some(3));
+        assert_eq!(publication.inputs.len(), 2);
     }
 
     #[test]
     fn a_publication_that_materialized_no_row_says_so() {
-        let projection = projection();
-        let inputs = MvPublicationInputs::freeze(projection.definition(), &pinned_at_binding())
-            .expect("every occurrence is pinned");
-        let source_revision = projection.source_revision();
-        let publication = freeze_publication_document(
-            &source_revision,
-            projection.interpretation(),
-            LakePublicationId::try_from_uuid(uuid::Uuid::now_v7()).expect("publication id"),
-            &inputs,
-            MvPublicationResult {
-                kind: PublicationKind::IncrementalRefresh,
-                logical_result_rows: 0,
-            },
-            1_700_000_020_000,
-        )
-        .expect("an empty result is a valid publication");
-
-        assert!(publication.output.empty_result);
-        assert_eq!(publication.statistics.logical_result_rows, Some(0));
+        assert_eq!(frozen_roundtrip(Some(0)).logical_result_rows, Some(0));
+        assert_eq!(frozen_roundtrip(None).logical_result_rows, None);
     }
 }

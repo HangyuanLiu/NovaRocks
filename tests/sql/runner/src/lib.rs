@@ -3208,8 +3208,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                                 "MV REST mutation oracle requires the runner-owned publication catalog proxy"
                                             ))?;
                                         let counts = control.mutation_counts(namespace, table);
-                                        let expected_commits =
-                                            expectation.table_commits.unwrap_or(publications + 1);
+                                        let expected_commits = expectation
+                                            .table_commits
+                                            .unwrap_or(publications + expectation.slot_changes + 1);
                                         anyhow::ensure!(
                                             counts.stage_create_forwarded == 1
                                                 && counts.stage_create_succeeded == 1

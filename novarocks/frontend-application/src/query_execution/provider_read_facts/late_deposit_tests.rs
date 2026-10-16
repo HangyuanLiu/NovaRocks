@@ -62,6 +62,17 @@ impl Drop for ActualFrozenTable {
         self.destroyed.store(true, Ordering::Release);
     }
 }
+#[derive(Debug, Eq, PartialEq)]
+enum ReadOpenCall {
+    Generic(
+        SchemaTableName,
+        ConnectorReadRelationVersion,
+        Option<String>,
+    ),
+    WholeMv(SchemaTableName, ConnectorTableObjectId, Option<i64>),
+    PartitionMv(SchemaTableName, ConnectorMvTargetPartitionSelection),
+}
+
 struct LateProvider {
     descriptor: ConnectorInstanceDescriptor,
     catalog: CatalogHandle,
@@ -70,6 +81,24 @@ struct LateProvider {
     opens: AtomicUsize,
     freezes: AtomicUsize,
     public_schemas: AtomicUsize,
+    read_opens: Mutex<Vec<ReadOpenCall>>,
+}
+impl LateProvider {
+    fn open_table(
+        &self,
+        name: &SchemaTableName,
+        call: ReadOpenCall,
+    ) -> Result<Option<Arc<ActualFrozenTable>>, ConnectorError> {
+        self.read_opens.lock().unwrap().push(call);
+        self.opens.fetch_add(1, Ordering::AcqRel);
+        if name.schema_name() != "db" || name.table_name() != "orders" {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "wrong read relation",
+            ));
+        }
+        Ok(self.table.lock().unwrap().take())
+    }
 }
 impl ProviderReadRuntime for LateProvider {
     type Table = Arc<ActualFrozenTable>;
@@ -91,18 +120,37 @@ impl ProviderReadMetadata for LateProvider {
         &self,
         _: &ConnectorSession,
         name: &SchemaTableName,
-        _: ConnectorReadRelationVersion,
-        _: Option<&str>,
+        version: ConnectorReadRelationVersion,
+        reference: Option<&str>,
     ) -> Result<Option<Self::Table>, ConnectorError> {
         // The fixture owns exactly one table; no fallback/private payload reconstruction.
-        self.opens.fetch_add(1, Ordering::AcqRel);
-        if name.schema_name() != "db" || name.table_name() != "orders" {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "wrong read relation",
-            ));
-        }
-        Ok(self.table.lock().unwrap().take())
+        self.open_table(
+            name,
+            ReadOpenCall::Generic(name.clone(), version, reference.map(str::to_owned)),
+        )
+    }
+    fn get_mv_target_handle(
+        &self,
+        _: &ConnectorSession,
+        name: &SchemaTableName,
+        object_id: &ConnectorTableObjectId,
+        snapshot_id: Option<i64>,
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        self.open_table(
+            name,
+            ReadOpenCall::WholeMv(name.clone(), object_id.clone(), snapshot_id),
+        )
+    }
+    fn get_mv_target_partition_handle(
+        &self,
+        _: &ConnectorSession,
+        name: &SchemaTableName,
+        selection: &ConnectorMvTargetPartitionSelection,
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        self.open_table(
+            name,
+            ReadOpenCall::PartitionMv(name.clone(), selection.clone()),
+        )
     }
     fn get_pinned_file_set_handle(
         &self,
@@ -415,6 +463,7 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
         opens: AtomicUsize::new(0),
         freezes: AtomicUsize::new(0),
         public_schemas: AtomicUsize::new(0),
+        read_opens: Mutex::new(Vec::new()),
     });
     let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
     let seals = Arc::new(AtomicUsize::new(0));
@@ -638,4 +687,229 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     assert!(destroyed.load(Ordering::Acquire));
     assert_eq!(after.result_windows.held_positions, [0; 4]);
     assert!(after.scopes.is_empty() && shutdown.is_ok());
+}
+
+#[test]
+fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history() {
+    let instance = ConnectorInstanceId::parse("catalog.analytics").unwrap();
+    let catalog = CatalogHandle::new(instance.clone(), CatalogVersion::from_bytes([7; 32]));
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    // This routing test needs no delayed teardown; the original lifecycle test
+    // above retains its independently held/released destruction witness.
+    drop(entered_rx);
+    drop(release);
+    let table = Arc::new(ActualFrozenTable {
+        entered,
+        release: Mutex::new(release_rx),
+        destroyed: Arc::new(AtomicBool::new(false)),
+    });
+    let provider = Arc::new(LateProvider {
+        descriptor: ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: instance.clone(),
+        },
+        catalog: catalog.clone(),
+        table: Mutex::new(None),
+        declared_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+        opens: AtomicUsize::new(0),
+        freezes: AtomicUsize::new(0),
+        public_schemas: AtomicUsize::new(0),
+        read_opens: Mutex::new(Vec::new()),
+    });
+    let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
+    let props = CatalogProperties::new(
+        catalog.clone(),
+        provider.descriptor.provider_id.clone(),
+        1,
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let generic = Arc::new(
+        novarocks_catalog_application::test_support::test_control_binding_for(instance.clone(), 7)
+            .with_catalog_properties(props.clone())
+            .unwrap(),
+    );
+    let host = ConnectorControlHost::new();
+    host.register_role_binding(
+        ConnectorControlRoleBinding::try_new(
+            NormalizedCatalogProperties::try_new(props).unwrap(),
+            generic,
+            Some(ConnectorControlReadBinding::new(
+                adapter.clone(),
+                adapter.clone(),
+                None,
+                Arc::new(LateEncoder {
+                    catalog: catalog.clone(),
+                    relation_calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )),
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let materialization = QueryScanMaterialization {
+        table: novarocks_spi::connector::ConnectorTableHandle::try_new(
+            instance.clone(),
+            Bytes::from_static(b"orders"),
+        )
+        .unwrap(),
+        catalog_handle: catalog,
+        schema: Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, false),
+        ])),
+        selector: ConnectorReadSelector::SnapshotId(41),
+        mv_partition_selection: None,
+        statistics_pin: None,
+        planning_lease: host.acquire_current(&instance).unwrap(),
+    };
+    let session =
+        ConnectorSession::try_new("mv-routing", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
+            .unwrap();
+    let name = SchemaTableName::try_new("db", "orders").unwrap();
+    // FE must forward provider identity bytes, rather than interpret them as a UUID.
+    let object =
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"\0provider-object\xff")).unwrap();
+    let mv_relation = |snapshot| ProviderReadRelationNeed::MvTarget {
+        relation: TableIdentity::new(instance.as_str(), "db", "orders"),
+        target_table_uuid: "00000000-0000-0000-0000-000000000041".into(),
+        target_snapshot_id: snapshot,
+        use_affected_partitions: false,
+    };
+    let open = |relation: &ProviderReadRelationNeed, admitted: &AdmittedRead| {
+        *provider.table.lock().unwrap() = Some(table.clone());
+        let (opened, work) = open_relation(
+            adapter.as_ref(),
+            &session,
+            &name,
+            relation,
+            admitted,
+            "db.orders",
+        )
+        .expect("the admitted route opens its provider table");
+        assert_eq!(opened.binding(), adapter.binding());
+        assert!(Arc::ptr_eq(adapter.table(&opened).unwrap(), &table));
+        assert!(work.is_none());
+        assert!(provider.table.lock().unwrap().is_none());
+        std::mem::take(&mut *provider.read_opens.lock().unwrap())
+    };
+    for snapshot in [Some(41), None] {
+        let mut frozen = materialization.clone();
+        frozen.selector = snapshot.map_or(
+            ConnectorReadSelector::Current,
+            ConnectorReadSelector::SnapshotId,
+        );
+        assert_eq!(
+            open(
+                &mv_relation(snapshot),
+                &AdmittedRead::MvTarget {
+                    materialization: frozen,
+                    object_id: object.clone(),
+                }
+            ),
+            [ReadOpenCall::WholeMv(
+                name.clone(),
+                object.clone(),
+                snapshot
+            )],
+        );
+    }
+    let selection = |object_id| {
+        ConnectorMvTargetPartitionSelection::try_new(
+            object_id,
+            Bytes::from_static(b"opaque-spec"),
+            vec![
+                MvExactPartitionField::try_new(
+                    Bytes::from_static(b"partition-field"),
+                    Bytes::from_static(b"source-field"),
+                    MvExactPartitionTransform::Identity,
+                )
+                .unwrap(),
+            ],
+            vec![vec![ConnectorMvPartitionValue::String(Arc::from("emea"))]],
+            41,
+        )
+        .unwrap()
+    };
+    let mut partition_relation = mv_relation(Some(41));
+    if let ProviderReadRelationNeed::MvTarget {
+        use_affected_partitions,
+        ..
+    } = &mut partition_relation
+    {
+        *use_affected_partitions = true;
+    }
+    let mut partitioned = materialization.clone();
+    partitioned.mv_partition_selection = Some(selection(object.clone()));
+    assert_eq!(
+        open(
+            &partition_relation,
+            &AdmittedRead::MvTarget {
+                materialization: partitioned.clone(),
+                object_id: object.clone(),
+            }
+        ),
+        [ReadOpenCall::PartitionMv(
+            name.clone(),
+            partitioned.mv_partition_selection.clone().unwrap(),
+        )],
+    );
+    for relation in [
+        ProviderReadRelationNeed::Data {
+            relation: TableIdentity::new(instance.as_str(), "db", "orders"),
+            version: ProviderReadVersionNeed::Snapshot(41),
+        },
+        ProviderReadRelationNeed::FrozenInputSet {
+            relation: TableIdentity::new(instance.as_str(), "db", "orders"),
+            version: ProviderReadVersionNeed::Snapshot(41),
+        },
+    ] {
+        assert_eq!(
+            open(&relation, &AdmittedRead::Relation(materialization.clone())),
+            [ReadOpenCall::Generic(
+                name.clone(),
+                ConnectorReadRelationVersion::SnapshotId(41),
+                None
+            )],
+        );
+    }
+    *provider.table.lock().unwrap() = Some(table.clone());
+    let error = open_relation(
+        adapter.as_ref(),
+        &session,
+        &name,
+        &partition_relation,
+        &AdmittedRead::Relation(materialization),
+        "db.orders",
+    )
+    .expect_err("ordinary admission cannot open an MV target");
+    assert!(error.contains("lacks its exact MV target admission"));
+    partitioned.mv_partition_selection = Some(selection(
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"foreign-object")).unwrap(),
+    ));
+    assert!(
+        open_relation(
+            adapter.as_ref(),
+            &session,
+            &name,
+            &partition_relation,
+            &AdmittedRead::MvTarget {
+                materialization: partitioned,
+                object_id: object
+            },
+            "db.orders",
+        )
+        .is_err(),
+        "a foreign selection must fail before provider dispatch"
+    );
+    assert!(provider.read_opens.lock().unwrap().is_empty());
+    assert!(Arc::ptr_eq(
+        provider.table.lock().unwrap().as_ref().unwrap(),
+        &table
+    ));
 }

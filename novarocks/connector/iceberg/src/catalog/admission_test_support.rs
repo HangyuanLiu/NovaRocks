@@ -16,7 +16,7 @@
 // under the License.
 
 //! Explicitly permissive owner for publication protocol tests only.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
@@ -41,6 +41,8 @@ struct AdmittedCatalog {
     inner: Arc<dyn NovaRocksCatalog>,
     recorder: Option<FrozenRecorder>,
     completion_transformer: Option<CompletionTransformer>,
+    snapshot_trace: Option<Arc<Mutex<Vec<super::SnapshotLoading>>>>,
+    dispatch_fault: Option<Arc<Mutex<Option<crate::iceberg::ErrorKind>>>>,
 }
 
 pub(crate) fn all_admitted(inner: Arc<dyn NovaRocksCatalog>) -> Arc<dyn NovaRocksCatalog> {
@@ -48,6 +50,8 @@ pub(crate) fn all_admitted(inner: Arc<dyn NovaRocksCatalog>) -> Arc<dyn NovaRock
         inner,
         recorder: None,
         completion_transformer: None,
+        snapshot_trace: None,
+        dispatch_fault: None,
     })
 }
 
@@ -59,6 +63,8 @@ pub(crate) fn all_admitted_recording(
         inner,
         recorder: Some(recorder),
         completion_transformer: None,
+        snapshot_trace: None,
+        dispatch_fault: None,
     })
 }
 /// Lose the first actually-Applied reply after the real dispatch exits.
@@ -99,6 +105,47 @@ pub(crate) fn all_admitted_recording_with_lost_reply(
         inner,
         recorder: Some(recorder),
         completion_transformer: Some(transformer),
+        snapshot_trace: None,
+        dispatch_fault: None,
+    })
+}
+
+pub(crate) fn all_admitted_with_snapshot_trace(
+    inner: Arc<dyn NovaRocksCatalog>,
+    trace: Arc<std::sync::Mutex<Vec<super::SnapshotLoading>>>,
+) -> Arc<dyn NovaRocksCatalog> {
+    Arc::new(AdmittedCatalog {
+        inner,
+        snapshot_trace: Some(trace),
+        recorder: None,
+        completion_transformer: None,
+        dispatch_fault: None,
+    })
+}
+
+impl AdmittedCatalog {
+    fn trace_snapshot_loading(&self, snapshots: super::SnapshotLoading) {
+        if let Some(trace) = &self.snapshot_trace {
+            trace
+                .lock()
+                .expect("snapshot loading trace")
+                .push(snapshots);
+        }
+    }
+}
+
+pub(crate) fn all_admitted_recording_with_snapshot_trace_and_dispatch_fault(
+    inner: Arc<dyn NovaRocksCatalog>,
+    recorder: FrozenRecorder,
+    snapshot_trace: Arc<Mutex<Vec<super::SnapshotLoading>>>,
+    dispatch_fault: Arc<Mutex<Option<crate::iceberg::ErrorKind>>>,
+) -> Arc<dyn NovaRocksCatalog> {
+    Arc::new(AdmittedCatalog {
+        inner,
+        recorder: Some(recorder),
+        completion_transformer: None,
+        snapshot_trace: Some(snapshot_trace),
+        dispatch_fault: Some(dispatch_fault),
     })
 }
 
@@ -114,6 +161,7 @@ struct RecordedDispatch {
     inner: Box<dyn super::publication_dispatch::PreparedCatalogDispatch>,
     recorder: FrozenRecorder,
     completion_transformer: Option<CompletionTransformer>,
+    dispatch_fault: Option<Arc<Mutex<Option<crate::iceberg::ErrorKind>>>>,
     requirements: Vec<crate::iceberg::TableRequirement>,
     updates: Vec<crate::iceberg::TableUpdate>,
 }
@@ -124,6 +172,45 @@ impl super::publication_dispatch::PreparedCatalogDispatch for RecordedDispatch {
         context: super::publication::EvidenceContext,
     ) -> super::publication_dispatch::DispatchCompletion {
         (self.recorder)(&self.requirements, &self.updates);
+        let fault = self
+            .dispatch_fault
+            .as_ref()
+            .and_then(|fault| fault.lock().expect("dispatch fault lock poisoned").take());
+        if let Some(kind) = fault {
+            use crate::commit::attempt::observation::{DispatchEvidence, ProtocolObservation};
+            use novarocks_spi::connector::{
+                ConnectorMutationFailure, ConnectorMutationFailureKind,
+            };
+            let rejected = matches!(
+                kind,
+                crate::iceberg::ErrorKind::CatalogCommitConflicts
+                    | crate::iceberg::ErrorKind::PreconditionFailed
+            );
+            let failure = ConnectorMutationFailure::new(
+                if rejected {
+                    ConnectorMutationFailureKind::Conflict
+                } else {
+                    ConnectorMutationFailureKind::Unavailable
+                },
+                format!("Injected prepared catalog dispatch fault: {kind:?}"),
+            );
+            let observation = ProtocolObservation {
+                adapter: "test-prepared-dispatch",
+                stage: "before-delegate",
+                ..Default::default()
+            };
+            return super::publication_dispatch::DispatchCompletion::evidence(if rejected {
+                DispatchEvidence::Rejected {
+                    failure,
+                    observation,
+                }
+            } else {
+                DispatchEvidence::Unknown {
+                    failure,
+                    observation,
+                }
+            });
+        }
         let completion = self.inner.dispatch_once(context).await;
         match &self.completion_transformer {
             Some(transformer) => transformer(completion),
@@ -222,6 +309,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
                     inner: dispatch,
                     recorder: recorder.clone(),
                     completion_transformer: self.completion_transformer.clone(),
+                    dispatch_fault: self.dispatch_fault.clone(),
                     requirements,
                     updates,
                 }),
@@ -238,6 +326,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
         table: super::CatalogTableName,
         file_io: crate::iceberg::io::FileIO,
     ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        self.trace_snapshot_loading(super::SnapshotLoading::All);
         self.inner.load_commit_base(table, file_io).await
     }
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
@@ -280,7 +369,62 @@ impl NovaRocksCatalog for AdmittedCatalog {
         &self,
         table: CatalogTableName,
     ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(super::SnapshotLoading::All);
         self.inner.load_table(table).await
+    }
+
+    async fn load_table_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        snapshots: super::SnapshotLoading,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(snapshots);
+        self.inner.load_table_with_snapshots(table, snapshots).await
+    }
+
+    async fn load_table_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(super::SnapshotLoading::All);
+        self.inner.load_table_for_read(table, binding).await
+    }
+
+    async fn load_table_for_read_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+        snapshots: super::SnapshotLoading,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(snapshots);
+        self.inner
+            .load_table_for_read_with_snapshots(table, binding, snapshots)
+            .await
+    }
+
+    async fn load_complete_metadata_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+        validator: Option<&super::CatalogMetadataValidator>,
+    ) -> Result<super::CatalogMetadataLoad, ConnectorError> {
+        self.trace_snapshot_loading(super::SnapshotLoading::All);
+        self.inner
+            .load_complete_metadata_for_read(table, binding, validator)
+            .await
+    }
+
+    async fn load_commit_base_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+        snapshots: super::SnapshotLoading,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        self.trace_snapshot_loading(snapshots);
+        self.inner
+            .load_commit_base_with_snapshots(table, file_io, snapshots)
+            .await
     }
 
     async fn view_exists_for_request(

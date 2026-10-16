@@ -257,3 +257,217 @@ async fn submitted_is_a_phase_not_a_success_conclusion() {
     );
     assert!(!job.state.is_terminal());
 }
+
+#[cfg(feature = "test-controls")]
+mod statement_observation_tests {
+    use super::*;
+    use novarocks_failpoint::target_binding::StatementWorkNomination;
+    use std::sync::Mutex;
+
+    fn nomination() -> Arc<StatementWorkNomination> {
+        Arc::new(StatementWorkNomination {
+            target_session_id: "statistics-owner-test".into(),
+            statement_run_token: "original-analyze".into(),
+            frontend_process_id: "019200aa-0000-7000-8000-0000000000ab".into(),
+            connection_id: 1,
+            session_epoch: 2,
+            statement_generation: 3,
+        })
+    }
+
+    struct NominatedExecutor {
+        inner: PublishExecutor,
+        seen: Mutex<Vec<(crate::StatisticsJobId, Option<StatementWorkNomination>)>>,
+        fail_before_take: bool,
+    }
+    impl StatisticsAttemptExecutor for NominatedExecutor {
+        fn prepare(
+            &self,
+            job: &StatisticsJob,
+            context: &crate::StatisticsAttemptContext,
+        ) -> Result<(), StatisticsAttemptError> {
+            context.stage_scope().check().map_err(failed)?;
+            if self.fail_before_take {
+                return Err(StatisticsAttemptError::Failed(StatisticsFailure {
+                    compile_control: None,
+                    message: Arc::from("preparation refused before request construction"),
+                }));
+            }
+            let nomination = context.take_test_statement_nomination().unwrap();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((job.id, nomination.as_deref().cloned()));
+            assert!(context.take_test_statement_nomination().unwrap().is_none());
+            Ok(())
+        }
+        fn collect(
+            &self,
+            job: &StatisticsJob,
+            context: &crate::StatisticsAttemptContext,
+        ) -> Result<(), StatisticsAttemptError> {
+            assert!(context.take_test_statement_nomination().unwrap().is_none());
+            self.inner.collect(job, context)
+        }
+        fn publish(
+            &self,
+            job: &StatisticsJob,
+            context: &crate::StatisticsAttemptContext,
+        ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
+            assert!(context.take_test_statement_nomination().unwrap().is_none());
+            self.inner.publish(job, context)
+        }
+    }
+
+    #[tokio::test]
+    async fn nomination_moves_once_to_exact_preparation_and_never_to_an_unrelated_job() {
+        for fail_before_take in [false, true] {
+            let repository = StatisticsJobRepository::new();
+            let original = nomination();
+            let weak = Arc::downgrade(&original);
+            let expected = original.as_ref().clone();
+            let nominated = repository
+                .create_admitted(
+                    create(1),
+                    root()
+                        .await
+                        .with_test_statement_nomination(original)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let unrelated = repository
+                .create_admitted(create(2), root().await)
+                .await
+                .unwrap();
+            assert!(
+                weak.upgrade().is_some(),
+                "queued job must retain its own nomination"
+            );
+            let executor = Arc::new(NominatedExecutor {
+                inner: PublishExecutor {
+                    publications: AtomicUsize::new(0),
+                    outcome: StatisticsPublicationFact::KnownCommitted,
+                    finalization_failure: false,
+                },
+                seen: Mutex::new(Vec::new()),
+                fail_before_take,
+            });
+            let worker = StatisticsWorker::new(repository.clone(), executor.clone());
+            let terminal = worker.run_one(3).await.unwrap().unwrap();
+            assert_eq!(terminal.id, nominated.id);
+            assert!(terminal.convergence.is_complete());
+            assert!(
+                weak.upgrade().is_none(),
+                "terminal history must not retain preparation evidence"
+            );
+            let terminal = worker.run_one(4).await.unwrap().unwrap();
+            assert_eq!(terminal.id, unrelated.id);
+            let seen = executor.seen.lock().unwrap();
+            if fail_before_take {
+                assert!(seen.is_empty());
+                assert_eq!(executor.inner.publications.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(
+                    *seen,
+                    [(nominated.id, Some(expected)), (unrelated.id, None)]
+                );
+                assert_eq!(executor.inner.publications.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_shutdown_and_actual_convergence_release_unconsumed_nomination() {
+        for path in 0..3 {
+            let repository = StatisticsJobRepository::new();
+            let original = nomination();
+            let weak = Arc::downgrade(&original);
+            let job = repository
+                .create_admitted(
+                    create(1),
+                    root()
+                        .await
+                        .with_test_statement_nomination(original)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            match path {
+                0 => {
+                    repository.request_cancel(job.id, 2).await.unwrap();
+                }
+                1 => {
+                    repository.request_stop_for_process_exit(2).unwrap();
+                }
+                _ => {
+                    repository.claim_next(2).await.unwrap().unwrap();
+                    repository
+                        .conclude(
+                            job.id,
+                            StatisticsJobPhase::Preparing,
+                            StatisticsJobConclusion::Failed,
+                            StatisticsPublicationFact::NotStarted,
+                            None,
+                            3,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        weak.upgrade().is_some(),
+                        "business conclusion cannot invent runtime convergence"
+                    );
+                    repository
+                        .record_convergence(
+                            job.id,
+                            crate::StatisticsConvergence {
+                                collection_stopped: true,
+                                execution_resources_released: true,
+                                provider_session_closed: true,
+                            },
+                            4,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(
+                repository
+                    .get(job.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .convergence
+                    .is_complete()
+            );
+            assert!(
+                weak.upgrade().is_none(),
+                "retained terminal row is observation only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_invalid_and_foreign_statement_evidence() {
+        assert!(
+            root()
+                .await
+                .with_test_statement_nomination(Arc::new(StatementWorkNomination::default()))
+                .is_err()
+        );
+        let original = nomination();
+        let admission = root()
+            .await
+            .with_test_statement_nomination(original.clone())
+            .unwrap()
+            .with_test_statement_nomination(original.clone())
+            .unwrap();
+        let mut foreign = original.as_ref().clone();
+        foreign.statement_generation += 1;
+        assert!(
+            admission
+                .with_test_statement_nomination(Arc::new(foreign))
+                .is_err()
+        );
+    }
+}

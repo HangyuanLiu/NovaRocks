@@ -139,8 +139,8 @@ const fn apply_key_kind_to_refresh_identity(kind: ApplyKeyKind) -> RefreshIdenti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
 
     fn interpretation() -> InterpretationDocument {

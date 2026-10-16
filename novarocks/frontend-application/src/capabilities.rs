@@ -181,6 +181,7 @@ pub struct DmlEnginePorts {
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     query_execution: QueryExecutionService,
     connector_runtime: tokio::runtime::Handle,
     lake_publication_runtime_policy:
@@ -197,6 +198,7 @@ impl DmlEnginePorts {
         typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         query_execution: QueryExecutionService,
         connector_runtime: tokio::runtime::Handle,
         lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
@@ -213,6 +215,7 @@ impl DmlEnginePorts {
             typed_connector_control,
             unified_statistics,
             mv_storage_observation,
+            mv_readiness,
             query_execution,
             connector_runtime,
             lake_publication_runtime_policy,
@@ -232,6 +235,7 @@ impl DmlEnginePorts {
             Arc::clone(&self.typed_connector_control),
             Arc::clone(&self.unified_statistics),
             Arc::clone(&self.mv_storage_observation),
+            Arc::clone(&self.mv_readiness),
             self.query_execution.clone(),
         )
         .with_lake_publication_runtime_policy(self.lake_publication_runtime_policy)
@@ -335,16 +339,19 @@ pub fn backend_command_executor(ports: BackendCommandPorts) -> BackendCommandExe
 pub struct IcebergRefCommandPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
 }
 
 impl IcebergRefCommandPorts {
     pub fn new(
         connector_control: Arc<dyn ConnectorControlRegistry>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     ) -> Self {
         Self {
             connector_control,
             mv_storage_observation,
+            mv_readiness,
         }
     }
 }
@@ -355,6 +362,7 @@ pub fn iceberg_ref_command_executor(
     iceberg_ref_command::IcebergRefCommandExecutor::new(
         ports.connector_control,
         ports.mv_storage_observation,
+        ports.mv_readiness,
     )
 }
 
@@ -369,6 +377,7 @@ pub struct MaintenanceCommandPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
     runtime: Handle,
@@ -383,6 +392,7 @@ impl MaintenanceCommandPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
         runtime: Handle,
@@ -398,6 +408,7 @@ impl MaintenanceCommandPorts {
             connector_control,
             typed_connector_control,
             mv_storage_observation,
+            mv_readiness,
             query_execution,
             service,
             runtime,
@@ -412,6 +423,7 @@ impl MaintenanceCommandPorts {
             Arc::clone(&self.connector_control),
             Arc::clone(&self.typed_connector_control),
             Arc::clone(&self.mv_storage_observation),
+            Arc::clone(&self.mv_readiness),
             self.query_execution.clone(),
             Arc::clone(&self.service),
             self.constant_policy,
@@ -431,6 +443,7 @@ pub fn maintenance_command_executor(
             ports.connector_control,
             ports.typed_connector_control,
             ports.mv_storage_observation,
+            ports.mv_readiness,
             ports.query_execution,
             ports.service,
             ports.constant_policy,

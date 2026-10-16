@@ -498,7 +498,6 @@ impl IcebergWriteSessionControl {
             let plan = plan_copy_on_write_branches(&material, &recipes, match_contract)?;
             let IcebergSessionFlavorPlan {
                 flavor,
-                publication,
                 document_publication,
                 rewrite_inputs,
                 copy_on_write,
@@ -511,7 +510,6 @@ impl IcebergWriteSessionControl {
                     purpose: request.purpose,
                     table: material.table,
                     base_version_digest: Some(base_digest),
-                    publication,
                     document_publication,
                     staged_metadata: None,
                     rewrite_inputs,

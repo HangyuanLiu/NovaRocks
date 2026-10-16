@@ -34,7 +34,7 @@ use novarocks_spi::connector::{
 use novarocks_mv_application::persistence::exact_revision::{
     persist_exact_connector_revision, restore_exact_query_revision,
 };
-use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotInfo {
@@ -74,7 +74,7 @@ pub(crate) struct DownstreamFloor {
 /// dependency on a replaced object, while an unresolved version of the current
 /// object blocks expiration for safety.
 pub(crate) fn downstream_floor(
-    projections: &[StoredMvProjection],
+    projections: &[StoredKeyedMvProjection],
     catalog: &str,
     namespace: &str,
     table: &str,
@@ -84,11 +84,10 @@ pub(crate) fn downstream_floor(
     let mut floor_ts: Option<i64> = None;
     let mut unknown = false;
     for projection in projections {
-        let MvPublicationState::Published(publication) = projection.facts.publication() else {
+        let Some(publication) = projection.facts.publication() else {
             continue;
         };
         let inputs = publication
-            .document()
             .inputs
             .iter()
             .map(|input| (input.relation_occurrence_id, input))
@@ -147,7 +146,7 @@ pub fn collect_table_stats_with_ports(
     catalog: &str,
     namespace: &str,
     table: &str,
-    projections: &[StoredMvProjection],
+    projections: &[StoredKeyedMvProjection],
 ) -> Result<TableMaintenanceStats, String> {
     let context = crate::connector::connector_request_context(
         None,
@@ -258,10 +257,9 @@ pub fn collect_table_stats_with_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use bytes::Bytes;
-    use novarocks_mv_application::persistence::{
-        projection::StoredMvProjection, test_support::ProjectionFixture,
-    };
+    use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{ConnectorProviderId, ConnectorTableObjectId};
 
@@ -279,7 +277,7 @@ mod tests {
         relation: &str,
         object: &'static [u8],
         snapshots: [i64; 2],
-    ) -> StoredMvProjection {
+    ) -> StoredKeyedMvProjection {
         let target_name = format!("mv_{mv_id}");
         let mut fixture = ProjectionFixture::new(
             MvTarget::from_parts(Some("ice"), "analytics", &target_name),
@@ -306,7 +304,7 @@ mod tests {
             input.object_id = object_id;
             input.native_data_version = data_version;
         }
-        StoredMvProjection {
+        StoredKeyedMvProjection {
             mv_id,
             facts: fixture.build().unwrap(),
         }

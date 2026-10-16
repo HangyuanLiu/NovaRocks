@@ -2,7 +2,18 @@
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0.
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use std::sync::Arc;
 
@@ -10,7 +21,7 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
     ConnectorDocumentStorageManagement, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorPrepareDocumentsRequest, ProviderBindingEpoch,
+    ConnectorInstanceDescriptor, ProviderBindingEpoch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +82,7 @@ impl ConnectorDocumentStorageManagement for IcebergDocumentStorage {
         &self,
         request: ConnectorDocumentManagementAdmissionRequest,
     ) -> Result<Bytes, ConnectorError> {
-        super::io::check_context(request.context())?;
+        super::context::check_context(request.context())?;
         use crate::catalog::admission::{
             CatalogAdmissionRequest, CatalogOperation, connector_unsupported,
         };
@@ -114,76 +125,19 @@ impl ConnectorDocumentStorageManagement for IcebergDocumentStorage {
             .map(Bytes::from)
             .map_err(|error| internal(format!("encode Iceberg document admission: {error}")))
     }
+}
 
-    fn prepare_documents(
-        &self,
-        request: ConnectorPrepareDocumentsRequest,
-    ) -> Result<Bytes, ConnectorError> {
-        super::io::check_context(request.context())?;
-        let token: AdmissionTokenV1 = serde_json::from_slice(request.admission().provider_token())
-            .map_err(|error| {
-                ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    format!("decode Iceberg document admission: {error}"),
-                )
-            })?;
-        validate_admission_token(&token, request.admission())?;
-        let (file_io, root) = match request.admission().operation() {
-            ConnectorDocumentManagementOperation::Create => {
-                let root = create_document_root(
-                    &self.runtime.control_state().configuration().warehouse_uri,
-                    request.admission().operation_id().to_bytes(),
-                );
-                let binding = self
-                    .runtime
-                    .resources()
-                    .planning_binding()
-                    .for_request(request.context().clone());
-                (
-                    crate::fs_io::build_file_io_for_location(&root, binding),
-                    root,
-                )
-            }
-            ConnectorDocumentManagementOperation::SingleTargetUpdate
-            | ConnectorDocumentManagementOperation::Publication => {
-                let target = request.admission().target();
-                let physical = self
-                    .runtime
-                    .load_table_classified_for_request(
-                        &target.namespace,
-                        &target.table,
-                        request.context(),
-                    )
-                    .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
-                let table = physical.into_table();
-                let expected = request.admission().expected_object_id().ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "Iceberg document update requires an exact table object",
-                    )
-                })?;
-                super::observation::validate_expected_object(expected, table.metadata())?;
-                (
-                    table.file_io().clone(),
-                    table.metadata().location().to_string(),
-                )
-            }
-            ConnectorDocumentManagementOperation::Drop => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "drop does not prepare application documents",
-                ));
-            }
-        };
-        let manifest = super::io::prepare_document_carriers(
-            self.runtime.resources().catalog_runtime(),
-            &file_io,
-            &root,
-            request.documents(),
-            request.context(),
-        )?;
-        super::codec::encode_document_manifest(&manifest)
-    }
+pub(crate) fn validate_management_admission(
+    admission: &novarocks_spi::connector::ConnectorDocumentManagementAdmission,
+) -> Result<(), ConnectorError> {
+    let token: AdmissionTokenV1 =
+        serde_json::from_slice(admission.provider_token()).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode Iceberg document admission: {error}"),
+            )
+        })?;
+    validate_admission_token(&token, admission)
 }
 
 fn validate_admission_token(
@@ -212,17 +166,6 @@ fn validate_admission_token(
         ));
     }
     Ok(())
-}
-
-fn create_document_root(warehouse: &str, operation_id: [u8; 16]) -> String {
-    let operation = operation_id
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!(
-        "{}/_novarocks/document-staging/v1/{operation}",
-        warehouse.trim_end_matches('/')
-    )
 }
 
 fn internal(message: impl Into<String>) -> ConnectorError {

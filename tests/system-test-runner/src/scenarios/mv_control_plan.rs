@@ -65,6 +65,21 @@ pub(in crate::scenarios) fn observation(
     )
 }
 
+pub(in crate::scenarios) fn document_expiry(
+    id: &str,
+    catalog: &str,
+    namespace: &str,
+    mv: &str,
+    token: &str,
+    directory: Option<&Path>,
+) -> DomainGrant {
+    let mut parameters = json!({"action":"document-expiry","catalog":catalog,"namespace":namespace,"mv":mv,"token":token});
+    if let Some(directory) = directory {
+        parameters["directory"] = json!(directory);
+    }
+    action(id, parameters)
+}
+
 pub(in crate::scenarios) fn wipe(id: &str) -> DomainGrant {
     // This is the versioned consumer input, validated by the canonical owner
     // novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY.

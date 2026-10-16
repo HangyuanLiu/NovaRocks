@@ -24,6 +24,7 @@ mod identity;
 mod intent;
 mod outcome;
 mod request;
+pub(crate) use request::validate_document_expiry_update;
 
 pub use artifacts::{
     ArtifactClass, ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactWriteState,

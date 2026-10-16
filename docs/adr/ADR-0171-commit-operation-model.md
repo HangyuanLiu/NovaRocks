@@ -6,6 +6,8 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0180
+    scope: "Request-shape table for document storage: marker-only MetadataOnly, zero-file SnapshotProducing slot changes and all-observed-ref expiry; immutable operations, dependency validation and artifact ownership remain unchanged"
   - id: ADR-0179
     scope: "Late SDK carrier and transaction outcome, plus operation-owned reusable rewrite manifests; immutable intent, dependency, inheritance and artifact ownership contracts remain active"
     link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"

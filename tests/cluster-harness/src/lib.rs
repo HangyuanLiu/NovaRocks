@@ -37,6 +37,7 @@ pub mod process_resources;
 pub mod publication;
 pub mod publication_catalog;
 pub mod publication_service;
+pub mod recording_rest_catalog;
 pub mod vended_rest_catalog;
 
 use anyhow::{Context, Result, bail, ensure};

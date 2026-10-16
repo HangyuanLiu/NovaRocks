@@ -130,6 +130,8 @@ pub struct MvManagementStatus {
     pub local_incarnation: ProcessIncarnation,
     pub phase: MvManagementPhase,
     pub unsettled: Vec<MvUnsettledEffectStatus>,
+    pub pending_slot_changes: usize,
+    pub latest_slot_change_conclusion: Option<novarocks_spi::connector::CommitConclusion>,
     /// Issued only when a declaration could actually be used. A phase that no
     /// operator statement can change carries none, so a challenge never
     /// suggests an action that does not exist.
@@ -228,6 +230,8 @@ impl ManagementContinuationService {
             local_owner: self.entrance.owner().clone(),
             local_incarnation: self.entrance.incarnation().clone(),
             phase,
+            pending_slot_changes: self.entrance.pending_slot_changes(table),
+            latest_slot_change_conclusion: self.entrance.latest_slot_change_conclusion(table),
             required_evidence,
             unsettled,
             challenge: issued,

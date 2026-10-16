@@ -903,6 +903,9 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 ),
             });
         }
+        for key in request.properties.keys() {
+            crate::document_storage::keyed::write::reject_reserved_property(key)?;
+        }
         let stage_publication = StagePublication {
             journal: crate::commit::attempt::observation::PublicationJournal::for_runtime(
                 crate::commit::model::OperationToken::from_mutation(request.operation_id),
@@ -935,21 +938,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         }
 
         let mut properties = request.properties;
-        properties.retain(|key, _| {
-            !key.eq_ignore_ascii_case(CTAS_OPERATION_MARKER)
-                && !key.eq_ignore_ascii_case(
-                    crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY,
-                )
-                && !key.eq_ignore_ascii_case(
-                    crate::document_storage::observation::MANAGED_KIND_PROPERTY,
-                )
-                && !key.eq_ignore_ascii_case(
-                    crate::document_storage::observation::MANAGED_OWNER_PROPERTY,
-                )
-                && !key.eq_ignore_ascii_case(
-                    crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY,
-                )
-        });
+        properties.retain(|key, _| !key.eq_ignore_ascii_case(CTAS_OPERATION_MARKER));
         properties.insert(
             Arc::from(CTAS_OPERATION_MARKER),
             Arc::from(publication_marker(request.publication_id)),
@@ -1699,7 +1688,7 @@ fn publication_expectation(
 
 fn publication_matches(
     table: &crate::iceberg::table::Table,
-    operation_id: ConnectorStagedCreateOperationId,
+    _operation_id: ConnectorStagedCreateOperationId,
     prepared: &PreparedOperation,
     expected_snapshot_id: Option<i64>,
 ) -> bool {
@@ -1728,69 +1717,20 @@ fn publication_document_properties(
     handle: &ConnectorStagedTableHandle,
     payload: &ConnectorStagedCreatePublicationPayload,
 ) -> Result<Option<HashMap<String, String>>, ConnectorError> {
-    let intent = match payload {
+    match payload {
         ConnectorStagedCreatePublicationPayload::Ordinary => {
             if handle.document_target().is_some() {
                 return Err(invalid(
-                    "document-managed staged target requires application documents at publication",
+                    "document-managed staged target requires keyed documents at publication",
                 ));
             }
-            return Ok(None);
+            Ok(None)
         }
-        ConnectorStagedCreatePublicationPayload::ApplicationDocuments(intent) => intent,
-    };
-    if handle.document_target() != Some(intent.prepared_target()) {
-        return Err(invalid(
-            "application documents do not match the exact staged target",
-        ));
+        ConnectorStagedCreatePublicationPayload::KeyedDocuments(intent) => {
+            intent.validate_for_handle(handle)?;
+            crate::document_storage::keyed::write::create_properties(&intent.documents).map(Some)
+        }
     }
-    let prepared = intent.prepared_documents();
-    let manifest =
-        crate::document_storage::codec::decode_document_manifest(prepared.provider_token())?;
-    if manifest.documents.len() != prepared.documents().len()
-        || manifest
-            .documents
-            .iter()
-            .zip(prepared.documents())
-            .any(|(envelope, document)| {
-                let Ok(stored) = crate::document_storage::codec::stored_document(envelope) else {
-                    return true;
-                };
-                stored.id() != document.id()
-                    || !matches!(
-                        document.attachment(),
-                        novarocks_spi::connector::ConnectorDocumentAttachment::TableMetadata
-                    )
-                    || !matches!(
-                        stored.attachment(),
-                        novarocks_spi::connector::ConnectorStoredDocumentAttachment::TableMetadata
-                    )
-            })
-    {
-        return Err(corrupt(
-            "prepared Iceberg document manifest does not match its exact create publication",
-        ));
-    }
-    let encoded = std::str::from_utf8(prepared.provider_token())
-        .map_err(|_| corrupt("prepared Iceberg document manifest is not valid UTF-8 metadata"))?;
-    Ok(Some(HashMap::from([
-        (
-            crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-            encoded.to_string(),
-        ),
-        (
-            crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
-            intent.marker().kind().to_string(),
-        ),
-        (
-            crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
-            intent.marker().owner().to_string(),
-        ),
-        (
-            crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
-            intent.marker().incarnation().to_string(),
-        ),
-    ])))
 }
 
 fn publication_receipt(
@@ -2151,24 +2091,26 @@ mod tests {
     }
 
     #[test]
-    fn applied_publication_requires_the_exact_document_manifest_and_managed_marker() {
+    fn applied_publication_requires_every_exact_keyed_property_and_management_slot() {
         let runtime = hadoop_runtime();
         let mut prepared = prepared_operation(&runtime);
         let document_properties = HashMap::from([
             (
-                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-                "exact-manifest".to_string(),
+                crate::document_storage::keyed::keys::version_key(
+                    novarocks_spi::connector::DocumentIdentity::from_bytes([1; 32]),
+                ),
+                "exact-version-envelope".to_string(),
             ),
             (
-                crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
+                "novarocks.doc.v2.slot.novarocks.mv~configuration".to_string(),
                 "mv".to_string(),
             ),
             (
-                crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+                "novarocks.doc.v2.root.novarocks.mv".to_string(),
                 "deployment".to_string(),
             ),
             (
-                crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
+                "novarocks.doc.v2.slot.novarocks.mv~management".to_string(),
                 "incarnation".to_string(),
             ),
         ]);
@@ -2194,8 +2136,7 @@ mod tests {
             None
         ));
 
-        published_properties
-            .remove(crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY);
+        published_properties.remove("novarocks.doc.v2.slot.novarocks.mv~management");
         let partial = publication_table_with_properties(
             &prepared,
             published_properties.clone(),
@@ -2213,7 +2154,7 @@ mod tests {
         ));
 
         published_properties.insert(
-            crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
+            "novarocks.doc.v2.slot.novarocks.mv~management".to_string(),
             "other".to_string(),
         );
         let mismatched = publication_table_with_properties(

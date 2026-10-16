@@ -18,7 +18,7 @@
 use crate::mv::domain::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_mv_application::persistence::codec::{ExpressionKind, TargetPartitionTransform};
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::schema::{
     MvPartitionContract, MvPartitionTransformContract,
 };
@@ -30,7 +30,7 @@ use novarocks_spi::connector::{
 /// binding prove that each target field is the same source field and transform
 /// as the provider's per-file impact. Any weaker relation requires a full scan.
 pub(crate) fn map_connector_partition_to_mv_key(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     source_occurrence_id: u32,
     source_observation: &MvSchemaValidationObservation,
     target_partition: &MvPartitionContract,
@@ -185,15 +185,15 @@ fn impact_transform_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use bytes::Bytes;
     use novarocks_mv_application::persistence::codec::{
         ApplyKeyKind, ExpressionShape, PhysicalFieldLogicalIdentity, SourceFieldReference,
         TargetPartitionFieldBinding,
     };
     use novarocks_mv_application::persistence::identity::FieldIdentity;
-    use novarocks_mv_application::persistence::projection::StoredMvProjection;
+    use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
     use novarocks_mv_application::persistence::schema::MvPartitionFieldContract;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
         ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
@@ -213,8 +213,8 @@ mod tests {
         .unwrap()
     }
 
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(
                 MvTarget::from_parts(Some("ice"), "sales", "mv"),
@@ -279,7 +279,7 @@ mod tests {
         .unwrap()
     }
 
-    fn partitioned_projection() -> StoredMvProjection {
+    fn partitioned_projection() -> StoredKeyedMvProjection {
         let mut fixture =
             ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None);
         fixture.definition.relation_occurrences.truncate(1);
@@ -313,7 +313,7 @@ mod tests {
             source_target_field_id: fixture.interpretation.outputs[0].target_field_id.clone(),
             transform: TargetPartitionTransform::Identity,
         }];
-        StoredMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: fixture.build().unwrap(),
         }

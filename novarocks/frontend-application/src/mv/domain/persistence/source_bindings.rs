@@ -45,7 +45,15 @@ pub(crate) fn observe_mv_create_source_bindings(
     sql_facts: &SqlMvCreatePersistenceFacts,
     bindings: &QueryTableBindingStore,
     context: ConnectorRequestContext,
-) -> Result<Vec<MvCreateRelationObservation>, String> {
+) -> Result<
+    (
+        Vec<MvCreateRelationObservation>,
+        novarocks_mv_application::persistence::codec::keyed::BindingDocument,
+    ),
+    String,
+> {
+    let mut formats = Vec::new();
+    let observations =
     sql_facts
         .relation_occurrences()
         .iter()
@@ -100,6 +108,7 @@ pub(crate) fn observe_mv_create_source_bindings(
                         .to_string(),
                 );
             }
+            formats.push(novarocks_mv_application::persistence::codec::keyed::DataVersionFormat::from_issued_fact(revision.data_version()).map_err(|error|error.to_string())?);
             let (object_id, _data_version) =
                 persist_exact_connector_revision(&revision).map_err(|error| error.to_string())?;
             bind_relation_fields(
@@ -108,7 +117,13 @@ pub(crate) fn observe_mv_create_source_bindings(
                 bytes::Bytes::copy_from_slice(object_id.as_bytes()),
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((
+        observations,
+        novarocks_mv_application::persistence::codec::keyed::BindingDocument {
+            data_versions: formats,
+        },
+    ))
 }
 
 fn bind_relation_fields(

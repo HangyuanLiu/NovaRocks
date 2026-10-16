@@ -59,11 +59,9 @@ pub(super) enum Schema {
     TargetBinding,
     TargetPartitionFieldBinding,
     PhysicalFieldBinding,
-    PublicationDocument,
-    PublicationInput,
-    PublicationOutput,
-    PublicationStatistics,
     ConfigurationDocument,
+    BindingDocument,
+    DataVersionFormat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,21 +275,10 @@ const TARGET: &[Field] = &[
 ];
 const TARGET_PARTITION_FIELD: &[Field] = &[bytes(1), bytes(2), scalar(3), scalar(4)];
 const PHYSICAL_FIELD: &[Field] = &[scalar(1), bytes(2), bytes(3), bytes(4), boolean(5)];
-const PUBLICATION: &[Field] = &[
-    scalar(1),
-    bytes(2),
-    bytes(3),
-    bytes(4),
-    repeated_message(5, Schema::PublicationInput),
-    message(6, Schema::PublicationOutput),
-    scalar(7),
-    message(8, Schema::PublicationStatistics),
-    scalar(9),
-];
-const PUBLICATION_INPUT: &[Field] = &[scalar(1), bytes(2), bytes(3)];
-const PUBLICATION_OUTPUT: &[Field] = &[bytes(1), boolean(2)];
-const PUBLICATION_STATISTICS: &[Field] = &[scalar(1), scalar(2)];
 const CONFIGURATION: &[Field] = &[scalar(1), scalar(2), boolean(3), scalar(4), scalar(5)];
+
+const BINDING: &[Field] = &[scalar(1), repeated_message(2, Schema::DataVersionFormat)];
+const DATA_VERSION_FORMAT: &[Field] = &[bytes(1), bytes(2), scalar(3), scalar(4)];
 
 impl Schema {
     fn fields(self) -> &'static [Field] {
@@ -314,11 +301,9 @@ impl Schema {
             Self::TargetBinding => TARGET,
             Self::TargetPartitionFieldBinding => TARGET_PARTITION_FIELD,
             Self::PhysicalFieldBinding => PHYSICAL_FIELD,
-            Self::PublicationDocument => PUBLICATION,
-            Self::PublicationInput => PUBLICATION_INPUT,
-            Self::PublicationOutput => PUBLICATION_OUTPUT,
-            Self::PublicationStatistics => PUBLICATION_STATISTICS,
             Self::ConfigurationDocument => CONFIGURATION,
+            Self::BindingDocument => BINDING,
+            Self::DataVersionFormat => DATA_VERSION_FORMAT,
         }
     }
 }
@@ -689,10 +674,6 @@ mod tests {
             std::mem::size_of::<proto::BranchInterpretation>(),
             std::mem::size_of::<proto::TargetBinding>(),
             std::mem::size_of::<proto::PhysicalFieldBinding>(),
-            std::mem::size_of::<proto::PublicationDocument>(),
-            std::mem::size_of::<proto::PublicationInput>(),
-            std::mem::size_of::<proto::PublicationOutput>(),
-            std::mem::size_of::<proto::PublicationStatistics>(),
             std::mem::size_of::<proto::ConfigurationDocument>(),
         ];
         let largest = generated_sizes.into_iter().max().expect("generated DTOs");

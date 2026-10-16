@@ -3269,6 +3269,143 @@ mod tests {
             "{error}"
         );
     }
+    #[test]
+    fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_boundary() {
+        use crate::exec::chunk::{
+            RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage,
+            borrowed_root_chunk_storage,
+        };
+        use arrow::array::Float64Array;
+        use novarocks_type_contract::DecimalOverflowPolicy;
+
+        let limits = RootArrayStorageLimits {
+            bytes: 1024 * 1024,
+            nodes: 256,
+            depth: 64,
+        };
+        // The first subtraction is the original count(*) - count(DISTINCT
+        // _row_id) shape. Other rows retain both left and right NULL behavior.
+        let cases = [
+            ("add", 12, 12, 12.0, 12.0),
+            ("subtract", 0, 2, 0.0, 2.0),
+            ("multiply", 36, 35, 36.0, 35.0),
+            ("divide", 1, 1, 1.0, 1.4),
+            ("modulo", 0, 2, 0.0, 2.0),
+        ];
+        // Exercise integer and floating kernels, plus SQL's integral inputs
+        // with a declared floating division result. No cast hides an outer Arc.
+        for mode in 0..3 {
+            for (operation, first_int, last_int, first_float, last_float) in cases {
+                if mode == 2 && operation != "divide" {
+                    continue;
+                }
+                let left = SlotId::new(2);
+                let right = SlotId::new(3);
+                let input_type = if mode == 1 {
+                    DataType::Float64
+                } else {
+                    DataType::Int64
+                };
+                let output_type = if mode == 0 {
+                    DataType::Int64
+                } else {
+                    DataType::Float64
+                };
+                let mut arena = ExprArena::default();
+                let a = arena.push_typed(ExprNode::SlotId(left), input_type.clone());
+                let b = arena.push_typed(ExprNode::SlotId(right), input_type.clone());
+                let policy = DecimalOverflowPolicy::ReportError;
+                let expression = match operation {
+                    "add" => ExprNode::Add(a, b, policy),
+                    "subtract" => ExprNode::Sub(a, b, policy),
+                    "multiply" => ExprNode::Mul(a, b, policy),
+                    "divide" => ExprNode::Div(a, b, policy),
+                    "modulo" => ExprNode::Mod(a, b, policy),
+                    _ => unreachable!("closed arithmetic fixture"),
+                };
+                let expression = arena.push_typed(expression, output_type.clone());
+                // This fixture installs the same construction owner and actual
+                // Project processing as the existing component tests.
+                let mut project = final_identity_operator_with_field(Field::new(
+                    "arithmetic_result",
+                    output_type.clone(),
+                    true,
+                ));
+                project.arena = Arc::new(arena);
+                project.exprs = vec![expression];
+                project.validate_final_result_input = false;
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("count_all", input_type.clone(), true),
+                    Field::new("count_distinct", input_type, true),
+                ]));
+                let columns: Vec<ArrayRef> = if mode == 1 {
+                    vec![
+                        Arc::new(Float64Array::from(vec![
+                            Some(6.0),
+                            None,
+                            Some(7.0),
+                            Some(6.0),
+                        ])),
+                        Arc::new(Float64Array::from(vec![
+                            Some(6.0),
+                            Some(2.0),
+                            Some(5.0),
+                            None,
+                        ])),
+                    ]
+                } else {
+                    vec![
+                        Arc::new(Int64Array::from(vec![Some(6), None, Some(7), Some(6)])),
+                        Arc::new(Int64Array::from(vec![Some(6), Some(2), Some(5), None])),
+                    ]
+                };
+                let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+                let input =
+                    Chunk::new_with_chunk_schema(batch, chunk_schema_of(&schema, &[left, right]));
+                let output = run_declared_physical_fixture(&mut project, input)
+                    .unwrap()
+                    .unwrap();
+                if mode == 0 {
+                    let values = output.columns()[0]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    assert_eq!(
+                        values,
+                        &Int64Array::from(vec![Some(first_int), None, Some(last_int), None])
+                    );
+                } else {
+                    let values = output.columns()[0]
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap();
+                    assert_eq!(
+                        values,
+                        &Float64Array::from(vec![Some(first_float), None, Some(last_float), None])
+                    );
+                }
+                borrowed_root_chunk_storage(&output, limits).expect(
+                    "actual arithmetic Project output must expose a concrete standard carrier",
+                );
+                let mut final_identity = final_identity_operator_with_field(Field::new(
+                    "arithmetic_result",
+                    output_type,
+                    true,
+                ));
+                let output = run_declared_physical_fixture(&mut final_identity, output)
+                    .unwrap()
+                    .unwrap();
+                borrowed_root_chunk_storage(&output, limits)
+                    .expect("the final identity preserves the actual arithmetic array owner");
+                let wrapped: ArrayRef = Arc::new(output.columns()[0].clone());
+                assert_eq!(
+                    borrowed_root_array_storage(wrapped.as_ref(), limits),
+                    Err(RootArrayStorageError::CarrierOuterOwnerMismatch),
+                    "producer correctness must not weaken root outer-owner rejection",
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorDocumentManagementObservation};
+use novarocks_spi::connector::ConnectorCommittedVersion;
 
 use super::{
     CreateIntent, DeploymentOwner, EffectIdentity, ManagedMvTarget, ManagementOwnershipError,
@@ -107,24 +107,6 @@ pub struct FreshManagementObservation {
 }
 
 impl FreshManagementObservation {
-    fn try_from_connector(
-        request_id: ManagementObservationRequestId,
-        expected_target: &ManagedMvTarget,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<Self, ManagementObservationError> {
-        observation
-            .validate_sealed()
-            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
-        expected_target.validate_observation(observation)?;
-        Ok(Self {
-            request_id,
-            target: expected_target.clone(),
-            owner: DeploymentOwner::parse(observation.marker().owner())?,
-            incarnation: ProcessIncarnation::parse(observation.marker().incarnation())?,
-            metadata_version: observation.metadata_version().clone(),
-        })
-    }
-
     pub const fn target(&self) -> &ManagedMvTarget {
         &self.target
     }
@@ -174,23 +156,58 @@ pub struct PendingCreateIntentObservation {
 }
 
 impl PendingCreateIntentObservation {
-    pub(super) const fn for_intent(intent: CreateIntent) -> Self {
-        Self { intent }
+    pub fn complete_keyed(
+        self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            FreshCreateIntentObservation,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationError,
+    > {
+        if request.catalog_handle != *self.intent.catalog()
+            || request.target != *self.intent.table()
+        {
+            return Err(ManagementObservationError::EffectTargetMismatch);
+        }
+        let catalog = request.catalog_handle.clone();
+        let view = lease
+            .observe_keyed_documents(request)
+            .map_err(|error| match error {
+                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error)
+                    if error.table_object_binding_failure()
+                        == Some(
+                            novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                        ) =>
+                {
+                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+                }
+                _ => ManagementObservationError::UnsealedObservation,
+            })?;
+        let slot = view
+            .slots
+            .get(
+                &crate::persistence::keyed_documents::management_slot_name()
+                    .map_err(|_| ManagementObservationError::InvalidProvenance)?,
+            )
+            .ok_or(ManagementObservationError::InvalidProvenance)?;
+        crate::persistence::keyed_documents::decode_management_slot(&slot.value)
+            .map_err(|_| ManagementObservationError::InvalidProvenance)?;
+        let target = ManagedMvTarget::try_new(catalog, view.table.clone(), view.object_id.clone())?;
+        let target = self.intent.bind_target(target)?;
+        Ok((
+            FreshCreateIntentObservation {
+                intent: self.intent,
+                target,
+            },
+            view,
+        ))
     }
 
-    pub fn complete(
-        self,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<FreshCreateIntentObservation, ManagementObservationError> {
-        observation
-            .validate_sealed()
-            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
-        let target = ManagedMvTarget::from_observation(observation)?;
-        let target = self.intent.bind_target(target)?;
-        Ok(FreshCreateIntentObservation {
-            intent: self.intent,
-            target,
-        })
+    pub(super) const fn for_intent(intent: CreateIntent) -> Self {
+        Self { intent }
     }
 }
 
@@ -218,11 +235,56 @@ impl FreshCreateIntentObservation {
 }
 
 impl PendingManagementObservation {
-    pub fn complete(
+    /// Obtain the fresh observation through the retained lease itself; raw
+    /// decoded keyed views cannot mint a management admission capability.
+    pub fn complete_keyed(
         self,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<FreshManagementObservation, ManagementObservationError> {
-        FreshManagementObservation::try_from_connector(self.request_id, &self.target, observation)
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            FreshManagementObservation,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationError,
+    > {
+        if request.catalog_handle != *self.target.catalog()
+            || request.target != *self.target.table()
+            || request.object_id != *self.target.object_id()
+        {
+            return Err(ManagementObservationError::EffectTargetMismatch);
+        }
+        let view = lease
+            .observe_keyed_documents(request)
+            .map_err(|error| match error {
+                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error)
+                    if error.table_object_binding_failure()
+                        == Some(
+                            novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                        ) =>
+                {
+                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+                }
+                _ => ManagementObservationError::UnsealedObservation,
+            })?;
+        let slot = view
+            .slots
+            .get(
+                &crate::persistence::keyed_documents::management_slot_name()
+                    .map_err(|_| ManagementObservationError::InvalidProvenance)?,
+            )
+            .ok_or(ManagementObservationError::InvalidProvenance)?;
+        let (owner, incarnation) =
+            crate::persistence::keyed_documents::decode_management_slot(&slot.value)
+                .map_err(|_| ManagementObservationError::InvalidProvenance)?;
+        let fresh = FreshManagementObservation {
+            request_id: self.request_id,
+            target: self.target,
+            owner,
+            incarnation,
+            metadata_version: view.metadata_version.clone(),
+        };
+        Ok((fresh, view))
     }
 }
 
@@ -414,17 +476,24 @@ impl ManagementObservationState {
         result
     }
 
-    /// Complete one exact request and apply it atomically to the state. This
-    /// path can close admission on object replacement; callers must not turn a
-    /// failed exact observation into a candidate miss.
-    pub fn complete_current_observation(
+    /// Consume the current ticket even when a keyed provider observation fails.
+    /// The retained lease mints the fresh capability; callers cannot substitute
+    /// a historical view or reapply the same observation ticket.
+    pub fn complete_keyed_current_observation(
         &mut self,
         pending: PendingManagementObservation,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<ManagementObservationPhase, ManagementObservationError> {
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            ManagementObservationPhase,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationError,
+    > {
         self.consume_current_request(pending.request_id)?;
-        let fresh = match pending.complete(observation) {
-            Ok(fresh) => fresh,
+        let (fresh, view) = match pending.complete_keyed(lease, request) {
+            Ok(observation) => observation,
             Err(error) => {
                 if matches!(
                     error,
@@ -436,7 +505,8 @@ impl ManagementObservationState {
                 return Err(error);
             }
         };
-        self.apply_current_observation(fresh)
+        let phase = self.apply_current_observation(fresh)?;
+        Ok((phase, view))
     }
 
     pub fn record_registration_terminal(

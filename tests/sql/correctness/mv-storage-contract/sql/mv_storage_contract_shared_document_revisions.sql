@@ -6,7 +6,7 @@
 --
 -- @sequential=true
 -- @tags=mv,iceberg,rest,minio,storage-contract,document-retention
--- Two real refreshes share D/L while each output owns an exact P. The runner
+-- Two real refreshes share B/D/L while each publication has a distinct P. The runner
 -- reads the isolated REST table metadata before cleanup, not a mocked graph.
 
 -- query 1
@@ -44,11 +44,9 @@ TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 INSERT INTO mvgraph_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 5
--- @tags=mv,iceberg,rest,minio,storage-contract,document-retention,test-capability:mv-document-observation
+-- @tags=mv,iceberg,rest,minio,storage-contract,document-retention
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=0
--- @result_contains=package
--- @result_contains=lake-documents
+-- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=0,slot-changes=0
 SET CATALOG mvgraph_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_graph
@@ -56,18 +54,12 @@ DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL
 PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT k, v FROM fact;
-CALL mvgraph_${uuid0}.system.novarocks_imv_stateless_rebuild(
-  table => 'ns_${uuid0}.mv_graph', level => 'package');
 
 -- query 6
--- @tags=mv,iceberg,rest,minio,storage-contract,document-retention,test-capability:mv-document-observation
+-- @tags=mv,iceberg,rest,minio,storage-contract,document-retention
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=1
--- @result_contains=provenance
--- @result_contains=lake-documents
+-- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=1,slot-changes=0
 REFRESH MATERIALIZED VIEW mv_graph WITH SYNC MODE;
-CALL mvgraph_${uuid0}.system.novarocks_imv_stateless_rebuild(
-  table => 'ns_${uuid0}.mv_graph', level => 'provenance');
 
 -- query 7
 -- @skip_result_check=true
@@ -78,7 +70,7 @@ INSERT INTO mvgraph_${uuid0}.ns_${uuid0}.fact VALUES ('east', 20);
 REFRESH MATERIALIZED VIEW mv_graph WITH SYNC MODE;
 
 -- query 9
--- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=2
+-- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=2,slot-changes=0
 -- @skip_result_check=true
 -- @result_contains=east
 -- @result_contains=10

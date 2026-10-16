@@ -21,15 +21,13 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCommittedVersion, ConnectorControlRuntimeId,
-    ConnectorDocumentManagementObservation, ConnectorDocumentManagementOperation,
-    ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorDocumentManagementOperation, ConnectorTableIdentity, ConnectorTableObjectId,
 };
 
 use crate::activity::{
     CanonicalMvTarget, MvActivityAdmissionError, MvActivityGate, MvActivityGateError,
     MvActivityLease, MvActivityObservation, MvActivityOwner, MvActivityTicket,
 };
-use crate::persistence::documents::MvObservedCurrentDocuments;
 
 /// Single-use proof that the management owner admitted the exact same Current
 /// observation after effect closure and owner/incarnation validation.
@@ -44,12 +42,15 @@ pub struct MvCurrentManagementAdmission {
 }
 
 impl MvCurrentManagementAdmission {
-    pub(crate) fn matches(&self, documents: &MvObservedCurrentDocuments) -> bool {
+    pub(crate) fn matches_keyed(
+        &self,
+        documents: &crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+    ) -> bool {
         self.liveness.is_open()
             && self.target == documents.management_target
             && self.owner == documents.deployment_owner
             && self.incarnation == documents.process_incarnation
-            && self.metadata_version == documents.metadata_version
+            && self.metadata_version == documents.view.metadata_version
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -57,12 +58,14 @@ impl MvCurrentManagementAdmission {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(documents: &MvObservedCurrentDocuments) -> Self {
+    pub(crate) fn for_test_keyed(
+        documents: &crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+    ) -> Self {
         Self {
             target: documents.management_target.clone(),
             owner: documents.deployment_owner.clone(),
             incarnation: documents.process_incarnation.clone(),
-            metadata_version: documents.metadata_version.clone(),
+            metadata_version: documents.view.metadata_version.clone(),
             liveness: ManagementObservationLiveness::new(),
         }
     }
@@ -78,6 +81,43 @@ use super::{
     ManagementObservationError, ManagementObservationPhase, ManagementObservationState,
     ProcessIncarnation, UnsettledEffect,
 };
+
+/// Fresh deletion-only preparation for an already installed exact target.
+/// It cannot authorize a data projection, publication, or readmission.
+#[derive(Debug)]
+pub struct MvDropManagementObservation {
+    target: ManagedMvTarget,
+    dependencies: ManagementDependencySet,
+    root_binding: novarocks_spi::connector::DocumentIdentity,
+    configuration_revision: crate::persistence::identity::DocumentRevision,
+}
+
+impl MvDropManagementObservation {
+    pub fn target(&self) -> &ManagedMvTarget {
+        &self.target
+    }
+
+    pub fn request(&self) -> ManagementRequest {
+        ManagementRequest {
+            catalog: self.target.catalog().clone(),
+            table: self.target.table().clone(),
+            expected_object_id: Some(self.target.object_id().clone()),
+            operation: ConnectorDocumentManagementOperation::Drop,
+            expected_dependencies: Some(self.dependencies.clone()),
+            effect_scope: EffectScope::CATALOG_AND_OBJECT_DELETION,
+            frozen_effect_identity: None,
+            create_intent: None,
+        }
+    }
+
+    /// Recheck the preparation after taking the same target's activity lease.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.dependencies == other.dependencies
+            && self.root_binding == other.root_binding
+            && self.configuration_revision == other.configuration_revision
+    }
+}
 
 /// Exact MV-domain dependencies frozen before a long computation. Reacquiring
 /// the entrance with an older set fails rather than publishing old output.
@@ -251,6 +291,8 @@ pub enum MvManagementPhase {
     Stopping,
     /// A fresh Current observation found a different process incarnation.
     IncarnationMismatch,
+    /// A fresh Current observation transferred this target to another deployment.
+    OwnerMismatch,
 }
 
 impl MvManagementPhase {
@@ -270,6 +312,7 @@ impl MvManagementPhase {
             Self::AwaitingCreateBinding => "AWAITING_CREATE_BINDING",
             Self::Stopping => "STOPPING",
             Self::IncarnationMismatch => "INCARNATION_MISMATCH",
+            Self::OwnerMismatch => "OWNER_MISMATCH",
         }
     }
 }
@@ -291,12 +334,16 @@ struct TargetAdmissionState {
     target: ManagedMvTarget,
     dependencies: ManagementDependencySet,
     unsettled: HashMap<super::EffectIdentity, UnsettledEffect>,
+    pending_slot_changes:
+        HashMap<super::EffectIdentity, novarocks_spi::connector::UnknownCommitEvidence>,
+    latest_slot_change_conclusion: Option<novarocks_spi::connector::CommitConclusion>,
     pending_committed_effect: Option<super::EffectIdentity>,
     pending_continuation: Option<ManagementContinuation>,
     pending_observation: Option<ManagementObservationAuthorization>,
     installed_observation: Option<ManagementObservationLiveness>,
     ready: bool,
     incarnation_mismatch: bool,
+    owner_mismatch: bool,
 }
 
 impl ManagementEntrance {
@@ -310,6 +357,320 @@ impl ManagementEntrance {
                 unbound_create: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    pub fn pending_slot_changes(&self, table: &ConnectorTableIdentity) -> usize {
+        lock(&self.inner.state)
+            .get(table)
+            .map_or(0, |state| state.pending_slot_changes.len())
+    }
+    pub fn latest_slot_change_conclusion(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Option<novarocks_spi::connector::CommitConclusion> {
+        lock(&self.inner.state)
+            .get(table)
+            .and_then(|state| state.latest_slot_change_conclusion.clone())
+    }
+    /// Call after every fresh keyed observation. Provider I/O runs without the
+    /// admission mutex. Only terminal conclusions retire pending evidence.
+    pub fn resolve_pending_slot_changes(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<SlotChangeConvergence, novarocks_spi::connector::ConnectorError> {
+        self.resolve_slot_changes(
+            &request.catalog_handle,
+            &request.target,
+            &request.object_id,
+            |evidence| lease.resolve_keyed_commit(request.clone(), evidence),
+        )
+    }
+    pub(super) fn resolve_slot_changes(
+        &self,
+        catalog: &CatalogHandle,
+        table: &ConnectorTableIdentity,
+        object_id: &novarocks_spi::connector::ConnectorTableObjectId,
+        mut resolve: impl FnMut(
+            novarocks_spi::connector::UnknownCommitEvidence,
+        ) -> Result<
+            novarocks_spi::connector::CommitConclusion,
+            novarocks_spi::connector::ConnectorError,
+        >,
+    ) -> Result<SlotChangeConvergence, novarocks_spi::connector::ConnectorError> {
+        use novarocks_spi::connector::{CommitConclusion, ConnectorError, ConnectorErrorKind};
+        let pending = {
+            let states = lock(&self.inner.state);
+            match states.get(table) {
+                Some(state)
+                    if state.target.catalog() == catalog
+                        && state.target.object_id() == object_id =>
+                {
+                    state.pending_slot_changes.clone()
+                }
+                Some(_) => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "pending slot change target was replaced",
+                    ));
+                }
+                None => return Ok(SlotChangeConvergence::default()),
+            }
+        };
+        let mut result = SlotChangeConvergence::default();
+        for (effect, evidence) in pending {
+            let conclusion = resolve(evidence.clone())?;
+            if conclusion == CommitConclusion::StillUnknown {
+                continue;
+            }
+            let mut states = lock(&self.inner.state);
+            let Some(state) = states.get_mut(table) else {
+                continue;
+            };
+            if state.target.catalog() != catalog
+                || state.target.object_id() != object_id
+                || state.pending_slot_changes.get(&effect) != Some(&evidence)
+            {
+                continue;
+            }
+            state.pending_slot_changes.remove(&effect);
+            state.latest_slot_change_conclusion = Some(conclusion.clone());
+            result.reinstall_current_projection |=
+                matches!(conclusion, CommitConclusion::Committed(_));
+            result.conclusions.push(conclusion);
+        }
+        Ok(result)
+    }
+
+    /// Revoke from the exact actual Current management slot independently of
+    /// publication or root decoding. This private path grants no capability.
+    pub(crate) fn revoke_foreign_current_management(
+        &self,
+        view: &novarocks_spi::connector::KeyedDocumentView,
+        catalog: &CatalogHandle,
+    ) -> Result<bool, crate::persistence::documents::MvDocumentError> {
+        use crate::persistence::{
+            documents::MvDocumentError,
+            keyed_documents::{decode_management_slot, management_slot_name},
+        };
+        let slot = view
+            .slots
+            .get(&management_slot_name()?)
+            .ok_or_else(|| MvDocumentError::Contract("missing MV management slot".into()))?;
+        let (owner, incarnation) = decode_management_slot(&slot.value)?;
+        let mut states = lock(&self.inner.state);
+        if let Some(current) = states.get_mut(&view.table) {
+            if current.target.catalog() == catalog
+                && current.target.object_id() == &view.object_id
+                && (owner != self.inner.owner || incarnation != self.inner.incarnation)
+            {
+                current.ready = false;
+                current.owner_mismatch = owner != self.inner.owner;
+                current.incarnation_mismatch = incarnation != self.inner.incarnation;
+                if let Some(installed) = &current.installed_observation {
+                    installed.close();
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Observe only the strict current management/root facts needed to delete
+    /// an already installed target. Missing current P never becomes an absent
+    /// publication in a usable projection or a new readmission capability.
+    pub fn observe_keyed_drop(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        budget: crate::persistence::validation::PersistenceDecodeBudget,
+    ) -> Result<
+        (MvDropManagementObservation, SlotChangeConvergence),
+        crate::persistence::documents::MvDocumentError,
+    > {
+        use crate::persistence::{
+            documents::MvDocumentError, keyed_documents::decode_keyed_drop_documents,
+        };
+        let error = |message: &str| MvDocumentError::Contract(message.into());
+        let validate = |current: &TargetAdmissionState| {
+            if current.target.catalog() != &request.catalog_handle
+                || current.target.table() != &request.target
+                || current.target.object_id() != &request.object_id
+                || current.dependencies.control_runtime_id != lease.control_runtime_id()
+            {
+                return Err(error(
+                    "MV DROP exact installed target or control runtime changed",
+                ));
+            }
+            if !current.ready
+                || current.owner_mismatch
+                || current.incarnation_mismatch
+                || !current.unsettled.is_empty()
+                || current.pending_committed_effect.is_some()
+                || current.pending_observation.is_some()
+                || !current
+                    .installed_observation
+                    .as_ref()
+                    .is_some_and(ManagementObservationLiveness::is_open)
+            {
+                return Err(error(
+                    "MV DROP installed management admission is closed or unsettled",
+                ));
+            }
+            Ok(())
+        };
+        {
+            let states = lock(&self.inner.state);
+            let current = states
+                .get(&request.target)
+                .ok_or_else(|| error("MV DROP target has not been admitted"))?;
+            validate(current)?;
+        }
+        let mut view = lease
+            .observe_keyed_documents(request.clone())
+            .map_err(MvDocumentError::KeyedStorage)?;
+        // Revoke foreign exact-target authority before C/root decoding and
+        // before consuming any pending slot evidence.
+        if self.revoke_foreign_current_management(&view, &request.catalog_handle)? {
+            return Err(error(
+                "MV DROP Current management slot names another owner or incarnation",
+            ));
+        }
+        let mut documents =
+            decode_keyed_drop_documents(&view, request.catalog_handle.clone(), budget)?;
+        let convergence = self.resolve_pending_slot_changes(lease, request.clone())?;
+        if convergence.reinstall_current_projection {
+            view = lease
+                .observe_keyed_documents(request.clone())
+                .map_err(MvDocumentError::KeyedStorage)?;
+            if self.revoke_foreign_current_management(&view, &request.catalog_handle)? {
+                return Err(error(
+                    "MV DROP Current management slot names another owner or incarnation",
+                ));
+            }
+            documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone(), budget)?;
+        }
+        let mut states = lock(&self.inner.state);
+        let current = states
+            .get_mut(&request.target)
+            .ok_or_else(|| error("MV DROP target admission disappeared"))?;
+        validate(current)?;
+        if current.target != documents.target {
+            return Err(error("MV DROP target changed during observation"));
+        }
+        if documents.owner != self.inner.owner || documents.incarnation != self.inner.incarnation {
+            current.ready = false;
+            current.owner_mismatch = documents.owner != self.inner.owner;
+            current.incarnation_mismatch = documents.incarnation != self.inner.incarnation;
+            if let Some(liveness) = &current.installed_observation {
+                liveness.close();
+            }
+            return Err(error(
+                "MV DROP Current management slot names another owner or incarnation",
+            ));
+        }
+        if current.dependencies.definition_revision
+            != *documents.versions.definition_revision().as_bytes()
+            || current.dependencies.interpretation_revision
+                != *documents.versions.interpretation_revision().as_bytes()
+        {
+            return Err(error(
+                "MV DROP current root definition or interpretation changed",
+            ));
+        }
+        // The publication component is the installed admission's revision gate,
+        // not a claim that this externally modified current snapshot has P.
+        // Do not update admission or publish a replacement projection here.
+        Ok((
+            MvDropManagementObservation {
+                target: documents.target,
+                dependencies: current.dependencies.clone(),
+                root_binding: documents.versions.binding.identity(),
+                configuration_revision: documents.configuration_revision,
+            },
+            convergence,
+        ))
+    }
+
+    /// Refresh the capability of an already admitted target from a real,
+    /// retained-lease observation. Pending slot evidence is reconciled here;
+    /// no raw view supplied by a caller can mint this capability.
+    pub fn observe_keyed_admission(
+        &self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        budget: crate::persistence::validation::PersistenceDecodeBudget,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            MvCurrentManagementAdmission,
+            SlotChangeConvergence,
+        ),
+        crate::persistence::documents::MvDocumentError,
+    > {
+        use crate::persistence::{
+            documents::MvDocumentError,
+            keyed_documents::{
+                decode_current_keyed_documents, observe_current_keyed_view_with_management,
+            },
+        };
+        let control = lease.control_runtime_id();
+        let catalog = request.catalog_handle.clone();
+        let (view, convergence) = observe_current_keyed_view_with_management(lease, request, self)?;
+        if self.revoke_foreign_current_management(&view, &catalog)? {
+            return Err(MvDocumentError::Contract(
+                "keyed observation Current management names another owner or incarnation".into(),
+            ));
+        }
+        let documents = decode_current_keyed_documents(view, catalog, budget)?;
+        let mut states = lock(&self.inner.state);
+        let current = states.get_mut(&documents.view.table).ok_or_else(|| {
+            MvDocumentError::Contract("keyed observation target has not been admitted".into())
+        })?;
+        if current.target != documents.management_target {
+            return Err(MvDocumentError::Contract(
+                "keyed observation cannot renew another target admission".into(),
+            ));
+        }
+        if documents.deployment_owner != self.inner.owner
+            || documents.process_incarnation != self.inner.incarnation
+        {
+            current.ready = false;
+            current.owner_mismatch = documents.deployment_owner != self.inner.owner;
+            current.incarnation_mismatch = documents.process_incarnation != self.inner.incarnation;
+            if let Some(installed) = &current.installed_observation {
+                installed.close();
+            }
+            return Err(MvDocumentError::Contract(
+                "keyed observation Current management names another owner or incarnation".into(),
+            ));
+        }
+        if !current.ready
+            || !current.unsettled.is_empty()
+            || current.pending_committed_effect.is_some()
+            || current.pending_observation.is_some()
+        {
+            return Err(MvDocumentError::Contract(
+                "keyed observation cannot renew this target admission".into(),
+            ));
+        }
+        let liveness = current
+            .installed_observation
+            .as_ref()
+            .filter(|live| live.is_open())
+            .cloned()
+            .ok_or_else(|| {
+                MvDocumentError::Contract("keyed observation target admission is closed".into())
+            })?;
+        current.dependencies = documents.management_dependencies(control);
+        let admission = MvCurrentManagementAdmission {
+            target: documents.management_target.clone(),
+            owner: documents.deployment_owner.clone(),
+            incarnation: documents.process_incarnation.clone(),
+            metadata_version: documents.view.metadata_version.clone(),
+            liveness,
+        };
+        Ok((documents, admission, convergence))
     }
 
     pub fn owner(&self) -> &DeploymentOwner {
@@ -337,7 +698,7 @@ impl ManagementEntrance {
         }
         let mut state = lock(&self.inner.state);
         if let Some(current) = state.get(observation.target().table()) {
-            if current.incarnation_mismatch {
+            if current.incarnation_mismatch || current.owner_mismatch {
                 return Err(ManagementAdmissionError::ReadmissionIncomplete);
             }
             let current_effects = current
@@ -372,18 +733,30 @@ impl ManagementEntrance {
                 .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?,
             liveness: observation.liveness().clone(),
         };
+        let (pending_slot_changes, latest_slot_change_conclusion) = state
+            .get_mut(observation.target().table())
+            .map(|current| {
+                (
+                    std::mem::take(&mut current.pending_slot_changes),
+                    current.latest_slot_change_conclusion.clone(),
+                )
+            })
+            .unwrap_or_default();
         state.insert(
             observation.target().table().clone(),
             TargetAdmissionState {
                 target: observation.target().clone(),
                 dependencies,
                 unsettled: HashMap::new(),
+                pending_slot_changes,
+                latest_slot_change_conclusion,
                 pending_committed_effect: None,
                 pending_continuation: None,
                 pending_observation: None,
                 installed_observation: Some(observation.liveness().clone()),
                 ready: true,
                 incarnation_mismatch: false,
+                owner_mismatch: false,
             },
         );
         Ok(admission)
@@ -507,6 +880,8 @@ impl ManagementEntrance {
                     None,
                     ConnectorControlRuntimeId::from_bytes([0; 16]),
                 ),
+                pending_slot_changes: HashMap::new(),
+                latest_slot_change_conclusion: None,
                 unsettled: HashMap::from([(
                     recovery_barrier.responsibility().identity(),
                     recovery_barrier.clone(),
@@ -517,6 +892,7 @@ impl ManagementEntrance {
                 installed_observation: None,
                 ready: false,
                 incarnation_mismatch: false,
+                owner_mismatch: false,
             },
         );
         ManagementObservationState::try_new(
@@ -642,6 +1018,9 @@ impl ManagementEntrance {
         let Some(current) = state.get(table) else {
             return MvManagementPhase::NotObserved;
         };
+        if current.owner_mismatch {
+            return MvManagementPhase::OwnerMismatch;
+        }
         if current.incarnation_mismatch {
             return MvManagementPhase::IncarnationMismatch;
         }
@@ -666,30 +1045,62 @@ impl ManagementEntrance {
     }
 
     /// Close this process's admission when a provider Current observation of
-    /// the exact installed target names another incarnation. An already
+    /// the exact installed target names another owner or incarnation. An already
     /// dispatched effect is not revoked; this only stops future admissions.
     /// Historical observations must never be passed to this method.
-    pub fn close_on_current_incarnation_mismatch(
+    pub fn close_on_keyed_current_management_mismatch(
         &self,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> bool {
-        let mut state = lock(&self.inner.state);
-        let Some(current) = state.get_mut(observation.target()) else {
-            return false;
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<bool, crate::persistence::documents::MvDocumentError> {
+        use crate::persistence::{
+            documents::MvDocumentError,
+            keyed_documents::{decode_management_slot, management_slot_name},
         };
-        if current.target.catalog() != observation.catalog_handle()
-            || current.target.object_id() != observation.object_id()
-            || observation.marker().owner() != self.inner.owner.as_str()
-            || observation.marker().incarnation() == self.inner.incarnation.as_str()
+        let catalog = request.catalog_handle.clone();
+        let mut view = lease
+            .observe_keyed_documents(request.clone())
+            .map_err(MvDocumentError::KeyedStorage)?;
+        // A foreign target observation cannot reconcile this target's pending
+        // evidence. The exact target is checked again after provider I/O.
         {
-            return false;
+            let states = lock(&self.inner.state);
+            let Some(current) = states.get(&view.table) else {
+                return Ok(false);
+            };
+            if current.target.catalog() != &catalog || current.target.object_id() != &view.object_id
+            {
+                return Ok(false);
+            }
+        }
+        let convergence = self.resolve_pending_slot_changes(lease, request.clone())?;
+        if convergence.reinstall_current_projection {
+            view = lease
+                .observe_keyed_documents(request)
+                .map_err(MvDocumentError::KeyedStorage)?;
+        }
+        let slot = view
+            .slots
+            .get(&management_slot_name()?)
+            .ok_or_else(|| MvDocumentError::Contract("missing MV management slot".into()))?;
+        let (owner, incarnation) = decode_management_slot(&slot.value)?;
+        let mut states = lock(&self.inner.state);
+        let Some(current) = states.get_mut(&view.table) else {
+            return Ok(false);
+        };
+        if current.target.catalog() != &catalog
+            || current.target.object_id() != &view.object_id
+            || (owner == self.inner.owner && incarnation == self.inner.incarnation)
+        {
+            return Ok(false);
         }
         current.ready = false;
-        current.incarnation_mismatch = true;
+        current.owner_mismatch = owner != self.inner.owner;
+        current.incarnation_mismatch = incarnation != self.inner.incarnation;
         if let Some(installed) = &current.installed_observation {
             installed.close();
         }
-        true
+        Ok(true)
     }
 
     /// Where one target stands in this process's activity gate. Diagnostic
@@ -821,6 +1232,12 @@ impl ManagementEntranceTicket {
             dispatched: None,
         })
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlotChangeConvergence {
+    pub reinstall_current_projection: bool,
+    pub conclusions: Vec<novarocks_spi::connector::CommitConclusion>,
 }
 
 pub struct ManagementEntranceLease {
@@ -989,6 +1406,46 @@ impl ManagementEntranceLease {
         Ok(())
     }
 
+    /// A lost slot-change result retains its provider evidence without closing
+    /// admission. Publication/other unknowns keep using record_terminal.
+    pub fn record_slot_change_unknown(
+        mut self,
+        evidence: novarocks_spi::connector::UnknownCommitEvidence,
+    ) -> Result<(), ManagementAdmissionError> {
+        use novarocks_spi::connector::UnknownCommitIdentity;
+        if self.request.operation != ConnectorDocumentManagementOperation::SingleTargetUpdate
+            || self.request.effect_scope != EffectScope::CATALOG_COMMIT
+            || !matches!(evidence.identity, UnknownCommitIdentity::SlotWriter { .. })
+            || evidence.preselected_snapshot <= 0
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        let entrance = self
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        let mut states = lock(&entrance.state);
+        let current = states
+            .get_mut(&self.request.table)
+            .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+        if current.target != *responsibility.target()
+            || !current.ready
+            || !current.unsettled.is_empty()
+            || current.pending_committed_effect.is_some()
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        current
+            .pending_slot_changes
+            .insert(responsibility.identity(), evidence);
+        self.dispatched.take();
+        self.activity.take();
+        Ok(())
+    }
+
     pub fn record_terminal(
         mut self,
         disposition: EffectDisposition,
@@ -1122,12 +1579,15 @@ fn record_committed(
             ConnectorControlRuntimeId::from_bytes([0; 16]),
         ),
         unsettled: HashMap::new(),
+        pending_slot_changes: HashMap::new(),
+        latest_slot_change_conclusion: None,
         pending_committed_effect: None,
         pending_continuation: None,
         pending_observation: None,
         installed_observation: None,
         ready: false,
         incarnation_mismatch: false,
+        owner_mismatch: false,
     });
     if target.target != *responsibility.target()
         || !target.unsettled.is_empty()
@@ -1307,12 +1767,15 @@ fn record_unsettled(
             ConnectorControlRuntimeId::from_bytes([0; 16]),
         ),
         unsettled: HashMap::new(),
+        pending_slot_changes: HashMap::new(),
+        latest_slot_change_conclusion: None,
         pending_committed_effect: None,
         pending_continuation: None,
         pending_observation: None,
         installed_observation: None,
         ready: false,
         incarnation_mismatch: false,
+        owner_mismatch: false,
     });
     if target.target != *responsibility.target()
         || target.pending_committed_effect.is_some()

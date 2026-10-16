@@ -15,37 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Product-owned Current observation, ordered installation, and candidate inventory.
-
+//! Product-owned keyed Current observation, ordered installation and inventory.
 use crate::dependency::MvDependencyObjectIdentity;
 use crate::management::MvCurrentManagementAdmission;
-use crate::persistence::documents::{MvDocumentError, MvObservedCurrentDocuments};
-use crate::persistence::projection::{
-    MvDocumentProjection, MvOutputStatistics, StoredMvProjection,
-};
+use crate::persistence::documents::MvDocumentError;
 use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::process_runtime::{ProcessRuntime, ProjectionOrder, TargetReadiness};
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionInventoryBound,
-    MvProjectionInventoryEntry, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
-    ReplaceMvProjectionRequest,
+    MvProjectionInventoryBound, MvProjectionInventoryEntry, MvRepositoryError,
+    MvRepositoryErrorKind,
 };
 use novarocks_spi::connector::{CatalogHandle, ConnectorRequestContext, LakePublicationId};
 use std::sync::Arc;
 use uuid::Uuid;
-
-#[derive(Clone)]
-pub struct MvReadinessService {
-    repository: Arc<dyn MvRepository>,
-    runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
-}
-
-#[derive(Clone)]
-pub struct MvCandidateReader {
-    repository: Arc<dyn MvRepository>,
-}
-
 pub struct MvRuntimePublicationLease {
     runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
     target: MvTarget,
@@ -110,41 +93,6 @@ pub enum MvQueryAdmission {
     Quarantined(String),
 }
 
-pub struct MvCurrentProjectionObservation {
-    pub documents: MvObservedCurrentDocuments,
-    pub management_admission: MvCurrentManagementAdmission,
-    pub output_statistics: Option<MvOutputStatistics>,
-}
-
-/// A validated Current document set that may populate the rebuildable
-/// Accelerator inventory but carries no effect authority. Foreign ownership
-/// and an incomplete restart readmission are both valid read-only states.
-pub struct MvReadOnlyCurrentProjectionObservation {
-    pub documents: MvObservedCurrentDocuments,
-    pub output_statistics: Option<MvOutputStatistics>,
-}
-
-/// Called only after product reservation. Implementations resolve the exact
-/// provider source and use the MV-owned sealed document reader.
-#[async_trait::async_trait]
-pub trait MvCurrentProjectionSource: Send + Sync {
-    async fn observe(
-        &self,
-        request: &MvCurrentProjectionRequest,
-    ) -> Result<MvCurrentProjectionObservation, MvProjectionError>;
-}
-
-/// Read-only Current observation. Implementations must use the same sealed
-/// document reader as management admission, but must not manufacture a
-/// management token or recovery barrier.
-#[async_trait::async_trait]
-pub trait MvReadOnlyCurrentProjectionSource: Send + Sync {
-    async fn observe_read_only(
-        &self,
-        request: &MvCurrentProjectionRequest,
-    ) -> Result<MvReadOnlyCurrentProjectionObservation, MvProjectionError>;
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MvProjectionErrorKind {
     SourceConflict,
@@ -188,6 +136,12 @@ impl From<MvDocumentError> for MvProjectionError {
     fn from(error: MvDocumentError) -> Self {
         use novarocks_spi::connector::ConnectorErrorKind as K;
         let kind = match &error {
+            MvDocumentError::KeyedStorage(
+                novarocks_spi::connector::KeyedDocumentReadError::LegacyFormat { .. },
+            ) => MvProjectionErrorKind::Unsupported,
+            MvDocumentError::KeyedStorage(
+                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error),
+            ) => return Self::from(MvDocumentError::Connector(error.clone())),
             MvDocumentError::Connector(error) => match error.kind() {
                 K::Unsupported => MvProjectionErrorKind::Unsupported,
                 K::Cancelled => MvProjectionErrorKind::Cancelled,
@@ -206,185 +160,6 @@ impl From<MvDocumentError> for MvProjectionError {
     }
 }
 
-#[derive(Debug)]
-pub enum MvProjectionInstallOutcome {
-    Installed(LoadedMvProjection),
-    Unchanged(LoadedMvProjection),
-    Removed,
-    AlreadyAbsent,
-    Superseded,
-    /// The observation reached a target object this process already holds a
-    /// projection for, under a different catalog attachment.
-    ///
-    /// A materialized view is the object it publishes into, not the attachment
-    /// a discovery happened to see it through, so nothing is installed: the
-    /// existing projection is the one. Two attachments over one catalog are an
-    /// ordinary deployment, and registering the view once per attachment would
-    /// make its own `DROP CATALOG` refuse and leave the real target competing
-    /// with its own aliases.
-    AlreadyProjectedElsewhere(MvTarget),
-}
-
-struct ProjectionReservation {
-    target: MvTarget,
-    generation: u64,
-    expected: Option<LoadedMvProjection>,
-    order: Arc<tokio::sync::Mutex<ProjectionOrder>>,
-    /// This process managed the target when the reservation was taken.
-    managed: bool,
-    /// The version it managed, so management is restored only for that exact
-    /// projection and never for one the observation replaced.
-    installed_before: Option<crate::repository::MvProjectionVersion>,
-}
-
-/// Single-use deletion expectation captured before the provider effect.
-pub struct MvProjectionDeleteGuard {
-    reservation: ProjectionReservation,
-}
-impl MvProjectionDeleteGuard {
-    pub fn has_projection(&self) -> bool {
-        self.reservation.expected.is_some()
-    }
-
-    pub fn expected_target_object_id(
-        &self,
-    ) -> Option<&novarocks_spi::connector::ConnectorTableObjectId> {
-        self.reservation
-            .expected
-            .as_ref()
-            .map(|loaded| &loaded.projection.facts.source_revision().target_object_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(target: MvTarget) -> Self {
-        Self {
-            reservation: ProjectionReservation {
-                target,
-                generation: 0,
-                expected: None,
-                order: Arc::new(tokio::sync::Mutex::new(ProjectionOrder::default())),
-                managed: false,
-                installed_before: None,
-            },
-        }
-    }
-}
-pub enum MvDropReadiness {
-    ReadyToDrop(MvProjectionDeleteGuard),
-    AlreadyAbsent,
-}
-/// One projection in the shown inventory, with what this process may do with
-/// it.
-#[derive(Clone, Debug)]
-pub struct ListedMvProjection {
-    pub loaded: LoadedMvProjection,
-    pub manageability: MvListedManageability,
-}
-
-/// A complete bounded locator snapshot, consumed one fresh model at a time.
-/// The service still owns readiness/order and the repository still owns CAS.
-pub struct MvBoundedProjectionInventory {
-    service: MvReadinessService,
-    entries: std::vec::IntoIter<MvProjectionInventoryEntry>,
-    bound: MvProjectionInventoryBound,
-}
-
-impl MvBoundedProjectionInventory {
-    /// Order only thin locators; fresh models still remain one-at-a-time.
-    pub fn order_by_namespace_and_name(&mut self) {
-        self.entries.as_mut_slice().sort_by(|left, right| {
-            left.target
-                .namespace()
-                .cmp(right.target.namespace())
-                .then(left.target.name().cmp(right.target.name()))
-        });
-    }
-
-    pub async fn next_ready(&mut self) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        for entry in self.entries.by_ref() {
-            let order = self.service.runtime.projection_order(entry.target.clone());
-            let cell = order.lock().await;
-            // Provider/decoder failure is never a readiness verdict: propagate
-            // it instead of returning a truncated successful inventory.
-            let Some(loaded) = self
-                .service
-                .repository
-                .find_by_target_bounded(&entry.target, self.bound)
-                .await?
-            else {
-                continue;
-            };
-            let ready = self.service.runtime.with_readiness(&entry.target, |state| {
-                matches!(state, TargetReadiness::Ready)
-            });
-            if ready && cell.installed.as_ref() == Some(&loaded.version) {
-                return Ok(Some(loaded));
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn next_listable(&mut self) -> Result<Option<ListedMvProjection>, MvRepositoryError> {
-        for entry in self.entries.by_ref() {
-            let mut bound = self.bound;
-            let manageability = self
-                .service
-                .runtime
-                .with_readiness(&entry.target, |state| {
-                    let reason_bytes = match state {
-                        TargetReadiness::ReadOnly(reason)
-                        | TargetReadiness::Unavailable(reason) => reason.len(),
-                        _ => 0,
-                    };
-                    bound.decode.max_working_set_bytes = bound
-                        .decode
-                        .max_working_set_bytes
-                        .checked_sub(reason_bytes)
-                        .filter(|remaining| *remaining > 0)
-                        .ok_or_else(|| {
-                            MvRepositoryError::new(
-                                MvRepositoryErrorKind::InvalidRequest,
-                                "MV readiness reason exceeds its decoded page bound",
-                            )
-                        })?;
-                    Ok::<_, MvRepositoryError>(match state {
-                        TargetReadiness::Ready => Some(MvListedManageability::Manageable),
-                        TargetReadiness::ReadOnly(reason) => {
-                            Some(MvListedManageability::ReadOnly(reason.clone()))
-                        }
-                        TargetReadiness::Unavailable(reason) => {
-                            Some(MvListedManageability::Unavailable(reason.clone()))
-                        }
-                        TargetReadiness::Unobserved => None,
-                    })
-                })?;
-            let Some(manageability) = manageability else {
-                continue;
-            };
-            let order = self.service.runtime.projection_order(entry.target.clone());
-            let cell = order.lock().await;
-            let Some(loaded) = self
-                .service
-                .repository
-                .find_by_target_bounded(&entry.target, bound)
-                .await?
-            else {
-                continue;
-            };
-            if matches!(manageability, MvListedManageability::Manageable)
-                && cell.installed.as_ref() != Some(&loaded.version)
-            {
-                continue;
-            }
-            return Ok(Some(ListedMvProjection {
-                loaded,
-                manageability,
-            }));
-        }
-        Ok(None)
-    }
-}
-
 /// Whether this process may manage a projection it can show.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MvListedManageability {
@@ -397,9 +172,58 @@ pub enum MvListedManageability {
     Unavailable(String),
 }
 
-impl MvReadinessService {
+pub enum MvDropReadiness<G = MvKeyedProjectionDeleteGuard> {
+    ReadyToDrop(G),
+    AlreadyAbsent,
+}
+fn check_context(context: &ConnectorRequestContext) -> Result<(), MvProjectionError> {
+    if context.is_cancelled() {
+        return Err(MvProjectionError::new(
+            MvProjectionErrorKind::Cancelled,
+            "MV Current observation cancelled",
+        ));
+    }
+    if std::time::Instant::now() >= context.deadline() {
+        return Err(MvProjectionError::new(
+            MvProjectionErrorKind::DeadlineExceeded,
+            "MV Current observation deadline elapsed",
+        ));
+    }
+    Ok(())
+}
+
+const OBSERVATION_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The sole readiness service for the Accelerator repository and process runtime.
+#[derive(Clone)]
+pub struct MvKeyedReadinessService {
+    repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+    runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
+}
+#[async_trait::async_trait]
+pub trait MvKeyedCurrentProjectionSource: Send + Sync {
+    async fn observe_current_keyed(
+        &self,
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            MvCurrentManagementAdmission,
+        ),
+        MvProjectionError,
+    >;
+}
+#[derive(Debug)]
+pub enum MvKeyedProjectionInstallOutcome {
+    AlreadyProjectedElsewhere(MvTarget),
+    AlreadyAbsent,
+    Removed,
+    Installed(crate::state_store_repository::keyed::LoadedKeyedMvProjection),
+    Unchanged(crate::state_store_repository::keyed::LoadedKeyedMvProjection),
+    Superseded,
+}
+impl MvKeyedReadinessService {
     pub fn new(
-        repository: Arc<dyn MvRepository>,
+        repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
         runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
     ) -> Self {
         Self {
@@ -407,321 +231,301 @@ impl MvReadinessService {
             runtime,
         }
     }
-    pub fn candidate_reader(&self) -> MvCandidateReader {
-        MvCandidateReader {
-            repository: Arc::clone(&self.repository),
-        }
-    }
-    async fn reserve(&self, target: MvTarget) -> Result<ProjectionReservation, MvProjectionError> {
+    /// Reserve order before invoking the provider. A slower earlier read can
+    /// never overwrite a later observation or an explicit invalidation.
+    pub async fn observe_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedCurrentProjectionSource,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let target = request.target().clone();
+        let budget = request.decode_budget();
         let order = self.runtime.projection_order(target.clone());
-        let mut cell = order.lock().await;
-        let generation = cell.advance()?;
-        // What this process held before the reservation cleared it. A
-        // read-only observation of a target this process already manages must
-        // not revoke that management: the read-only path exists to populate
-        // the inventory for targets whose management has not been
-        // established, not to take it away from one that has.
-        let managed = matches!(self.runtime.readiness(&target), TargetReadiness::Ready)
-            && cell.installed.is_some();
-        let installed_before = cell.installed.clone();
-        cell.installed = None;
-        cell.pending = Some(generation);
-        self.runtime
-            .set_unavailable(target.clone(), "fresh Current observation pending".into());
-        // Captured before the provider source is invoked, under the same gate
-        // used by installers and invalidators.
-        let expected = self.repository.find_by_target(&target).await?;
-        drop(cell);
-        Ok(ProjectionReservation {
-            target,
-            generation,
-            expected,
-            order,
-            managed,
-            installed_before,
-        })
-    }
-    async fn matches_repository(
-        &self,
-        reservation: &ProjectionReservation,
-    ) -> Result<bool, MvProjectionError> {
-        let current = self.repository.find_by_target(&reservation.target).await?;
-        Ok(match (&reservation.expected, current) {
-            (None, None) => true,
-            (Some(expected), Some(current)) => {
-                expected.projection.mv_id == current.projection.mv_id
-                    && expected.version == current.version
-                    && expected.projection.facts.source_revision().target_object_id
-                        == current.projection.facts.source_revision().target_object_id
-            }
-            _ => false,
-        })
-    }
-    pub async fn observe_current_and_install(
-        &self,
-        operation_id: Uuid,
-        request: MvCurrentProjectionRequest,
-        source: &dyn MvCurrentProjectionSource,
-    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
-        let reservation = self.reserve(request.target.clone()).await?;
-        let result = async {
-            check_context(&request.context)?;
-            let observation = source.observe(&request).await?;
-            check_context(&request.context)?;
-            if observation.documents.management_target.catalog() != request.catalog()
-                || observation.documents.target.instance_id.as_str()
-                    != request.target.catalog().unwrap_or_default()
-                || observation.documents.target.namespace.as_ref() != request.target.namespace()
-                || observation.documents.target.table.as_ref() != request.target.name()
-            {
-                return Err(MvProjectionError::new(
-                    MvProjectionErrorKind::SourceConflict,
-                    "MV observation belongs to another catalog binding or logical target",
-                ));
-            }
-            if !observation
-                .management_admission
-                .matches(&observation.documents)
-            {
-                return Err(MvProjectionError::new(
-                    MvProjectionErrorKind::SourceConflict,
-                    "MV Current observation is not admitted for management",
-                ));
-            }
-            let facts = MvDocumentProjection::try_from_current(
-                observation.documents,
-                observation.output_statistics,
-            )
-            .map_err(|error| {
-                MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, error)
-            })?;
-            Ok((facts, Some(observation.management_admission)))
-        }
-        .await;
-        self.finish_observation(
-            Some(request.context()),
-            operation_id,
-            reservation,
-            result,
-            true,
-        )
-        .await
-    }
-
-    /// Populate the canonical candidate inventory from sealed Current facts
-    /// without granting refresh, DDL, dependency-guard, or scheduler
-    /// readiness. A later successful management readmission must perform a
-    /// fresh ordered observation before effect-capable consumers may proceed.
-    pub async fn observe_current_read_only_and_install(
-        &self,
-        operation_id: Uuid,
-        request: MvCurrentProjectionRequest,
-        source: &dyn MvReadOnlyCurrentProjectionSource,
-    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
-        let reservation = self.reserve(request.target.clone()).await?;
-        let result = async {
-            check_context(&request.context)?;
-            let observation = source.observe_read_only(&request).await?;
-            check_context(&request.context)?;
-            if observation.documents.management_target.catalog() != request.catalog()
-                || observation.documents.target.instance_id.as_str()
-                    != request.target.catalog().unwrap_or_default()
-                || observation.documents.target.namespace.as_ref() != request.target.namespace()
-                || observation.documents.target.table.as_ref() != request.target.name()
-            {
-                return Err(MvProjectionError::new(
-                    MvProjectionErrorKind::SourceConflict,
-                    "MV read-only observation belongs to another catalog binding or logical target",
-                ));
-            }
-            let facts = MvDocumentProjection::try_from_current(
-                observation.documents,
-                observation.output_statistics,
-            )
-            .map_err(|error| {
-                MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, error)
-            })?;
-            Ok((facts, None))
-        }
-        .await;
-        self.finish_observation(
-            Some(request.context()),
-            operation_id,
-            reservation,
-            result,
-            false,
-        )
-        .await
-    }
-
-    async fn finish_observation(
-        &self,
-        context: Option<&ConnectorRequestContext>,
-        operation_id: Uuid,
-        reservation: ProjectionReservation,
-        result: Result<
-            (MvDocumentProjection, Option<MvCurrentManagementAdmission>),
-            MvProjectionError,
-        >,
-        publish_management_readiness: bool,
-    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
-        let mut cell = reservation.order.lock().await;
-        if cell.generation != reservation.generation {
-            return Ok(MvProjectionInstallOutcome::Superseded);
-        }
-        // From here the cell is held to the end, so a waiter released now sees
-        // this observation's outcome rather than its midpoint.
-        cell.settle(reservation.generation);
-        if !self.matches_repository(&reservation).await? {
-            return Ok(MvProjectionInstallOutcome::Superseded);
-        }
-        let result = result.and_then(|facts| {
-            if let Some(context) = context {
-                check_context(context)?;
-            }
-            Ok(facts)
-        });
-        let (facts, management_admission) = match result {
-            Ok(facts) => facts,
-            Err(error) => {
-                self.runtime
-                    .set_unavailable(reservation.target, error.to_string());
-                return Err(error);
-            }
-        };
-        if facts.target() != &reservation.target {
-            return Err(MvProjectionError::new(
-                MvProjectionErrorKind::SourceConflict,
-                "MV installation target changed",
-            ));
-        }
-        if management_admission
-            .as_ref()
-            .is_some_and(|admission| !admission.is_open())
-        {
-            return Err(MvProjectionError::new(
-                MvProjectionErrorKind::SourceConflict,
-                "MV management admission closed before projection installation",
-            ));
-        }
-        let (loaded, unchanged) = match reservation.expected {
-            Some(expected)
-                if expected.projection.facts.source_revision() == facts.source_revision() =>
-            {
-                (expected, true)
-            }
-            Some(expected) => {
-                let result = self
-                    .repository
-                    .replace_projection(
-                        operation_id,
-                        ReplaceMvProjectionRequest {
-                            mv_id: expected.projection.mv_id,
-                            expected_version: expected.version,
-                            projection: facts.into(),
-                        },
-                    )
-                    .await;
-                match result {
-                    Ok(loaded) => (loaded, false),
-                    Err(error) => {
-                        self.runtime
-                            .set_unavailable(reservation.target, error.to_string());
-                        return Err(error.into());
-                    }
-                }
-            }
-            None => {
-                // A materialized view is the target object it publishes into.
-                // The same object is reachable through every catalog
-                // attachment over its catalog, and a discovery through a
-                // second attachment observes the same documents under a
-                // different name -- so what it found is the projection that
-                // already exists, not a new one.
-                if let Some(existing) = self
-                    .repository
-                    .find_by_target_object(&facts.source_revision().target_object_id)
-                    .await?
-                {
-                    let owner = existing.projection.facts.target().clone();
-                    self.runtime.set_unavailable(
-                        reservation.target,
-                        format!(
-                            "MV target object is already projected as {}.{}.{}",
-                            owner.catalog().unwrap_or(""),
-                            owner.namespace(),
-                            owner.name()
-                        ),
-                    );
-                    return Ok(MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner));
-                }
-                match self
-                    .repository
-                    .create_projection(operation_id, facts.into())
-                    .await
-                {
-                    Ok(loaded) => (loaded, false),
-                    Err(error) => {
-                        self.runtime
-                            .set_unavailable(reservation.target, error.to_string());
-                        return Err(error.into());
-                    }
-                }
-            }
-        };
-        // The provider observation and repository effect may both suspend.
-        // A cancelled installer may leave a rebuildable cache record but must
-        // never publish management readiness after its caller has stopped.
-        if let Some(context) = context {
-            if let Err(error) = check_context(context) {
-                self.runtime
-                    .set_unavailable(reservation.target, error.to_string());
-                return Err(error);
-            }
-        }
-        if management_admission
-            .as_ref()
-            .is_some_and(|admission| !admission.is_open())
-        {
-            self.runtime.set_unavailable(
-                reservation.target,
-                "MV management admission closed during projection installation".into(),
-            );
-            return Err(MvProjectionError::new(
-                MvProjectionErrorKind::SourceConflict,
-                "MV management admission closed during projection installation",
-            ));
-        }
-        // A read-only observation that found the very projection this process
-        // was already managing leaves that management where it was. Revoking
-        // it would make a rediscovery -- which runs whenever a catalog is
-        // admitted, not only at startup -- close management on a view this
-        // process created and refreshes, and the next REFRESH or DROP would be
-        // told the target has no successful fresh observation. A restart still
-        // closes management, because a fresh process manages nothing yet.
-        let keeps_established_management = !publish_management_readiness
-            && unchanged
-            && reservation.managed
-            && reservation.installed_before.as_ref() == Some(&loaded.version);
-        if publish_management_readiness || keeps_established_management {
-            cell.installed = Some(loaded.version.clone());
-            self.runtime.set_ready(reservation.target);
-        } else {
+        let (generation, expected) = {
+            let mut cell = order.lock().await;
+            let generation = cell.advance()?;
             cell.installed = None;
-            self.runtime.set_read_only(
-                reservation.target,
-                "MV projection is read-only until management readmission completes".into(),
+            cell.pending = Some(generation);
+            self.runtime.set_unavailable(
+                target.clone(),
+                "fresh keyed Current observation pending".into(),
             );
+            let expected = self
+                .repository
+                .find_keyed_by_target(&target, budget)
+                .await?;
+            (generation, expected)
+        };
+        let observed = source.observe_current_keyed(request.clone()).await;
+        let mut cell = order.lock().await;
+        if cell.generation != generation {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
         }
-        Ok(if unchanged {
-            MvProjectionInstallOutcome::Unchanged(loaded)
+        cell.settle(generation);
+        let current = self
+            .repository
+            .find_keyed_by_target(&target, budget)
+            .await?;
+        if current.as_ref().map(|v| &v.version) != expected.as_ref().map(|v| &v.version) {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        let (observed, admission) = match observed {
+            Ok(value) => value,
+            Err(error) => {
+                self.runtime.set_unavailable(target, error.to_string());
+                return Err(error);
+            }
+        };
+        check_context(request.context())?;
+        if !admission.matches_keyed(&observed)
+            || observed.view.table.instance_id.as_str() != target.catalog().unwrap_or("")
+            || observed.view.table.namespace.as_ref() != target.namespace()
+            || observed.view.table.table.as_ref() != target.name()
+        {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "keyed projection lacks admission for this exact observation",
+            ));
+        }
+        let facts =
+            crate::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(
+                observed,
+            )
+            .map_err(|e| MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, e))?;
+        let unchanged = expected
+            .as_ref()
+            .is_some_and(|old| old.projection.facts.source_revision() == facts.source_revision());
+        if expected.is_none() {
+            if let Some(existing) = self
+                .repository
+                .find_keyed_by_target_object(&facts.source_revision().target_object_id)
+                .await?
+            {
+                let other = existing.projection.facts.target();
+                self.runtime.set_unavailable(
+                    target,
+                    "target object is already projected through another catalog".into(),
+                );
+                return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
+                    other,
+                ));
+            }
+        }
+        let loaded = if unchanged {
+            expected.expect("unchanged requires an expected root")
         } else {
-            MvProjectionInstallOutcome::Installed(loaded)
+            self.repository
+                .install_keyed_projection(operation_id, facts, expected)
+                .await?
+        };
+        check_context(request.context())?;
+        if !admission.is_open() {
+            self.runtime.set_unavailable(
+                target,
+                "management admission closed during keyed installation".into(),
+            );
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "management admission closed during keyed installation",
+            ));
+        }
+        cell.installed = Some(loaded.version.clone());
+        self.runtime.set_ready(target);
+        Ok(if unchanged {
+            MvKeyedProjectionInstallOutcome::Unchanged(loaded)
+        } else {
+            MvKeyedProjectionInstallOutcome::Installed(loaded)
         })
     }
+    pub async fn load_ready(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        let Some(loaded) = self
+            .repository
+            .find_keyed_by_target(target, PersistenceDecodeBudget::default())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !matches!(self.runtime.readiness(target), TargetReadiness::Ready)
+            || cell.installed.as_ref() != Some(&loaded.version)
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "keyed MV target requires a successful fresh Current observation",
+            ));
+        }
+        Ok(Some(loaded))
+    }
+}
 
-    /// Explicit management/catalog invalidation is a new ordered event, never
-    /// the completion callback of an older observation.
+#[derive(Clone)]
+pub struct MvKeyedCandidateReader {
+    repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+}
+impl MvKeyedCandidateReader {
+    pub async fn list_candidate_definitions(
+        &self,
+    ) -> Result<Vec<crate::persistence::keyed_documents::StoredKeyedMvProjection>, MvRepositoryError>
+    {
+        Ok(self
+            .repository
+            .list_keyed_projections()
+            .await?
+            .into_iter()
+            .map(|v| v.projection)
+            .collect())
+    }
+}
+pub struct MvBoundedKeyedProjectionInventory {
+    service: MvKeyedReadinessService,
+    entries: std::vec::IntoIter<MvProjectionInventoryEntry>,
+    bound: MvProjectionInventoryBound,
+}
+#[derive(Debug)]
+pub struct ListedKeyedMvProjection {
+    pub loaded: crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+    pub manageability: MvListedManageability,
+}
+impl MvBoundedKeyedProjectionInventory {
+    pub fn order_by_namespace_and_name(&mut self) {
+        self.entries.as_mut_slice().sort_by(|a, b| {
+            a.target
+                .namespace()
+                .cmp(b.target.namespace())
+                .then(a.target.name().cmp(b.target.name()))
+        });
+    }
+    pub async fn next_ready(
+        &mut self,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        for entry in self.entries.by_ref() {
+            let order = self.service.runtime.projection_order(entry.target.clone());
+            let cell = order.lock().await;
+            let Some(loaded) = self
+                .service
+                .repository
+                .find_keyed_by_target_bounded(&entry.target, self.bound)
+                .await?
+            else {
+                continue;
+            };
+            if matches!(
+                self.service.runtime.readiness(&entry.target),
+                TargetReadiness::Ready
+            ) && cell.installed.as_ref() == Some(&loaded.version)
+            {
+                return Ok(Some(loaded));
+            }
+        }
+        Ok(None)
+    }
+    pub async fn next_listable(
+        &mut self,
+    ) -> Result<Option<ListedKeyedMvProjection>, MvRepositoryError> {
+        for entry in self.entries.by_ref() {
+            let mut bound = self.bound;
+            let state = self
+                .service
+                .runtime
+                .with_readiness(&entry.target, |state| {
+                    let bytes = match state {
+                        TargetReadiness::ReadOnly(r) | TargetReadiness::Unavailable(r) => r.len(),
+                        _ => 0,
+                    };
+                    bound.decode.max_working_set_bytes = bound
+                        .decode
+                        .max_working_set_bytes
+                        .checked_sub(bytes)
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| {
+                            MvRepositoryError::new(
+                                MvRepositoryErrorKind::InvalidRequest,
+                                "keyed readiness reason exceeds decode budget",
+                            )
+                        })?;
+                    Ok::<_, MvRepositoryError>(match state {
+                        TargetReadiness::Ready => Some(MvListedManageability::Manageable),
+                        TargetReadiness::ReadOnly(r) => {
+                            Some(MvListedManageability::ReadOnly(r.clone()))
+                        }
+                        TargetReadiness::Unavailable(r) => {
+                            Some(MvListedManageability::Unavailable(r.clone()))
+                        }
+                        TargetReadiness::Unobserved => None,
+                    })
+                })?;
+            let Some(manageability) = state else {
+                continue;
+            };
+            let order = self.service.runtime.projection_order(entry.target.clone());
+            let cell = order.lock().await;
+            let Some(loaded) = self
+                .service
+                .repository
+                .find_keyed_by_target_bounded(&entry.target, bound)
+                .await?
+            else {
+                continue;
+            };
+            if manageability == MvListedManageability::Manageable
+                && cell.installed.as_ref() != Some(&loaded.version)
+            {
+                continue;
+            }
+            return Ok(Some(ListedKeyedMvProjection {
+                loaded,
+                manageability,
+            }));
+        }
+        Ok(None)
+    }
+}
+pub struct MvKeyedProjectionDeleteGuard {
+    target: MvTarget,
+    generation: u64,
+    expected: Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+    order: Arc<tokio::sync::Mutex<ProjectionOrder>>,
+}
+impl MvKeyedProjectionDeleteGuard {
+    pub fn has_projection(&self) -> bool {
+        self.expected.is_some()
+    }
+    pub fn expected_target_object_id(
+        &self,
+    ) -> Option<&novarocks_spi::connector::ConnectorTableObjectId> {
+        self.expected
+            .as_ref()
+            .map(|e| &e.projection.facts.source_revision().target_object_id)
+    }
+}
+pub type MvKeyedDropReadiness = MvDropReadiness<MvKeyedProjectionDeleteGuard>;
+#[async_trait::async_trait]
+pub trait MvKeyedReadOnlyCurrentProjectionSource: Send + Sync {
+    async fn observe_current_keyed_read_only(
+        &self,
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        MvProjectionError,
+    >;
+}
+impl MvKeyedReadinessService {
+    pub fn candidate_reader(&self) -> MvKeyedCandidateReader {
+        MvKeyedCandidateReader {
+            repository: self.repository.clone(),
+        }
+    }
     pub async fn invalidate_current(
         &self,
         target: MvTarget,
@@ -734,280 +538,6 @@ impl MvReadinessService {
         cell.supersede();
         self.runtime.set_unavailable(target, reason);
         Ok(())
-    }
-    pub async fn reserve_projection_delete(
-        &self,
-        target: MvTarget,
-    ) -> Result<MvProjectionDeleteGuard, MvProjectionError> {
-        Ok(MvProjectionDeleteGuard {
-            reservation: self.reserve(target).await?,
-        })
-    }
-    pub async fn delete_after_provider_drop(
-        &self,
-        operation_id: Uuid,
-        guard: MvProjectionDeleteGuard,
-    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
-        let reservation = guard.reservation;
-        let mut cell = reservation.order.lock().await;
-        if cell.generation != reservation.generation {
-            return Ok(MvProjectionInstallOutcome::Superseded);
-        }
-        cell.settle(reservation.generation);
-        if !self.matches_repository(&reservation).await? {
-            return Ok(MvProjectionInstallOutcome::Superseded);
-        }
-        let Some(expected) = reservation.expected else {
-            return Ok(MvProjectionInstallOutcome::AlreadyAbsent);
-        };
-        let removed = self
-            .repository
-            .delete_projection(
-                operation_id,
-                DeleteMvProjectionRequest {
-                    mv_id: expected.projection.mv_id,
-                    expected_version: expected.version,
-                    expected_source_revision: expected.projection.facts.source_revision().clone(),
-                },
-            )
-            .await?;
-        cell.installed = None;
-        self.runtime
-            .set_unavailable(reservation.target, "MV target was removed".into());
-        Ok(if removed {
-            MvProjectionInstallOutcome::Removed
-        } else {
-            MvProjectionInstallOutcome::AlreadyAbsent
-        })
-    }
-    /// Whether plain SQL may read one MV target's storage.
-    ///
-    /// Reading an MV is not a management operation, so a target whose
-    /// management is closed pending readmission remains readable: its
-    /// publication is exactly what the lake says it is. A target whose
-    /// projection is itself in doubt is not readable, which is the case this
-    /// answer exists to separate out.
-    pub async fn query_admission(
-        &self,
-        target: &MvTarget,
-    ) -> Result<MvQueryAdmission, MvRepositoryError> {
-        if self.repository.find_by_target(target).await?.is_none() {
-            return Ok(MvQueryAdmission::NotAnMv);
-        }
-        Ok(match self.runtime.readiness(target) {
-            TargetReadiness::Ready | TargetReadiness::ReadOnly(_) => MvQueryAdmission::Admitted,
-            TargetReadiness::Unavailable(reason) => MvQueryAdmission::Quarantined(reason),
-            TargetReadiness::Unobserved => MvQueryAdmission::Quarantined(
-                "MV target has not been observed in this process".to_string(),
-            ),
-        })
-    }
-
-    /// The management-facing read: the same answer as [`Self::load_ready`],
-    /// except that an observation already in flight is waited for rather than
-    /// reported as the absence of one.
-    ///
-    /// A statement that reaches this while a background refresh is mid-read
-    /// would otherwise be told the target has no successful fresh observation
-    /// -- about a target whose observation is succeeding as it asks. Waiting
-    /// is what that sentence already means; it was simply not being done.
-    /// Inventory scans deliberately do not use this: they visit every target
-    /// and want whatever is known now.
-    pub async fn load_ready_settled(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        let order = self.runtime.projection_order(target.clone());
-        let deadline = tokio::time::Instant::now() + OBSERVATION_SETTLE_WAIT;
-        loop {
-            let cell = order.lock().await;
-            if cell.pending.is_none() {
-                break;
-            }
-            // Register as a waiter before releasing the cell. `notify_waiters`
-            // wakes only the waiters registered when it runs and leaves no
-            // permit behind, and the settler holds this cell while it calls it
-            // -- so enabling here, under the cell, is what makes the wake-up
-            // unmissable. Merely constructing the future would not: it
-            // registers nothing until first polled.
-            let settled = std::sync::Arc::clone(&cell.settled);
-            let notified = settled.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            drop(cell);
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                break;
-            }
-        }
-        self.load_ready(target).await
-    }
-
-    pub async fn load_ready(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        let order = self.runtime.projection_order(target.clone());
-        let cell = order.lock().await;
-        let Some(loaded) = self.repository.find_by_target(target).await? else {
-            return Ok(None);
-        };
-        if !matches!(self.runtime.readiness(target), TargetReadiness::Ready)
-            || cell.installed.as_ref() != Some(&loaded.version)
-        {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Unavailable,
-                "MV target requires a successful fresh Current observation",
-            ));
-        }
-        Ok(Some(loaded))
-    }
-    pub async fn bounded_projection_inventory(
-        &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<MvBoundedProjectionInventory, MvRepositoryError> {
-        let entries = self.repository.list_projection_inventory(bound).await?;
-        Ok(MvBoundedProjectionInventory {
-            service: self.clone(),
-            entries: entries.into_iter(),
-            bound,
-        })
-    }
-
-    pub async fn list_ready_projections(
-        &self,
-    ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
-        let mut result = Vec::new();
-        for projection in self.repository.list_projections().await? {
-            match self.load_ready(projection.projection.facts.target()).await {
-                Ok(Some(loaded)) => result.push(loaded),
-                Ok(None) => {}
-                Err(error) if error.kind() == MvRepositoryErrorKind::Unavailable => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(result)
-    }
-    pub async fn list_ready_dependencies_by_downstream(
-        &self,
-        projection: &LoadedMvProjection,
-    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
-        let current = self
-            .load_ready(projection.projection.facts.target())
-            .await?;
-        if current.as_ref().map(|current| &current.version) != Some(&projection.version) {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                "MV dependency root changed",
-            ));
-        }
-        self.repository
-            .list_dependencies_by_downstream(projection.projection.mv_id)
-            .await
-    }
-    /// Local display keeps the current ready version and bounded index read
-    /// under the target's observation order, without cloning a second model.
-    pub async fn list_ready_dependencies_by_downstream_bounded(
-        &self,
-        projection: &LoadedMvProjection,
-        bound: crate::repository::MvDependencyReadBound,
-    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
-        let target = projection.projection.facts.target();
-        let order = self.runtime.projection_order(target.clone());
-        let cell = order.lock().await;
-        let ready = self
-            .runtime
-            .with_readiness(target, |state| matches!(state, TargetReadiness::Ready));
-        if !ready || cell.installed.as_ref() != Some(&projection.version) {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Unavailable,
-                "MV target requires a successful fresh Current observation",
-            ));
-        }
-        self.repository
-            .list_dependencies_by_downstream_bounded(
-                projection.projection.mv_id,
-                &projection.version,
-                bound,
-            )
-            .await
-    }
-
-    pub async fn ensure_no_ready_downstream_dependencies(
-        &self,
-        upstream: &MvDependencyObjectIdentity,
-    ) -> Result<(), MvRepositoryError> {
-        for projection in self.list_ready_projections().await? {
-            for dependency in self
-                .list_ready_dependencies_by_downstream(&projection)
-                .await?
-            {
-                if dependency.upstream.catalog.as_deref()
-                    != Some(upstream.catalog_instance.as_str())
-                {
-                    continue;
-                }
-                // A dependency records its upstream object inside the
-                // application's own fact envelope, which is not the provider's
-                // bare identity: comparing the two as bytes never matches, and
-                // a guard that never matches is a guard that is not there.
-                // Opening the envelope is not a provider decode -- the value
-                // inside is handed back unchanged and stays opaque.
-                let persisted = crate::persistence::identity::ObjectIdentity::try_new(
-                    dependency.upstream_object_id.to_vec(),
-                )
-                .map_err(|error| {
-                    MvRepositoryError::new(
-                        MvRepositoryErrorKind::Corruption,
-                        format!("MV dependency upstream object identity is unreadable: {error}"),
-                    )
-                })?;
-                // An identity this process cannot read is not an absence of a
-                // dependency. Refusing is the only answer that cannot drop a
-                // base table out from under a view.
-                let names = crate::persistence::exact_revision::persisted_object_names(
-                    &persisted,
-                    &upstream.object_id,
-                )
-                .map_err(|error| {
-                    MvRepositoryError::new(
-                        MvRepositoryErrorKind::Corruption,
-                        format!("MV dependency upstream object identity is unreadable: {error}"),
-                    )
-                })?;
-                if names {
-                    return Err(MvRepositoryError::new(
-                        MvRepositoryErrorKind::Conflict,
-                        "exact object has downstream materialized views",
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-    pub async fn prepare_drop(
-        &self,
-        target: &MvTarget,
-        if_exists: bool,
-    ) -> Result<MvDropReadiness, MvProjectionError> {
-        let Some(loaded) = self.load_ready(target).await? else {
-            return if if_exists {
-                Ok(MvDropReadiness::AlreadyAbsent)
-            } else {
-                Err(MvProjectionError::new(
-                    MvProjectionErrorKind::SourceConflict,
-                    "materialized view does not exist",
-                ))
-            };
-        };
-        let source = loaded.projection.facts.source_revision();
-        self.ensure_no_ready_downstream_dependencies(&MvDependencyObjectIdentity::new(
-            source.target.instance_id.as_str(),
-            source.target_object_id.clone(),
-        ))
-        .await?;
-        Ok(MvDropReadiness::ReadyToDrop(
-            self.reserve_projection_delete(target.clone()).await?,
-        ))
     }
     pub fn begin_publication(
         &self,
@@ -1047,60 +577,554 @@ impl MvReadinessService {
         self.repository.wipe_accelerator(operation_id).await?;
         Ok(())
     }
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub async fn seed_projection(
+    pub async fn query_admission(
         &self,
-        operation_id: Uuid,
-        facts: MvDocumentProjection,
-    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
-        let reservation = self.reserve(facts.target().clone()).await?;
-        self.finish_observation(None, operation_id, reservation, Ok((facts, None)), true)
+        target: &MvTarget,
+    ) -> Result<MvQueryAdmission, MvRepositoryError> {
+        if self
+            .repository
+            .find_keyed_by_target(target, PersistenceDecodeBudget::default())
+            .await?
+            .is_none()
+        {
+            return Ok(MvQueryAdmission::NotAnMv);
+        }
+        Ok(match self.runtime.readiness(target) {
+            TargetReadiness::Ready | TargetReadiness::ReadOnly(_) => MvQueryAdmission::Admitted,
+            TargetReadiness::Unavailable(r) => MvQueryAdmission::Quarantined(r),
+            TargetReadiness::Unobserved => MvQueryAdmission::Quarantined(
+                "MV target has not been observed in this process".into(),
+            ),
+        })
+    }
+    pub async fn load_ready_settled(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        let order = self.runtime.projection_order(target.clone());
+        let deadline = tokio::time::Instant::now() + OBSERVATION_SETTLE_WAIT;
+        loop {
+            let cell = order.lock().await;
+            if cell.pending.is_none() {
+                break;
+            }
+            let settled = Arc::clone(&cell.settled);
+            let notified = settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(cell);
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
+        self.load_ready(target).await
+    }
+    pub async fn bounded_projection_inventory(
+        &self,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<MvBoundedKeyedProjectionInventory, MvRepositoryError> {
+        Ok(MvBoundedKeyedProjectionInventory {
+            service: self.clone(),
+            entries: self
+                .repository
+                .list_keyed_projection_inventory(bound)
+                .await?
+                .into_iter(),
+            bound,
+        })
+    }
+    pub async fn list_ready_projections(
+        &self,
+    ) -> Result<Vec<crate::state_store_repository::keyed::LoadedKeyedMvProjection>, MvRepositoryError>
+    {
+        let mut values = Vec::new();
+        for loaded in self.repository.list_keyed_projections().await? {
+            match self.load_ready(&loaded.projection.facts.target()).await {
+                Ok(Some(v)) => values.push(v),
+                Ok(None) => {}
+                Err(e) if e.kind() == MvRepositoryErrorKind::Unavailable => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(values)
+    }
+    pub async fn list_ready_dependencies_by_downstream_bounded(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+        bound: crate::repository::MvDependencyReadBound,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        let target = loaded.projection.facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        if !matches!(self.runtime.readiness(&target), TargetReadiness::Ready)
+            || cell.installed.as_ref() != Some(&loaded.version)
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "keyed dependency root is not ready",
+            ));
+        }
+        self.repository
+            .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
             .await
     }
-}
-impl MvCandidateReader {
-    /// Inventory only. Consumers independently freeze and prove exact historical reads.
-    pub async fn list_candidate_definitions(
+    pub async fn ensure_no_ready_downstream_dependencies(
         &self,
-    ) -> Result<Vec<StoredMvProjection>, MvRepositoryError> {
-        Ok(self
+        upstream: &MvDependencyObjectIdentity,
+    ) -> Result<(), MvRepositoryError> {
+        for loaded in self.list_ready_projections().await? {
+            for r in &loaded.projection.facts.definition().relation_occurrences {
+                if r.catalog_at_binding == upstream.catalog_instance.as_str()
+                    && crate::persistence::exact_revision::persisted_object_names(
+                        &r.object_id,
+                        &upstream.object_id,
+                    )
+                    .map_err(|e| {
+                        MvRepositoryError::new(MvRepositoryErrorKind::Corruption, e.to_string())
+                    })?
+                {
+                    return Err(MvRepositoryError::new(
+                        MvRepositoryErrorKind::Conflict,
+                        "exact object has downstream materialized views",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    pub async fn reserve_projection_delete(
+        &self,
+        target: MvTarget,
+    ) -> Result<MvKeyedProjectionDeleteGuard, MvProjectionError> {
+        let order = self.runtime.projection_order(target.clone());
+        let mut cell = order.lock().await;
+        let generation = cell.advance()?;
+        cell.installed = None;
+        cell.pending = Some(generation);
+        self.runtime
+            .set_unavailable(target.clone(), "MV deletion pending".into());
+        let expected = match self
             .repository
-            .list_projections()
-            .await?
-            .into_iter()
-            .map(|value| value.projection)
-            .collect())
+            .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                cell.settle(generation);
+                return Err(e.into());
+            }
+        };
+        drop(cell);
+        Ok(MvKeyedProjectionDeleteGuard {
+            target,
+            generation,
+            expected,
+            order,
+        })
+    }
+    pub async fn delete_after_provider_drop(
+        &self,
+        operation: Uuid,
+        guard: MvKeyedProjectionDeleteGuard,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let mut cell = guard.order.lock().await;
+        if cell.generation != guard.generation {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        cell.settle(guard.generation);
+        let current = self
+            .repository
+            .find_keyed_by_target(&guard.target, PersistenceDecodeBudget::default())
+            .await?;
+        if current.as_ref().map(|v| &v.version) != guard.expected.as_ref().map(|v| &v.version) {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        let Some(expected) = guard.expected else {
+            return Ok(MvKeyedProjectionInstallOutcome::AlreadyAbsent);
+        };
+        let removed = self
+            .repository
+            .delete_keyed_projection(operation, expected)
+            .await?;
+        cell.installed = None;
+        self.runtime
+            .set_unavailable(guard.target, "MV target was removed".into());
+        Ok(if removed {
+            MvKeyedProjectionInstallOutcome::Removed
+        } else {
+            MvKeyedProjectionInstallOutcome::AlreadyAbsent
+        })
+    }
+    pub async fn prepare_drop(
+        &self,
+        target: &MvTarget,
+        if_exists: bool,
+    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
+        let Some(loaded) = self.load_ready(target).await? else {
+            return if if_exists {
+                Ok(MvKeyedDropReadiness::AlreadyAbsent)
+            } else {
+                Err(MvProjectionError::new(
+                    MvProjectionErrorKind::SourceConflict,
+                    "materialized view does not exist",
+                ))
+            };
+        };
+        self.ensure_no_ready_downstream_dependencies(&MvDependencyObjectIdentity::new(
+            loaded
+                .projection
+                .facts
+                .source_revision()
+                .target
+                .instance_id
+                .as_str(),
+            loaded
+                .projection
+                .facts
+                .source_revision()
+                .target_object_id
+                .clone(),
+        ))
+        .await?;
+        Ok(MvKeyedDropReadiness::ReadyToDrop(
+            self.reserve_projection_delete(target.clone()).await?,
+        ))
+    }
+    pub async fn observe_current_read_only_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedReadOnlyCurrentProjectionSource,
+        reason: String,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let target = request.target().clone();
+        let order = self.runtime.projection_order(target.clone());
+        let (generation, expected, managed, installed) = {
+            let mut cell = order.lock().await;
+            let generation = cell.advance()?;
+            let managed = matches!(self.runtime.readiness(&target), TargetReadiness::Ready);
+            let installed = cell.installed.take();
+            cell.pending = Some(generation);
+            self.runtime.set_unavailable(
+                target.clone(),
+                "fresh keyed read-only observation pending".into(),
+            );
+            let expected = self
+                .repository
+                .find_keyed_by_target(&target, request.decode_budget())
+                .await?;
+            (generation, expected, managed, installed)
+        };
+        let observed = source
+            .observe_current_keyed_read_only(request.clone())
+            .await;
+        let mut cell = order.lock().await;
+        if cell.generation != generation {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        cell.settle(generation);
+        let current = self
+            .repository
+            .find_keyed_by_target(&target, request.decode_budget())
+            .await?;
+        if current.as_ref().map(|v| &v.version) != expected.as_ref().map(|v| &v.version) {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        let observed = observed?;
+        check_context(request.context())?;
+        let facts =
+            crate::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(
+                observed,
+            )
+            .map_err(|e| MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, e))?;
+        if facts.target() != target {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "keyed read-only observation target changed",
+            ));
+        }
+        let unchanged = expected
+            .as_ref()
+            .is_some_and(|v| v.projection.facts.source_revision() == facts.source_revision());
+        if expected.is_none() {
+            if let Some(existing) = self
+                .repository
+                .find_keyed_by_target_object(&facts.source_revision().target_object_id)
+                .await?
+            {
+                self.runtime.set_unavailable(
+                    target,
+                    "target object is already projected through another catalog".into(),
+                );
+                return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
+                    existing.projection.facts.target(),
+                ));
+            }
+        }
+        let loaded = if unchanged {
+            expected.expect("unchanged requires a root")
+        } else {
+            self.repository
+                .install_keyed_projection(operation_id, facts, expected)
+                .await?
+        };
+        check_context(request.context())?;
+        if managed && unchanged && installed.as_ref() == Some(&loaded.version) {
+            cell.installed = Some(loaded.version.clone());
+            self.runtime.set_ready(target);
+        } else {
+            cell.installed = None;
+            self.runtime.set_read_only(target, reason);
+        }
+        Ok(if unchanged {
+            MvKeyedProjectionInstallOutcome::Unchanged(loaded)
+        } else {
+            MvKeyedProjectionInstallOutcome::Installed(loaded)
+        })
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn seed_projection(
+        &self,
+        operation: Uuid,
+        facts: crate::persistence::keyed_documents::MvKeyedDocumentProjection,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let target = facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let mut cell = order.lock().await;
+        cell.advance()?;
+        cell.supersede();
+        let expected = self
+            .repository
+            .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
+            .await?;
+        let loaded = self
+            .repository
+            .install_keyed_projection(operation, facts, expected)
+            .await?;
+        cell.installed = Some(loaded.version.clone());
+        self.runtime.set_ready(target);
+        Ok(MvKeyedProjectionInstallOutcome::Installed(loaded))
     }
 }
-fn check_context(context: &ConnectorRequestContext) -> Result<(), MvProjectionError> {
-    if context.is_cancelled() {
-        return Err(MvProjectionError::new(
-            MvProjectionErrorKind::Cancelled,
-            "MV Current observation cancelled",
-        ));
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+    use crate::persistence::keyed_documents::*;
+    use crate::repository::MvDependencyReadBound;
+    struct Source(MvKeyedObservedCurrentDocuments);
+    #[async_trait::async_trait]
+    impl MvKeyedCurrentProjectionSource for Source {
+        async fn observe_current_keyed(
+            &self,
+            _: MvCurrentProjectionRequest,
+        ) -> Result<
+            (
+                MvKeyedObservedCurrentDocuments,
+                MvCurrentManagementAdmission,
+            ),
+            MvProjectionError,
+        > {
+            Ok((
+                self.0.clone(),
+                MvCurrentManagementAdmission::for_test_keyed(&self.0),
+            ))
+        }
     }
-    if std::time::Instant::now() >= context.deadline() {
-        return Err(MvProjectionError::new(
-            MvProjectionErrorKind::DeadlineExceeded,
-            "MV Current observation deadline elapsed",
-        ));
+    #[async_trait::async_trait]
+    impl MvKeyedReadOnlyCurrentProjectionSource for Source {
+        async fn observe_current_keyed_read_only(
+            &self,
+            _: MvCurrentProjectionRequest,
+        ) -> Result<MvKeyedObservedCurrentDocuments, MvProjectionError> {
+            Ok(self.0.clone())
+        }
     }
-    Ok(())
+    async fn service() -> MvKeyedReadinessService {
+        let store = Arc::new(
+            novarocks_state_store_testkit::testing::InMemoryStateStore::new(format!(
+                "keyed-readiness-{}",
+                Uuid::now_v7()
+            )),
+        );
+        let repository = crate::state_store_repository::StateStoreMvRepository::open(
+            store,
+            novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+        )
+        .await
+        .unwrap();
+        MvKeyedReadinessService::new(repository, Arc::new(ProcessRuntime::default()))
+    }
+    fn input(published: bool) -> (MvCurrentProjectionRequest, Source) {
+        let (catalog, view) = keyed_view_fixture(Some(17), published);
+        let decoded = decode_current_keyed_documents(
+            view,
+            catalog.clone(),
+            PersistenceDecodeBudget::default(),
+        )
+        .unwrap();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            stop.view(),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        (
+            MvCurrentProjectionRequest::try_new(
+                catalog,
+                MvTarget::from_parts(Some("ice"), "sales", "mv"),
+                context,
+                PersistenceDecodeBudget::default(),
+            )
+            .unwrap(),
+            Source(decoded),
+        )
+    }
+    #[tokio::test]
+    async fn keyed_ready_inventory_candidate_read_only_and_delete_share_one_root() {
+        let service = service().await;
+        let (request, source) = input(true);
+        let target = request.target().clone();
+        assert!(matches!(
+            service
+                .observe_and_install(Uuid::now_v7(), request.clone(), &source)
+                .await
+                .unwrap(),
+            MvKeyedProjectionInstallOutcome::Installed(_)
+        ));
+        let loaded = service.load_ready_settled(&target).await.unwrap().unwrap();
+        assert_eq!(loaded.projection.facts.publication_snapshot(), Some(17));
+        assert!(matches!(
+            service.query_admission(&target).await.unwrap(),
+            MvQueryAdmission::Admitted
+        ));
+        assert_eq!(
+            service
+                .candidate_reader()
+                .list_candidate_definitions()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let bound = MvProjectionInventoryBound {
+            entries: 4,
+            snapshot_bytes: 64 * 1024,
+            raw_page_bytes: 1024 * 1024,
+            single_name_bytes: 1024,
+            continuation_token_bytes: 4096,
+            decode: PersistenceDecodeBudget::default(),
+        };
+        let mut inventory = service.bounded_projection_inventory(bound).await.unwrap();
+        assert!(inventory.next_ready().await.unwrap().is_some());
+        assert!(inventory.next_ready().await.unwrap().is_none());
+        let dependencies = service
+            .list_ready_dependencies_by_downstream_bounded(
+                &loaded,
+                MvDependencyReadBound {
+                    inventory: bound,
+                    entries: 8,
+                    collection_bytes: 64 * 1024,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(dependencies.len(), 2);
+        assert_eq!(
+            service
+                .list_ready_dependencies_by_downstream(&loaded)
+                .await
+                .unwrap(),
+            dependencies
+        );
+        assert!(matches!(
+            service
+                .observe_current_read_only_and_install(
+                    Uuid::now_v7(),
+                    request,
+                    &source,
+                    "foreign".into()
+                )
+                .await
+                .unwrap(),
+            MvKeyedProjectionInstallOutcome::Unchanged(_)
+        ));
+        assert!(service.load_ready(&target).await.unwrap().is_some());
+        let guard = service
+            .reserve_projection_delete(target.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .delete_after_provider_drop(Uuid::now_v7(), guard)
+                .await
+                .unwrap(),
+            MvKeyedProjectionInstallOutcome::Removed
+        ));
+        assert!(service.load_ready(&target).await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn keyed_control_adapter_observes_the_same_active_publication() {
+        let service = service().await;
+        let (request, source) = input(false);
+        let target = request.target().clone();
+        service
+            .observe_and_install(Uuid::now_v7(), request, &source)
+            .await
+            .unwrap();
+        let hold = service
+            .begin_publication(
+                target,
+                LakePublicationId::try_from_uuid(Uuid::now_v7()).unwrap(),
+            )
+            .unwrap();
+        assert!(service.ensure_no_active_publications().is_err());
+        assert!(service.ensure_no_active_publications().is_err());
+        drop(hold);
+        assert!(service.ensure_no_active_publications().is_ok());
+    }
+    #[tokio::test]
+    async fn keyed_scheduler_consumes_only_actual_compact_publication_facts() {
+        use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
+        let (_, source) = input(true);
+        let facts = MvKeyedDocumentProjection::try_from_current(source.0).unwrap();
+        let due = facts.publication().unwrap().publication_prepared_at_ms
+            + facts.configuration().refresh_interval_ms.unwrap();
+        let mut scheduler = MvRefreshScheduler::new(MvSchedulerConfig::new(true, 1000, 1, 10, 40));
+        scheduler.observe_projection(StoredKeyedMvProjection { mv_id: 7, facts }, due as i64);
+        let ready = scheduler.take_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].projection().mv_id, 7);
+    }
+}
+
+impl MvKeyedReadinessService {
+    pub async fn list_ready_dependencies_by_downstream(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        let target = loaded.projection.facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        if !matches!(self.runtime.readiness(&target), TargetReadiness::Ready)
+            || cell.installed.as_ref() != Some(&loaded.version)
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "keyed dependency root is not ready",
+            ));
+        }
+        self.repository
+            .list_keyed_dependencies_by_downstream(loaded)
+            .await
+    }
 }
 
 #[cfg(test)]
 #[path = "readiness_tests.rs"]
-mod tests;
-
-/// How long a management read waits for an observation that is already in
-/// flight before answering from what the process knows now.
-///
-/// The wait exists because a management read that arrives mid-observation
-/// would otherwise report "no successful fresh observation" about a target
-/// whose observation is succeeding as it asks -- which is what a background
-/// refresh running beside a user statement makes routine. The bound exists
-/// because a reservation whose owner was dropped without settling would
-/// otherwise hold the reader forever: after it, the reader answers exactly as
-/// it did before this wait existed.
-const OBSERVATION_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+mod readiness_tests;

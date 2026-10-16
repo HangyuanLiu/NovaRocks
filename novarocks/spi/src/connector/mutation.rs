@@ -510,12 +510,9 @@ pub enum ConnectorCatalogMutationOperation {
         properties: Vec<(Arc<str>, Arc<str>)>,
         policy: CreatePolicy,
     },
-    /// Replace application-owned opaque documents in one exact table metadata
-    /// commit. Providers must not reinterpret this as an arbitrary property
-    /// patch or publish a new data snapshot.
-    UpdateApplicationDocuments {
-        intent: super::ConnectorDocumentUpdateIntent,
-    },
+    /// Typed marker, main-conditioned slot, or full-observation expiry intent.
+    /// Each channel admits only the side effects specified by its own shape.
+    KeyedDocuments { intent: super::KeyedMutationIntent },
     DropTable {
         table: ConnectorTableIdentity,
         policy: DropPolicy,
@@ -573,7 +570,7 @@ impl ConnectorCatalogMutationOperation {
             Self::CreateNamespace { .. } => "create-namespace",
             Self::DropNamespace { .. } => "drop-namespace",
             Self::CreateTable { .. } => "create-table",
-            Self::UpdateApplicationDocuments { .. } => "update-application-documents",
+            Self::KeyedDocuments { .. } => "keyed-documents",
             Self::DropTable { .. } => "drop-table",
             Self::CreateView { .. } => "create-view",
             Self::DropView { .. } => "drop-view",
@@ -601,7 +598,7 @@ impl ConnectorCatalogMutationOperation {
         operation_id: ConnectorMutationOperationId,
     ) -> Result<(), ConnectorError> {
         self.validate()?;
-        if let Self::UpdateApplicationDocuments { intent } = self {
+        if let Self::KeyedDocuments { intent } = self {
             intent.validate_for(owner, operation_id)?;
         }
         Ok(())

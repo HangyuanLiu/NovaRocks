@@ -44,6 +44,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 pub(super) struct ManagedMvRestFixture {
     rest: IsolatedIcebergRestFixture,
     create_catalog_sql: String,
+    recording: Option<novarocks_cluster_harness::recording_rest_catalog::RecordingRestCatalog>,
 }
 
 impl ManagedMvRestFixture {
@@ -108,9 +109,34 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
             Self {
                 rest,
                 create_catalog_sql,
+                recording: None,
             },
             launch,
         ))
+    }
+
+    pub(super) fn start_recorded(
+        scenario_root: &Path,
+        catalog: &str,
+    ) -> Result<(Self, ScenarioLaunchConfig)> {
+        let (mut fixture, launch) = Self::start(scenario_root, catalog)?;
+        let recording =
+            novarocks_cluster_harness::recording_rest_catalog::RecordingRestCatalog::start(
+                fixture.rest_uri(),
+            )?;
+        fixture.create_catalog_sql = fixture
+            .create_catalog_sql
+            .replace(fixture.rest_uri(), recording.uri());
+        fixture.recording = Some(recording);
+        Ok((fixture, launch))
+    }
+    pub(super) fn recorded_requests(
+        &self,
+    ) -> Result<Vec<novarocks_cluster_harness::recording_rest_catalog::RecordedRestRequest>> {
+        self.recording
+            .as_ref()
+            .context("managed MV fixture has no request recorder")?
+            .requests()
     }
 
     pub(super) fn create_catalog_sql(&self) -> &str {
@@ -126,6 +152,9 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
     }
 
     pub(super) fn shutdown(&mut self) -> Result<()> {
+        if let Some(recording) = self.recording.as_mut() {
+            recording.shutdown()?;
+        }
         self.rest
             .shutdown()
             .context("shutdown private managed MV REST fixture")

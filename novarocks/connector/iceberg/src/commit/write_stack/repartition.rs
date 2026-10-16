@@ -29,16 +29,12 @@
 //! the session that prepares it by the expected-prior-default observation
 //! check, which is an optimistic-concurrency fence against the live table.
 
-use std::collections::HashMap;
-
 use novarocks_spi::connector::{
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning, ConnectorError,
-    ConnectorErrorKind, ConnectorManagedDescriptorProperties, ConnectorManagedPartitionField,
-    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
-    ConnectorManagedPartitionTransform,
+    ConnectorErrorKind, ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
+    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionTransform,
 };
 
-use crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY;
 use crate::commit::write_stack::domain::{corrupt, invalid};
 
 /// One prepared atomic replacement: declarative updates for common staging,
@@ -76,43 +72,10 @@ impl IcebergPreparedRepartition {
     }
 }
 
-/// Prepare the full atomic replacement: the partition transition followed by
-/// the managed descriptor properties, so `metadata_updates` is exactly
-/// `[AddSpec, SetDefaultSpec, SetProperties]`. That shape is what the single
-/// external commit requires ahead of its snapshot updates.
-pub(crate) fn prepare_managed_repartition(
-    metadata: &crate::iceberg::spec::TableMetadata,
-    replacement: &ConnectorManagedPartitionSpecReplacement,
-    descriptor_properties: &ConnectorManagedDescriptorProperties,
-) -> Result<IcebergPreparedRepartition, ConnectorError> {
-    let mut prepared = preview_managed_repartition(metadata, replacement)?;
-    let descriptor_properties = managed_descriptor_property_updates(descriptor_properties)?;
-    let build = crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(
-        prepared.prospective_metadata.clone(),
-        None,
-    )
-    .set_properties(descriptor_properties.clone())
-    .map_err(|error| invalid(format!("bind managed MV descriptor properties: {error}")))?
-    .build()
-    .map_err(|error| {
-        invalid(format!(
-            "finalize managed MV descriptor properties: {error}"
-        ))
-    })?;
-    prepared.prospective_metadata = build.metadata;
-    prepared
-        .metadata_updates
-        .push(crate::iceberg::TableUpdate::SetProperties {
-            updates: descriptor_properties,
-        });
-    Ok(prepared)
-}
-
-/// Prepare the partition transition alone, without the descriptor properties.
+/// Prepare the atomic partition transition.
 ///
 /// This is the read-only preview: it answers "which physical partitioning would
-/// this replacement establish" without proposing the application's descriptor
-/// change, so its `metadata_updates` stop at `[AddSpec, SetDefaultSpec]`.
+/// this replacement establish"; its `metadata_updates` are `[AddSpec, SetDefaultSpec]`.
 pub(crate) fn preview_managed_repartition(
     metadata: &crate::iceberg::spec::TableMetadata,
     replacement: &ConnectorManagedPartitionSpecReplacement,
@@ -233,35 +196,6 @@ pub(crate) fn preview_managed_repartition(
     })
 }
 
-/// Turn the opaque application descriptor carrier into the property map the
-/// `SetProperties` update carries. The provider owns publication metadata, so a
-/// descriptor key that collides with one of those keys fails closed rather than
-/// silently overwriting the provider's own record of the publication.
-fn managed_descriptor_property_updates(
-    descriptor: &ConnectorManagedDescriptorProperties,
-) -> Result<HashMap<String, String>, ConnectorError> {
-    let mut updates = HashMap::with_capacity(descriptor.entries().len());
-    for (key, value) in descriptor.entries() {
-        if matches!(
-            key.as_ref(),
-            crate::commit::MV_PUBLICATION_ID_PROP
-                | crate::commit::MV_PUBLICATION_PROVENANCE_PROP
-                | crate::commit::MV_REFRESH_ROW_COUNT_PROP
-                | ICEBERG_WRITE_SESSION_MARKER_PROPERTY
-        ) {
-            return Err(invalid(
-                "managed MV descriptor properties conflict with provider-owned publication metadata",
-            ));
-        }
-        if updates.insert(key.to_string(), value.to_string()).is_some() {
-            return Err(invalid(
-                "managed MV descriptor properties contain a duplicate key",
-            ));
-        }
-    }
-    Ok(updates)
-}
-
 /// Observe a live partition spec as the neutral field vocabulary, so the prior
 /// default can be compared against the replacement's expectation without either
 /// side reading provider metadata.
@@ -350,7 +284,7 @@ mod tests {
     use std::sync::Arc;
 
     use novarocks_spi::connector::{
-        ConnectorErrorKind, ConnectorManagedDescriptorProperties, ConnectorManagedPartitionField,
+        ConnectorErrorKind, ConnectorManagedPartitionField,
         ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
         ConnectorManagedPartitionTransform, ConnectorWriteOperationId,
     };
@@ -419,41 +353,18 @@ mod tests {
         .expect("replacement")
     }
 
-    fn descriptor_properties() -> ConnectorManagedDescriptorProperties {
-        ConnectorManagedDescriptorProperties::try_new(vec![
-            (
-                Arc::from("novarocks.mv.descriptor.hash"),
-                Arc::from("descriptor-hash"),
-            ),
-            (
-                Arc::from("novarocks.mv.descriptor.inline"),
-                Arc::from("descriptor-inline"),
-            ),
-            (
-                Arc::from("novarocks.mv.descriptor.package-id"),
-                Arc::from("db.mv"),
-            ),
-        ])
-        .expect("descriptor properties")
-    }
-
     #[test]
-    fn a_prepared_repartition_is_add_spec_then_set_default_spec_then_set_properties() {
+    fn a_prepared_repartition_is_add_spec_then_set_default_spec() {
         let metadata = unpartitioned_metadata();
         let replacement = replacement(prior_observation(&metadata), identity_on_id());
-        let descriptor = descriptor_properties();
 
-        let prepared = prepare_managed_repartition(&metadata, &replacement, &descriptor)
-            .expect("prepare the repartition");
+        let prepared =
+            preview_managed_repartition(&metadata, &replacement).expect("prepare the repartition");
 
-        assert_eq!(prepared.metadata_updates().len(), 3);
+        assert_eq!(prepared.metadata_updates().len(), 2);
         assert!(matches!(
             prepared.metadata_updates()[1],
             crate::iceberg::TableUpdate::SetDefaultSpec { .. }
-        ));
-        assert!(matches!(
-            prepared.metadata_updates()[2],
-            crate::iceberg::TableUpdate::SetProperties { .. }
         ));
         let crate::iceberg::TableUpdate::AddSpec { spec } = &prepared.metadata_updates()[0] else {
             panic!("partition replacement must start with AddSpec");
@@ -478,20 +389,10 @@ mod tests {
             committed_field.transform(),
             ConnectorManagedPartitionTransform::Identity
         );
-        for (key, value) in descriptor.entries() {
-            assert_eq!(
-                prepared
-                    .prospective_metadata()
-                    .properties()
-                    .get(key.as_ref())
-                    .map(String::as_str),
-                Some(value.as_ref())
-            );
-        }
     }
 
     #[test]
-    fn a_preview_stops_before_the_descriptor_properties() {
+    fn a_preview_contains_only_the_partition_transition() {
         let metadata = unpartitioned_metadata();
         let replacement = replacement(prior_observation(&metadata), identity_on_id());
 
@@ -526,7 +427,7 @@ mod tests {
         .expect("stale observation");
         let replacement = replacement(stale, identity_on_id());
 
-        let error = prepare_managed_repartition(&metadata, &replacement, &descriptor_properties())
+        let error = preview_managed_repartition(&metadata, &replacement)
             .expect_err("a stale prior observation must fail closed");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
@@ -543,7 +444,7 @@ mod tests {
         .expect("observation of another spec ID");
         let replacement = replacement(wrong_spec_id, identity_on_id());
 
-        let error = prepare_managed_repartition(&metadata, &replacement, &descriptor_properties())
+        let error = preview_managed_repartition(&metadata, &replacement)
             .expect_err("a prior observation of another spec ID must fail closed");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
@@ -609,41 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_descriptor_properties_reject_provider_owned_keys() {
-        for reserved in [
-            crate::commit::MV_PUBLICATION_ID_PROP,
-            crate::commit::MV_PUBLICATION_PROVENANCE_PROP,
-            crate::commit::MV_REFRESH_ROW_COUNT_PROP,
-            ICEBERG_WRITE_SESSION_MARKER_PROPERTY,
-        ] {
-            let descriptor = ConnectorManagedDescriptorProperties::try_new(vec![(
-                Arc::from(reserved),
-                Arc::from("01890f3c-4e70-7cc0-8000-000000000012"),
-            )])
-            .expect("opaque descriptor carrier");
-
-            let error = managed_descriptor_property_updates(&descriptor)
-                .expect_err("provider-owned descriptor key must fail closed");
-            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        }
-    }
-
-    #[test]
-    fn a_reserved_descriptor_key_refuses_the_whole_repartition() {
-        let metadata = unpartitioned_metadata();
-        let replacement = replacement(prior_observation(&metadata), identity_on_id());
-        let descriptor = ConnectorManagedDescriptorProperties::try_new(vec![(
-            Arc::from(crate::commit::MV_PUBLICATION_ID_PROP),
-            Arc::from("01890f3c-4e70-7cc0-8000-000000000012"),
-        )])
-        .expect("opaque descriptor carrier");
-
-        let error = prepare_managed_repartition(&metadata, &replacement, &descriptor)
-            .expect_err("a provider-owned descriptor key must fail the whole preparation");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    }
-
-    #[test]
     fn managed_partition_fields_observe_a_bound_spec_as_neutral_fields() {
         let metadata = unpartitioned_metadata();
         assert!(
@@ -689,10 +555,9 @@ mod tests {
             })
             .unwrap()
         };
-        let first = prepare_managed_repartition(
+        let first = preview_managed_repartition(
             &base,
             &replacement(prior_observation(&base), identity_on_id()),
-            &descriptor_properties(),
         )
         .unwrap();
         let operation = intent(&base);

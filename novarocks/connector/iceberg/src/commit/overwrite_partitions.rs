@@ -138,7 +138,7 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
             .extend(super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?);
         let mut summary =
             super::overwrite::snapshot_file_summary(&intent.changes().added, &removed)?;
-        super::overwrite::set_visible_rows_after_removal(view, &removed, &mut summary)?;
+        super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
         summary.insert("replace-partitions".into(), "true".into());
         super::overwrite::prepare_snapshot_change(
             view,

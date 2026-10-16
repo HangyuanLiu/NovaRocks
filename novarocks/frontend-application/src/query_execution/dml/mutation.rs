@@ -750,6 +750,7 @@ mod tests {
             std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            crate::mv::domain::test_admission::test_readiness(),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }

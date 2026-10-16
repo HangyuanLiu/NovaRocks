@@ -30,6 +30,7 @@ use crate::iceberg::{Error, ErrorKind, Result, TableIdent, TableRequirement, Tab
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorOperationControl, ConnectorRequestContext};
 
+#[derive(Clone)]
 pub enum StagingBase {
     Existing {
         metadata: TableMetadata,
@@ -136,6 +137,28 @@ impl StagingState {
                     .map(|s| s.snapshot_id()),
             });
         }
+        if intent.shape() == RequestShape::DocumentExpiry {
+            requirements::push_unique(
+                &mut requirements,
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: intent.target_ref().to_owned(),
+                    snapshot_id: base
+                        .snapshot_for_ref(intent.target_ref())
+                        .map(|s| s.snapshot_id()),
+                },
+            );
+            let mut refs: Vec<_> = base.refs().iter().collect();
+            refs.sort_by_key(|(name, _)| *name);
+            for (name, reference) in refs {
+                requirements::push_unique(
+                    &mut requirements,
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: name.clone(),
+                        snapshot_id: Some(reference.snapshot_id),
+                    },
+                );
+            }
+        }
         let initialization_len = updates.len();
         Ok(Self {
             metadata: base.clone(),
@@ -171,6 +194,9 @@ impl StagingState {
         let mut updates = self.updates.clone();
         let mut metadata = self.metadata.clone();
         for update in change.updates {
+            if intent.shape() == RequestShape::DocumentExpiry {
+                crate::commit::model::validate_document_expiry_update(&update)?;
+            }
             if intent.shape() == RequestShape::RefRetention {
                 crate::commit::model::validate_ref_retention_update(&update)?;
             }

@@ -29,7 +29,7 @@ use bytes::Bytes;
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
     ConnectorDocumentManagementOperation, ConnectorDocumentStorageBinding,
-    ConnectorDocumentStorageManagement, ConnectorPrepareDocumentsRequest,
+    ConnectorDocumentStorageManagement,
 };
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorInstanceDescriptor,
@@ -73,13 +73,6 @@ impl ConnectorDocumentStorageManagement for AdmittingManagement {
         _request: ConnectorDocumentManagementAdmissionRequest,
     ) -> Result<Bytes, ConnectorError> {
         Ok(Bytes::from_static(b"test-admission-token"))
-    }
-
-    fn prepare_documents(
-        &self,
-        _request: ConnectorPrepareDocumentsRequest,
-    ) -> Result<Bytes, ConnectorError> {
-        Ok(Bytes::from_static(b"test-prepared-token"))
     }
 }
 
@@ -143,4 +136,60 @@ pub(crate) fn publication_admission(
             .expect("test admission request"),
         )
         .expect("test publication admission")
+}
+
+pub(crate) use novarocks_mv_application::persistence::test_support::{
+    KeyedProjectionFixture, sample_keyed_projection,
+};
+
+pub(crate) async fn keyed_repository()
+-> Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository> {
+    novarocks_mv_application::state_store_repository::StateStoreMvRepository::open(
+        Arc::new(novarocks_state_store_testkit::testing::InMemoryStateStore::new("fe-keyed-tests")),
+        Default::default(),
+    )
+    .await
+    .expect("test keyed repository")
+}
+pub(crate) fn management_entrance() -> Arc<novarocks_mv_application::management::ManagementEntrance>
+{
+    Arc::new(
+        novarocks_mv_application::management::ManagementEntrance::new(
+            novarocks_mv_application::management::DeploymentOwner::parse("test-deployment")
+                .unwrap(),
+            novarocks_mv_application::management::ProcessIncarnation::parse("test-process")
+                .unwrap(),
+        ),
+    )
+}
+pub(crate) async fn keyed_product() -> (
+    novarocks_mv_application::service::MvKeyedProductService,
+    Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository>,
+) {
+    let repository = keyed_repository().await;
+    let product=novarocks_mv_application::service::MvKeyedProductService::new_with_keyed_management_continuation(Default::default(),repository.clone(),Default::default(),management_entrance(),Default::default());
+    (product, repository)
+}
+
+/// Each test gets an independent MV state owner; only the Tokio executor is shared.
+pub(crate) fn test_readiness() -> Arc<crate::mv::domain::readiness::MvReadinessPort> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test MV executor")
+    });
+    let (product, _) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| runtime.block_on(keyed_product()))
+            .join()
+            .expect("construct test MV owner")
+    });
+    Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
+        product.keyed_readiness_service().unwrap(),
+        runtime.handle().clone(),
+        product.management_entrance().unwrap(),
+    ))
 }

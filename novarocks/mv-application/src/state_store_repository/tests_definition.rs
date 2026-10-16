@@ -16,13 +16,11 @@
 // under the License.
 
 use super::StateStoreMvRepository;
-use crate::persistence::identity::ObjectIdentity;
-use crate::persistence::test_support::ProjectionFixture;
+use crate::persistence::keyed_documents::MvKeyedDocumentProjection;
+use crate::persistence::test_support::KeyedProjectionFixture;
+use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::product::MvTarget;
-use crate::repository::{
-    DeleteMvProjectionRequest, MvProjectionRequest, MvRepository, MvRepositoryErrorKind,
-    ReplaceMvProjectionRequest,
-};
+use crate::repository::MvRepositoryErrorKind;
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, StateStore, Value};
@@ -51,13 +49,13 @@ pub(crate) fn target(table: &str) -> MvTarget {
     MvTarget::from_parts(Some("ice"), "sales", table)
 }
 
-pub(crate) fn projection_request(
+pub(crate) fn projection_facts(
     table: &str,
     object: &[u8],
     snapshot_id: i64,
     dependency: &str,
-) -> MvProjectionRequest {
-    let mut fixture = ProjectionFixture::new(target(table), Some(snapshot_id));
+) -> MvKeyedDocumentProjection {
+    let mut fixture = KeyedProjectionFixture::new(target(table), Some(snapshot_id));
     fixture.object_id = object_id(object);
     // Encoded the way the documents encode one, so a fixture dependency and a
     // fixture projection disagree in exactly the ways production ones do.
@@ -71,16 +69,17 @@ pub(crate) fn projection_request(
     for source in &mut fixture.publication.as_mut().unwrap().inputs {
         source.object_id = upstream.clone();
     }
-    fixture.build().unwrap().into()
+    fixture.build().unwrap()
 }
 
 #[tokio::test]
 async fn reopening_the_repository_retains_the_exact_lake_source_projection() {
     let (store, repository) = repository().await;
     let created = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            projection_request("retained", b"retained-object", 9, "orders"),
+            projection_facts("retained", b"retained-object", 9, "orders"),
+            None,
         )
         .await
         .unwrap();
@@ -94,7 +93,10 @@ async fn reopening_the_repository_retains_the_exact_lake_source_projection() {
     .expect("reopen MV Accelerator repository");
     assert_eq!(
         reopened
-            .load_by_id(created.projection.mv_id)
+            .find_keyed_by_target(
+                &created.projection.facts.target(),
+                PersistenceDecodeBudget::default()
+            )
             .await
             .unwrap()
             .unwrap()
@@ -104,99 +106,158 @@ async fn reopening_the_repository_retains_the_exact_lake_source_projection() {
 }
 
 #[tokio::test]
-async fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
+async fn whole_keyed_projection_cas_replaces_root_and_dependency_indexes() {
     let (_host, repository) = repository().await;
     let created = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            projection_request("orders_mv", b"object-a", 11, "orders"),
+            projection_facts("orders_mv", b"object-a", 11, "orders"),
+            None,
         )
         .await
         .expect("create projection");
     let stale_version = created.version.clone();
 
     let replaced = repository
-        .replace_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            ReplaceMvProjectionRequest {
-                mv_id: created.projection.mv_id,
-                expected_version: created.version,
-                projection: projection_request("orders_mv_v2", b"object-a", 12, "customers"),
-            },
+            projection_facts("orders_mv", b"object-a", 12, "customers"),
+            Some({
+                let mut expected = created.clone();
+                expected.version = (created.version).clone();
+                expected
+            }),
         )
         .await
         .expect("replace projection");
 
-    assert!(
-        repository
-            .find_by_target(&target("orders_mv"))
-            .await
-            .unwrap()
-            .is_none()
-    );
     assert_eq!(
         repository
-            .find_by_target(&target("orders_mv_v2"))
+            .find_keyed_by_target(&target("orders_mv"), PersistenceDecodeBudget::default())
             .await
             .unwrap()
             .unwrap(),
         replaced
     );
     let dependencies = repository
-        .list_dependencies_by_downstream(replaced.projection.mv_id)
+        .list_keyed_dependencies_by_downstream(&replaced)
         .await
         .unwrap();
     assert_eq!(dependencies.len(), 2);
     assert_eq!(dependencies[0].upstream.name, "customers");
 
     let error = repository
-        .replace_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            ReplaceMvProjectionRequest {
-                mv_id: replaced.projection.mv_id,
-                expected_version: stale_version,
-                projection: projection_request("stale", b"object-a", 13, "orders"),
-            },
+            projection_facts("orders_mv", b"object-a", 13, "orders"),
+            Some({
+                let mut expected = replaced.clone();
+                expected.version = (stale_version).clone();
+                expected
+            }),
         )
         .await
         .expect_err("stale CAS must fail");
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository
+            .find_keyed_by_target(&target("orders_mv"), PersistenceDecodeBudget::default())
+            .await
+            .unwrap(),
+        Some(replaced.clone())
+    );
+    assert!(
+        repository
+            .list_keyed_dependencies_by_downstream(&replaced)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.upstream.name == "customers")
+    );
 }
 
 #[tokio::test]
-async fn replacement_target_conflict_rolls_back_the_whole_projection() {
-    let (_host, repository) = repository().await;
+async fn different_target_install_refuses_without_changing_either_projection() {
+    let (_, repository) = repository().await;
     let first = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            projection_request("first", b"object-first", 21, "orders"),
+            projection_facts("first", b"object-first", 21, "orders"),
+            None,
         )
         .await
         .unwrap();
-    repository
-        .create_projection(
+    let second = repository
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            projection_request("second", b"object-second", 22, "customers"),
+            projection_facts("second", b"object-second", 22, "customers"),
+            None,
         )
         .await
         .unwrap();
-
-    assert!(
-        repository
-            .replace_projection(
+    for target_name in ["second", "unoccupied"] {
+        let error = repository
+            .install_keyed_projection(
                 uuid::Uuid::now_v7(),
-                ReplaceMvProjectionRequest {
-                    mv_id: first.projection.mv_id,
-                    expected_version: first.version.clone(),
-                    projection: projection_request("second", b"object-first", 23, "lineitem",),
-                },
+                projection_facts(target_name, b"object-first", 23, "lineitem"),
+                Some(first.clone()),
             )
             .await
-            .is_err()
+            .unwrap_err();
+        assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
+    }
+    assert_eq!(
+        repository
+            .find_keyed_by_target(&target("first"), PersistenceDecodeBudget::default())
+            .await
+            .unwrap(),
+        Some(first.clone())
     );
     assert_eq!(
-        repository.load_by_id(first.projection.mv_id).await.unwrap(),
-        Some(first)
+        repository
+            .find_keyed_by_target(&target("second"), PersistenceDecodeBudget::default())
+            .await
+            .unwrap(),
+        Some(second.clone())
+    );
+    assert!(
+        repository
+            .find_keyed_by_target(&target("unoccupied"), PersistenceDecodeBudget::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .list_keyed_dependencies_by_downstream(&first)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.upstream.name == "orders")
+    );
+    assert!(
+        repository
+            .list_keyed_dependencies_by_downstream(&second)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.upstream.name == "customers")
+    );
+    let error = repository
+        .install_keyed_projection(
+            uuid::Uuid::now_v7(),
+            projection_facts("second", b"another-object", 24, "lineitem"),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
+    assert_eq!(
+        repository
+            .find_keyed_by_target(&target("second"), PersistenceDecodeBudget::default())
+            .await
+            .unwrap(),
+        Some(second)
     );
 }
 
@@ -204,48 +265,49 @@ async fn replacement_target_conflict_rolls_back_the_whole_projection() {
 async fn delete_requires_exact_object_source_and_version() {
     let (_host, repository) = repository().await;
     let created = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            projection_request("delete_me", b"object-live", 31, "orders"),
+            projection_facts("delete_me", b"object-live", 31, "orders"),
+            None,
         )
         .await
         .unwrap();
     let mut stale_source = created.projection.facts.source_revision().clone();
     stale_source.target_object_id = object_id(b"object-recreated");
     let error = repository
-        .delete_projection(
-            uuid::Uuid::now_v7(),
-            DeleteMvProjectionRequest {
-                mv_id: created.projection.mv_id,
-                expected_version: created.version.clone(),
-                expected_source_revision: stale_source,
-            },
-        )
+        .delete_keyed_projection(uuid::Uuid::now_v7(), {
+            let mut expected = created.clone();
+            expected.version = (created.version.clone()).clone();
+            expected.projection.facts.source = (stale_source).clone();
+            expected
+        })
         .await
         .expect_err("logical name cannot authorize deletion");
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert!(
         repository
-            .load_by_id(created.projection.mv_id)
+            .find_keyed_by_target(
+                &created.projection.facts.target(),
+                PersistenceDecodeBudget::default()
+            )
             .await
             .unwrap()
             .is_some()
     );
 
     repository
-        .delete_projection(
-            uuid::Uuid::now_v7(),
-            DeleteMvProjectionRequest {
-                mv_id: created.projection.mv_id,
-                expected_version: created.version,
-                expected_source_revision: created.projection.facts.source_revision().clone(),
-            },
-        )
+        .delete_keyed_projection(uuid::Uuid::now_v7(), {
+            let mut expected = created.clone();
+            expected.version = (created.version).clone();
+            expected.projection.facts.source =
+                (created.projection.facts.source_revision().clone()).clone();
+            expected
+        })
         .await
         .expect("exact guarded delete");
     assert!(
         repository
-            .find_by_target(&target("delete_me"))
+            .find_keyed_by_target(&target("delete_me"), PersistenceDecodeBudget::default())
             .await
             .unwrap()
             .is_none()
@@ -256,9 +318,10 @@ async fn delete_requires_exact_object_source_and_version() {
 async fn whole_family_wipe_allows_internal_id_reallocation() {
     let (_host, repository) = repository().await;
     let first = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            projection_request("before_wipe", b"object-before", 41, "orders"),
+            projection_facts("before_wipe", b"object-before", 41, "orders"),
+            None,
         )
         .await
         .unwrap();
@@ -267,9 +330,10 @@ async fn whole_family_wipe_allows_internal_id_reallocation() {
         .await
         .expect("wipe current Accelerator family");
     let rebuilt = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            projection_request("after_wipe", b"object-after", 42, "orders"),
+            projection_facts("after_wipe", b"object-after", 42, "orders"),
+            None,
         )
         .await
         .unwrap();

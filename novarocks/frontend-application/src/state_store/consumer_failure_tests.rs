@@ -44,11 +44,11 @@ use novarocks_catalog_application::{
     CatalogAttachment, CatalogAttachmentErrorKind, CatalogAttachmentRepository,
 };
 use novarocks_mv_application::persistence::codec::RefreshPolicy;
-use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+use novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection;
+use novarocks_mv_application::persistence::test_support::KeyedProjectionFixture;
+use novarocks_mv_application::persistence::validation::PersistenceDecodeBudget;
 use novarocks_mv_application::product::MvTarget;
-use novarocks_mv_application::repository::{
-    MvProjectionRequest, MvRepository, MvRepositoryErrorKind,
-};
+use novarocks_mv_application::repository::MvRepositoryErrorKind;
 use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,
@@ -384,15 +384,14 @@ fn attachment() -> CatalogAttachment {
     }
 }
 
-fn projection_request() -> MvProjectionRequest {
-    let mut fixture = ProjectionFixture::new(mv_target(), Some(9));
+fn projection_facts() -> MvKeyedDocumentProjection {
+    let mut fixture = KeyedProjectionFixture::new(mv_target(), Some(9));
     fixture.configuration.refresh_policy = RefreshPolicy::Manual;
     fixture.configuration.refresh_interval_ms = None;
     fixture.configuration.max_staleness_ms = None;
     fixture
         .build()
-        .expect("validated MV document projection")
-        .into()
+        .expect("validated keyed MV document projection")
 }
 
 fn observation() -> GcOwnedRefObservation {
@@ -504,7 +503,8 @@ async fn mv_accelerator_waits_out_admission_saturation_and_creates_exactly_once(
 
     let held = store.attempts().reserve().expect("hold the only attempt");
 
-    let mut pending = Box::pin(repository.create_projection(Uuid::now_v7(), projection_request()));
+    let mut pending =
+        Box::pin(repository.install_keyed_projection(Uuid::now_v7(), projection_facts(), None));
     assert!(
         tokio::time::timeout(Duration::from_millis(120), &mut pending)
             .await
@@ -657,7 +657,7 @@ async fn mv_accelerator_reports_an_unknown_commit_instead_of_calling_it_absent()
     store.script_commits(CommitScript::UnknownAndUnresolvable);
 
     let error = repository
-        .create_projection(Uuid::now_v7(), projection_request())
+        .install_keyed_projection(Uuid::now_v7(), projection_facts(), None)
         .await
         .expect_err("an unresolvable commit is not a success");
 
@@ -672,7 +672,7 @@ async fn mv_accelerator_reports_an_unknown_commit_instead_of_calling_it_absent()
     // write "not done".
     assert!(
         repository
-            .find_by_target(&mv_target())
+            .find_keyed_by_target(&mv_target(), PersistenceDecodeBudget::default())
             .await
             .expect("target lookup")
             .is_none()
@@ -751,7 +751,7 @@ async fn mv_accelerator_never_retries_a_commit_the_store_proved_dead() {
     store.script_commits(CommitScript::DefiniteFailure);
 
     let error = repository
-        .create_projection(Uuid::now_v7(), projection_request())
+        .install_keyed_projection(Uuid::now_v7(), projection_facts(), None)
         .await
         .expect_err("a proven-dead commit is not a success");
 
@@ -857,7 +857,7 @@ async fn mv_accelerator_reports_a_spent_budget_without_writing_twice() {
     store.script_commits(CommitScript::Conflict);
 
     let error = repository
-        .create_projection(Uuid::now_v7(), projection_request())
+        .install_keyed_projection(Uuid::now_v7(), projection_facts(), None)
         .await
         .expect_err("an exhausted retry budget is not a success");
     // Every attempt lost a race, so the MV Accelerator reports contention.
@@ -876,7 +876,7 @@ async fn mv_accelerator_reports_a_spent_budget_without_writing_twice() {
     stalled.stall_begin_write(Duration::from_secs(30));
 
     let error = repository
-        .create_projection(Uuid::now_v7(), projection_request())
+        .install_keyed_projection(Uuid::now_v7(), projection_facts(), None)
         .await
         .expect_err("an expired budget is not a success");
     // Nothing was dispatched, so this is provably clean and must not be

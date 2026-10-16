@@ -1,0 +1,24 @@
+{
+  "properties": {
+    "novarocks.doc.v2.rev.9511bc0effd8814681edc3da1098267dde93c40b35f4e0a311d0b14bf9ee811e": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"definition\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"definition\",\"version\":1},\"refs\":[],\"content\":\"CAEaAggBGgIIAg\",\"id\":\"9511bc0effd8814681edc3da1098267dde93c40b35f4e0a311d0b14bf9ee811e\"}",
+    "novarocks.doc.v2.rev.5184ab5e935f44e3fa0433f1c20eb418192b027b55842814a6d0cdd3afd601b5": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"interpretation\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"interpretation\",\"version\":2},\"refs\":[{\"rel\":\"definition\",\"id\":\"9511bc0effd8814681edc3da1098267dde93c40b35f4e0a311d0b14bf9ee811e\"}],\"content\":\"CAISIJURvA7_2IFGge3D2hCYJn3ek8QLNfTgoxHQsUv57oEe\",\"id\":\"5184ab5e935f44e3fa0433f1c20eb418192b027b55842814a6d0cdd3afd601b5\"}",
+    "novarocks.doc.v2.rev.f65b811db4116caa4a08de08f5f4e6cde4e57b4812f4bfccf711225e83903ef1": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"binding\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"binding\",\"version\":1},\"refs\":[{\"rel\":\"definition\",\"id\":\"9511bc0effd8814681edc3da1098267dde93c40b35f4e0a311d0b14bf9ee811e\"},{\"rel\":\"interpretation\",\"id\":\"5184ab5e935f44e3fa0433f1c20eb418192b027b55842814a6d0cdd3afd601b5\"}],\"content\":\"CAESJAoHaWNlYmVyZxIVY29ubmVjdG9yLXNuYXBzaG90LWlkGAEgCRIkCgdpY2ViZXJnEhVjb25uZWN0b3Itc25hcHNob3QtaWQYASAJ\",\"id\":\"f65b811db4116caa4a08de08f5f4e6cde4e57b4812f4bfccf711225e83903ef1\"}",
+    "novarocks.doc.v2.root.novarocks.mv": "f65b811db4116caa4a08de08f5f4e6cde4e57b4812f4bfccf711225e83903ef1",
+    "novarocks.doc.v2.slot.novarocks.mv~configuration": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"version\":1},\"writer\":null,\"content\":\"CAE\",\"digest\":\"e57df23133e78ebd011d4196fde5c8c482b29ba7e63b0f37a072c6e174d6e326\"}",
+    "novarocks.doc.v2.slot.novarocks.storage~management": "{\"v\":2,\"owner\":\"novarocks.storage\",\"name\":\"management\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"management\",\"version\":1},\"writer\":null,\"content\":\"AAAAEW1hdGVyaWFsaXplZC12aWV3AAAAA2RlcAAAAARwcm9j\",\"digest\":\"149aff168aa4beffbacfd3c9dfc9fc4e9b27c88eb3ea535cbdc506af4b97cc00\"}"
+  },
+  "definition": "9511bc0effd8814681edc3da1098267dde93c40b35f4e0a311d0b14bf9ee811e",
+  "interpretation": "5184ab5e935f44e3fa0433f1c20eb418192b027b55842814a6d0cdd3afd601b5",
+  "binding": "f65b811db4116caa4a08de08f5f4e6cde4e57b4812f4bfccf711225e83903ef1",
+  "configuration_writers": {
+    "1": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"version\":1},\"writer\":1,\"content\":\"CAE\",\"digest\":\"e4298ec974041586af9be66120b25b1321913adec82828855023923119b5f19b\"}",
+    "2": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"version\":1},\"writer\":2,\"content\":\"CAE\",\"digest\":\"d811ad1033e40bb6cf205fe2de9cc707056fc947d916dffb9bc025db71400e93\"}",
+    "3": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"configuration\",\"version\":1},\"writer\":3,\"content\":\"CAE\",\"digest\":\"beb43e7e998896fe410795a2422f9fb6ac3e01c5da2c935dd5e22d3b55e8ec27\"}"
+  },
+  "repartition": {
+    "interpretation": "b6fc21a7a041b52f7570917a368f1af82495689e79d3dc27d5835ae477f7c031",
+    "interpretation_value": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"interpretation\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"interpretation\",\"version\":2},\"refs\":[{\"rel\":\"definition\",\"id\":\"9511bc0effd8814681edc3da1098267dde93c40b35f4e0a311d0b14bf9ee811e\"}],\"content\":\"CAISIJURvA7_2IFGge3D2hCYJn3ek8QLNfTgoxHQsUv57oEeSgA\",\"id\":\"b6fc21a7a041b52f7570917a368f1af82495689e79d3dc27d5835ae477f7c031\"}",
+    "binding": "d0186dfa32b4fb75fe18bfcc9ea377bedfe8c9bb7d362f7ddd6b3ac4af3e4add",
+    "binding_value": "{\"v\":2,\"owner\":\"novarocks.mv\",\"name\":\"binding\",\"format\":{\"owner\":\"novarocks.mv\",\"name\":\"binding\",\"version\":1},\"refs\":[{\"rel\":\"definition\",\"id\":\"9511bc0effd8814681edc3da1098267dde93c40b35f4e0a311d0b14bf9ee811e\"},{\"rel\":\"interpretation\",\"id\":\"b6fc21a7a041b52f7570917a368f1af82495689e79d3dc27d5835ae477f7c031\"}],\"content\":\"CAESJAoHaWNlYmVyZxIVY29ubmVjdG9yLXNuYXBzaG90LWlkGAEgCRIkCgdpY2ViZXJnEhVjb25uZWN0b3Itc25hcHNob3QtaWQYASAJ\",\"id\":\"d0186dfa32b4fb75fe18bfcc9ea377bedfe8c9bb7d362f7ddd6b3ac4af3e4add\"}"
+  }
+}

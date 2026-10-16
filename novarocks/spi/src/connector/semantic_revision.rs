@@ -84,6 +84,14 @@ impl ConnectorSemanticFact {
     pub const fn value(&self) -> &Bytes {
         &self.value
     }
+
+    /// The bound declared by this SPI-owned provider observation format.
+    /// Private or unknown persisted formats require their own declaration;
+    /// an observed value length never declares a future value bound.
+    pub fn declared_max_value_bytes(&self) -> Option<u16> {
+        (self.format() == SNAPSHOT_ID_FORMAT && self.version() == SEMANTIC_FACT_VERSION_V1)
+            .then_some(9)
+    }
 }
 
 impl fmt::Debug for ConnectorSemanticFact {
@@ -216,6 +224,37 @@ pub enum ConnectorCanonicalReadPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_data_format_declares_its_bound_independently_of_current_value() {
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let object = ConnectorTableObjectId::try_new(Bytes::from_static(b"object")).unwrap();
+        let empty = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            provider.clone(),
+            &object,
+            None,
+        )
+        .unwrap();
+        let present = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            provider.clone(),
+            &object,
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(empty.data_version().declared_max_value_bytes(), Some(9));
+        assert_eq!(present.data_version().declared_max_value_bytes(), Some(9));
+        let private = ConnectorExactSemanticRevision::try_from_persisted_facts(
+            provider,
+            TABLE_OBJECT_ID_FORMAT,
+            1,
+            Bytes::from_static(b"object"),
+            "private-version",
+            1,
+            Bytes::from_static(b"1"),
+        )
+        .unwrap();
+        assert_eq!(private.data_version().declared_max_value_bytes(), None);
+    }
 
     #[test]
     fn semantic_revision_distinguishes_object_and_snapshot() {

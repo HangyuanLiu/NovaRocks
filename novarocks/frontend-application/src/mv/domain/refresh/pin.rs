@@ -36,7 +36,7 @@
 
 use std::collections::HashSet;
 
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_types::naming::TableIdentity;
@@ -178,7 +178,7 @@ impl RefreshSnapshotPin {
 /// Rejects a refresh when a persisted base-table identity no longer matches
 /// the identity frozen in this attempt's pin.
 pub fn validate_refresh_pin_table_object_ids(
-    mv_definition: &StoredMvProjection,
+    mv_definition: &StoredKeyedMvProjection,
     pin: &RefreshSnapshotPin,
     base_refs: &[TableIdentity],
 ) -> Result<(), String> {
@@ -191,7 +191,7 @@ pub fn validate_refresh_pin_table_object_ids(
 }
 
 fn validate_refresh_pin_table_object_ids_for_operation(
-    mv_definition: &StoredMvProjection,
+    mv_definition: &StoredKeyedMvProjection,
     pin: &RefreshSnapshotPin,
     base_refs: &[TableIdentity],
     unsafe_message: &str,
@@ -553,7 +553,7 @@ fn resolve_table_factor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_parser::printer::print_query;
 
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn pin_identity_validation_retains_repeated_definition_occurrences() {
-        let projection = StoredMvProjection {
+        let projection = StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None)
                 .build()

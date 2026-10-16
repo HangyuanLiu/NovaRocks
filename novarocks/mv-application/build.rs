@@ -10,7 +10,6 @@ const IDL_DIR: &str = "idl";
 const PROTO_FILES: &[&str] = &[
     "persistence/definition.proto",
     "persistence/interpretation.proto",
-    "persistence/publication.proto",
     "persistence/configuration.proto",
 ];
 

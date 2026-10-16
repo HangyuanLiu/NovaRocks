@@ -44,8 +44,7 @@ use crate::connector::write_stack::runtime::{
 };
 use crate::connector::write_stack::target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 use crate::connector::{
-    ConnectorDocumentPublicationDeclaration, ConnectorDocumentPublicationIntent,
-    ConnectorManagedPublicationIntent, ConnectorRowMutationEffect, ConnectorTableHandle,
+    ConnectorDocumentPublicationDeclaration, ConnectorRowMutationEffect, ConnectorTableHandle,
     ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
     ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
     ConnectorWriteReceipt, ConnectorWriteRouteId, ConnectorWriteTargetRef,
@@ -209,22 +208,11 @@ pub enum ConnectorWriteSessionFlavor {
     /// this is the same provider-owned table value the staged-create capability
     /// vends, and it names no publication, operation, or attempt.
     StagedCreate(ConnectorTableHandle),
-    /// A durable publication whose identity belongs to the upper layer that
-    /// owns it. The publication id never reaches a writer recipe, a commit
-    /// fragment, or a backend -- but it does reach the snapshot the commit
-    /// writes, because the publication fence reads it back off that summary.
-    ///
-    /// `shape` is declared by the caller and cannot be inferred: an incremental
-    /// merge-on-read refresh arrives as a `RowLineage` input with `_file` /
-    /// `_pos` identity, which is indistinguishable from an ordinary DML row
-    /// mutation by input alone -- and the difference decides whether the commit
-    /// is a publication or DML.
-    ManagedPublication {
-        intent: ConnectorManagedPublicationIntent,
-        shape: ConnectorManagedPublicationShape,
-    },
     /// A publication whose application-owned durable facts are attached by
     /// the same existing write-session commit that publishes its data.
+    /// The caller declares `shape`: an incremental `_file` / `_pos` change
+    /// stream shares its physical input with a row mutation, while this
+    /// declaration binds the session to its publication contract.
     ApplicationDocumentPublication {
         declaration: ConnectorDocumentPublicationDeclaration,
         shape: ConnectorManagedPublicationShape,
@@ -1074,7 +1062,7 @@ pub struct ConnectorWriteFinishRequest<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorWriteFinishPublication {
     None,
-    ApplicationDocuments(ConnectorDocumentPublicationIntent),
+    KeyedDocuments(crate::connector::KeyedPublicationIntent),
 }
 
 /// Release a begin session that never reached a complete prepared write set.
@@ -1096,8 +1084,9 @@ pub struct ConnectorWriteSessionReconcileRequest<'a> {
 /// The frontend-only external write authority of one exact provider
 /// generation.
 ///
-/// Every method here mutates, or may mutate, external catalog state. None of
-/// them is reachable from a backend role binding.
+/// Admission and prepared-result projection read exact provider facts; terminal
+/// methods own external catalog effects. None is reachable from a backend role
+/// binding.
 pub trait ConnectorWriteControl: Send + Sync {
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
 
@@ -1126,6 +1115,22 @@ pub trait ConnectorWriteControl: Send + Sync {
         &self,
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>;
+
+    /// Project a complete prepared write's exact visible-row change against
+    /// this session's admitted version, without committing or reading data.
+    /// None means the provider cannot establish that logical fact; physical
+    /// file record totals and writer input counts are not substitutes.
+    fn prepared_logical_row_change(
+        &self,
+        _commit: &ConnectorWriteCommitHandle,
+        _prepared: &ConnectorPreparedWriteSet,
+        _context: &ConnectorRequestContext,
+    ) -> Result<Option<super::prepared::ConnectorWriteRowChange>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not project prepared logical row changes",
+        ))
+    }
 
     fn abort_write(
         &self,

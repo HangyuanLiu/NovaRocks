@@ -20,9 +20,35 @@ fn output_type_rollup_fixture(
     count: bool,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
 ) -> (Memo, MExpr, MvRewriteCandidate, OutputColumn) {
+    output_type_rollup_fixture_with_shape(count, policy, false, false)
+}
+
+fn output_type_rollup_fixture_with_shape(
+    count: bool,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    grouped: bool,
+    count_expression: bool,
+) -> (Memo, MExpr, MvRewriteCandidate, OutputColumn) {
+    fn count_argument(arg: &OutputColumn, out: &OutputColumn) -> AggregateCall {
+        AggregateCall {
+            name: "count".to_string(),
+            distinct: false,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            output_column_id: out.column_id,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col_ref(arg)],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            ),
+        }
+    }
     let mv_a = col(100, "a");
+    let mv_b = col(101, "b");
+    let mv_measure = col(102, "nullable_measure");
     let mut mv_value = col(110, "materialized_aggregate");
-    let mut mv_call = if count {
+    let mut mv_call = if count && count_expression {
+        count_argument(&mv_measure, &mv_value)
+    } else if count {
         count_star(&mv_value)
     } else {
         sum_call(&mv_a, &mv_value)
@@ -43,12 +69,20 @@ fn output_type_rollup_fixture(
     mv_value.value_type = selected.clone();
     let mv_plan = LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(LogicalAggregateNode {
-            group_by: vec![col_ref(&mv_a)],
+            group_by: if grouped {
+                vec![col_ref(&mv_a), col_ref(&mv_b)]
+            } else {
+                vec![col_ref(&mv_a)]
+            },
             aggregates: vec![mv_call],
-            output_columns: vec![mv_a.clone(), mv_value.clone()],
+            output_columns: if grouped {
+                vec![mv_a.clone(), mv_b.clone(), mv_value.clone()]
+            } else {
+                vec![mv_a.clone(), mv_value.clone()]
+            },
             already_pushed: false,
         }),
-        vec![base_scan(std::slice::from_ref(&mv_a))],
+        vec![base_scan(&[mv_a.clone(), mv_b, mv_measure])],
         None,
     );
     let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
@@ -56,10 +90,15 @@ fn output_type_rollup_fixture(
         "cat",
         "ns",
         "exact_output_mv",
-        &["a", "materialized_aggregate"],
+        if grouped {
+            &["a", "b", "materialized_aggregate"]
+        } else {
+            &["a", "materialized_aggregate"]
+        },
     );
-    target_table.columns[1].data_type = mv_value.value_type.data_type().clone();
-    target_table.columns[1].nullable = mv_value.value_type.nullable();
+    let value_index = if grouped { 2 } else { 1 };
+    target_table.columns[value_index].data_type = mv_value.value_type.data_type().clone();
+    target_table.columns[value_index].nullable = mv_value.value_type.nullable();
     let candidate = MvRewriteCandidate {
         mv_name: "exact_output_mv".into(),
         mv,
@@ -71,8 +110,11 @@ fn output_type_rollup_fixture(
     };
 
     let a = col(1, "a");
+    let measure = col(2, "nullable_measure");
     let mut published = col(3, "query_published_name");
-    let mut call = if count {
+    let mut call = if count && count_expression {
+        count_argument(&measure, &published)
+    } else if count {
         count_star(&published)
     } else {
         sum_call(&a, &published)
@@ -90,12 +132,16 @@ fn output_type_rollup_fixture(
     published.value_type = selected.clone();
     let query = LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(LogicalAggregateNode {
-            group_by: vec![],
+            group_by: if grouped { vec![col_ref(&a)] } else { vec![] },
             aggregates: vec![call],
-            output_columns: vec![published.clone()],
+            output_columns: if grouped {
+                vec![a.clone(), published.clone()]
+            } else {
+                vec![published.clone()]
+            },
             already_pushed: false,
         }),
-        vec![base_scan(std::slice::from_ref(&a))],
+        vec![base_scan(&[a, measure])],
         None,
     );
     let mut memo = test_memo();
@@ -243,7 +289,10 @@ fn rollup_refuses_target_storage_and_query_published_type_drift() {
     let Operator::LogicalAggregate(aggregate) = &mut expr.op else {
         panic!("aggregate fixture")
     };
-    aggregate.output_columns[0].value_type = aggregate.output_columns[0].value_type.with_nullable(false).unwrap();
+    aggregate.output_columns[0].value_type = aggregate.output_columns[0]
+        .value_type
+        .with_nullable(false)
+        .unwrap();
     assert!(
         aggregate.output_layout.aggregate_columns[0]
             .value_type
@@ -327,6 +376,99 @@ fn count_rollup_every_original_control_callback_refuses_without_later_observatio
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             }
+        }
+    }
+}
+
+#[test]
+fn grouped_count_star_and_expression_rollups_preserve_exact_nonnull_outputs() {
+    for count_expression in [false, true] {
+        for policy in [
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        ] {
+            let (mut memo, expr, candidate, published) =
+                output_type_rollup_fixture_with_shape(true, policy, true, count_expression);
+            assert!(!published.value_type.nullable());
+            let Operator::LogicalAggregate(original) = &expr.op else {
+                panic!("original grouped aggregate");
+            };
+            let group_key = original.output_layout.group_key_columns[0].clone();
+            assert_eq!(original.group_by.len(), 1);
+            let alternatives = MvRewriteRule::new(vec![candidate])
+                .apply(&expr, &mut memo, crate::optimizer::test_optimizer_control())
+                .unwrap();
+            assert_eq!(alternatives.len(), 1);
+            let Operator::LogicalProject(project) = &alternatives[0].op else {
+                panic!("COUNT requires a selected COALESCE projection");
+            };
+            let visible = project
+                .items
+                .iter()
+                .find(|item| item.output_column_id == published.column_id)
+                .unwrap();
+            assert_eq!(memo.scalars.value_type(visible.expr), &published.value_type);
+            let ScalarNode::FunctionCall {
+                name,
+                args,
+                binding,
+                ..
+            } = memo.scalars.node(visible.expr)
+            else {
+                panic!("real COALESCE binding");
+            };
+            assert_eq!(name, "coalesce");
+            assert_eq!(binding.decimal_overflow_policy(), policy);
+            let novarocks_functions::FunctionResultType::Scalar(selected) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar COALESCE");
+            };
+            assert_eq!(selected, &published.value_type);
+            assert!(!memo.scalars.value_type(args[1]).nullable());
+            let Operator::LogicalAggregate(inner) =
+                &memo.groups[alternatives[0].children[0]].logical_exprs[0].op
+            else {
+                panic!("actual rollup aggregate");
+            };
+            assert_eq!(
+                inner.group_by.len(),
+                1,
+                "COALESCE must not turn an empty grouped input into a scalar row"
+            );
+            assert_eq!(
+                inner.output_layout.group_key_columns[0].column_id,
+                group_key.column_id
+            );
+            assert_eq!(
+                inner.output_layout.group_key_columns[0].value_type,
+                group_key.value_type
+            );
+            let novarocks_functions::FunctionResultType::Scalar(sum_selected) =
+                &inner.aggregates[0].source.binding().selected.result_type
+            else {
+                panic!("SUM scalar result");
+            };
+            assert!(sum_selected.nullable());
+            assert_eq!(memo.scalars.value_type(args[0]), sum_selected);
+            assert_eq!(
+                &inner.output_layout.aggregate_columns[0].value_type,
+                sum_selected
+            );
+            assert_ne!(
+                inner.output_layout.aggregate_columns[0].column_id,
+                published.column_id
+            );
+            // Retain the MV's strict target-type rejection for grouped COUNT.
+            let (mut memo, expr, mut candidate, _) =
+                output_type_rollup_fixture_with_shape(true, policy, true, count_expression);
+            candidate.target_table.columns[2].nullable = true;
+            assert!(
+                MvRewriteRule::new(vec![candidate])
+                    .apply(&expr, &mut memo, crate::optimizer::test_optimizer_control())
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }

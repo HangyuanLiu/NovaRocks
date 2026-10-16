@@ -292,6 +292,16 @@ struct PreparedObservedPublisher<R> {
 }
 #[async_trait]
 impl<R: Clone + Send + Sync + 'static> Publisher for PreparedObservedPublisher<R> {
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
+        self.inner.load_target_with_snapshots(attempt, mode).await
+    }
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        self.inner.pinned_expiry_base()
+    }
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.inner.load_target(attempt).await
     }

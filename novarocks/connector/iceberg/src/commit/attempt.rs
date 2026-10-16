@@ -46,6 +46,23 @@ pub(crate) type Report = PublicationReport<CommitProof, CatalogCommitEvidence>;
 pub(crate) trait Publisher: Send + Sync {
     /// Read the authoritative target; no cached source snapshot is a retry base.
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase>;
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
+        if mode != crate::catalog::SnapshotLoading::All {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Publisher has no refs-scoped metadata load",
+            ));
+        }
+        self.load_target(attempt).await
+    }
+    /// Expiry receives the exact full observation. It may never reload a base.
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        None
+    }
     /// Encode and bound the complete recovery ledger before publication becomes
     /// possible. Failure here is definitely undispatched.
     fn preflight_recovery(
@@ -61,6 +78,34 @@ pub(crate) trait Publisher: Send + Sync {
 /// It shares staging and retry with owner publication without changing topology.
 pub(crate) type RecoveryPreflight =
     std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
+
+/// Dispatch through the same owner while preserving one observed expiry base.
+pub(crate) struct PinnedExpiryPublisher<'a> {
+    pub inner: std::sync::Arc<dyn Publisher + 'a>,
+    pub base: StagingBase,
+}
+#[async_trait]
+impl Publisher for PinnedExpiryPublisher<'_> {
+    async fn load_target(&self, _attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Pinned expiry cannot reload its base",
+        ))
+    }
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        Some(self.base.clone())
+    }
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()> {
+        self.inner.preflight_recovery(request, operation)
+    }
+    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        self.inner.dispatch_once(request).await
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetryPolicy {
@@ -189,10 +234,19 @@ pub(crate) async fn run(
                     let attempt = operation
                         .begin_attempt()
                         .map_err(|error| before_dispatch_failure(&error))?;
-                    let base = publisher
-                        .load_target(&attempt)
-                        .await
-                        .map_err(|error| before_dispatch_failure(&error))?;
+                    let loaded = if intent.shape() == RequestShape::DocumentExpiry {
+                        publisher.pinned_expiry_base().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "Document expiry requires its exact full-observation base",
+                            )
+                        })
+                    } else {
+                        publisher
+                            .load_target_with_snapshots(&attempt, intent.snapshot_loading())
+                            .await
+                    };
+                    let base = loaded.map_err(|error| before_dispatch_failure(&error))?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
                     let (request, retained) =
@@ -234,7 +288,7 @@ pub(crate) async fn run(
             }
             CatalogOutcome::KnownUncommitted { failure }
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && intent.shape() != RequestShape::Create
+                    && intent.permits_conflict_retry()
                     && attempt_number < policy.retries =>
             {
                 // An unsuccessful bounded cleanup remains in the ledger; it never permits path reuse.
@@ -256,6 +310,20 @@ pub(crate) async fn run(
                     return rejected(operation, before_dispatch_failure(&error)).await;
                 }
                 attempt_number += 1;
+            }
+            CatalogOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+                    && intent.shape() != RequestShape::DocumentExpiry
+                    && intent.shape() != RequestShape::Create
+                    && intent
+                        .dependencies()
+                        .contains(&super::model::Dependency::RefUnchanged) =>
+            {
+                // One diagnostic observation cannot authorize another prepare or dispatch.
+                // Its failure/cancellation never changes the already-known disposition.
+                let failure =
+                    diagnose_known_ref_conflict(intent, &attempt, publisher, failure).await;
+                return rejected(operation, failure).await;
             }
             CatalogOutcome::KnownUncommitted { failure } => {
                 return rejected(operation, failure).await;
@@ -291,6 +359,50 @@ fn check_window(
         )));
     }
     Ok(())
+}
+
+/// Best-effort dependency detail after a definite rejection. Always retain
+/// the original failure unless the same table's fresh ref actually proves it.
+async fn diagnose_known_ref_conflict(
+    intent: &OperationIntent,
+    attempt: &IcebergCommitAttempt,
+    publisher: &dyn Publisher,
+    original: ConnectorMutationFailure,
+) -> ConnectorMutationFailure {
+    if attempt.check_active().is_err() {
+        return original;
+    }
+    let Ok(StagingBase::Existing { metadata, .. }) = publisher
+        .load_target_with_snapshots(attempt, crate::catalog::SnapshotLoading::Refs)
+        .await
+    else {
+        return original;
+    };
+    if attempt.check_active().is_err() || intent.target().uuid != Some(metadata.uuid()) {
+        return original;
+    }
+    let parent = metadata
+        .snapshot_for_ref(intent.target_ref())
+        .map(|snapshot| snapshot.snapshot_id());
+    let verdict = dependency::diagnose_ref_unchanged(intent, &metadata, parent, attempt).await;
+    if attempt.check_active().is_err() {
+        return original;
+    }
+    match verdict {
+        Ok(
+            verdict @ Verdict::Broken {
+                dependency: super::model::Dependency::RefUnchanged,
+                ..
+            },
+        ) => ConnectorMutationFailure::new(
+            original.kind(),
+            format!(
+                "Iceberg commit dependency failed: {verdict:?}; original rejection: {}",
+                original.message(),
+            ),
+        ),
+        _ => original,
+    }
 }
 
 async fn prepare(
@@ -476,7 +588,7 @@ mod tests {
     use crate::iceberg::TableUpdate;
     use crate::iceberg::spec::{FormatVersion, Struct, TableMetadata};
     use std::sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -494,6 +606,9 @@ mod tests {
         cancel_after_load: bool,
         load_delay: Duration,
         recovery_refused: bool,
+        diagnostic_refused: bool,
+        cancel_after_diagnostic: bool,
+        load_modes: Mutex<Vec<crate::catalog::SnapshotLoading>>,
         loads: AtomicUsize,
         requests: Mutex<Vec<serde_json::Value>>,
     }
@@ -506,6 +621,9 @@ mod tests {
                 cancel_after_load: false,
                 load_delay: Duration::ZERO,
                 recovery_refused: false,
+                diagnostic_refused: false,
+                cancel_after_diagnostic: false,
+                load_modes: Mutex::new(Vec::new()),
                 loads: AtomicUsize::new(0),
                 requests: Mutex::new(Vec::new()),
             }
@@ -513,6 +631,26 @@ mod tests {
     }
     #[async_trait]
     impl Publisher for ControlledPublisher<'_> {
+        async fn load_target_with_snapshots(
+            &self,
+            attempt: &IcebergCommitAttempt,
+            mode: crate::catalog::SnapshotLoading,
+        ) -> Result<StagingBase> {
+            self.load_modes.lock().unwrap().push(mode);
+            let base = self.load_target(attempt).await?;
+            if mode == crate::catalog::SnapshotLoading::Refs {
+                if self.cancel_after_diagnostic {
+                    self.fixture.cancel();
+                }
+                if self.diagnostic_refused {
+                    return Err(Error::new(
+                        ErrorKind::Unexpected,
+                        "Diagnostic observation failed",
+                    ));
+                }
+            }
+            Ok(base)
+        }
         async fn load_target(&self, _: &IcebergCommitAttempt) -> Result<StagingBase> {
             self.loads.fetch_add(1, Ordering::SeqCst);
             if !self.load_delay.is_zero() {
@@ -678,6 +816,22 @@ mod tests {
             .await
             .0
     }
+    struct CountingPreparer<'a> {
+        inner: &'a dyn Preparer,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Preparer for CountingPreparer<'_> {
+        async fn prepare(
+            &self,
+            view: &super::super::staging::StagedView<'_>,
+            intent: &OperationIntent,
+        ) -> Result<PreparedChange> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.prepare(view, intent).await
+        }
+    }
+
     async fn invoke(
         fixture: &Fixture,
         intent: &OperationIntent,
@@ -926,6 +1080,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_expiry_uses_only_pinned_full_base_and_never_retries_conflict() {
+        for conflict in [false, true] {
+            let fixture = Fixture::new();
+            let metadata = fixture.metadata(FormatVersion::V2);
+            let intent = OperationIntent::new(OperationIntentParts {
+                target: TableTarget {
+                    ident: crate::iceberg::TableIdent::new(
+                        crate::iceberg::NamespaceIdent::new("db".into()),
+                        "t".into(),
+                    ),
+                    uuid: Some(metadata.uuid()),
+                },
+                target_ref: "main".into(),
+                start: None,
+                changes: FileChanges::default(),
+                dependencies: vec![Dependency::NoReadDependency],
+                isolation: IsolationLevel::Snapshot,
+                shape: RequestShape::DocumentExpiry,
+                summary: std::collections::BTreeMap::new(),
+                token: fixture.operation.token(),
+            })
+            .unwrap();
+            let dispatch = if conflict {
+                Dispatch::ConflictThen(metadata.clone())
+            } else {
+                Dispatch::Commit
+            };
+            let inner = Arc::new(ControlledPublisher::new(
+                &fixture,
+                metadata.clone(),
+                dispatch,
+            ));
+            let pinned = PinnedExpiryPublisher {
+                inner: inner.clone(),
+                base: StagingBase::Existing {
+                    metadata: metadata.clone(),
+                    metadata_location: "file:///exact-full-load.metadata.json".into(),
+                },
+            };
+            let prefix = PreparedChange {
+                requirements: vec![],
+                updates: vec![TableUpdate::RemoveProperties {
+                    removals: vec![format!("novarocks.doc.v2.rev.{}", "0".repeat(64))],
+                }],
+            };
+            let report = run(&fixture.operation, &intent, &prefix, &[], &pinned, policy()).await;
+            if conflict {
+                assert!(matches!(
+                    report.publication,
+                    PublicationOutcome::KnownUncommitted(_)
+                ));
+            } else {
+                assert!(matches!(
+                    report.publication,
+                    PublicationOutcome::Committed(_)
+                ));
+            }
+            assert_eq!(inner.loads.load(Ordering::SeqCst), 0);
+            assert_eq!(inner.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn document_expiry_without_a_full_base_is_rejected_without_load_or_dispatch() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: crate::iceberg::TableIdent::new(
+                    crate::iceberg::NamespaceIdent::new("db".into()),
+                    "t".into(),
+                ),
+                uuid: Some(metadata.uuid()),
+            },
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges::default(),
+            dependencies: vec![Dependency::NoReadDependency],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::DocumentExpiry,
+            summary: std::collections::BTreeMap::new(),
+            token: fixture.operation.token(),
+        })
+        .unwrap();
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(matches!(
+            report.publication,
+            PublicationOutcome::KnownUncommitted(_)
+        ));
+        assert_eq!(publisher.loads.load(Ordering::SeqCst), 0);
+        assert!(publisher.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn read_dependency_conflict_stops_before_a_second_dispatch() {
         let baseline = Fixture::new();
         let metadata = append_state(&baseline, baseline.metadata(FormatVersion::V3), 2).await;
@@ -934,48 +1191,160 @@ mod tests {
         let fixture = Fixture::new();
         let intent = append_intent(&fixture, &metadata, vec![Dependency::RefUnchanged]);
         let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::ConflictThen(raced));
-        let report = invoke(&fixture, &intent, &publisher).await;
+        let prepares = CountingPreparer {
+            inner: &FastAppendPreparer,
+            calls: AtomicUsize::new(0),
+        };
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&prepares],
+            &publisher,
+            policy(),
+        )
+        .await;
         let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
             panic!("dependency must reject")
         };
         assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
-        assert!(failure.message().contains("RefUnchanged"));
+        assert!(
+            failure
+                .message()
+                .contains("Injected concurrent catalog commit")
+        );
         assert_eq!(publisher.requests.lock().unwrap().len(), 1);
         assert_eq!(publisher.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *publisher.load_modes.lock().unwrap(),
+            vec![
+                crate::catalog::SnapshotLoading::All,
+                crate::catalog::SnapshotLoading::Refs
+            ]
+        );
+        assert_eq!(prepares.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            failure
+                .message()
+                .contains("Broken { dependency: RefUnchanged")
+        );
         assert!(fixture.operation.artifacts().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn unknown_dispatch_retains_every_owned_object_without_retry_or_cleanup() {
-        let fixture = Fixture::new();
-        let metadata = fixture.metadata(FormatVersion::V3);
-        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
-        let file = intent.changes().added[0].file().file_path();
-        std::fs::write(file.strip_prefix("file://").unwrap(), b"session data").unwrap();
-        fixture
-            .operation
-            .adopt_session_data(ObjectIdentity::new(file).unwrap())
-            .unwrap();
-        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Unknown);
-        let report = invoke(&fixture, &intent, &publisher).await;
-        let PublicationOutcome::Unknown {
-            artifacts,
-            operation,
-            ..
-        } = report.publication
-        else {
-            panic!("unknown")
-        };
-        assert_eq!(operation, fixture.operation.token());
-        assert_eq!(artifacts.len(), 3);
-        assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
-        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
-        assert_eq!(publisher.loads.load(Ordering::SeqCst), 1);
-        for artifact in artifacts {
+    async fn ref_conflict_diagnostic_is_best_effort_and_never_reprepares() {
+        for mode in [
+            "same-ref",
+            "load-error",
+            "cancel-during-observation",
+            "cancel-before-observation",
+        ] {
+            let baseline = Fixture::new();
+            let metadata = append_state(&baseline, baseline.metadata(FormatVersion::V3), 2).await;
+            let competitor = Fixture::new();
+            let raced = append_state(&competitor, metadata.clone(), 4).await;
+            let fixture = Fixture::new();
+            let intent = append_intent(&fixture, &metadata, vec![Dependency::RefUnchanged]);
+            let dispatch = if mode == "cancel-before-observation" {
+                Dispatch::AlwaysConflict
+            } else if mode == "same-ref" {
+                Dispatch::ConflictThen(metadata.clone())
+            } else {
+                Dispatch::ConflictThen(raced)
+            };
+            let mut publisher = ControlledPublisher::new(&fixture, metadata, dispatch);
+            publisher.diagnostic_refused = mode == "load-error";
+            publisher.cancel_after_diagnostic = mode == "cancel-during-observation";
+            let prepares = CountingPreparer {
+                inner: &FastAppendPreparer,
+                calls: AtomicUsize::new(0),
+            };
+            let report = run(
+                &fixture.operation,
+                &intent,
+                &PreparedChange::default(),
+                &[&prepares],
+                &publisher,
+                policy(),
+            )
+            .await;
+            let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+                panic!("diagnostic cannot change known rejection")
+            };
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
             assert!(
-                std::path::Path::new(artifact.object.path().strip_prefix("file://").unwrap())
-                    .exists()
+                !failure.message().contains("Broken"),
+                "{mode}: {}",
+                failure.message()
             );
+            if mode == "cancel-before-observation" {
+                assert_eq!(
+                    failure.message(),
+                    "Injected conflict followed by cancellation"
+                );
+                assert_eq!(publisher.loads.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    *publisher.load_modes.lock().unwrap(),
+                    vec![crate::catalog::SnapshotLoading::All]
+                );
+            } else {
+                assert_eq!(failure.message(), "Injected concurrent catalog commit");
+                assert_eq!(publisher.loads.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    *publisher.load_modes.lock().unwrap(),
+                    vec![
+                        crate::catalog::SnapshotLoading::All,
+                        crate::catalog::SnapshotLoading::Refs
+                    ]
+                );
+            }
+            assert_eq!(prepares.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                report.cleanup,
+                IcebergCleanupReport::Complete { deleted: 2 }
+            );
+            assert!(fixture.operation.artifacts().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_dispatch_retains_every_owned_object_without_retry_or_cleanup() {
+        for dependency in [Dependency::NoReadDependency, Dependency::RefUnchanged] {
+            let fixture = Fixture::new();
+            let metadata = fixture.metadata(FormatVersion::V3);
+            let intent = append_intent(&fixture, &metadata, vec![dependency]);
+            let file = intent.changes().added[0].file().file_path();
+            std::fs::write(file.strip_prefix("file://").unwrap(), b"session data").unwrap();
+            fixture
+                .operation
+                .adopt_session_data(ObjectIdentity::new(file).unwrap())
+                .unwrap();
+            let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Unknown);
+            let report = invoke(&fixture, &intent, &publisher).await;
+            let PublicationOutcome::Unknown {
+                artifacts,
+                operation,
+                ..
+            } = report.publication
+            else {
+                panic!("unknown")
+            };
+            assert_eq!(operation, fixture.operation.token());
+            assert_eq!(artifacts.len(), 3);
+            assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
+            assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+            assert_eq!(publisher.loads.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *publisher.load_modes.lock().unwrap(),
+                vec![crate::catalog::SnapshotLoading::All]
+            );
+            for artifact in artifacts {
+                assert!(
+                    std::path::Path::new(artifact.object.path().strip_prefix("file://").unwrap())
+                        .exists()
+                );
+            }
         }
     }
 
@@ -1553,5 +1922,110 @@ mod tests {
         assert!(attempt.file_io().exists(&selected_path).await.unwrap());
         assert!(attempt.file_io().exists(unused.path()).await.unwrap());
         assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_cleanup() {
+        use crate::commit::model::StartSnapshot;
+        use crate::commit::slot_change::SlotChangePreparer;
+        use bytes::Bytes;
+        use novarocks_spi::connector::{
+            ConnectorDocumentFormat, ConnectorSlotName, ConnectorSlotValue, KeyedSlotChange,
+        };
+
+        // Source and writer must have separate operations: the writer never owns
+        // the parent's existing manifests and must not clean them on rejection.
+        let source = Fixture::new();
+        let metadata = source.metadata_with_data_and_delete_manifests().await;
+        let source_objects = source.operation.artifacts().unwrap();
+        assert_eq!(source_objects.len(), 3); // data manifest + delete manifest + list
+        let fixture = Fixture::new();
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                uuid: Some(metadata.uuid()),
+            },
+            target_ref: "main".into(),
+            start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
+                snapshot_id: snapshot.snapshot_id(),
+                sequence_number: snapshot.sequence_number(),
+            }),
+            changes: FileChanges::default(),
+            dependencies: vec![Dependency::RefUnchanged],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: Default::default(),
+            token: fixture.operation.token(),
+        })
+        .unwrap();
+        let preparer = SlotChangePreparer {
+            change: KeyedSlotChange {
+                slots: std::collections::BTreeMap::from([(
+                    ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap(),
+                    ConnectorSlotValue {
+                        format: ConnectorDocumentFormat::try_new(
+                            "novarocks.mv",
+                            "configuration",
+                            1,
+                        )
+                        .unwrap(),
+                        content: Bytes::from_static(b"paused"),
+                    },
+                )]),
+                markers_remove: Default::default(),
+            },
+        };
+        // Deliberately retain the same main in the injected catalog conflict. A
+        // mistaken retry would otherwise pass RefUnchanged and commit attempt 2.
+        let publisher =
+            ControlledPublisher::new(&fixture, metadata.clone(), Dispatch::ConflictThen(metadata));
+        let counted = CountingPreparer {
+            inner: &preparer,
+            calls: AtomicUsize::new(0),
+        };
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&counted],
+            &publisher,
+            policy(),
+        )
+        .await;
+        let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+            panic!("slot conflict must terminate the operation");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
+        assert_eq!(
+            report.cleanup,
+            IcebergCleanupReport::Complete { deleted: 1 }
+        );
+        assert_eq!(publisher.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *publisher.load_modes.lock().unwrap(),
+            vec![
+                crate::catalog::SnapshotLoading::All,
+                crate::catalog::SnapshotLoading::Refs
+            ]
+        );
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failure.message(), "Injected concurrent catalog commit");
+        let requests = publisher.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let list = requests[0]["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|update| update["action"] == "add-snapshot")
+            .unwrap()["snapshot"]["manifest-list"]
+            .as_str()
+            .unwrap();
+        assert!(!std::path::Path::new(list.strip_prefix("file://").unwrap()).exists());
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        for original in source_objects {
+            assert!(
+                std::path::Path::new(original.object.path().strip_prefix("file://").unwrap())
+                    .exists()
+            );
+        }
     }
 }

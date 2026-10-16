@@ -31,6 +31,9 @@ use novarocks_result_contract::RootProfileV1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootArrayStorageError {
     UnsupportedCarrier,
+    UnsupportedSchemaType,
+    CarrierDowncastMismatch,
+    CarrierOuterOwnerMismatch,
     UnknownMetadataOwner,
     CapacityExceeded,
     WorkExceeded,
@@ -321,13 +324,13 @@ fn exact<T: Array + 'static>(array: &dyn Array) -> Result<&T, RootArrayStorageEr
     let value = array
         .as_any()
         .downcast_ref::<T>()
-        .ok_or(RootArrayStorageError::UnsupportedCarrier)?;
+        .ok_or(RootArrayStorageError::CarrierDowncastMismatch)?;
     // Do not accept a wrapper exposing a different embedded standard array
     // through as_any(): its outer owner would not be represented by this proof.
     if size_of_val(array) != size_of::<T>()
         || std::ptr::from_ref(array).cast::<()>() != std::ptr::from_ref(value).cast::<()>()
     {
-        return Err(RootArrayStorageError::UnsupportedCarrier);
+        return Err(RootArrayStorageError::CarrierOuterOwnerMismatch);
     }
     Ok(value)
 }

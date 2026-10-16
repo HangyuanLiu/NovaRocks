@@ -458,7 +458,7 @@ fn forwarded_as_any_cannot_hide_the_actual_outer_owner() {
     let wrapper = &inner as &dyn Array;
     assert_eq!(
         no_allocation(|| borrowed_root_array_storage(wrapper, storage_limits(4096))),
-        Err(RootArrayStorageError::UnsupportedCarrier)
+        Err(RootArrayStorageError::CarrierOuterOwnerMismatch)
     );
     no_allocation(|| borrowed_root_array_storage(inner.as_ref(), storage_limits(4096))).unwrap();
 }

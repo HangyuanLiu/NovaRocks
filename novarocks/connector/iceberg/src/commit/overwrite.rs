@@ -64,7 +64,7 @@ impl super::staging::Preparer for OverwritePreparer {
         .await?;
         manifests.extend(write_added_intent_data(view, intent, snapshot_id).await?);
         let operation = match (intent.changes().added.is_empty(), removed.is_empty()) {
-            (false, true) => Operation::Append,
+            (true, true) | (false, true) => Operation::Append,
             (true, false) => Operation::Delete,
             _ => Operation::Overwrite,
         };
@@ -261,20 +261,15 @@ pub(crate) async fn prepare_snapshot_change(
     let parent_summary = parent
         .and_then(|id| metadata.snapshot_by_id(id))
         .map(|s| s.summary());
-    // A row-level preparer can calculate visible rows from its exact delete
-    // applicability facts. File counters alone cannot reconstruct that value.
+    // A preparer may supply an exact physical data-record total, including for
+    // a full overwrite whose parent total is absent.
     let exact_records = properties.get("total-records").cloned();
     let mut finalized = finalize_snapshot_summary(properties, parent_summary, truncate_full_table);
     if let Some(total) = exact_records {
         finalized.insert("total-records".into(), total);
     }
-    let properties = merge_snapshot_summary_properties(
-        finalized,
-        intent.summary(),
-        metadata.uuid(),
-        snapshot_id,
-    )
-    .map_err(to_iceberg_unexpected)?;
+    let properties = merge_snapshot_summary_properties(finalized, intent.summary())
+        .map_err(to_iceberg_unexpected)?;
     let list = super::staging::write_manifest_list(
         view.artifacts(),
         metadata,
@@ -333,10 +328,9 @@ pub(crate) async fn prepare_snapshot_change(
     })
 }
 
-/// Snapshot sizes count logical delete blobs rather than shared Puffin containers.
-pub(crate) fn set_visible_rows_after_removal(
+/// Removing a data file subtracts all its records, independently of its DVs.
+pub(crate) fn set_physical_rows_after_removal(
     view: &super::staging::StagedView<'_>,
-    removed: &[super::dependency::LiveEntry],
     summary: &mut HashMap<String, String>,
 ) -> crate::iceberg::Result<()> {
     let Some(total) = view
@@ -351,30 +345,16 @@ pub(crate) fn set_visible_rows_after_removal(
     let parent: u64 = total
         .parse()
         .map_err(|_| invalid("Parent total-records is invalid"))?;
-    let data_paths: std::collections::BTreeSet<_> = removed
-        .iter()
-        .filter_map(|entry| match entry.frozen.identity() {
-            super::model::EntryIdentity::DataFile { path } => Some(path),
-            _ => None,
-        })
-        .collect();
-    let deleted_vectors = removed.iter().filter(|entry| matches!(entry.frozen.identity(),
-        super::model::EntryIdentity::DeletionVector { referenced_data_file, .. } if data_paths.contains(referenced_data_file)
-    )).try_fold(0u64, |sum, entry| sum.checked_add(entry.file.record_count())
-        .ok_or_else(|| invalid("Removed deletion-vector cardinality overflow")))?;
     let removed_data: u64 = summary["deleted-records"]
         .parse()
         .expect("checked summary count");
     let added: u64 = summary["added-records"]
         .parse()
         .expect("checked summary count");
-    let removed_live = removed_data
-        .checked_sub(deleted_vectors)
-        .ok_or_else(|| invalid("Removed deletion-vector cardinality exceeds removed data rows"))?;
     let total = parent
-        .checked_sub(removed_live)
+        .checked_sub(removed_data)
         .and_then(|n| n.checked_add(added))
-        .ok_or_else(|| invalid("Visible row total overflow or underflow"))?;
+        .ok_or_else(|| invalid("Physical data-record total overflow or underflow"))?;
     summary.insert("total-records".into(), total.to_string());
     Ok(())
 }
@@ -772,39 +752,16 @@ mod tests {
         publish_append(fixture, table, target_ref, vec![file], BTreeMap::new()).await
     }
 
-    fn pending_document_properties() -> (BTreeMap<String, String>, Vec<u8>) {
-        let content = b"publication".to_vec();
-        let manifest =
-            crate::document_storage::envelope::IcebergDocumentManifestV1 {
-                version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
-                documents: vec![crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
-                version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
-                owner: "novarocks.mv".to_string(),
-                name: "publication".to_string(),
-                format_owner: "novarocks.mv".to_string(),
-                format_name: "publication".to_string(),
-                format_version: 1,
-                revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
-                    &content,
-                )
-                .to_bytes(),
-                encoded_len: content.len() as u64,
-                references: Vec::new(),
-                attachment:
-                    crate::document_storage::envelope::IcebergDocumentAttachmentV1::CommitOutput,
-                carrier: crate::document_storage::envelope::IcebergDocumentCarrierV1::Available {
-                    content,
-                },
-            }],
-            };
-        let unresolved = crate::document_storage::codec::encode_document_manifest(&manifest)
-            .expect("encode prepared publication")
-            .to_vec();
-        let properties = BTreeMap::from([(
-            crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY.to_string(),
-            String::from_utf8(unresolved.clone()).expect("manifest is utf8"),
-        )]);
-        (properties, unresolved)
+    fn keyed_record_properties() -> (BTreeMap<String, String>, (String, String)) {
+        let record = novarocks_spi::connector::ConnectorSnapshotRecord {
+            owner: "example.application".into(),
+            name: "state".into(),
+            binding: None,
+            payload: bytes::Bytes::from_static(b"opaque-publication"),
+        };
+        let key = crate::document_storage::keyed::keys::record_key(&record.owner, &record.name);
+        let value = crate::document_storage::keyed::record::encode_record(&record).unwrap();
+        (BTreeMap::from([(key.clone(), value.clone())]), (key, value))
     }
 
     async fn live_data_paths(table: &Table, target_ref: &str) -> BTreeSet<String> {
@@ -836,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_only_document_publication_creates_one_exact_snapshot() {
+    async fn empty_append_publishes_one_snapshot_with_exact_keyed_record() {
         let fixture = empty_local_table(FormatVersion::V2).await;
         let table = fixture
             .catalog
@@ -844,7 +801,7 @@ mod tests {
             .await
             .unwrap();
         let before_count = table.metadata().snapshots().len();
-        let (snapshot_properties, unresolved) = pending_document_properties();
+        let (snapshot_properties, expected_record) = keyed_record_properties();
         let snapshot_id =
             publish_append(&fixture, &table, "main", Vec::new(), snapshot_properties).await;
         let reloaded = fixture
@@ -854,12 +811,16 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.metadata().current_snapshot_id(), Some(snapshot_id));
         assert_eq!(reloaded.metadata().snapshots().len(), before_count + 1);
-        crate::document_storage::publication::validate_expected_manifest(
-            reloaded.metadata(),
-            snapshot_id,
-            &unresolved,
-        )
-        .expect("validate exact committed output attachment");
+        assert_eq!(
+            reloaded
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties
+                .get(&expected_record.0),
+            Some(&expected_record.1)
+        );
         let current = reloaded.metadata().current_snapshot().unwrap();
         assert_eq!(
             current.summary().additional_properties["added-data-files"],
@@ -869,13 +830,10 @@ mod tests {
             current.summary().additional_properties["added-records"],
             "0"
         );
-        assert!(!current.summary().additional_properties.contains_key(
-            crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY,
-        ));
     }
 
     #[tokio::test]
-    async fn v06_metadata_only_document_publication_preserves_populated_live_data_files() {
+    async fn empty_append_preserves_populated_live_data_and_exact_keyed_record() {
         let fixture = empty_local_table(FormatVersion::V2).await;
         let table = fixture
             .catalog
@@ -892,7 +850,7 @@ mod tests {
         let base_snapshot_id = populated.metadata().current_snapshot_id().unwrap();
         let before_paths = live_data_paths(&populated, "main").await;
         assert_eq!(before_paths, BTreeSet::from([existing_path]));
-        let (snapshot_properties, unresolved) = pending_document_properties();
+        let (snapshot_properties, expected_record) = keyed_record_properties();
         let snapshot_id = publish_append(
             &fixture,
             &populated,
@@ -922,12 +880,13 @@ mod tests {
             snapshot.summary().additional_properties["added-data-files"],
             "0"
         );
-        crate::document_storage::publication::validate_expected_manifest(
-            published.metadata(),
-            snapshot_id,
-            &unresolved,
-        )
-        .expect("validate documents on the advanced snapshot");
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get(&expected_record.0),
+            Some(&expected_record.1)
+        );
     }
 
     #[tokio::test]
@@ -1792,5 +1751,59 @@ pub(crate) mod preparer_tests {
             .unwrap_err();
         assert_eq!(error.kind(), crate::iceberg::ErrorKind::DataInvalid);
         assert!(engine.updates().is_empty());
+    }
+
+    impl Fixture {
+        pub(crate) async fn metadata_with_data_and_delete_manifests(&self) -> TableMetadata {
+            let base = self.metadata(FormatVersion::V3);
+            let seed = vec![
+                AddedContent::new_logical_data(data("s3://b/data.parquet", 3, Struct::empty()), 0)
+                    .unwrap(),
+                AddedContent::new_logical_data(
+                    dv("s3://b/deletes.puffin", "s3://b/data.parquet", 4, 7),
+                    0,
+                )
+                .unwrap(),
+            ];
+            let intent = self.intent(&base, "main", Vec::new());
+            self.stage(base, &intent, &Seed(seed)).await.0
+        }
+    }
+    #[tokio::test]
+    async fn zero_file_publication_uses_append_with_and_without_an_empty_parent() {
+        let fixture = Fixture::new();
+        let mut base = fixture.metadata(FormatVersion::V2);
+        for _ in 0..2 {
+            let intent = OperationIntent::new(OperationIntentParts {
+                target: TableTarget {
+                    ident: TableIdent::from_strs(["db", "t"]).unwrap(),
+                    uuid: Some(base.uuid()),
+                },
+                target_ref: "main".into(),
+                start: base
+                    .current_snapshot()
+                    .map(|s| crate::commit::model::StartSnapshot {
+                        snapshot_id: s.snapshot_id(),
+                        sequence_number: s.sequence_number(),
+                    }),
+                changes: FileChanges::default(),
+                dependencies: vec![Dependency::RefUnchanged],
+                isolation: IsolationLevel::Snapshot,
+                shape: RequestShape::SnapshotProducing,
+                summary: BTreeMap::from([(
+                    "novarocks.doc.v2.record.novarocks.test~publication".into(),
+                    "2.-.YQ".into(),
+                )]),
+                token: fixture.operation.token(),
+            })
+            .unwrap();
+            let (next, request) = fixture.stage(base, &intent, &OverwritePreparer).await;
+            assert_eq!(
+                next.current_snapshot().unwrap().summary().operation,
+                Operation::Append
+            );
+            assert_eq!(request.artifacts().attempt_owned().len(), 1);
+            base = next;
+        }
     }
 }

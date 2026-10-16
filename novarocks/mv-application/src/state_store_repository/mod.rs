@@ -18,6 +18,7 @@
 pub mod catalog;
 pub mod codec;
 pub mod key;
+pub mod keyed;
 mod operation;
 
 #[cfg(test)]
@@ -42,26 +43,21 @@ use novarocks_state_store_api::{
 use uuid::Uuid;
 
 use crate::dependency::MvDependencyObjectRef;
-use crate::persistence::dependency::{
-    StoredMvDependency, classify_dependencies, projection_dependencies,
-};
-use crate::persistence::projection::StoredMvProjection;
+use crate::persistence::dependency::StoredMvDependency;
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvDependencyReadBound,
-    MvProjectionInventoryBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
-    MvProjectionRequest, MvProjectionVersion, MvRepository, MvRepositoryError,
-    MvRepositoryErrorKind, MvTargetLookup, ReplaceMvProjectionRequest,
+    MvDependencyReadBound, MvProjectionInventoryBound, MvProjectionInventoryBuilder,
+    MvProjectionInventoryEntry, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
 };
 use crate::repository_metrics::MvRepositoryMetrics;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use self::codec::{
-    DecodedMvRecord, MvRecordKind, MvSequence, decode_dependency_with_budget, decode_projection,
-    decode_projection_with_budget, decode_record, encode_projection, encode_record,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_dependency_with_budget,
+    decode_keyed_projection, decode_record, encode_record,
 };
 use self::key::{
-    accelerator_prefix, dependency_by_downstream_key, dependency_by_downstream_prefix,
+    dependency_by_downstream_key, dependency_by_downstream_prefix,
     dependency_by_upstream_catalog_prefixes, dependency_by_upstream_key,
     dependency_by_upstream_prefix, projection_by_id_key, projection_prefix, sequence_key,
     target_lookup_catalog_prefix, target_lookup_key,
@@ -132,15 +128,19 @@ impl StateStoreMvRepository {
         let inventory = roots
             .into_iter()
             .map(|record| {
-                decode_projection(&record.key, &record.value)
-                    .map(|decoded| decoded.value)
-                    .map_err(corruption)
+                decode_keyed_projection(
+                    &record.key,
+                    &record.value,
+                    crate::persistence::validation::PersistenceDecodeBudget::default(),
+                )
+                .map(|decoded| decoded.value)
+                .map_err(corruption)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut dependencies = decode_dependencies(rows)?;
         let mut expected = Vec::new();
         for root in &inventory {
-            for dependency in projection_dependencies(root.mv_id, &root.facts) {
+            for dependency in keyed::keyed_dependencies(root.mv_id, &root.facts) {
                 let downstream_key = dependency_by_downstream_key(
                     root.mv_id,
                     &dependency.upstream,
@@ -169,7 +169,15 @@ impl StateStoreMvRepository {
                 "MV dependency index is incomplete or differs from its canonical occurrences",
             ));
         }
-        classify_dependencies(&mut dependencies, &inventory);
+        let inventory = inventory
+            .into_iter()
+            .map(|root| MvProjectionInventoryEntry {
+                mv_id: root.mv_id,
+                target: root.facts.target(),
+                object_id: root.facts.source_revision().target_object_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        crate::bounded_dependencies::classify(&mut dependencies, &inventory);
         transaction
             .abort()
             .await
@@ -192,471 +200,6 @@ impl StateStoreMvRepository {
             .await
             .map_err(operation::state_store_error)?;
         Ok(record)
-    }
-}
-
-#[async_trait::async_trait]
-impl MvRepository for StateStoreMvRepository {
-    async fn create_projection(
-        &self,
-        operation_id: Uuid,
-        projection: MvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError> {
-        let dependencies = projection_dependencies(0, &projection.facts);
-        let store = Arc::clone(&self.store);
-        let mv_id = operation::run(
-            store.as_ref(),
-            &self.runner_metrics,
-            self.run_policy,
-            "create MV Accelerator projection",
-            move |transaction| {
-                let projection = projection.clone();
-                let dependencies = dependencies.clone();
-                Box::pin(async move {
-                    let sequence_key = sequence_key().map_err(invalid_state_store)?;
-                    let (next_id, sequence_precondition) =
-                        match transaction.get(&sequence_key).await? {
-                            Some(record) => {
-                                let decoded: DecodedMvRecord<MvSequence> =
-                                    decode_record(&sequence_key, &record.value)
-                                        .map_err(invalid_state_store)?;
-                                let next_id =
-                                    decoded.value.last_allocated_id.checked_add(1).ok_or_else(
-                                        || invalid_state_store("MV ID sequence exhausted"),
-                                    )?;
-                                (next_id, Precondition::Version(record.version))
-                            }
-                            None => (1, Precondition::Absent),
-                        };
-                    let definition = definition_from_request(next_id, &projection);
-                    let root_key = projection_by_id_key(next_id).map_err(invalid_state_store)?;
-                    if transaction.get(&root_key).await?.is_some() {
-                        return Err(conflict_state_store("MV Accelerator projection ID exists"));
-                    }
-                    let target = definition_target(&definition).map_err(invalid_state_store)?;
-                    let target_key = target_key(&target).map_err(invalid_state_store)?;
-                    if transaction.get(&target_key).await?.is_some() {
-                        return Err(conflict_state_store("MV Accelerator target already exists"));
-                    }
-                    put_sequence(
-                        transaction,
-                        operation_id,
-                        MvSequence {
-                            last_allocated_id: next_id,
-                        },
-                        sequence_precondition,
-                    )
-                    .await?;
-                    put_projection(transaction, operation_id, &definition, Precondition::Absent)
-                        .await?;
-                    put_target_lookup(
-                        transaction,
-                        operation_id,
-                        target_key,
-                        next_id,
-                        Precondition::Absent,
-                    )
-                    .await?;
-                    for dependency in dependencies_for_mv(next_id, &dependencies) {
-                        put_dependency_pair(transaction, operation_id, &dependency).await?;
-                    }
-                    Ok(next_id)
-                })
-            },
-        )
-        .await?;
-        self.load_by_id(mv_id)
-            .await?
-            .ok_or_else(|| corruption("created MV Accelerator projection is missing"))
-    }
-
-    async fn replace_projection(
-        &self,
-        operation_id: Uuid,
-        request: ReplaceMvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError> {
-        if request.mv_id <= 0 {
-            return Err(invalid("MV projection ID must be positive"));
-        }
-
-        let mv_id = request.mv_id;
-        let desired_dependencies =
-            projection_dependencies(request.mv_id, &request.projection.facts);
-        let expected_version = request.expected_version.store_version().clone();
-        let page_size = self.store.limits().max_page_size;
-        let store = Arc::clone(&self.store);
-        operation::run(
-            store.as_ref(),
-            &self.runner_metrics,
-            self.run_policy,
-            "replace MV Accelerator projection",
-            move |transaction| {
-                let request = request.clone();
-                let expected_version = expected_version.clone();
-                let desired_dependencies = desired_dependencies.clone();
-                Box::pin(async move {
-                    let root_key =
-                        projection_by_id_key(request.mv_id).map_err(invalid_state_store)?;
-                    let root_record = transaction
-                        .get(&root_key)
-                        .await?
-                        .ok_or_else(|| conflict_state_store("MV projection changed before CAS"))?;
-                    if root_record.version != expected_version {
-                        return Err(conflict_state_store("MV projection changed before CAS"));
-                    }
-                    let current = decode_projection(&root_key, &root_record.value)
-                        .map_err(invalid_state_store)?
-                        .value;
-                    let next = definition_from_request(request.mv_id, &request.projection);
-                    replace_target_index(transaction, operation_id, &current, &next).await?;
-                    replace_dependency_indexes(
-                        transaction,
-                        operation_id,
-                        request.mv_id,
-                        &desired_dependencies,
-                        page_size,
-                    )
-                    .await?;
-                    put_projection(
-                        transaction,
-                        operation_id,
-                        &next,
-                        Precondition::Version(root_record.version),
-                    )
-                    .await?;
-                    Ok(())
-                })
-            },
-        )
-        .await?;
-        self.load_by_id(mv_id)
-            .await?
-            .ok_or_else(|| corruption("replaced MV Accelerator projection is missing"))
-    }
-
-    async fn load_by_id(
-        &self,
-        mv_id: i64,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        if mv_id <= 0 {
-            return Err(invalid("MV projection ID must be positive"));
-        }
-        let key = projection_by_id_key(mv_id).map_err(corruption)?;
-        self.read_record(&key)
-            .await?
-            .map(|record| loaded_projection(&key, record))
-            .transpose()
-    }
-
-    async fn find_by_target(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        let key = target_key(target).map_err(corruption)?;
-        let Some(lookup_record) = self.read_record(&key).await? else {
-            return Ok(None);
-        };
-        let lookup: DecodedMvRecord<MvTargetLookup> =
-            decode_record(&key, &lookup_record.value).map_err(corruption)?;
-        let loaded = self.load_by_id(lookup.value.mv_id).await?.ok_or_else(|| {
-            corruption("MV Accelerator target lookup references a missing projection")
-        })?;
-        if definition_target(&loaded.projection).map_err(corruption)? != *target {
-            return Err(corruption(
-                "MV Accelerator target lookup does not match its projection",
-            ));
-        }
-        Ok(Some(loaded))
-    }
-
-    async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
-        let records = self
-            .scan_prefix(projection_prefix().map_err(corruption)?)
-            .await?;
-        records
-            .into_iter()
-            .map(|record| {
-                let key = record.key.clone();
-                loaded_projection(&key, record)
-            })
-            .collect()
-    }
-
-    async fn list_projection_inventory(
-        &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
-        MvProjectionInventoryBuilder::new(bound)?;
-        let mut transaction = self
-            .store
-            .begin_read()
-            .await
-            .map_err(operation::state_store_error)?;
-        let result = bounded_inventory(transaction.as_mut(), bound).await;
-        // Error, budget refusal and success all close the same snapshot before
-        // a readiness consumer may start its fresh per-target lookups.
-        let close = transaction
-            .abort()
-            .await
-            .map_err(operation::state_store_error);
-        match (result, close) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(entries), Ok(())) => Ok(entries),
-        }
-    }
-
-    async fn find_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        MvProjectionInventoryBuilder::new(bound)?;
-        let key = target_key(target).map_err(corruption)?;
-        let Some(lookup_record) = self.read_record(&key).await? else {
-            return Ok(None);
-        };
-        check_inventory_raw_record(&lookup_record, bound)?;
-        let lookup: DecodedMvRecord<MvTargetLookup> =
-            decode_record(&key, &lookup_record.value).map_err(corruption)?;
-        let key = projection_by_id_key(lookup.value.mv_id).map_err(corruption)?;
-        let record = self.read_record(&key).await?.ok_or_else(|| {
-            corruption("MV Accelerator target lookup references a missing projection")
-        })?;
-        check_inventory_raw_record(&record, bound)?;
-        let decoded =
-            decode_projection_with_budget(&key, &record.value, bound.decode).map_err(corruption)?;
-        let loaded = LoadedMvProjection {
-            projection: decoded.value,
-            version: MvProjectionVersion::from_store(record.version),
-        };
-        if loaded.projection.facts.target() != target {
-            return Err(corruption(
-                "MV Accelerator target lookup does not match its projection",
-            ));
-        }
-        Ok(Some(loaded))
-    }
-
-    /// A delete stamps no record, so it carries no operation provenance; the
-    /// runner owns the attempt identity this write is retried under.
-    async fn delete_projection(
-        &self,
-        _operation_id: Uuid,
-        request: DeleteMvProjectionRequest,
-    ) -> Result<bool, MvRepositoryError> {
-        if request.mv_id <= 0 {
-            return Err(invalid("MV projection ID must be positive"));
-        }
-        let expected_version = request.expected_version.store_version().clone();
-        let page_size = self.store.limits().max_page_size;
-        let store = Arc::clone(&self.store);
-        operation::run(
-            store.as_ref(),
-            &self.runner_metrics,
-            self.run_policy,
-            "delete MV Accelerator projection",
-            move |transaction| {
-                let request = request.clone();
-                let expected_version = expected_version.clone();
-                Box::pin(async move {
-                    let root_key =
-                        projection_by_id_key(request.mv_id).map_err(invalid_state_store)?;
-                    let Some(root_record) = transaction.get(&root_key).await? else {
-                        return Ok(false);
-                    };
-                    if root_record.version != expected_version {
-                        return Err(conflict_state_store("MV projection changed before delete"));
-                    }
-                    let definition = decode_projection(&root_key, &root_record.value)
-                        .map_err(invalid_state_store)?
-                        .value;
-                    if definition.facts.source_revision() != &request.expected_source_revision {
-                        return Err(conflict_state_store(
-                            "MV source revision changed before delete",
-                        ));
-                    }
-                    delete_indexes_for_projection(
-                        transaction,
-                        &definition,
-                        request.mv_id,
-                        page_size,
-                    )
-                    .await?;
-                    transaction
-                        .delete(root_key, Precondition::Version(root_record.version))
-                        .await?;
-                    Ok(true)
-                })
-            },
-        )
-        .await
-    }
-
-    #[cfg(any(test, feature = "test-controls"))]
-    async fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
-        let records = self
-            .scan_prefix(accelerator_prefix().map_err(corruption)?)
-            .await?;
-        let store = Arc::clone(&self.store);
-        operation::run(
-            store.as_ref(),
-            &self.runner_metrics,
-            self.run_policy,
-            "wipe MV Accelerator family",
-            move |transaction| {
-                let records = records.clone();
-                Box::pin(async move {
-                    for record in &records {
-                        let current = transaction.get(&record.key).await?.ok_or_else(|| {
-                            conflict_state_store("MV Accelerator changed before wipe")
-                        })?;
-                        if current.version != record.version {
-                            return Err(conflict_state_store("MV Accelerator changed before wipe"));
-                        }
-                        transaction
-                            .delete(
-                                record.key.clone(),
-                                Precondition::Version(record.version.clone()),
-                            )
-                            .await?;
-                    }
-                    Ok(())
-                })
-            },
-        )
-        .await
-    }
-
-    async fn list_dependencies_by_downstream(
-        &self,
-        mv_id: i64,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.classified_dependencies(dependency_by_downstream_prefix(mv_id).map_err(corruption)?)
-            .await
-    }
-
-    async fn list_dependencies_by_downstream_bounded(
-        &self,
-        mv_id: i64,
-        expected_version: &MvProjectionVersion,
-        bound: MvDependencyReadBound,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        use crate::bounded_dependencies::{DependencyCollector, classify, validate_canonical};
-        let mut dependencies = DependencyCollector::new(bound)?;
-        let root_key = projection_by_id_key(mv_id).map_err(corruption)?;
-        let mut transaction = self
-            .store
-            .begin_read()
-            .await
-            .map_err(operation::state_store_error)?;
-        let result = async {
-            // Current CAS and D's canonical occurrences are read from exactly
-            // the snapshot that also owns the index and classification scan.
-            {
-                let root = transaction
-                    .get(&root_key)
-                    .await
-                    .map_err(operation::state_store_error)?
-                    .ok_or_else(|| {
-                        MvRepositoryError::new(
-                            MvRepositoryErrorKind::Conflict,
-                            "MV dependency root disappeared",
-                        )
-                    })?;
-                if &root.version != expected_version.store_version() {
-                    return Err(MvRepositoryError::new(
-                        MvRepositoryErrorKind::Conflict,
-                        "MV dependency root changed",
-                    ));
-                }
-                check_inventory_raw_record(&root, bound.inventory)?;
-                let projection =
-                    decode_projection_with_budget(&root_key, &root.value, bound.inventory.decode)
-                        .map_err(corruption)?
-                        .value;
-                if projection.mv_id != mv_id || root.key != root_key {
-                    return Err(corruption(
-                        "MV dependency root key differs from its identity",
-                    ));
-                }
-                drop(root);
-                let mut range = BoundedRecordRange::new(
-                    dependency_by_downstream_prefix(mv_id).map_err(corruption)?,
-                )?;
-                while let Some(record) = range.next(transaction.as_mut(), bound.inventory).await? {
-                    let dependency = decode_dependency_with_budget(
-                        &record.key,
-                        &record.value,
-                        bound.inventory.decode.max_working_set_bytes,
-                    )
-                    .map_err(corruption)?
-                    .value;
-                    let expected_key = dependency_by_downstream_key(
-                        dependency.downstream_mv_id,
-                        &dependency.upstream,
-                        dependency.occurrence_id,
-                    )
-                    .map_err(corruption)?;
-                    if record.key != expected_key {
-                        return Err(corruption(
-                            "MV dependency key differs from its canonical occurrence",
-                        ));
-                    }
-                    dependencies.push(dependency)?;
-                }
-                let dependencies = dependencies.finish();
-                validate_canonical(&projection, &dependencies)?;
-                // Drop the fresh canonical root before opening the inventory
-                // page; the caller may still own its earlier ready model.
-                drop(projection);
-                let inventory = bounded_inventory(transaction.as_mut(), bound.inventory).await?;
-                let mut dependencies = dependencies;
-                classify(&mut dependencies, &inventory);
-                Ok(dependencies)
-            }
-        }
-        .await;
-        let close = transaction
-            .abort()
-            .await
-            .map_err(operation::state_store_error);
-        match (result, close) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(dependencies), Ok(())) => Ok(dependencies),
-        }
-    }
-
-    async fn list_downstream_dependencies(
-        &self,
-        upstream: &MvDependencyObjectRef,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.classified_dependencies(dependency_by_upstream_prefix(upstream).map_err(corruption)?)
-            .await
-    }
-
-    async fn ensure_no_downstream_dependencies(
-        &self,
-        upstream: &MvDependencyObjectRef,
-    ) -> Result<(), MvRepositoryError> {
-        let dependencies = self.list_downstream_dependencies(upstream).await?;
-        if dependencies.is_empty() {
-            Ok(())
-        } else {
-            Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                format!(
-                    "{} has downstream materialized views: {}",
-                    upstream.display_name(),
-                    dependencies
-                        .iter()
-                        .map(|dependency| dependency.downstream_mv_id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ))
-        }
     }
 }
 
@@ -884,26 +427,6 @@ impl BoundedRecordRange {
     }
 }
 
-async fn bounded_inventory(
-    transaction: &mut dyn ReadTransaction,
-    bound: MvProjectionInventoryBound,
-) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
-    let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
-    let mut range = BoundedRecordRange::new(projection_prefix().map_err(corruption)?)?;
-    while let Some(record) = range.next(transaction, bound).await? {
-        let projection = decode_projection_with_budget(&record.key, &record.value, bound.decode)
-            .map_err(corruption)?
-            .value;
-        if record.key != projection_by_id_key(projection.mv_id).map_err(corruption)? {
-            return Err(corruption(
-                "MV inventory root key differs from its identity",
-            ));
-        }
-        inventory.push(&projection)?;
-    }
-    Ok(inventory.finish())
-}
-
 fn check_inventory_raw_record(
     record: &StateRecord,
     bound: MvProjectionInventoryBound,
@@ -921,30 +444,6 @@ fn check_inventory_raw_record(
         ));
     }
     Ok(())
-}
-
-fn loaded_projection(
-    key: &Key,
-    record: StateRecord,
-) -> Result<LoadedMvProjection, MvRepositoryError> {
-    let definition = decode_projection(key, &record.value)
-        .map_err(corruption)?
-        .value;
-    Ok(LoadedMvProjection {
-        projection: definition,
-        version: MvProjectionVersion::from_store(record.version),
-    })
-}
-
-fn definition_from_request(mv_id: i64, request: &MvProjectionRequest) -> StoredMvProjection {
-    StoredMvProjection {
-        mv_id,
-        facts: request.facts.clone(),
-    }
-}
-
-fn definition_target(projection: &StoredMvProjection) -> Result<MvTarget, String> {
-    Ok(projection.facts.target().clone())
 }
 
 fn target_key(target: &MvTarget) -> Result<Key, String> {
@@ -975,17 +474,6 @@ async fn put_sequence(
     let key = sequence_key().map_err(invalid_state_store)?;
     let value = encode_record(MvRecordKind::Sequence, operation_id, &sequence)
         .map_err(invalid_state_store)?;
-    transaction.put(key, value, precondition).await
-}
-
-async fn put_projection(
-    transaction: &mut dyn WriteTransaction,
-    operation_id: Uuid,
-    definition: &StoredMvProjection,
-    precondition: Precondition,
-) -> Result<(), StateStoreError> {
-    let key = projection_by_id_key(definition.mv_id).map_err(invalid_state_store)?;
-    let value = encode_projection(operation_id, definition).map_err(invalid_state_store)?;
     transaction.put(key, value, precondition).await
 }
 
@@ -1032,54 +520,6 @@ async fn put_dependency_pair(
         .put(downstream, value.clone(), Precondition::Absent)
         .await?;
     transaction.put(upstream, value, Precondition::Absent).await
-}
-
-async fn replace_target_index(
-    transaction: &mut dyn WriteTransaction,
-    operation_id: Uuid,
-    current: &StoredMvProjection,
-    next: &StoredMvProjection,
-) -> Result<(), StateStoreError> {
-    let current_key = target_key(&definition_target(current).map_err(invalid_state_store)?)
-        .map_err(invalid_state_store)?;
-    let next_key = target_key(&definition_target(next).map_err(invalid_state_store)?)
-        .map_err(invalid_state_store)?;
-    let current_record = transaction
-        .get(&current_key)
-        .await?
-        .ok_or_else(|| invalid_state_store("MV target lookup is missing"))?;
-    let lookup: DecodedMvRecord<MvTargetLookup> =
-        decode_record(&current_key, &current_record.value).map_err(invalid_state_store)?;
-    if lookup.value.mv_id != current.mv_id {
-        return Err(invalid_state_store(
-            "MV target lookup references a different projection",
-        ));
-    }
-    if current_key == next_key {
-        put_target_lookup(
-            transaction,
-            operation_id,
-            next_key,
-            next.mv_id,
-            Precondition::Version(current_record.version),
-        )
-        .await
-    } else {
-        if transaction.get(&next_key).await?.is_some() {
-            return Err(conflict_state_store("replacement MV target already exists"));
-        }
-        transaction
-            .delete(current_key, Precondition::Version(current_record.version))
-            .await?;
-        put_target_lookup(
-            transaction,
-            operation_id,
-            next_key,
-            next.mv_id,
-            Precondition::Absent,
-        )
-        .await
-    }
 }
 
 async fn replace_dependency_indexes(
@@ -1154,14 +594,13 @@ async fn replace_dependency_indexes(
     Ok(())
 }
 
-async fn delete_indexes_for_projection(
+async fn delete_indexes_for_target(
     transaction: &mut dyn WriteTransaction,
-    definition: &StoredMvProjection,
+    target: &MvTarget,
     mv_id: i64,
     page_size: usize,
 ) -> Result<(), StateStoreError> {
-    let target_key = target_key(&definition_target(definition).map_err(invalid_state_store)?)
-        .map_err(invalid_state_store)?;
+    let target_key = target_key(target).map_err(invalid_state_store)?;
     let target = transaction
         .get(&target_key)
         .await?
@@ -1264,3 +703,75 @@ fn conflict_state_store(_message: impl Into<String>) -> StateStoreError {
         "MV Accelerator StateStore transaction precondition failed",
     )
 }
+
+impl StateStoreMvRepository {
+    pub async fn list_downstream_dependencies(
+        &self,
+        upstream: &MvDependencyObjectRef,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        self.classified_dependencies(dependency_by_upstream_prefix(upstream).map_err(corruption)?)
+            .await
+    }
+
+    pub async fn ensure_no_downstream_dependencies(
+        &self,
+        upstream: &MvDependencyObjectRef,
+    ) -> Result<(), MvRepositoryError> {
+        let dependencies = self.list_downstream_dependencies(upstream).await?;
+        if dependencies.is_empty() {
+            Ok(())
+        } else {
+            Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!(
+                    "{} has downstream materialized views: {}",
+                    upstream.display_name(),
+                    dependencies
+                        .iter()
+                        .map(|dependency| dependency.downstream_mv_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ))
+        }
+    }
+}
+impl StateStoreMvRepository {
+    #[cfg(any(test, feature = "test-controls"))]
+    pub async fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
+        let records = self
+            .scan_prefix(accelerator_prefix().map_err(corruption)?)
+            .await?;
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            self.run_policy,
+            "wipe MV Accelerator family",
+            move |transaction| {
+                let records = records.clone();
+                Box::pin(async move {
+                    for record in &records {
+                        let current = transaction.get(&record.key).await?.ok_or_else(|| {
+                            conflict_state_store("MV Accelerator changed before wipe")
+                        })?;
+                        if current.version != record.version {
+                            return Err(conflict_state_store("MV Accelerator changed before wipe"));
+                        }
+                        transaction
+                            .delete(
+                                record.key.clone(),
+                                Precondition::Version(record.version.clone()),
+                            )
+                            .await?;
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .await
+    }
+}
+
+#[cfg(any(test, feature = "test-controls"))]
+use self::key::accelerator_prefix;

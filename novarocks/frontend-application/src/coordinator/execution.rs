@@ -689,30 +689,31 @@ impl FrontendDistributedQueryCoordinator {
         let _query = self.registry.register(query_id, intent)?;
         let scheduler = &backend_services.scheduler;
         #[cfg(feature = "test-controls")]
-        let scheduler = if let (Some(native), Some(nomination)) =
-            (&self.test_native, &parts.test_statement_nomination)
-        {
-            scheduler
-                .clone()
-                .with_test_nomination(native.clone(), nomination.clone())
-        } else {
-            scheduler.clone()
+        let nominated_execution = match (
+            &parts.test_statement_nomination,
+            &self.statement_observation,
+        ) {
+            (Some(nomination), Some(owner)) => owner
+                .bind_nominated_attempt(nomination, execution_id)
+                .map_err(failed)?,
+            (Some(_), None) => {
+                return Err(failed(
+                    "Native nomination has no statement observation owner",
+                ));
+            }
+            (None, _) => None,
         };
         #[cfg(feature = "test-controls")]
-        if let Some(nomination) = &parts.test_statement_nomination {
-            if let Some(owner) = &self.statement_observation {
-                owner
-                    .bind_nominated_attempt(
-                        nomination,
-                        novarocks_types::QueryExecutionId::new(
-                            execution_id.query_id(),
-                            novarocks_types::AttemptId::new(execution_id.attempt_id().get())
-                                .map_err(|error| failed(error.to_string()))?,
-                        )
-                        .map_err(|error| failed(error.to_string()))?,
-                    )
-                    .map_err(failed)?;
-            }
+        let scheduler =
+            if let (Some(native), Some(nomination)) = (&self.test_native, &nominated_execution) {
+                scheduler
+                    .clone()
+                    .with_test_nomination(native.clone(), Arc::new(nomination.clone()))
+            } else {
+                scheduler.clone()
+            };
+        #[cfg(feature = "test-controls")]
+        if let Some(nomination) = &nominated_execution {
             if let Some(observations) = &self.test_observations {
                 let execution = novarocks_types::QueryExecutionId::new(
                     execution_id.query_id(),

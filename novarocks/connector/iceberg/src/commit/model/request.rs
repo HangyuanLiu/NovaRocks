@@ -31,6 +31,7 @@ pub enum RequestShape {
     SnapshotProducing,
     MetadataOnly,
     RefRetention,
+    DocumentExpiry,
     Create,
 }
 
@@ -119,7 +120,8 @@ impl FrozenRequest {
                 },
                 RequestShape::SnapshotProducing
                 | RequestShape::MetadataOnly
-                | RequestShape::RefRetention,
+                | RequestShape::RefRetention
+                | RequestShape::DocumentExpiry,
             ) => {
                 if metadata_location.is_empty() {
                     return Err(invalid(
@@ -173,6 +175,42 @@ impl FrozenRequest {
                     return Err(invalid(
                         "Metadata-only publication must not acquire a ref CAS",
                     ));
+                }
+                if parts.shape == RequestShape::DocumentExpiry {
+                    // Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
+                    if parts.requirements.iter().any(|requirement| {
+                        !matches!(
+                            requirement,
+                            TableRequirement::UuidMatch { .. }
+                                | TableRequirement::RefSnapshotIdMatch { .. }
+                        )
+                    }) {
+                        return Err(invalid(
+                            "Document expiry only permits UUID and observed-ref requirements",
+                        ));
+                    }
+                    if !parts
+                        .requirements
+                        .contains(&TableRequirement::RefSnapshotIdMatch {
+                            r#ref: parts.target_ref.clone(),
+                            snapshot_id: *parent,
+                        })
+                    {
+                        return Err(invalid(
+                            "Document expiry must assert its exact target ref, including absence",
+                        ));
+                    }
+                    for update in &parts.updates {
+                        validate_document_expiry_update(update)?;
+                    }
+                    for update in &parts.updates {
+                        if let TableUpdate::RemoveSnapshots { snapshot_ids } = update {
+                            if parts.requirements.iter().any(|requirement| matches!(requirement,
+                                TableRequirement::RefSnapshotIdMatch{snapshot_id:Some(id),..} if snapshot_ids.contains(id))) {
+                                return Err(invalid("Document expiry cannot remove an observed ref head"));
+                            }
+                        }
+                    }
                 }
                 if parts.shape == RequestShape::RefRetention {
                     for update in &parts.updates {
@@ -577,5 +615,25 @@ mod tests {
             .updates
             .push(TableUpdate::SetCurrentSchema { schema_id: 0 });
         assert!(FrozenRequest::new(schema).is_err());
+    }
+}
+
+/// Expiry has no property write, snapshot creation, ref mutation or file effect.
+pub(crate) fn validate_document_expiry_update(update: &TableUpdate) -> Result<()> {
+    match update {
+        TableUpdate::RemoveSnapshots { .. } => Ok(()),
+        TableUpdate::RemoveProperties { removals }
+            if removals.iter().all(|key| {
+                key.strip_prefix("novarocks.doc.v2.rev.")
+                    .is_some_and(|identity| {
+                        novarocks_spi::connector::DocumentIdentity::parse_hex(identity).is_ok()
+                    })
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(
+            "Document expiry only permits snapshot removal and document-version property removal",
+        )),
     }
 }

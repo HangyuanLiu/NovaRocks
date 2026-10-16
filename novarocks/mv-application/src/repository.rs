@@ -25,12 +25,9 @@ use std::fmt;
 
 use novarocks_state_store_api::VersionToken;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::persistence::definition::{MvAcceleratorSourceRevision, MvDesiredRefreshPolicy};
+use crate::persistence::definition::MvDesiredRefreshPolicy;
 pub use crate::persistence::dependency::CreateMvDependencyRequest;
-use crate::persistence::dependency::StoredMvDependency;
-use crate::persistence::projection::{MvDocumentProjection, StoredMvProjection};
 use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::product::MvTarget;
 
@@ -99,18 +96,6 @@ impl Default for InitialMvRefreshConfiguration {
     }
 }
 
-/// A validated complete document root, replaced with its derived indexes in one CAS.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvProjectionRequest {
-    pub facts: MvDocumentProjection,
-}
-
-impl From<MvDocumentProjection> for MvProjectionRequest {
-    fn from(facts: MvDocumentProjection) -> Self {
-        Self { facts }
-    }
-}
-
 /// Opaque StateStore version returned only by a successful repository read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvProjectionVersion(VersionToken);
@@ -123,12 +108,6 @@ impl MvProjectionVersion {
     pub(crate) fn store_version(&self) -> &VersionToken {
         &self.0
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LoadedMvProjection {
-    pub projection: StoredMvProjection,
-    pub version: MvProjectionVersion,
 }
 
 /// One explicit inventory promise. It is supplied by the local consumer;
@@ -192,15 +171,15 @@ impl MvProjectionInventoryBuilder {
         MvRepositoryError::new(MvRepositoryErrorKind::InvalidRequest, message)
     }
 
-    pub(crate) fn push(
+    pub(crate) fn push_facts(
         &mut self,
-        projection: &StoredMvProjection,
+        mv_id: i64,
+        target: &MvTarget,
+        object: &novarocks_spi::connector::ConnectorTableObjectId,
     ) -> Result<(), MvRepositoryError> {
         if self.entries.len() >= self.bound.entries {
             return Err(Self::refusal("MV inventory exceeds its entry bound"));
         }
-        let target = projection.facts.target();
-        let object = &projection.facts.source_revision().target_object_id;
         if [
             target.catalog().unwrap_or_default(),
             target.namespace(),
@@ -261,7 +240,7 @@ impl MvProjectionInventoryBuilder {
             MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error.to_string())
         })?;
         self.entries.push(MvProjectionInventoryEntry {
-            mv_id: projection.mv_id,
+            mv_id,
             target: target.clone(),
             object_id,
         });
@@ -272,119 +251,4 @@ impl MvProjectionInventoryBuilder {
     pub(crate) fn finish(self) -> Vec<MvProjectionInventoryEntry> {
         self.entries
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReplaceMvProjectionRequest {
-    pub mv_id: i64,
-    pub expected_version: MvProjectionVersion,
-    pub projection: MvProjectionRequest,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeleteMvProjectionRequest {
-    pub mv_id: i64,
-    pub expected_version: MvProjectionVersion,
-    pub expected_source_revision: MvAcceleratorSourceRevision,
-}
-
-/// Asynchronous application port. Durable state is reached through an async
-/// StateStore, and this boundary says so rather than hiding a blocking bridge
-/// behind a synchronous signature. No raw key or transaction crosses it.
-///
-/// The port is async because the store is. The previous synchronous contract
-/// forced every implementation to block a worker thread, and made the whole
-/// port unusable on a current-thread runtime — which is what test
-/// compositions actually run on.
-#[async_trait::async_trait]
-pub trait MvRepository: Send + Sync {
-    async fn create_projection(
-        &self,
-        operation_id: Uuid,
-        projection: MvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError>;
-
-    async fn replace_projection(
-        &self,
-        operation_id: Uuid,
-        request: ReplaceMvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError>;
-
-    async fn load_by_id(&self, mv_id: i64)
-    -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
-
-    async fn find_by_target(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
-
-    async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError>;
-
-    /// Complete bounded inventory; implementations must page directly rather
-    /// than calling the full-model list and checking its length afterwards.
-    async fn list_projection_inventory(
-        &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError>;
-
-    /// Fresh target lookup with an explicit decode promise, checked before
-    /// owned projection materialization. No inventory version is a CAS token.
-    async fn find_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
-
-    /// The projection of one provider target object, whichever catalog
-    /// attachment it was discovered through.
-    ///
-    /// A materialized view is the object it publishes into. The by-target
-    /// index is keyed by the attachment's own name, so it cannot answer this:
-    /// one object reachable through two attachments has two names and one
-    /// projection. Scanning is deliberate -- this is asked once per
-    /// installation, and a second durable index would have to be kept exact
-    /// against the one that already exists.
-    async fn find_by_target_object(
-        &self,
-        object_id: &novarocks_spi::connector::ConnectorTableObjectId,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        Ok(self.list_projections().await?.into_iter().find(|loaded| {
-            &loaded.projection.facts.source_revision().target_object_id == object_id
-        }))
-    }
-
-    async fn delete_projection(
-        &self,
-        operation_id: Uuid,
-        request: DeleteMvProjectionRequest,
-    ) -> Result<bool, MvRepositoryError>;
-
-    /// Test/harness-only wipe of the complete current Accelerator family,
-    /// including the internal sequence. Old physical families remain untouched.
-    #[cfg(any(test, feature = "test-controls"))]
-    async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError>;
-
-    async fn list_dependencies_by_downstream(
-        &self,
-        mv_id: i64,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
-
-    /// Exact downstream version and canonical occurrences, classified only
-    /// against one complete bounded inventory in the same read snapshot.
-    async fn list_dependencies_by_downstream_bounded(
-        &self,
-        mv_id: i64,
-        expected_version: &MvProjectionVersion,
-        bound: MvDependencyReadBound,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
-
-    async fn list_downstream_dependencies(
-        &self,
-        upstream: &crate::dependency::MvDependencyObjectRef,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
-
-    async fn ensure_no_downstream_dependencies(
-        &self,
-        upstream: &crate::dependency::MvDependencyObjectRef,
-    ) -> Result<(), MvRepositoryError>;
 }

@@ -56,7 +56,7 @@ impl NativeOriginalRequests {
         consume(request.request(), scope)
     }
 
-    pub(super) fn validate_scalar_actual_arguments(
+    pub(crate) fn validate_scalar_actual_arguments(
         &self,
         request: u32,
         actual: &[expr::Expr],
@@ -118,7 +118,12 @@ impl NativeOriginalRequests {
                         _ => None,
                     };
                     step(resources)?;
-                    if reference != *constant {
+                    // A captured constant is an exact source-address fact.
+                    // None carries no such fact: SQL may elide a Nested or
+                    // identity cast into a physical Constant while retaining
+                    // the original nonconstant request. Never promote that
+                    // runtime representation into a binding constant below.
+                    if constant.is_some() && reference != *constant {
                         return Err(invalid(
                             "scalar constant address differs from its original request",
                         ));

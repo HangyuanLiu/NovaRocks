@@ -17,22 +17,23 @@
 
 use super::tests_definition;
 
-use crate::repository::{MvRepository, ReplaceMvProjectionRequest};
-
 #[tokio::test]
 async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
     let (_host, repository) = tests_definition::repository().await;
     let created = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            tests_definition::projection_request("dependency", b"dependency-object", 51, "orders"),
+            tests_definition::projection_facts("dependency", b"dependency-object", 51, "orders"),
+            None,
         )
         .await
         .unwrap();
-    let upstream = created.projection.facts.dependencies()[0].relation.clone();
+    let upstream = created.projection.facts.definition().relation_occurrences[0]
+        .relation_at_binding
+        .clone();
     assert_eq!(
         repository
-            .list_dependencies_by_downstream(created.projection.mv_id)
+            .list_keyed_dependencies_by_downstream(&created)
             .await
             .unwrap()
             .len(),
@@ -40,26 +41,27 @@ async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
     );
 
     let replacement =
-        tests_definition::projection_request("dependency", b"dependency-object", 52, "customers");
+        tests_definition::projection_facts("dependency", b"dependency-object", 52, "customers");
     let replaced = repository
-        .replace_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            ReplaceMvProjectionRequest {
-                mv_id: created.projection.mv_id,
-                expected_version: created.version,
-                projection: replacement,
-            },
+            replacement,
+            Some({
+                let mut expected = created.clone();
+                expected.version = (created.version).clone();
+                expected
+            }),
         )
         .await
         .unwrap();
     let dependencies = repository
-        .list_dependencies_by_downstream(replaced.projection.mv_id)
+        .list_keyed_dependencies_by_downstream(&replaced)
         .await
         .unwrap();
     assert_eq!(dependencies.len(), 2);
     assert_eq!(dependencies[0].upstream.name, "customers");
     assert_ne!(
-        replaced.projection.facts.dependencies()[0].relation,
+        replaced.projection.facts.definition().relation_occurrences[0].relation_at_binding,
         upstream
     );
     repository
@@ -74,11 +76,11 @@ async fn exact_object_inventory_classification_is_independent_of_load_order() {
     for upstream_first in [false, true] {
         let (_, repository) = tests_definition::repository().await;
         let upstream_request =
-            || tests_definition::projection_request("orders", b"base-orders", 2, "other");
+            || tests_definition::projection_facts("orders", b"base-orders", 2, "other");
         let first = if upstream_first {
             Some(
                 repository
-                    .create_projection(uuid::Uuid::now_v7(), upstream_request())
+                    .install_keyed_projection(uuid::Uuid::now_v7(), upstream_request(), None)
                     .await
                     .unwrap(),
             )
@@ -86,15 +88,16 @@ async fn exact_object_inventory_classification_is_independent_of_load_order() {
             None
         };
         let downstream = repository
-            .create_projection(
+            .install_keyed_projection(
                 uuid::Uuid::now_v7(),
-                tests_definition::projection_request("downstream", b"downstream", 3, "orders"),
+                tests_definition::projection_facts("downstream", b"downstream", 3, "orders"),
+                None,
             )
             .await
             .unwrap();
         if !upstream_first {
             let rows = repository
-                .list_dependencies_by_downstream(downstream.projection.mv_id)
+                .list_keyed_dependencies_by_downstream(&downstream)
                 .await
                 .unwrap();
             assert!(
@@ -105,12 +108,12 @@ async fn exact_object_inventory_classification_is_independent_of_load_order() {
         let upstream = match first {
             Some(value) => value,
             None => repository
-                .create_projection(uuid::Uuid::now_v7(), upstream_request())
+                .install_keyed_projection(uuid::Uuid::now_v7(), upstream_request(), None)
                 .await
                 .unwrap(),
         };
         let rows = repository
-            .list_dependencies_by_downstream(downstream.projection.mv_id)
+            .list_keyed_dependencies_by_downstream(&downstream)
             .await
             .unwrap();
         assert_eq!(
@@ -123,23 +126,19 @@ async fn exact_object_inventory_classification_is_independent_of_load_order() {
                 .all(|row| row.upstream.object_type == MvDependencyObjectType::MaterializedView)
         );
         repository
-            .replace_projection(
+            .install_keyed_projection(
                 uuid::Uuid::now_v7(),
-                ReplaceMvProjectionRequest {
-                    mv_id: upstream.projection.mv_id,
-                    expected_version: upstream.version,
-                    projection: tests_definition::projection_request(
-                        "orders",
-                        b"replacement-object",
-                        4,
-                        "other",
-                    ),
-                },
+                tests_definition::projection_facts("orders", b"replacement-object", 4, "other"),
+                Some({
+                    let mut expected = upstream.clone();
+                    expected.version = (upstream.version).clone();
+                    expected
+                }),
             )
             .await
             .unwrap();
         let rows = repository
-            .list_dependencies_by_downstream(downstream.projection.mv_id)
+            .list_keyed_dependencies_by_downstream(&downstream)
             .await
             .unwrap();
         assert!(
@@ -160,9 +159,10 @@ async fn incomplete_or_failed_inventory_never_returns_external_classification() 
     use novarocks_state_store_testkit::conformance::FaultInjectingStateStore;
     let (store, repository) = tests_definition::repository().await;
     let downstream = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            tests_definition::projection_request("downstream", b"downstream", 3, "orders"),
+            tests_definition::projection_facts("downstream", b"downstream", 3, "orders"),
+            None,
         )
         .await
         .unwrap();
@@ -177,7 +177,7 @@ async fn incomplete_or_failed_inventory_never_returns_external_classification() 
     ));
     assert!(
         failing
-            .list_dependencies_by_downstream(downstream.projection.mv_id)
+            .list_keyed_dependencies_by_downstream(&downstream)
             .await
             .is_err()
     );
@@ -198,7 +198,7 @@ async fn incomplete_or_failed_inventory_never_returns_external_classification() 
     assert!(matches!(write.commit().await, CommitOutcome::Committed(_)));
     assert!(
         repository
-            .list_dependencies_by_downstream(downstream.projection.mv_id)
+            .list_keyed_dependencies_by_downstream(&downstream)
             .await
             .is_err()
     );
@@ -209,21 +209,23 @@ async fn exact_catalog_object_match_is_not_lost_when_binding_name_differs() {
     use crate::dependency::{MvDependencyObjectType, MvDependencyStorageEngine};
     let (_, repository) = tests_definition::repository().await;
     repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            tests_definition::projection_request("renamed_orders", b"base-orders", 1, "other"),
+            tests_definition::projection_facts("renamed_orders", b"base-orders", 1, "other"),
+            None,
         )
         .await
         .unwrap();
     let downstream = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            tests_definition::projection_request("downstream", b"downstream", 3, "orders"),
+            tests_definition::projection_facts("downstream", b"downstream", 3, "orders"),
+            None,
         )
         .await
         .unwrap();
     let rows = repository
-        .list_dependencies_by_downstream(downstream.projection.mv_id)
+        .list_keyed_dependencies_by_downstream(&downstream)
         .await
         .unwrap();
     assert!(rows.iter().all(|row| row.upstream.object_type
@@ -240,14 +242,15 @@ async fn missing_occurrence_index_is_detected_against_the_same_inventory_snapsho
     use novarocks_state_store_api::{CommitOutcome, Precondition, StateStore};
     let (store, repository) = tests_definition::repository().await;
     let downstream = repository
-        .create_projection(
+        .install_keyed_projection(
             uuid::Uuid::now_v7(),
-            tests_definition::projection_request("downstream", b"downstream", 3, "orders"),
+            tests_definition::projection_facts("downstream", b"downstream", 3, "orders"),
+            None,
         )
         .await
         .unwrap();
     let rows = repository
-        .list_dependencies_by_downstream(downstream.projection.mv_id)
+        .list_keyed_dependencies_by_downstream(&downstream)
         .await
         .unwrap();
     let row = &rows[0];
@@ -270,7 +273,7 @@ async fn missing_occurrence_index_is_detected_against_the_same_inventory_snapsho
     assert!(matches!(write.commit().await, CommitOutcome::Committed(_)));
     assert!(
         repository
-            .list_dependencies_by_downstream(downstream.projection.mv_id)
+            .list_keyed_dependencies_by_downstream(&downstream)
             .await
             .unwrap_err()
             .to_string()

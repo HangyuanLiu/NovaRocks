@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Borrowed structural preflight of the closed StoredMvProjectionV3 datum.
+//! Borrowed structural preflight of the registered keyed projection datum.
 //! The envelope's registered schema and fingerprint are checked by the caller.
 //! No Avro Value, ByteBuf or document model exists until this check succeeds.
 
-use crate::persistence::codec::preflight_current_document_set;
 use crate::persistence::validation::PersistenceDecodeBudget;
 
-pub(super) fn projection_v3(
+pub(super) fn projection(
     payload: &[u8],
     budget: PersistenceDecodeBudget,
+    version_four: bool,
 ) -> Result<PersistenceDecodeBudget, String> {
     let mut input = Datum { remaining: payload };
     input.long()?; // mv_id
@@ -48,6 +48,14 @@ pub(super) fn projection_v3(
     input.string()?;
     input.string()?;
     input.string()?;
+    let binding = if version_four {
+        let binding = input.optional(Datum::bytes)?;
+        input.optional(Datum::long)?;
+        input.optional(Datum::long)?;
+        binding
+    } else {
+        None
+    };
     if !input.remaining.is_empty() {
         return Err("MV Accelerator Avro payload has trailing bytes".into());
     }
@@ -68,15 +76,40 @@ pub(super) fn projection_v3(
         max_working_set_bytes: available,
         ..budget
     };
-    preflight_current_document_set(
-        definition,
-        interpretation,
-        publication,
-        configuration,
-        documents,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(documents)
+    if let Some(binding) = binding {
+        for content in [definition, interpretation, configuration, binding] {
+            if content.len() > documents.max_document_bytes {
+                return Err("keyed MV cache document exceeds decode bound".into());
+            }
+        }
+        if publication.is_some_and(|p| p.len() > 4096) {
+            return Err("keyed MV publication exceeds record bound".into());
+        }
+        if [
+            definition.len(),
+            interpretation.len(),
+            configuration.len(),
+            binding.len(),
+            publication.map_or(0, |p| p.len()),
+        ]
+        .into_iter()
+        .sum::<usize>()
+            > crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES
+        {
+            return Err("keyed MV document set exceeds decode bound".into());
+        }
+        crate::persistence::codec::keyed::preflight_keyed_document_set(
+            definition,
+            interpretation,
+            binding,
+            configuration,
+            publication,
+            documents,
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(documents);
+    }
+    Err("legacy MV projection has no keyed binding".into())
 }
 
 /// The registered dependency V3 is a fixed record, with no collections.

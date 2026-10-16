@@ -812,7 +812,8 @@ pub struct FrontendApplicationHost {
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
     abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
-    mv_repository: Option<Arc<dyn novarocks_mv_application::repository::MvRepository>>,
+    mv_repository:
+        Option<Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository>>,
     state_store_host: Option<StateStoreHost>,
     query_runtime: FrontendQueryRuntimeConfig,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
@@ -1644,8 +1645,9 @@ impl FrontendApplicationHost {
         match host.state_store() {
             Some(store) => match StateStoreMvRepository::open(store, host.run_policy()).await {
                 Ok(repository) => {
-                    let repository: Arc<dyn novarocks_mv_application::repository::MvRepository> =
-                        repository;
+                    let repository: Arc<
+                        novarocks_mv_application::state_store_repository::StateStoreMvRepository,
+                    > = repository;
                     host.mv_repository = Some(repository);
                 }
                 Err(error) => {
@@ -1788,8 +1790,10 @@ impl FrontendApplicationHost {
     /// retains a parallel MV repository capability.
     pub(crate) fn take_mv_repository_for_role_product_construction(
         &mut self,
-    ) -> Result<Arc<dyn novarocks_mv_application::repository::MvRepository>, FrontendApplicationError>
-    {
+    ) -> Result<
+        Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository>,
+        FrontendApplicationError,
+    > {
         self.mv_repository.take().ok_or_else(|| {
             FrontendApplicationError::server(
                 "frontend MV repository was already transferred or was never installed",

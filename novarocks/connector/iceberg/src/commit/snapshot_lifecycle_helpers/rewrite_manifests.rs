@@ -32,13 +32,14 @@
 //! * ADDED + EXISTING entries become EXISTING in the merged manifest
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{
     DataFile, DataFileBuilder, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestStatus, ManifestWriterBuilder, Operation, SnapshotReference, SnapshotRetention,
-    Summary,
+    ManifestStatus, ManifestWriterBuilder, Operation, Summary,
 };
 use crate::iceberg::{TableRequirement, TableUpdate};
 
@@ -80,9 +81,6 @@ fn clone_data_file_with_first_row_id(
 fn finalize_snapshot_summary(
     mut properties: HashMap<String, String>,
     previous: Option<&Summary>,
-    table_uuid: uuid::Uuid,
-    previous_snapshot_id: i64,
-    new_snapshot_id: i64,
 ) -> Result<HashMap<String, String>, crate::iceberg::Error> {
     const TOTALS: [(&str, &str, &str); 6] = [
         ("total-data-files", "added-data-files", "deleted-data-files"),
@@ -136,69 +134,19 @@ fn finalize_snapshot_summary(
         "engine-version".to_string(),
         env!("CARGO_PKG_VERSION").to_string(),
     );
-    if let Some(document_manifest) = previous.and_then(|summary| {
-        summary
-            .additional_properties
-            .get(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
-    }) {
-        let mut manifest =
-            crate::document_storage::codec::decode_document_manifest(document_manifest.as_bytes())
-                .map_err(document_manifest_error)?;
-        let previous_output_version =
-            crate::document_storage::observation::output_committed_version(
-                table_uuid,
-                previous_snapshot_id,
-            )
-            .map_err(document_manifest_error)?;
-        let output_version = crate::document_storage::observation::output_committed_version(
-            table_uuid,
-            new_snapshot_id,
-        )
-        .map_err(document_manifest_error)?;
-        let mut rebound = false;
-        for document in &mut manifest.documents {
-            if let crate::document_storage::envelope::IcebergDocumentAttachmentV1::ExactOutput {
-                committed_version,
-                snapshot_id,
-            } = &mut document.attachment
-                && *snapshot_id == Some(previous_snapshot_id)
-            {
-                if committed_version.as_slice() != previous_output_version.payload().as_ref() {
-                    return Err(crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        "Iceberg rewrite document attachment does not match the rewritten table UUID and snapshot",
-                    ));
-                }
-                *committed_version = output_version.payload().to_vec();
-                *snapshot_id = Some(new_snapshot_id);
-                rebound = true;
+    if let Some(previous) = previous {
+        for (key, value) in &previous.additional_properties {
+            if key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX) {
+                crate::document_storage::keyed::record::decode_record(key, value)
+                    .map_err(keyed_record_error)?;
+                properties.insert(key.clone(), value.clone());
             }
         }
-        if !rebound {
-            return Err(crate::iceberg::Error::new(
-                crate::iceberg::ErrorKind::DataInvalid,
-                "Iceberg rewrite document manifest has no exact-output attachment bound to the rewritten snapshot",
-            ));
-        }
-        let document_manifest = crate::document_storage::codec::encode_document_manifest(&manifest)
-            .map_err(document_manifest_error)?;
-        let document_manifest = String::from_utf8(document_manifest.to_vec()).map_err(|error| {
-            crate::iceberg::Error::new(
-                crate::iceberg::ErrorKind::DataInvalid,
-                format!("encode Iceberg rewrite document manifest as UTF-8: {error}"),
-            )
-        })?;
-        properties.insert(
-            crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-            document_manifest,
-        );
     }
     Ok(properties)
 }
 
-fn document_manifest_error(
-    error: novarocks_spi::connector::ConnectorError,
-) -> crate::iceberg::Error {
+fn keyed_record_error(error: novarocks_spi::connector::ConnectorError) -> crate::iceberg::Error {
     crate::iceberg::Error::new(
         crate::iceberg::ErrorKind::DataInvalid,
         format!("rewrite Iceberg document manifest: {error}"),
@@ -413,11 +361,7 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
         use crate::commit::staging::PreparedChange;
         let metadata = view.metadata();
         view.artifacts().check_active()?;
-        crate::document_storage::observation::validate_managed_rewrite_attachment(metadata)
-            .map_err(|error| {
-                crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.message())
-                    .with_source(error)
-            })?;
+        let carry = crate::commit::slot_change::carry_records_and_closure(metadata)?;
         let parent = metadata.snapshot_for_ref(intent.target_ref());
         let no_op = || PreparedChange {
             requirements: vec![TableRequirement::RefSnapshotIdMatch {
@@ -508,11 +452,8 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                 ),
             ]),
             Some(parent.summary()),
-            metadata.uuid(),
-            parent.snapshot_id(),
-            snapshot_id,
         )?;
-        crate::commit::overwrite::prepare_snapshot_change(
+        let mut change = crate::commit::overwrite::prepare_snapshot_change(
             view,
             intent,
             snapshot_id,
@@ -521,7 +462,22 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
             properties,
             false,
         )
-        .await
+        .await?;
+        if !carry.properties.is_empty() {
+            change.updates.push(TableUpdate::SetProperties {
+                updates: carry.properties,
+            });
+        }
+        crate::document_storage::keyed::write::trace_updates(
+            metadata.properties(),
+            &change.updates,
+            carry
+                .summary
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum(),
+        );
+        Ok(change)
     }
 }
 
@@ -537,109 +493,326 @@ fn rewrite_error(message: &str) -> crate::iceberg::Error {
 }
 
 #[cfg(test)]
-mod document_attachment_tests {
+mod keyed_record_tests {
     use super::*;
-
-    fn exact_manifest(table_uuid: uuid::Uuid, snapshot_id: i64) -> String {
-        let content = vec![1, 2, 3];
-        let committed_version =
-            crate::document_storage::observation::output_committed_version(table_uuid, snapshot_id)
-                .unwrap();
-        let manifest = crate::document_storage::envelope::IcebergDocumentManifestV1 {
-            version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
-            documents: vec![
-                crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
-                    version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
-                    owner: "novarocks.mv".to_string(),
-                    name: "definition".to_string(),
-                    format_owner: "novarocks.mv".to_string(),
-                    format_name: "definition".to_string(),
-                    format_version: 1,
-                    revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
-                        &content,
-                    )
-                    .to_bytes(),
-                    encoded_len: content.len() as u64,
-                    references: Vec::new(),
-                    attachment:
-                        crate::document_storage::envelope::IcebergDocumentAttachmentV1::ExactOutput {
-                            committed_version: committed_version.payload().to_vec(),
-                            snapshot_id: Some(snapshot_id),
-                        },
-                    carrier:
-                        crate::document_storage::envelope::IcebergDocumentCarrierV1::Available {
-                            content,
-                        },
-                },
-            ],
+    #[test]
+    fn rewrite_summary_carries_exact_record_bytes_and_refuses_malformed_current_record() {
+        let record = novarocks_spi::connector::ConnectorSnapshotRecord {
+            owner: "example.application".into(),
+            name: "state".into(),
+            binding: None,
+            payload: bytes::Bytes::from_static(b"opaque-state"),
         };
-        String::from_utf8(
-            crate::document_storage::codec::encode_document_manifest(&manifest)
-                .expect("manifest")
-                .to_vec(),
-        )
-        .expect("UTF-8")
+        let key = crate::document_storage::keyed::keys::record_key(&record.owner, &record.name);
+        let value = crate::document_storage::keyed::record::encode_record(&record).unwrap();
+        let mut previous = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(key.clone(), value.clone())]),
+        };
+        let rewritten = finalize_snapshot_summary(HashMap::new(), Some(&previous)).unwrap();
+        assert_eq!(rewritten.get(&key), Some(&value));
+        previous
+            .additional_properties
+            .insert(key, "malformed".into());
+        assert!(finalize_snapshot_summary(HashMap::new(), Some(&previous),).is_err());
     }
 
-    #[test]
-    fn rewrite_snapshot_rebinds_the_document_attachment_to_its_new_version() {
-        let table_uuid = uuid::Uuid::new_v4();
-        let previous = Summary {
-            operation: Operation::Append,
-            additional_properties: HashMap::from([(
-                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-                exact_manifest(table_uuid, 41),
-            )]),
-        };
-        let rewritten =
-            finalize_snapshot_summary(HashMap::new(), Some(&previous), table_uuid, 41, 99)
-                .expect("rebind manifest");
-        let rebound = crate::document_storage::codec::decode_document_manifest(
-            rewritten
-                .get(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
-                .expect("manifest")
-                .as_bytes(),
-        )
-        .expect("decode");
-        let expected =
-            crate::document_storage::observation::output_committed_version(table_uuid, 99).unwrap();
-        assert!(matches!(
-            &rebound.documents[0].attachment,
-            crate::document_storage::envelope::IcebergDocumentAttachmentV1::ExactOutput {
-                committed_version,
-                snapshot_id: Some(99),
-            } if committed_version.as_slice() == expected.payload().as_ref()
-        ));
+    struct RewriteArtifacts {
+        io: FileIO,
+        token: crate::commit::model::OperationToken,
+        attempt: Mutex<crate::commit::model::AttemptToken>,
+        ledger: Mutex<crate::commit::model::ArtifactLedger>,
+    }
+    impl RewriteArtifacts {
+        fn new() -> Self {
+            let token = crate::commit::model::OperationToken::from_write(
+                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([41; 16]),
+            );
+            Self {
+                io: FileIO::new_with_memory(),
+                token,
+                attempt: Mutex::new(crate::commit::model::AttemptToken::new(token, 0)),
+                ledger: Mutex::new(crate::commit::model::ArtifactLedger::new(token)),
+            }
+        }
+    }
+    impl crate::commit::model::ArtifactWriter for RewriteArtifacts {
+        fn file_io(&self) -> &FileIO {
+            &self.io
+        }
+        fn allocate(
+            &self,
+            class: crate::commit::model::ArtifactClass,
+            kind: crate::commit::model::ArtifactKind,
+        ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
+            use crate::commit::model::*;
+            let mut ledger = self.ledger.lock().unwrap();
+            let object = ObjectIdentity::new(format!(
+                "memory://rewrite/staged-{}.{}",
+                ledger.records().count(),
+                kind.extension()
+            ))?;
+            ledger.register(ArtifactRecord {
+                object: object.clone(),
+                class,
+                attempt: (class == ArtifactClass::Attempt).then_some(self.attempt_token()),
+                write_state: ArtifactWriteState::Allocated,
+            })?;
+            Ok(object)
+        }
+        fn attempt_token(&self) -> crate::commit::model::AttemptToken {
+            *self.attempt.lock().unwrap()
+        }
+        fn check_active(&self) -> crate::iceberg::Result<()> {
+            Ok(())
+        }
+        fn snapshot_artifacts(
+            &self,
+            references: &[crate::commit::model::ObjectIdentity],
+        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
+            self.ledger
+                .lock()
+                .unwrap()
+                .snapshot_for_attempt(self.attempt_token(), references.iter().cloned())
+        }
     }
 
-    #[test]
-    fn rewrite_snapshot_rejects_a_stale_document_attachment() {
-        let table_uuid = uuid::Uuid::new_v4();
-        let previous = Summary {
-            operation: Operation::Append,
-            additional_properties: HashMap::from([(
-                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-                exact_manifest(table_uuid, 40),
-            )]),
+    #[tokio::test]
+    async fn staged_rewrite_carries_record_closure_with_base_cas_and_reuses_operation_manifests() {
+        use crate::commit::model::*;
+        use crate::commit::staging::{StagingBase, StagingEngine};
+        use crate::document_storage::keyed::{envelope, keys, record};
+        use crate::iceberg::spec::*;
+        use crate::iceberg::{NamespaceIdent, TableIdent};
+        use bytes::Bytes;
+        use novarocks_spi::connector::{
+            ConnectorDocumentFormat, ConnectorDocumentVersion, ConnectorSnapshotRecord,
+            DocumentIdentity,
         };
-        assert!(
-            finalize_snapshot_summary(HashMap::new(), Some(&previous), table_uuid, 41, 99,)
-                .is_err()
+
+        let artifacts = RewriteArtifacts::new();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let version = |name: &str, refs, payload: &'static [u8]| {
+            ConnectorDocumentVersion::try_new(
+                "novarocks.mv",
+                name,
+                ConnectorDocumentFormat::try_new("novarocks.mv", name, 1).unwrap(),
+                refs,
+                Bytes::from_static(payload),
+            )
+            .unwrap()
+        };
+        let d = version("definition", vec![], b"definition");
+        let l = version(
+            "interpretation",
+            vec![("definition".into(), d.identity())],
+            b"layout",
         );
-    }
-
-    #[test]
-    fn rewrite_snapshot_rejects_a_foreign_committed_output_version() {
-        let table_uuid = uuid::Uuid::new_v4();
-        let previous = Summary {
-            operation: Operation::Append,
-            additional_properties: HashMap::from([(
-                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-                exact_manifest(uuid::Uuid::new_v4(), 41),
-            )]),
+        let b = version(
+            "binding",
+            vec![
+                ("definition".into(), d.identity()),
+                ("interpretation".into(), l.identity()),
+            ],
+            b"binding",
+        );
+        let mut expected_closure = [&d, &l, &b]
+            .into_iter()
+            .map(|version| {
+                (
+                    keys::version_key(version.identity()),
+                    envelope::encode_version(version).unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let root = keys::root_key("novarocks.mv");
+        let mut setup = expected_closure.clone();
+        setup.insert(root.clone(), DocumentIdentity::from_bytes([9; 32]).to_hex());
+        expected_closure.insert(root.clone(), b.identity().to_hex());
+        let expected_records = [
+            ConnectorSnapshotRecord {
+                owner: "novarocks.mv".into(),
+                name: "publication".into(),
+                binding: Some(b.identity()),
+                payload: Bytes::from_static(b"publication"),
+            },
+            ConnectorSnapshotRecord {
+                owner: "novarocks.test".into(),
+                name: "annotation".into(),
+                binding: None,
+                payload: Bytes::from_static(b"annotation"),
+            },
+        ]
+        .into_iter()
+        .map(|entry| {
+            (
+                keys::record_key(&entry.owner, &entry.name),
+                record::encode_record(&entry).unwrap(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+        let base = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://rewrite/table".into(),
+            FormatVersion::V2,
+            setup,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let target = TableTarget {
+            ident: TableIdent::new(NamespaceIdent::new("db".into()), "t".into()),
+            uuid: Some(base.uuid()),
         };
-        assert!(
-            finalize_snapshot_summary(HashMap::new(), Some(&previous), table_uuid, 41, 99).is_err()
+        let seed_intent = OperationIntent::new(OperationIntentParts {
+            target: target.clone(),
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges::default(),
+            dependencies: vec![Dependency::NoReadDependency],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: BTreeMap::new(),
+            token: artifacts.token,
+        })
+        .unwrap();
+        let mut sources = Vec::new();
+        // Real Avro files feed the production preparer; this is staging evidence,
+        // not a catalog dispatch or native-runtime publication claim.
+        for index in 0..2 {
+            let mut writer = ManifestWriterBuilder::new(
+                artifacts
+                    .io
+                    .new_output(format!("memory://rewrite/source-{index}.avro"))
+                    .unwrap(),
+                Some(77),
+                base.current_schema().clone(),
+                base.default_partition_spec().as_ref().clone(),
+            )
+            .build_v2_data();
+            writer
+                .add_existing_file(
+                    DataFileBuilder::default()
+                        .content(DataContentType::Data)
+                        .file_path(format!("memory://rewrite/data-{index}.parquet"))
+                        .file_format(DataFileFormat::Parquet)
+                        .partition(Struct::empty())
+                        .partition_spec_id(0)
+                        .record_count(1)
+                        .file_size_in_bytes(10)
+                        .build()
+                        .unwrap(),
+                    77,
+                    1,
+                    Some(1),
+                )
+                .unwrap();
+            sources.push(writer.write_manifest_file().await.unwrap());
+        }
+        let existing = |metadata| StagingBase::Existing {
+            metadata,
+            metadata_location: "memory://rewrite/table/metadata/base.metadata.json".into(),
+        };
+        let mut seed = StagingEngine::begin(existing(base), &seed_intent, &artifacts).unwrap();
+        let mut seed_summary = expected_records.clone();
+        seed_summary.insert("added-data-files".into(), "2".into());
+        seed_summary.insert("added-records".into(), "2".into());
+        let change = crate::commit::overwrite::prepare_snapshot_change(
+            &seed.view(),
+            &seed_intent,
+            77,
+            Operation::Append,
+            sources,
+            seed_summary,
+            false,
+        )
+        .await
+        .unwrap();
+        seed.stage_change(change).unwrap();
+        let parent = seed.metadata().clone();
+        let intent = OperationIntent::new(OperationIntentParts {
+            target,
+            target_ref: "main".into(),
+            start: Some(StartSnapshot {
+                snapshot_id: 77,
+                sequence_number: 1,
+            }),
+            changes: FileChanges::default(),
+            dependencies: vec![Dependency::RefUnchanged],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: BTreeMap::new(),
+            token: artifacts.token,
+        })
+        .unwrap();
+        let preparer = RewriteManifestsPreparer::new();
+        let mut paths = Vec::new();
+        let mut lists = Vec::new();
+        for attempt in 1..=2 {
+            *artifacts.attempt.lock().unwrap() = AttemptToken::new(artifacts.token, attempt);
+            let mut engine =
+                StagingEngine::begin(existing(parent.clone()), &intent, &artifacts).unwrap();
+            engine.stage(&preparer).await.unwrap();
+            let after = engine.metadata().clone();
+            let snapshot = after.current_snapshot().unwrap();
+            assert_eq!(snapshot.summary().operation, Operation::Replace);
+            for (key, value) in &expected_records {
+                assert_eq!(
+                    snapshot.summary().additional_properties.get(key),
+                    Some(value)
+                );
+            }
+            assert_eq!(after.properties().get(&root), Some(&b.identity().to_hex()));
+            let list = crate::manifest::load_manifest_list(snapshot, &artifacts.io, &after)
+                .await
+                .unwrap();
+            assert_eq!(list.entries().len(), 1);
+            paths.push(list.entries()[0].manifest_path.clone());
+            lists.push(snapshot.manifest_list().to_string());
+            let merged = ObjectIdentity::new(paths.last().unwrap().clone()).unwrap();
+            let request = engine.freeze(std::slice::from_ref(&merged)).unwrap();
+            assert_eq!(request.artifacts().operation_references(), &[merged]);
+            assert!(
+                request
+                    .requirements()
+                    .contains(&TableRequirement::UuidMatch {
+                        uuid: parent.uuid()
+                    })
+            );
+            let cas = TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".into(),
+                snapshot_id: Some(77),
+            };
+            assert_eq!(request.requirements().iter().filter(|requirement|
+                matches!(requirement, TableRequirement::RefSnapshotIdMatch { r#ref, .. } if r#ref == "main")
+            ).collect::<Vec<_>>(), vec![&cas]);
+            assert!(cas.check(Some(&parent)).is_ok());
+            assert!(cas.check(Some(&after)).is_err());
+            assert!(request.updates().iter().any(|update| matches!(update,
+                TableUpdate::SetProperties { updates } if updates == &expected_closure)));
+        }
+        assert_eq!(
+            paths[0], paths[1],
+            "The operation reuses its merged manifest"
+        );
+        assert_ne!(lists[0], lists[1], "Each attempt owns a new manifest-list");
+        let ledger = artifacts.ledger.lock().unwrap();
+        assert_eq!(
+            ledger
+                .records()
+                .filter(|entry| entry.class == ArtifactClass::Operation)
+                .count(),
+            1
         );
     }
 }

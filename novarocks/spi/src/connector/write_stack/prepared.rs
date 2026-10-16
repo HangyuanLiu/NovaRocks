@@ -109,6 +109,37 @@ impl PreparedWriteSetLedger {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriteRowCountAccumulator(u64);
 
+/// Exact change to the target's visible cardinality, independent of the
+/// number of input rows its writers accepted. Replacing a row contributes
+/// one insertion and one deletion, and therefore changes no cardinality.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteRowChange {
+    Replace(u64),
+    Delta { inserted: u64, deleted: u64 },
+}
+
+impl ConnectorWriteRowChange {
+    /// Apply only to the logical count of the exact admitted target version.
+    /// An unknown prior count stays unknown until a complete replacement.
+    pub fn apply(self, previous: Option<u64>) -> Result<Option<u64>, ConnectorError> {
+        match self {
+            Self::Replace(rows) => Ok(Some(rows)),
+            Self::Delta { inserted, deleted } => previous
+                .map(|rows| {
+                    // Subtract first so a cardinality-preserving replacement
+                    // cannot overflow an otherwise representable final count.
+                    rows.checked_sub(deleted)
+                        .and_then(|rows| rows.checked_add(inserted))
+                        .ok_or_else(|| ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "prepared logical row change exceeds the admitted target cardinality",
+                        ))
+                })
+                .transpose(),
+        }
+    }
+}
+
 impl WriteRowCountAccumulator {
     pub const fn new() -> Self {
         Self(0)
@@ -200,6 +231,73 @@ impl ConnectorPreparedWriteSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_cardinality_uses_net_effect_and_preserves_unknown() {
+        use ConnectorWriteRowChange::{Delta, Replace};
+        assert_eq!(
+            Delta {
+                inserted: 1,
+                deleted: 0
+            }
+            .apply(Some(2))
+            .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            Delta {
+                inserted: 0,
+                deleted: 2
+            }
+            .apply(Some(3))
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            Delta {
+                inserted: 1,
+                deleted: 1
+            }
+            .apply(Some(u64::MAX))
+            .unwrap(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            Delta {
+                inserted: 0,
+                deleted: 0
+            }
+            .apply(Some(3))
+            .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            Delta {
+                inserted: 1,
+                deleted: 0
+            }
+            .apply(None)
+            .unwrap(),
+            None
+        );
+        assert_eq!(Replace(0).apply(None).unwrap(), Some(0));
+        assert!(
+            Delta {
+                inserted: 0,
+                deleted: 2
+            }
+            .apply(Some(1))
+            .is_err()
+        );
+        assert!(
+            Delta {
+                inserted: 1,
+                deleted: 0
+            }
+            .apply(Some(u64::MAX))
+            .is_err()
+        );
+    }
     use crate::connector::write_stack::runtime::{ConnectorWriteBinding, OpaqueWritePayload};
     use crate::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,

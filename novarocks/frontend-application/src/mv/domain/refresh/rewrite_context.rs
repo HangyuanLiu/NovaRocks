@@ -29,7 +29,7 @@ use crate::mv::domain::rewrite::context::{
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::{
-    projection::StoredMvProjection, runtime_bindings::MvExactTargetSchemaFacts,
+    keyed_documents::StoredKeyedMvProjection, runtime_bindings::MvExactTargetSchemaFacts,
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
@@ -74,7 +74,7 @@ pub fn admitted_change_facts(
     reason = "The frozen MV context retains independent source schema, complete types and original publication facts."
 )]
 pub fn build_neutral_refresh_rewrite_context(
-    projection: Arc<StoredMvProjection>,
+    projection: Arc<StoredKeyedMvProjection>,
     current: Vec<MvRewriteSourceSnapshot>,
     previous: Vec<MvRewriteSourceSnapshot>,
     target_table_uuid: String,
@@ -102,7 +102,7 @@ pub fn build_neutral_refresh_rewrite_context(
 pub(crate) struct RefreshRewriteInputs<'a> {
     pub connector_control: &'a dyn ConnectorControlRegistry,
     pub connector_context: &'a ConnectorRequestContext,
-    pub projection: Arc<StoredMvProjection>,
+    pub projection: Arc<StoredKeyedMvProjection>,
     pub pin: &'a RefreshSnapshotPin,
     pub state_baseline: &'a RefreshStateBaseline,
     pub target_binding: &'a MvTargetBinding,

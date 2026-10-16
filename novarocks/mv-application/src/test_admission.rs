@@ -29,7 +29,7 @@ use bytes::Bytes;
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
     ConnectorDocumentManagementOperation, ConnectorDocumentStorageBinding,
-    ConnectorDocumentStorageManagement, ConnectorPrepareDocumentsRequest,
+    ConnectorDocumentStorageManagement,
 };
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorInstanceDescriptor,
@@ -73,13 +73,6 @@ impl ConnectorDocumentStorageManagement for AdmittingManagement {
         _request: ConnectorDocumentManagementAdmissionRequest,
     ) -> Result<Bytes, ConnectorError> {
         Ok(Bytes::from_static(b"test-admission-token"))
-    }
-
-    fn prepare_documents(
-        &self,
-        _request: ConnectorPrepareDocumentsRequest,
-    ) -> Result<Bytes, ConnectorError> {
-        Ok(Bytes::from_static(b"test-prepared-token"))
     }
 }
 

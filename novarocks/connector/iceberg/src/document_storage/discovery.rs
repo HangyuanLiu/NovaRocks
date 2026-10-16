@@ -2,7 +2,18 @@
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0.
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -85,7 +96,7 @@ pub(crate) fn discover(
     storage: &IcebergDocumentStorage,
     request: &ConnectorDocumentDiscoveryRequest,
 ) -> Result<ConnectorDocumentDiscoveryPage, ConnectorError> {
-    super::io::check_context(request.context())?;
+    super::context::check_context(request.context())?;
     let namespace = request.namespace().ok_or_else(|| {
         ConnectorError::new(
             ConnectorErrorKind::Unsupported,
@@ -99,7 +110,7 @@ pub(crate) fn discover(
     let namespace_name = crate::catalog::CatalogNamespaceName::new(namespace.clone());
     let page_size = request.page_size();
     loop {
-        super::io::check_context(request.context())?;
+        super::context::check_context(request.context())?;
         work.consume_page()?;
         let catalog = Arc::clone(storage.runtime().novarocks_catalog());
         let page_namespace = namespace_name.clone();
@@ -132,21 +143,23 @@ pub(crate) fn discover(
         }
         let mut items = Vec::with_capacity(page.tables.len());
         for table_name in page.tables {
-            super::io::check_context(request.context())?;
+            super::context::check_context(request.context())?;
             work.consume_table_load()?;
             let physical = storage
                 .runtime()
-                .load_table_classified_for_request(
+                .observe_table_classified_for_request_with_snapshots(
                     &table_name.namespace,
                     &table_name.name,
                     request.context(),
+                    crate::catalog::SnapshotLoading::Refs,
                 )
                 .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
             let table = physical.into_table();
-            let marker = match super::observation::managed_marker(table.metadata()) {
-                Ok(marker) => marker,
-                Err(error) if error.kind() == ConnectorErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
+            let marker = match super::keyed::view::management_marker(table.metadata())
+                .map_err(super::observation::keyed_read_error)?
+            {
+                Some(marker) => marker,
+                None => continue,
             };
             items.push(ConnectorDocumentDiscoveryItem::try_new(
                 ConnectorTableIdentity {
@@ -352,9 +365,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorDocumentStorageBudget,
-        ConnectorDocumentStorageLimits, ConnectorInstanceId, ConnectorProviderBindingKey,
-        ConnectorRequestContext, ProviderBindingEpoch,
+        CatalogHandle, CatalogVersion, ConnectorDocumentDiscoveryBudget, ConnectorInstanceId,
+        ConnectorProviderBindingKey, ConnectorRequestContext, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -369,17 +381,7 @@ mod tests {
             CatalogHandle::new(instance_id, CatalogVersion::from_bytes([2; 32])),
             Some(Arc::from("db")),
             max_items,
-            ConnectorDocumentStorageBudget::new(
-                ConnectorDocumentStorageLimits::try_new(
-                    16,
-                    16,
-                    1024 * 1024,
-                    max_items,
-                    max_items,
-                    64,
-                )
-                .unwrap(),
-            ),
+            ConnectorDocumentDiscoveryBudget::try_new(max_items).unwrap(),
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(30),
                 novarocks_spi::connector::ConnectorStopOwner::new().view(),

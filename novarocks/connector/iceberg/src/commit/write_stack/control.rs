@@ -35,6 +35,7 @@
 //!   recovery evidence. Marker absence during reconciliation is *not* proof of
 //!   non-commit, so an unresolved session stays unknown.
 
+mod logical_rows;
 mod publication;
 mod recovery_codec;
 
@@ -43,7 +44,6 @@ use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use base64::Engine;
 use bytes::Bytes;
 use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteBeginRequest, ConnectorWriteFinishRequest, ConnectorWriteSessionAbortRequest,
@@ -56,14 +56,14 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorManagedPublicationIntent, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
-    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
-    StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteReceipt,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, ProviderBindingEpoch, StatisticsArtifactIdentity,
+    StatisticsRequiredAggregation, StatisticsScanColumn,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,15 +72,13 @@ use crate::catalog::error::CatalogOutcome;
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
-    IcebergEmptyWriteDecision, IcebergManagedPublicationFacts, IcebergManagedPublicationProvenance,
-    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
-    IcebergWriterOutput, corrupt, invalid,
+    IcebergEmptyWriteDecision, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
+    IcebergWriteTableFacts, IcebergWriterOutput, corrupt, invalid,
 };
 use crate::commit::write_stack::flavor::{
     IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, IcebergSessionMaterial,
     plan_copy_on_write_branches, plan_distributed_rewrite_branches,
-    plan_document_publication_branches, plan_managed_publication_branches, plan_ordinary_branches,
-    plan_row_mutation_branches,
+    plan_document_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
@@ -98,7 +96,7 @@ use crate::write_descriptor::decode_partition_descriptor;
 pub const ICEBERG_WRITE_SESSION_MARKER_PROPERTY: &str = "novarocks.write.session.v1";
 
 /// The evidence schema version this control produces and accepts.
-pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 3;
+pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 4;
 
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
@@ -809,94 +807,24 @@ fn permits_fresh_eager_attempt(
     )
 }
 
-/// The summary properties the single external commit stamps onto its snapshot.
-///
-/// Two things are recorded, and each exists because something later reads it
-/// back off the snapshot rather than out of memory:
-///
-/// * the write-session marker, which is the only proof available to
-///   reconciliation after an unknown outcome;
-/// * a managed publication's durable provenance, whose publication id is what
-///   the publication fence matches when it fast-forwards a staged refresh
-///   (`commit::snapshot_matches_publication_marker`). A publication that
-///   committed without it would strand its own snapshot.
-///
-/// `staged_data_rows` seeds the provenance row count. The commit action
-/// replaces it with the committed snapshot's real `total-records`, so it is a
-/// starting value rather than a claim.
+/// The write-session marker proves the session's commit during reconciliation.
+/// Application document records are bound separately to the exact commit.
 #[cfg(test)]
 pub(crate) fn session_snapshot_properties(
     handle: &IcebergCommitHandle,
-    staged_data_rows: u64,
 ) -> Result<BTreeMap<String, String>, ConnectorError> {
-    session_snapshot_properties_with_documents(handle, staged_data_rows, None)
+    session_snapshot_properties_for_commit(handle)
 }
 
-fn session_snapshot_properties_with_documents(
+fn session_snapshot_properties_for_commit(
     handle: &IcebergCommitHandle,
-    staged_data_rows: u64,
-    document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
 ) -> Result<BTreeMap<String, String>, ConnectorError> {
     let mut properties = BTreeMap::new();
     properties.insert(
         ICEBERG_WRITE_SESSION_MARKER_PROPERTY.to_string(),
         handle.session_id().to_string(),
     );
-    if let Some(publication) = handle.publication() {
-        for (key, value) in publication
-            .provenance()
-            .to_summary_properties(publication.technique(), staged_data_rows)?
-        {
-            if properties.insert(key, value).is_some() {
-                return Err(internal(
-                    "Iceberg write session marker conflicts with managed snapshot properties",
-                ));
-            }
-        }
-    }
-    if let Some(publication) = document_publication {
-        crate::document_storage::publication::add_pending_snapshot_property(
-            &mut properties,
-            publication,
-        )?;
-    }
     Ok(properties)
-}
-
-fn publication_metadata_updates(
-    repartition: Option<&crate::commit::write_stack::repartition::IcebergPreparedRepartition>,
-    documents: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
-    metadata: &TableMetadata,
-) -> Result<Option<Vec<crate::iceberg::TableUpdate>>, ConnectorError> {
-    let mut updates = repartition.map(|prepared| prepared.metadata_updates().to_vec());
-    let metadata_properties = documents
-        .map(|documents| {
-            crate::document_storage::publication::publication_metadata_properties(
-                documents, metadata,
-            )
-        })
-        .transpose()?
-        .flatten();
-    if let Some(metadata_properties) = metadata_properties {
-        let updates = updates.as_mut().ok_or_else(|| {
-            invalid("metadata-attached publication documents require an atomic managed repartition")
-        })?;
-        match updates.last_mut() {
-            Some(crate::iceberg::TableUpdate::SetProperties { updates }) => {
-                for (key, value) in metadata_properties {
-                    if updates.insert(key, value).is_some() {
-                        return Err(invalid(
-                            "metadata-attached publication documents conflict with repartition properties",
-                        ));
-                    }
-                }
-            }
-            _ => updates.push(crate::iceberg::TableUpdate::SetProperties {
-                updates: metadata_properties,
-            }),
-        }
-    }
-    Ok(updates)
 }
 
 /// The replacement record one copy-on-write commit applies.
@@ -1073,13 +1001,13 @@ impl IcebergWriteSessionControl {
     ///
     /// The session's own state machine is the mutual exclusion: `begin_commit`
     /// latches, so a second `finish_write` cannot dispatch a second snapshot.
-    pub fn commit_prepared_set(
+    pub(crate) fn commit_prepared_set(
         &self,
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
-        document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
+        document_publication: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         #[cfg(feature = "test-controls")]
@@ -1149,6 +1077,24 @@ impl IcebergWriteSessionControl {
             document_publication,
             context,
         );
+        if document_publication.is_some()
+            && let Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure: rejection, ..
+            }) = &mut outcome
+            && rejection.kind() == ConnectorMutationFailureKind::InvalidRequest
+        {
+            let error = crate::document_storage::keyed::write::refusal_with_retained_bytes(
+                &self.runtime,
+                handle.table().namespace(),
+                handle.table().table_name(),
+                context,
+                invalid(rejection.message()),
+            );
+            *rejection = failure(
+                ConnectorMutationFailureKind::InvalidRequest,
+                error.to_string(),
+            );
+        }
         #[cfg(feature = "test-controls")]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),
@@ -1313,7 +1259,7 @@ impl IcebergWriteSessionControl {
         snapshot_id: i64,
         context: &ConnectorRequestContext,
     ) -> Result<Option<u64>, ConnectorError> {
-        if handle.publication().is_none() && handle.document_publication().is_none() {
+        if handle.document_publication().is_none() {
             return Ok(None);
         }
         let facts = handle.table();
@@ -1322,13 +1268,14 @@ impl IcebergWriteSessionControl {
             .invalidate_table_cache(facts.namespace(), facts.table_name());
         let table = self
             .runtime
-            .load_table_for_request(
+            .load_table_for_request_with_snapshots(
                 facts.namespace(),
                 facts.table_name(),
                 &context
                     .clone()
                     .without_vended_credential_lease_sink()
                     .after_external_effect(),
+                crate::catalog::SnapshotLoading::Refs,
             )
             .map_err(|error| internal(error.to_string()))?
             .into_table();
@@ -1385,21 +1332,14 @@ fn publication_row_count_from_metadata(
     metadata: &TableMetadata,
     snapshot_id: i64,
 ) -> Result<Option<u64>, ConnectorError> {
-    if handle.publication().is_none() && handle.document_publication().is_none() {
+    if handle.document_publication().is_none() {
         return Ok(None);
     }
     let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
         internal("committed Iceberg snapshot is absent during managed row-count projection")
     })?;
-    if handle.document_publication().is_some() {
-        let expected_manifest = handle.document_manifest()?.ok_or_else(|| {
-            internal("application-document publication lost its prepared manifest")
-        })?;
-        crate::document_storage::publication::validate_expected_manifest(
-            metadata,
-            snapshot_id,
-            &expected_manifest,
-        )?;
+    if let Some(records) = handle.document_records()? {
+        validate_document_records(snapshot, &records)?;
     }
     snapshot
         .summary()
@@ -1412,6 +1352,21 @@ fn publication_row_count_from_metadata(
                 "committed Iceberg snapshot has an unreadable row count: {error}"
             ))
         })
+}
+
+fn validate_document_records(
+    snapshot: &crate::iceberg::spec::Snapshot,
+    records: &BTreeMap<String, String>,
+) -> Result<(), ConnectorError> {
+    for (key, value) in records {
+        if snapshot.summary().additional_properties.get(key) != Some(value) {
+            return Err(corrupt(format!(
+                "selected publication snapshot {} has mismatching record {key}",
+                snapshot.snapshot_id()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Terminate a session whose empty prepared write set means "do nothing".
@@ -1577,7 +1532,7 @@ impl IcebergWriteSessionControl {
         let known = match journal.catalog_entry_outcome(entry) {
             known @ ExternalMutationOutcome::KnownUncommitted { .. } => return Ok(known),
             known @ ExternalMutationOutcome::KnownCommitted { .. } => {
-                if handle.publication().is_none() && handle.document_publication().is_none() {
+                if handle.document_publication().is_none() {
                     return Ok(known);
                 }
                 Some(known)
@@ -1689,14 +1644,15 @@ impl IcebergWriteSessionControl {
         let Some((snapshot_id, marker_value)) = matched else {
             return Ok(journal.catalog_entry_outcome(entry));
         };
-        if decoded.document_manifest_digest.is_some() {
-            let manifest = handle.document_manifest()?.ok_or_else(|| {
-                corrupt("Iceberg document publication evidence lost its prepared manifest")
-            })?;
-            crate::document_storage::publication::validate_expected_manifest(
-                metadata,
-                snapshot_id,
-                &manifest,
+        if decoded.document_record_digest.is_some() {
+            let records = handle
+                .document_records()?
+                .ok_or_else(|| corrupt("keyed publication evidence lost its exact record bytes"))?;
+            validate_document_records(
+                metadata
+                    .snapshot_by_id(snapshot_id)
+                    .ok_or_else(|| corrupt("selected publication snapshot is absent"))?,
+                &records,
             )?;
         }
         let descriptor = journal
@@ -2135,8 +2091,7 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::StagedCreate(_) => CatalogOperation::CreateTable(
                 crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
             ),
-            ConnectorWriteSessionFlavor::ManagedPublication { .. }
-            | ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
                 CatalogOperation::PublishDocuments
             }
             ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
@@ -2186,6 +2141,16 @@ impl IcebergWriteSessionControl {
             None => {
                 // Begin must observe the catalog after planning, even when FE shares one request cache.
                 let physical = if matches!(
+                    &request.flavor,
+                    ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
+                ) {
+                    self.runtime.observe_table_for_request_with_snapshots(
+                        namespace,
+                        table_name,
+                        &request.context,
+                        crate::catalog::SnapshotLoading::Refs,
+                    )
+                } else if matches!(
                     &request.flavor,
                     ConnectorWriteSessionFlavor::DistributedRewrite { .. }
                 ) {
@@ -2354,7 +2319,7 @@ impl IcebergWriteSessionControl {
             }
             _ => None,
         };
-        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
             &request.flavor
         {
             // A publication's base comes from the publication's own write
@@ -2403,34 +2368,6 @@ impl IcebergWriteSessionControl {
         // the spec the table still has would stage files partitioned against a
         // spec the same commit retires.
         let repartition = match &request.flavor {
-            ConnectorWriteSessionFlavor::ManagedPublication { intent, .. } => intent
-                .partition_spec_replacement()
-                .map(|replacement| {
-                    let prepared = crate::commit::write_stack::repartition::
-                        prepare_managed_repartition(
-                            &metadata,
-                            replacement,
-                            intent.descriptor_properties(),
-                        )?;
-                    // The caller signed the provider's own earlier preview into
-                    // the intent. Re-deriving it here and requiring equality is
-                    // the optimistic-concurrency check: a table whose spec moved
-                    // between preview and admission produces a different result
-                    // and is refused rather than silently repartitioned another
-                    // way.
-                    let expected = intent.expected_committed_partitioning().ok_or_else(|| {
-                        invalid(
-                            "Iceberg managed partition replacement is missing its exact preview partitioning",
-                        )
-                    })?;
-                    if prepared.committed() != expected {
-                        return Err(invalid(
-                            "Iceberg managed partition replacement no longer matches its exact preview partitioning",
-                        ));
-                    }
-                    Ok(prepared)
-                })
-                .transpose()?,
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
                 declaration,
                 ..
@@ -2488,11 +2425,28 @@ impl IcebergWriteSessionControl {
                 ConnectorWriteSessionFlavor::CopyOnWrite { .. }
             ),
         )?;
-        let authored_input = crate::commit::write_preparation::freeze_write_input_request(
-            writer_metadata,
-            &request.input,
-            &request.context,
-        )?;
+        let authored_input = if matches!(
+            &request.flavor,
+            ConnectorWriteSessionFlavor::DistributedRewrite {
+                shape: ConnectorDistributedRewriteShape::PositionDeletes { .. },
+                ..
+            }
+        ) {
+            // The retained rewrite header, exact object/base and groups were
+            // checked above. Only this provider-owned artifact relation uses
+            // file_path/pos; ordinary scan identities are still _file/_pos.
+            crate::commit::write_preparation::freeze_position_delete_rewrite_input(
+                writer_metadata,
+                &request.input,
+                &request.context,
+            )?
+        } else {
+            crate::commit::write_preparation::freeze_write_input_request(
+                writer_metadata,
+                &request.input,
+                &request.context,
+            )?
+        };
         crate::commit::write_preparation::validate_session_write_input_request(
             &request.input,
             &authored_input,
@@ -2552,9 +2506,6 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::Ordinary
             | ConnectorWriteSessionFlavor::StagedCreate(_) => {
                 plan_ordinary_branches(flavor_for(request)?, &material)?
-            }
-            ConnectorWriteSessionFlavor::ManagedPublication { intent, shape } => {
-                plan_managed_publication_branches(&material, publication_facts(intent, *shape)?)?
             }
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } => {
                 plan_document_publication_branches(
@@ -2620,7 +2571,6 @@ impl IcebergWriteSessionControl {
         };
         let IcebergSessionFlavorPlan {
             flavor,
-            publication,
             document_publication,
             rewrite_inputs,
             copy_on_write,
@@ -2633,7 +2583,6 @@ impl IcebergWriteSessionControl {
                 purpose: request.purpose,
                 table: material.table,
                 base_version_digest: request.base.as_ref().map(|base| base.digest()),
-                publication,
                 document_publication,
                 staged_metadata: staged.map(|staged| Arc::new(staged.metadata)),
                 rewrite_inputs,
@@ -2643,6 +2592,17 @@ impl IcebergWriteSessionControl {
                 branches,
             },
         )?;
+        let handle = if handle.document_publication().is_some() {
+            handle.with_frozen_delete_merge_targets(
+                targets
+                    .iter()
+                    .filter(|target| target.branch().writes_deletes())
+                    .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
+                    .collect(),
+            )?
+        } else {
+            handle
+        };
         if let Some(content) = frozen_rewrite {
             if targets.len() != content.groups.len() {
                 return Err(internal(
@@ -3032,70 +2992,6 @@ fn format_version_number(metadata: &TableMetadata) -> u8 {
     }
 }
 
-/// What a publication needs the session to know.
-///
-/// The boundary the publication id must respect is a *destination* boundary,
-/// not a "the provider never holds it" one. The session's writer recipes, its
-/// commit fragments, and every backend that executes them have no use for the
-/// id, and it reaches none of them.
-///
-/// It does reach exactly one thing, and must: the summary of the snapshot this
-/// session's own commit creates. The publication fence adjudicates a staged
-/// refresh by reading `MV_PUBLICATION_ID_PROP` back off that snapshot
-/// (`catalog_control::catalog_mutation` -> `snapshot_matches_publication_marker`),
-/// so a commit that omitted it would publish a snapshot no publication could
-/// ever claim — and would do so silently, because nothing before the fence
-/// looks for the property. Converting the intent's durable facts once, here, is
-/// what keeps the id off the execution path while still putting it where the
-/// fence looks.
-pub(crate) fn publication_facts(
-    intent: &ConnectorManagedPublicationIntent,
-    shape: ConnectorManagedPublicationShape,
-) -> Result<IcebergManagedPublicationFacts, ConnectorError> {
-    let bases = intent
-        .bases()
-        .iter()
-        .map(provenance_base_from_staged_fact)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(invalid)?;
-    Ok(IcebergManagedPublicationFacts::new(
-        intent.technique(),
-        intent.empty_input(),
-        shape,
-        IcebergManagedPublicationProvenance::try_new(
-            intent.publication_id(),
-            bases,
-            intent.definition_fingerprint().to_string(),
-            base64::engine::general_purpose::STANDARD
-                .encode(intent.descriptor_properties().digest()),
-        )?,
-    ))
-}
-
-/// One publication base, in the Iceberg provenance form the snapshot records.
-///
-/// The neutral base object identity stays opaque to everything but this
-/// conversion, which is the only place that is allowed to know it is a
-/// canonical Iceberg table UUID (ADR-0097).
-fn provenance_base_from_staged_fact(
-    base: &novarocks_spi::connector::ConnectorStagedPublicationBaseFact,
-) -> Result<crate::commit::ProvenanceBase, String> {
-    let uuid = std::str::from_utf8(base.object_id.as_bytes())
-        .map_err(|error| format!("Iceberg base object ID is not UTF-8: {error}"))?;
-    let parsed = uuid::Uuid::parse_str(uuid)
-        .map_err(|error| format!("Iceberg base object ID is not a UUID: {error}"))?;
-    if parsed.to_string() != uuid {
-        return Err("Iceberg base object ID is not a canonical UUID".to_string());
-    }
-    Ok(crate::commit::ProvenanceBase {
-        occurrence_id: base.occurrence_id,
-        table_fqn: base.table.to_string(),
-        uuid: uuid.to_string(),
-        from_snapshot: base.from_version,
-        to_snapshot: base.to_version,
-    })
-}
-
 /// Whether this session will seal a delete branch, and therefore has to freeze
 /// the old delete artifacts that branch must supersede.
 pub(crate) fn session_freezes_old_deletes(
@@ -3116,8 +3012,7 @@ pub(crate) fn session_freezes_old_deletes(
         // branch a DML row mutation does, so it must supersede the same old
         // artifacts. One that republishes rows wholesale seals no delete branch
         // at all and has nothing to freeze.
-        ConnectorWriteSessionFlavor::ManagedPublication { shape, .. }
-        | ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
+        ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
             *shape == ConnectorManagedPublicationShape::RowMutation
                 && !matches!(
                     signed,
@@ -3412,6 +3307,24 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         self.begin_cow_original(request, original, existing_caller_upper)
     }
 
+    fn prepared_logical_row_change(
+        &self,
+        commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+        prepared: &ConnectorPreparedWriteSet,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>,
+        ConnectorError,
+    > {
+        validate_context(context)?;
+        let handle = self.adapter.commit_handle(commit)?;
+        let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
+        validate_merged_old_references(&handle.frozen_old_references(), &validated)?;
+        let result = logical_rows::project(handle, &validated)?;
+        validate_context(context)?;
+        Ok(result)
+    }
+
     fn finish_write(
         &self,
         request: ConnectorWriteFinishRequest<'_>,
@@ -3421,14 +3334,15 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             handle.document_publication(),
             &request.publication,
         ) {
-            (
-                Some(frozen),
-                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(intent),
-            ) => {
+            (Some(frozen), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(intent)) => {
                 intent.validate_for(frozen.declaration())?;
-                handle.bind_document_manifest(intent.prepared_documents().provider_token())?;
+                let records = intent.documents.records.iter().map(|record| {
+                    Ok((crate::document_storage::keyed::keys::record_key(&record.owner,&record.name), crate::document_storage::keyed::record::encode_record(record)?))
+                }).collect::<Result<BTreeMap<_,_>,ConnectorError>>()?;
+                handle.bind_document_records(records)?;
                 Some(intent)
             }
+            (None, novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(_)) => return Err(invalid("ordinary write cannot attach keyed publication records")),
             (
                 None,
                 novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
@@ -3436,14 +3350,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             (Some(_), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None) => {
                 return Err(invalid(
                     "Iceberg document publication session requires its prepared documents",
-                ));
-            }
-            (
-                None,
-                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(_),
-            ) => {
-                return Err(invalid(
-                    "Iceberg ordinary write cannot attach application publication documents",
                 ));
             }
         };

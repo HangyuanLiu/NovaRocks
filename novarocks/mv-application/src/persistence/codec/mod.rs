@@ -18,6 +18,7 @@
 //! Canonical, bounded conversion between runtime values and private generated
 //! persistence DTOs. No function in this module performs I/O.
 
+pub mod keyed;
 mod model;
 mod wire;
 
@@ -31,12 +32,12 @@ use prost::Message;
 use crate::persistence::generated as proto;
 use crate::persistence::identity::{
     AggregateIdentity, ApplyKeyIdentity, BranchIdentity, ComputationIdentity, DocumentRevision,
-    FieldIdentity, IdentityError, NativeDataVersion, ObjectIdentity, OutputIdentity,
-    PartitionSpecVersion, PublicationIdentity, SchemaVersion, StateSlotIdentity,
+    FieldIdentity, IdentityError, ObjectIdentity, OutputIdentity, PartitionSpecVersion,
+    SchemaVersion, StateSlotIdentity,
 };
 use crate::persistence::validation::{
     PersistenceDecodeBudget, ValidationError, validate_configuration, validate_definition,
-    validate_interpretation, validate_publication, verify_computation_identity,
+    validate_interpretation, verify_computation_identity,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,28 +213,6 @@ pub fn decode_interpretation(
     Ok(document)
 }
 
-pub fn encode_publication(
-    document: &PublicationDocument,
-) -> Result<EncodedDocument, PersistenceCodecError> {
-    preflight_publication_source(document)?;
-    validate_publication(document)?;
-    encode_message(publication_to_proto(document))
-}
-
-pub fn decode_publication(
-    bytes: &[u8],
-    budget: PersistenceDecodeBudget,
-) -> Result<PublicationDocument, PersistenceCodecError> {
-    wire::preflight(bytes, wire::Schema::PublicationDocument, budget)?;
-    let dto =
-        proto::PublicationDocument::decode(bytes).map_err(PersistenceCodecError::ProtobufDecode)?;
-    require_version("publication", dto.format_version)?;
-    let document = publication_from_proto(dto)?;
-    validate_publication(&document)?;
-    ensure_canonical(bytes, publication_to_proto(&document))?;
-    Ok(document)
-}
-
 pub fn encode_configuration(
     document: &ConfigurationDocument,
 ) -> Result<EncodedDocument, PersistenceCodecError> {
@@ -254,58 +233,6 @@ pub fn decode_configuration(
     validate_configuration(&document)?;
     ensure_canonical(bytes, configuration_to_proto(&document))?;
     Ok(document)
-}
-
-/// Charges one simultaneously retained Current D/L/C/P set against a single
-/// decode budget before any document is materialized into its Rust model.
-/// Per-document preflight alone is insufficient because all decoded models
-/// remain live together in the application read model.
-pub fn preflight_current_document_set(
-    definition: &[u8],
-    interpretation: &[u8],
-    publication: Option<&[u8]>,
-    configuration: &[u8],
-    budget: PersistenceDecodeBudget,
-) -> Result<(), PersistenceCodecError> {
-    let required = [
-        (definition, wire::Schema::DefinitionDocument),
-        (interpretation, wire::Schema::InterpretationDocument),
-        (configuration, wire::Schema::ConfigurationDocument),
-    ];
-    let mut encoded_bytes = 0usize;
-    let mut working_set_bytes = 0usize;
-    let mut expanded_items = 0usize;
-    for (bytes, schema) in required
-        .into_iter()
-        .chain(publication.map(|bytes| (bytes, wire::Schema::PublicationDocument)))
-    {
-        let usage = wire::preflight(bytes, schema, budget)?;
-        encoded_bytes = encoded_bytes.saturating_add(usage.encoded_bytes);
-        working_set_bytes = working_set_bytes.saturating_add(usage.estimated_working_set_bytes);
-        expanded_items = expanded_items.saturating_add(usage.expanded_items);
-    }
-    if encoded_bytes > crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "Current encoded document set",
-            maximum: crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES,
-            actual: encoded_bytes,
-        });
-    }
-    if working_set_bytes > budget.max_working_set_bytes {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "Current decode working set",
-            maximum: budget.max_working_set_bytes,
-            actual: working_set_bytes,
-        });
-    }
-    if expanded_items > budget.max_items {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "Current expanded items",
-            maximum: budget.max_items,
-            actual: expanded_items,
-        });
-    }
-    Ok(())
 }
 
 fn encode_message(message: impl Message) -> Result<EncodedDocument, PersistenceCodecError> {
@@ -507,19 +434,6 @@ fn preflight_interpretation_source(
             .saturating_add(field.source_target_field_id.as_bytes().len());
     }
     preflight_source(bytes, items)
-}
-
-fn preflight_publication_source(
-    document: &PublicationDocument,
-) -> Result<(), PersistenceCodecError> {
-    let mut bytes =
-        document.publication_id.as_bytes().len() + document.output.object_id.as_bytes().len();
-    for input in &document.inputs {
-        bytes = bytes
-            .saturating_add(input.object_id.as_bytes().len())
-            .saturating_add(input.native_data_version.as_bytes().len());
-    }
-    preflight_source(bytes, document.inputs.len())
 }
 
 fn preflight_source(variable_bytes: usize, items: usize) -> Result<(), PersistenceCodecError> {
@@ -1138,104 +1052,6 @@ fn interpretation_from_proto(
                     })
                 })
                 .collect::<Result<_, PersistenceCodecError>>()?,
-        },
-    })
-}
-
-fn publication_to_proto(document: &PublicationDocument) -> proto::PublicationDocument {
-    proto::PublicationDocument {
-        publication_prepared_at_ms: Some(document.publication_prepared_at_ms),
-        format_version: Some(MV_PERSISTENCE_FORMAT_VERSION),
-        publication_id: Some(document.publication_id.as_bytes().to_vec()),
-        definition_revision: Some(document.definition_revision.as_bytes().to_vec()),
-        interpretation_revision: Some(document.interpretation_revision.as_bytes().to_vec()),
-        inputs: document
-            .inputs
-            .iter()
-            .map(|value| proto::PublicationInput {
-                relation_occurrence_id: Some(value.relation_occurrence_id),
-                object_id: Some(value.object_id.as_bytes().to_vec()),
-                native_data_version: Some(value.native_data_version.as_bytes().to_vec()),
-            })
-            .collect(),
-        output: Some(proto::PublicationOutput {
-            object_id: Some(document.output.object_id.as_bytes().to_vec()),
-            empty_result: Some(document.output.empty_result),
-        }),
-        kind: Some(match document.kind {
-            PublicationKind::FullRefresh => 1,
-            PublicationKind::IncrementalRefresh => 2,
-            PublicationKind::MetadataOnlyRefresh => 3,
-            PublicationKind::Repartition => 4,
-        }),
-        statistics: Some(proto::PublicationStatistics {
-            logical_result_rows: document.statistics.logical_result_rows,
-            processed_input_rows: document.statistics.processed_input_rows,
-        }),
-    }
-}
-
-fn publication_from_proto(
-    dto: proto::PublicationDocument,
-) -> Result<PublicationDocument, PersistenceCodecError> {
-    let output = required(dto.output, "publication.output")?;
-    let statistics = required(dto.statistics, "publication.statistics")?;
-    Ok(PublicationDocument {
-        publication_prepared_at_ms: required(
-            dto.publication_prepared_at_ms,
-            "publication.publication_prepared_at_ms",
-        )?,
-        publication_id: PublicationIdentity::try_new(required(
-            dto.publication_id,
-            "publication.publication_id",
-        )?)?,
-        definition_revision: DocumentRevision::try_from_bytes(&required(
-            dto.definition_revision,
-            "publication.definition_revision",
-        )?)?,
-        interpretation_revision: DocumentRevision::try_from_bytes(&required(
-            dto.interpretation_revision,
-            "publication.interpretation_revision",
-        )?)?,
-        inputs: dto
-            .inputs
-            .into_iter()
-            .map(|value| {
-                Ok(PublicationInput {
-                    relation_occurrence_id: required(
-                        value.relation_occurrence_id,
-                        "publication.input.relation_occurrence_id",
-                    )?,
-                    object_id: ObjectIdentity::try_new(required(
-                        value.object_id,
-                        "publication.input.object_id",
-                    )?)?,
-                    native_data_version: NativeDataVersion::try_new(required(
-                        value.native_data_version,
-                        "publication.input.native_data_version",
-                    )?)?,
-                })
-            })
-            .collect::<Result<_, PersistenceCodecError>>()?,
-        output: PublicationOutput {
-            object_id: ObjectIdentity::try_new(required(
-                output.object_id,
-                "publication.output.object_id",
-            )?)?,
-            empty_result: required(output.empty_result, "publication.output.empty_result")?,
-        },
-        kind: enum_value(dto.kind, "publication.kind", |value| {
-            Some(match value {
-                1 => PublicationKind::FullRefresh,
-                2 => PublicationKind::IncrementalRefresh,
-                3 => PublicationKind::MetadataOnlyRefresh,
-                4 => PublicationKind::Repartition,
-                _ => return None,
-            })
-        })?,
-        statistics: PublicationStatistics {
-            logical_result_rows: statistics.logical_result_rows,
-            processed_input_rows: statistics.processed_input_rows,
         },
     })
 }

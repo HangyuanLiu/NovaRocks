@@ -22,13 +22,13 @@
 //! material into a branch list. Keeping it pure is what makes each flavor's
 //! branch structure assertable without a catalog.
 //!
-//! The four flavors differ in exactly one thing — how many branches the write
+//! The flavors differ in how many branches the write
 //! needs and what each one accepts:
 //!
 //! * `Ordinary` keeps the canonical data-plus-delete shape unchanged.
-//! * `ManagedPublication` publishes data only, and carries its technique and
-//!   empty-input disposition (never its publication id) into the sealed
-//!   session.
+//! * `ManagedPublication` plans the application document publication from its
+//!   declared technique and input shape, retaining its exact admission and
+//!   empty-input disposition on the frontend session.
 //! * `RowMutation` seals one branch per change-event route, each carrying the
 //!   routing facts SQL needs. This is the port of the old
 //!   `activate_row_mutation` route graph: a route's `cohort_id` becomes its
@@ -60,8 +60,8 @@ use std::sync::Arc;
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
     IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
-    IcebergFrozenRewriteBranchInput, IcebergManagedPublicationFacts, IcebergWriteBranch,
-    IcebergWriteFlavor, IcebergWriteTableFacts, IcebergWriterOutput, invalid,
+    IcebergFrozenRewriteBranchInput, IcebergWriteBranch, IcebergWriteFlavor,
+    IcebergWriteTableFacts, IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::commit::write_stack::planning::{
@@ -178,8 +178,6 @@ fn delete_branch_format(branch: IcebergWriteBranch) -> Result<IcebergFileFormat,
 pub(crate) struct IcebergSessionFlavorPlan {
     /// The provider-private flavor the session commits as.
     pub flavor: IcebergWriteFlavor,
-    /// Present exactly on a managed publication.
-    pub publication: Option<IcebergManagedPublicationFacts>,
     /// Present exactly on an application-document publication.
     pub document_publication: Option<IcebergDocumentPublicationFacts>,
     /// Present exactly on a distributed rewrite: the exact input files each
@@ -222,7 +220,6 @@ pub(crate) fn plan_ordinary_branches(
     }
     Ok(IcebergSessionFlavorPlan {
         flavor,
-        publication: None,
         document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
@@ -244,7 +241,6 @@ fn plan_equality_delete_branches(
     })?;
     Ok(IcebergSessionFlavorPlan {
         flavor,
-        publication: None,
         document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
@@ -274,37 +270,6 @@ pub(crate) const fn ordinary_delete_branch(
     }
 }
 
-/// Plan a managed publication's branches.
-///
-/// The declared shape decides the structure, and only the structure. Both
-/// shapes seal the *same* session: the technique, the empty-input disposition
-/// and the durable provenance travel with it either way, because they decide
-/// the single external commit and what an empty write means, and no writer
-/// needs any of them.
-///
-/// * `Data` republishes rows wholesale, so it seals exactly one unrouted data
-///   branch.
-/// * `RowMutation` applies a change stream, so it seals the branches a row
-///   mutation needs and SQL routes change events to them. Its branch structure
-///   is planned by the same code an ordinary DML row mutation goes through --
-///   a publication's change stream is not a second kind of row mutation, it is
-///   the same one committed under a publication.
-pub(crate) fn plan_managed_publication_branches(
-    material: &IcebergSessionMaterial,
-    publication: IcebergManagedPublicationFacts,
-) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
-    let branches =
-        plan_publication_branch_list(material, publication.technique(), publication.shape())?;
-    Ok(IcebergSessionFlavorPlan {
-        flavor: IcebergWriteFlavor::ManagedPublication,
-        publication: Some(publication),
-        document_publication: None,
-        rewrite_inputs: Vec::new(),
-        copy_on_write: Vec::new(),
-        branches,
-    })
-}
-
 pub(crate) fn plan_document_publication_branches(
     material: &IcebergSessionMaterial,
     publication: IcebergDocumentPublicationFacts,
@@ -313,7 +278,6 @@ pub(crate) fn plan_document_publication_branches(
         plan_publication_branch_list(material, publication.technique(), publication.shape())?;
     Ok(IcebergSessionFlavorPlan {
         flavor: IcebergWriteFlavor::ManagedPublication,
-        publication: None,
         document_publication: Some(publication),
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
@@ -517,7 +481,6 @@ pub(crate) fn plan_distributed_rewrite_branches(
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     Ok(IcebergSessionFlavorPlan {
         flavor,
-        publication: None,
         document_publication: None,
         rewrite_inputs,
         copy_on_write: Vec::new(),
@@ -606,7 +569,6 @@ pub(crate) fn plan_row_mutation_branches(
             )?;
             Ok(IcebergSessionFlavorPlan {
                 flavor,
-                publication: None,
                 document_publication: None,
                 rewrite_inputs: Vec::new(),
                 copy_on_write: Vec::new(),
@@ -725,7 +687,6 @@ fn plan_merge_on_read_branches(
     )?;
     Ok(IcebergSessionFlavorPlan {
         flavor,
-        publication: None,
         document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
@@ -820,7 +781,6 @@ pub(crate) fn plan_copy_on_write_branches(
     }
     Ok(IcebergSessionFlavorPlan {
         flavor,
-        publication: None,
         document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: recipes.to_vec(),

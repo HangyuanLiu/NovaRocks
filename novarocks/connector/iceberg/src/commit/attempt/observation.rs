@@ -1228,6 +1228,17 @@ struct ObservedPublisher<R> {
 #[async_trait]
 #[cfg(test)]
 impl<R: Clone + Send + Sync + 'static> Publisher for ObservedPublisher<R> {
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> crate::iceberg::Result<StagingBase> {
+        self.inner.load_target_with_snapshots(attempt, mode).await
+    }
+
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        self.inner.pinned_expiry_base()
+    }
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.inner.load_target(attempt).await
     }
@@ -1373,6 +1384,174 @@ mod tests {
                 },
                 Behavior::PanicBeforeLoad => unreachable!(),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_journal_preserves_refs_loading_and_pinned_expiry_observation() {
+        use crate::catalog::publication::{CatalogEvidencePolicy, EvidenceContext};
+        use crate::catalog::publication_dispatch::{
+            DispatchCompletion, PreparationResult, PreparedCatalogDispatch, PreparedPublication,
+        };
+        use crate::commit::attempt::prepared::{PinnedExpiryPreparer, PublicationPreparer};
+        use crate::commit::model::{
+            Dependency, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
+            RequestShape, TableTarget,
+        };
+        use crate::iceberg::{TableIdent, TableUpdate};
+
+        struct TracedPreparedOwner {
+            facts: Fake,
+            modes: Arc<Mutex<Vec<crate::catalog::SnapshotLoading>>>,
+        }
+        struct Mutation {
+            calls: Arc<AtomicUsize>,
+            snapshot: Option<i64>,
+        }
+        #[async_trait]
+        impl PreparedCatalogDispatch for Mutation {
+            async fn dispatch_once(self: Box<Self>, _: EvidenceContext) -> DispatchCompletion {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                DispatchCompletion::evidence(DispatchEvidence::Applied {
+                    proof: CommitProof::applied(self.snapshot),
+                })
+            }
+        }
+        #[async_trait]
+        impl PublicationPreparer for TracedPreparedOwner {
+            async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+                self.load_target_with_snapshots(attempt, crate::catalog::SnapshotLoading::All)
+                    .await
+            }
+            async fn load_target_with_snapshots(
+                &self,
+                attempt: &IcebergCommitAttempt,
+                mode: crate::catalog::SnapshotLoading,
+            ) -> Result<StagingBase> {
+                self.modes.lock().unwrap().push(mode);
+                self.facts.load_target(attempt).await
+            }
+            fn preflight_recovery(
+                &self,
+                request: &FrozenRequest,
+                operation: &IcebergCommitOperation,
+            ) -> Result<()> {
+                self.facts.preflight_recovery(request, operation)
+            }
+            fn evidence_policy(&self) -> CatalogEvidencePolicy {
+                CatalogEvidencePolicy::default()
+            }
+            async fn prepare_dispatch(
+                self: Arc<Self>,
+                request: FrozenRequest,
+                descriptor: PublicationDescriptor,
+                _: ProviderBindingEpoch,
+                preparation: ConnectorRequestContext,
+            ) -> PreparationResult<PreparedPublication> {
+                preparation.check_active()?;
+                descriptor.validate_frozen(&request)?;
+                Ok(PreparedPublication::Mutation {
+                    binding: None,
+                    dispatch: Box::new(Mutation {
+                        calls: self.facts.dispatches.clone(),
+                        snapshot: request.ref_snapshot_after(request.target_ref()),
+                    }),
+                })
+            }
+        }
+
+        for expiry in [false, true] {
+            let fixture = Fixture::new();
+            let metadata = fixture.metadata(FormatVersion::V3);
+            let location = format!(
+                "file://{}/original.metadata.json",
+                fixture.directory.path().display()
+            );
+            let operation = fixture.operation.clone();
+            let journal = PublicationJournal::new(operation.token());
+            let modes = Arc::new(Mutex::new(Vec::new()));
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let inner: Arc<dyn PublicationPreparer> = Arc::new(TracedPreparedOwner {
+                facts: Fake {
+                    operation: operation.clone(),
+                    metadata: metadata.clone(),
+                    metadata_location: location.clone(),
+                    journal: journal.clone(),
+                    dispatches: dispatches.clone(),
+                    behavior: Behavior::Commit,
+                },
+                modes: modes.clone(),
+            });
+            let inner = if expiry {
+                Arc::new(PinnedExpiryPreparer {
+                    inner,
+                    base: StagingBase::Existing {
+                        metadata: metadata.clone(),
+                        metadata_location: location,
+                    },
+                }) as Arc<dyn PublicationPreparer>
+            } else {
+                inner
+            };
+            let publisher = journal.observe_prepared(inner);
+            let intent = if expiry {
+                OperationIntent::new(OperationIntentParts {
+                    target: TableTarget {
+                        ident: TableIdent::from_strs(["db", "t"]).unwrap(),
+                        uuid: Some(metadata.uuid()),
+                    },
+                    target_ref: "main".into(),
+                    start: None,
+                    changes: FileChanges::default(),
+                    dependencies: vec![Dependency::NoReadDependency],
+                    isolation: IsolationLevel::Snapshot,
+                    shape: RequestShape::DocumentExpiry,
+                    summary: Default::default(),
+                    token: operation.token(),
+                })
+                .unwrap()
+            } else {
+                fixture
+                    .intent(&metadata, "main", vec![])
+                    .with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
+            };
+            let prefix = if expiry {
+                PreparedChange {
+                    requirements: vec![],
+                    updates: vec![TableUpdate::RemoveProperties {
+                        removals: vec![format!("novarocks.doc.v2.rev.{}", "0".repeat(64))],
+                    }],
+                }
+            } else {
+                PreparedChange::default()
+            };
+            let preparers: Vec<&dyn crate::commit::staging::Preparer> = if expiry {
+                vec![]
+            } else {
+                vec![&FastAppendPreparer]
+            };
+            let report = run(
+                &operation,
+                &intent,
+                &prefix,
+                &preparers,
+                &publisher,
+                RetryPolicy::from_properties(metadata.properties()).unwrap(),
+            )
+            .await;
+            assert!(matches!(
+                journal.project(report),
+                ExternalMutationOutcome::KnownCommitted { .. }
+            ));
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *modes.lock().unwrap(),
+                if expiry {
+                    vec![]
+                } else {
+                    vec![crate::catalog::SnapshotLoading::Refs]
+                }
+            );
         }
     }
 

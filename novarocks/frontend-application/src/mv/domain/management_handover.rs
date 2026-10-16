@@ -17,14 +17,14 @@
 
 //! Handing one materialized view's ownership to another deployment.
 //!
-//! The managed marker on the target is what says which deployment may write
+//! The management slot on the target is what says which deployment may write
 //! it, so a handover is a commit against the target itself, not a local
 //! setting. Two things must be true before that commit, and this module
 //! refuses rather than arranging either of them on its own: nothing of this
 //! process's own may be in flight against the target, and the operator must
 //! quote a challenge this process issued from the status it is acting on.
 //!
-//! The replacement marker keeps the incarnation it observed. A handover says
+//! The replacement slot keeps the incarnation it observed. A handover says
 //! who owns the target, not who wrote it last, and leaving the previous
 //! writer's incarnation in place is what makes the taking deployment go
 //! through its own resume -- it sees an incarnation that is not its own and
@@ -34,13 +34,10 @@
 
 use novarocks_mv_application::management::{
     DeploymentOwner, EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope,
-    ManagedMvTarget, ManagementEntrance, ManagementRequest, ManagementTimestamp, MvManagementPhase,
+    ManagementEntrance, ManagementRequest, ManagementTimestamp, MvManagementPhase,
 };
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
-    ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-    ConnectorDocumentStorageLimits, ConnectorDocumentUpdateIntent, ConnectorManagedObjectMarker,
-    ConnectorManagedObjectMarkerChange, ConnectorPrepareDocumentsRequest,
 };
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorMutationOperationId,
@@ -53,14 +50,10 @@ use crate::mv::domain::management_call::ManagementCallTarget;
 /// What a handover statement actually did to the target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MvOwnerHandoverOutcome {
-    /// The marker now names the requested deployment. The previous owner is
+    /// The management slot now names the requested deployment. The previous owner is
     /// reported because an operator running this against the wrong target
     /// needs to see whose object they just moved.
     HandedOver { previous_owner: String },
-    /// The target already named the requested deployment, so there was
-    /// nothing to commit. Repeating a statement whose response was lost must
-    /// not look like a second handover.
-    AlreadyOwned,
 }
 
 /// Rewrite one target's managed owner to `new_owner`.
@@ -102,38 +95,21 @@ pub(crate) fn hand_over_managed_target(
     let documents_lease = lease
         .derive_document_storage_lease()
         .map_err(|error| format!("derive the handover MV document lease: {error}"))?;
-    let observation_request = ConnectorDocumentObservationRequest::try_new(
-        documents_lease.owner().clone(),
-        documents_lease.catalog_handle().clone(),
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents_lease,
         table.clone(),
         binding.object_id.clone(),
-        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
         context.clone(),
-    )
-    .map_err(|error| format!("build the handover MV observation request: {error}"))?;
-    let (observation, documents) =
-        novarocks_mv_application::persistence::documents::observe_current_management_document_set(
-            &documents_lease,
-            observation_request,
-            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
-        )
-        .map_err(|error| format!("observe the handover MV documents: {error}"))?
-        .into_parts();
-
-    if entrance.close_on_current_incarnation_mismatch(&observation) {
-        tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
-        return Err(
-            "MV Current marker names another process incarnation; management is closed".to_string(),
-        );
+    );
+    let (documents,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&documents_lease,request.clone(),novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),entrance).map_err(|e|e.to_string())?;
+    if phase != MvManagementPhase::NotObserved
+        && (documents.deployment_owner != *entrance.owner()
+            || documents.process_incarnation != *entrance.incarnation())
+    {
+        return Err("MV Current management slot names another writer; management is closed".into());
     }
-
-    let managed_target = ManagedMvTarget::from_observation(&observation)
-        .map_err(|error| format!("name the handover MV target: {error:?}"))?;
-    if observation.marker().owner() == new_owner.as_str() {
-        return Ok(MvOwnerHandoverOutcome::AlreadyOwned);
-    }
-    let previous_owner = observation.marker().owner().to_string();
-
+    let managed_target = documents.management_target.clone();
+    let previous_owner = documents.deployment_owner.as_str().to_string();
     // Taking the entrance is what closes admission, and it is taken before the
     // intent is built so no part of the handover is prepared against a target
     // another statement is already writing. A target this process has never
@@ -165,15 +141,32 @@ pub(crate) fn hand_over_managed_target(
     };
 
     let operation_id = ConnectorMutationOperationId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
-    let intent = build_owner_update_intent(
-        &documents_lease,
-        &observation,
-        &documents,
-        catalog_handle,
-        operation_id,
-        new_owner,
-        &context,
-    )?;
+    let admission = documents_lease
+        .admit_management(
+            ConnectorDocumentManagementAdmissionRequest::try_new(
+                documents_lease.owner().clone(),
+                catalog_handle,
+                operation_id,
+                table.clone(),
+                Some(binding.object_id.clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                context.clone(),
+            )
+            .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    let intent = novarocks_spi::connector::document_storage::KeyedMutationIntent {
+        admission,
+        expected_metadata: documents.view.metadata_version.clone(),
+        expected_snapshot: documents.view.current_snapshot,
+        mutation: novarocks_spi::connector::document_storage::KeyedMutation::SlotChange(
+            novarocks_mv_application::persistence::keyed_documents::keyed_management_slot_change(
+                new_owner,
+                &documents.process_incarnation,
+            )
+            .map_err(|e| e.to_string())?,
+        ),
+    };
 
     let responsibility = EffectResponsibility::new(
         EffectIdentity::from_bytes(operation_id.to_bytes()),
@@ -194,16 +187,26 @@ pub(crate) fn hand_over_managed_target(
     let resolved = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
         &mutation,
         operation_id,
-        novarocks_spi::connector::ConnectorCatalogMutationOperation::UpdateApplicationDocuments {
-            intent,
-        },
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::KeyedDocuments { intent },
         context,
     );
     let disposition = disposition_of(&resolved);
     if let Some(management) = management {
-        management
-            .record_terminal(disposition)
-            .map_err(|error| format!("record the MV handover terminal: {error:?}"))?;
+        if let crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown {
+            evidence, ..
+        } = &resolved
+        {
+            let typed = documents_lease
+                .decode_keyed_slot_change_evidence(request, evidence.clone())
+                .map_err(|e| e.to_string())?;
+            management
+                .record_slot_change_unknown(typed)
+                .map_err(|e| format!("record pending MV handover: {e:?}"))?;
+        } else {
+            management
+                .record_terminal(disposition)
+                .map_err(|e| format!("record MV handover terminal: {e:?}"))?;
+        }
     }
     match disposition {
         EffectDisposition::KnownCommitted => {
@@ -251,85 +254,21 @@ fn refuse_unready_phase(phase: MvManagementPhase) -> Result<(), String> {
         MvManagementPhase::Stopping => {
             Err("MV owner handover refused: this process is stopping".to_string())
         }
+        MvManagementPhase::OwnerMismatch => Err(
+            "MV owner handover refused: a fresh Current observation found another deployment managing this target; request handover from that owner"
+                .to_string(),
+        ),
         MvManagementPhase::IncarnationMismatch => Err(
-            "MV owner handover refused: a fresh Current observation found another process incarnation"
+            "MV owner handover refused: a fresh Current observation found another process incarnation managing this target; request handover from that owner"
                 .to_string(),
         ),
     }
 }
 
-/// The update that carries the new owner and nothing else.
-///
-/// It republishes the configuration document unchanged. C is the one document
-/// an owner may rewrite without changing what the view computes, so the commit
-/// states exactly "the owner changed and nothing else did".
-fn build_owner_update_intent(
-    documents_lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
-    observation: &novarocks_spi::connector::document_storage::ConnectorDocumentManagementObservation,
-    documents: &novarocks_mv_application::persistence::documents::MvObservedCurrentDocuments,
-    catalog_handle: novarocks_spi::connector::CatalogHandle,
-    operation_id: ConnectorMutationOperationId,
-    new_owner: &DeploymentOwner,
-    context: &ConnectorRequestContext,
-) -> Result<ConnectorDocumentUpdateIntent, String> {
-    let admission = documents_lease
-        .admit_management(
-            ConnectorDocumentManagementAdmissionRequest::try_new(
-                documents_lease.owner().clone(),
-                catalog_handle,
-                operation_id,
-                observation.target().clone(),
-                Some(observation.object_id().clone()),
-                ConnectorDocumentManagementOperation::SingleTargetUpdate,
-                context.clone(),
-            )
-            .map_err(|error| format!("build the MV handover admission: {error}"))?,
-        )
-        .map_err(|error| format!("admit the MV handover documents: {error}"))?;
-    let prepared = documents_lease
-        .prepare_documents(
-            ConnectorPrepareDocumentsRequest::try_new(
-                admission,
-                novarocks_mv_application::persistence::documents::configuration_document_set(
-                    documents.configuration(),
-                )
-                .map_err(|error| format!("encode the MV handover set: {error}"))?,
-                context.clone(),
-            )
-            .map_err(|error| format!("build the MV handover request: {error}"))?,
-        )
-        .map_err(|error| format!("prepare the MV handover documents: {error}"))?;
-    ConnectorDocumentUpdateIntent::try_new(
-        prepared,
-        observation.clone(),
-        ConnectorManagedObjectMarkerChange::Replace {
-            expected: observation.marker().clone(),
-            replacement: ConnectorManagedObjectMarker::try_new(
-                observation.marker().kind(),
-                new_owner.as_str(),
-                observation.marker().incarnation(),
-            )
-            .map_err(|error| format!("build the MV handover marker: {error}"))?,
-        },
-    )
-    .map_err(|error| format!("build the MV handover intent: {error}"))
-}
-
 fn disposition_of(
     resolved: &crate::connector::mutation::ResolvedCatalogMutation,
 ) -> EffectDisposition {
-    match resolved {
-        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(_) => {
-            EffectDisposition::KnownCommitted
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { .. }
-        | crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { .. } => {
-            EffectDisposition::KnownUncommitted
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { .. } => {
-            EffectDisposition::CommitUnknown
-        }
-    }
+    super::iceberg_refresh::configuration_effect_disposition(resolved)
 }
 
 fn now_management_timestamp() -> Result<ManagementTimestamp, String> {
@@ -378,6 +317,7 @@ mod tests {
                 "no bound object yet",
             ),
             (MvManagementPhase::Stopping, "process is stopping"),
+            (MvManagementPhase::OwnerMismatch, "another deployment"),
             (
                 MvManagementPhase::IncarnationMismatch,
                 "another process incarnation",

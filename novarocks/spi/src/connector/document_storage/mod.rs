@@ -15,51 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Provider-neutral storage for application-owned durable documents.
+//! Provider-neutral inline document storage.
 //!
-//! Applications own document schemas and codecs. Connectors own the physical
-//! envelope, attachment point, atomic mutation, discovery, and retention. The
-//! SPI treats every document body as opaque bytes and deliberately exposes no
-//! arbitrary table-property patch API.
+//! Applications own opaque payloads. Providers own exact observation, atomic
+//! publication, retention, and generation-scoped management admission.
 
 mod document;
+pub mod keyed;
 mod observation;
 mod operation;
-mod retention;
 
-pub use document::{
-    ConnectorDocument, ConnectorDocumentAttachment, ConnectorDocumentFormat, ConnectorDocumentId,
-    ConnectorDocumentName, ConnectorDocumentOwner, ConnectorDocumentReference,
-    ConnectorDocumentRevision, ConnectorDocumentSet, MAX_CONNECTOR_DOCUMENT_BYTES,
-    MAX_CONNECTOR_DOCUMENT_FORMAT_BYTES, MAX_CONNECTOR_DOCUMENT_NAME_BYTES,
-    MAX_CONNECTOR_DOCUMENT_REFERENCES, MAX_CONNECTOR_DOCUMENT_SET_BYTES, MAX_CONNECTOR_DOCUMENTS,
-};
+pub use document::ConnectorDocumentFormat;
+pub use keyed::*;
 pub use observation::{
-    ConnectorDeferredDocumentHandle, ConnectorDocumentCarrier,
-    ConnectorDocumentDiscoveryCompleteness, ConnectorDocumentDiscoveryIncompleteReason,
-    ConnectorDocumentDiscoveryItem, ConnectorDocumentDiscoveryPage,
-    ConnectorDocumentDiscoveryRequest, ConnectorDocumentLoadRequest,
-    ConnectorDocumentManagementObservation, ConnectorDocumentObservationRequest,
-    ConnectorDocumentStorageBudget, ConnectorDocumentStorageObservation,
-    ConnectorManagedObjectMarker, ConnectorStoredDocument, ConnectorStoredDocumentAttachment,
-    FrozenConnectorDocumentObservation, MAX_CONNECTOR_DEFERRED_DOCUMENT_HANDLE_BYTES,
+    ConnectorDocumentDiscoveryBudget, ConnectorDocumentDiscoveryCompleteness,
+    ConnectorDocumentDiscoveryIncompleteReason, ConnectorDocumentDiscoveryItem,
+    ConnectorDocumentDiscoveryPage, ConnectorDocumentDiscoveryRequest,
+    ConnectorDocumentStorageObservation, ConnectorManagedObjectMarker,
+    MAX_CONNECTOR_DOCUMENT_DISCOVERY_CURSOR_BYTES, MAX_CONNECTOR_DOCUMENT_DISCOVERY_ITEMS,
     MAX_CONNECTOR_DOCUMENT_DISCOVERY_PAGE_SIZE,
 };
 pub use operation::{
-    CONNECTOR_DOCUMENT_STORAGE_CONTRACT_VERSION, ConnectorDocumentCreatePublicationIntent,
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
     ConnectorDocumentManagementOperation, ConnectorDocumentPublicationDeclaration,
-    ConnectorDocumentPublicationIntent, ConnectorDocumentStorageBinding,
-    ConnectorDocumentStorageLease, ConnectorDocumentStorageLimits,
-    ConnectorDocumentStorageManagement, ConnectorDocumentUpdateIntent,
-    ConnectorManagedObjectMarkerChange, ConnectorPrepareDocumentsRequest,
-    ConnectorPreparedDocument, ConnectorPreparedDocumentSet,
-    DEFAULT_CONNECTOR_DOCUMENT_AVAILABLE_CONTENT_BYTES,
-    DEFAULT_CONNECTOR_DOCUMENT_AVAILABLE_CONTENT_TOTAL_BYTES,
-    DEFAULT_CONNECTOR_DOCUMENT_DECODE_WORKING_SET_BYTES,
-    DEFAULT_CONNECTOR_DOCUMENT_LOAD_TOTAL_BYTES, MAX_CONNECTOR_DOCUMENT_STRUCTURE_DEPTH,
-};
-pub use retention::{
-    ConnectorDocumentRetentionConstraint, ConnectorDocumentRetentionGraph,
-    ConnectorDocumentRetentionRoot,
+    ConnectorDocumentStorageBinding, ConnectorDocumentStorageLease,
+    ConnectorDocumentStorageManagement,
 };

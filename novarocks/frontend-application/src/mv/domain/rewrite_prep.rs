@@ -26,9 +26,9 @@ use std::{collections::HashSet, fmt, sync::Arc};
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use novarocks_mv_application::persistence::{
-    documents::{MvFrozenPublicationReadView, observe_frozen_publication_documents},
     exact_revision::restore_exact_query_revision,
-    projection::StoredMvProjection,
+    keyed_documents::StoredKeyedMvProjection,
+    keyed_documents::{MvKeyedObservedCurrentDocuments, observe_current_keyed_documents},
     validation::PersistenceDecodeBudget,
 };
 use novarocks_spi::connector::MvStorageObservationPort;
@@ -78,11 +78,10 @@ pub(crate) fn freeze_materialized_view_fact_with_ports(
             &requested_relations,
         )
     });
-    let budget = rewrite_document_budget();
     let report = novarocks_mv_application::candidate::inspect_candidates(
         relevant,
         |definition| definition.mv_id.to_string(),
-        |definition| freeze_mv_rewrite_definition(connector_control, &budget, definition),
+        |definition| freeze_mv_rewrite_definition(candidate_reader, connector_control, definition),
     );
     for diagnostic in report.diagnostics() {
         tracing::debug!(
@@ -112,11 +111,10 @@ pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
     _storage_observation: &dyn MvStorageObservationPort,
 ) -> Result<MvRewriteDefinitionIndex, String> {
     let definitions = optional_candidate_inventory(candidate_reader.list_candidate_definitions());
-    let budget = rewrite_document_budget();
     let report = novarocks_mv_application::candidate::inspect_candidates(
         definitions,
         |definition| definition.mv_id.to_string(),
-        |definition| freeze_mv_rewrite_definition(connector_control, &budget, definition),
+        |definition| freeze_mv_rewrite_definition(candidate_reader, connector_control, definition),
     );
     for diagnostic in report.diagnostics() {
         tracing::debug!(
@@ -144,7 +142,7 @@ where
     }
 }
 
-fn definition_base_names(projection: &StoredMvProjection) -> Vec<String> {
+fn definition_base_names(projection: &StoredKeyedMvProjection) -> Vec<String> {
     projection
         .facts
         .definition()
@@ -165,20 +163,14 @@ fn occurrence_table(
     }
 }
 
-fn rewrite_document_budget() -> novarocks_spi::connector::ConnectorDocumentStorageBudget {
-    novarocks_spi::connector::ConnectorDocumentStorageBudget::new(
-        novarocks_spi::connector::ConnectorDocumentStorageLimits::spec_default(),
-    )
-}
-
 fn freeze_mv_rewrite_definition(
+    candidate_reader: &MvCandidateReader,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    budget: &novarocks_spi::connector::ConnectorDocumentStorageBudget,
-    projection: StoredMvProjection,
+    projection: StoredKeyedMvProjection,
 ) -> Result<SqlMvRewriteDefinitionFacts, String> {
     use novarocks_spi::connector::{
-        ConnectorDocumentObservationRequest, ConnectorReadSelector, ConnectorTableIdentity,
-        ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
+        ConnectorReadSelector, ConnectorTableIdentity, ConnectorTableObjectRebindRequest,
+        ConnectorTableObjectSelector, ConnectorTableResolution,
     };
     let target = projection.facts.target();
     let target_catalog = target.catalog().ok_or("MV rewrite target has no catalog")?;
@@ -191,28 +183,24 @@ fn freeze_mv_rewrite_definition(
     let documents = planning
         .derive_document_storage_lease()
         .map_err(|error| error.to_string())?;
-    let request = ConnectorDocumentObservationRequest::try_new(
-        documents.owner().clone(),
-        documents.catalog_handle().clone(),
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
         ConnectorTableIdentity {
             instance_id: documents.owner().instance_id.clone(),
             namespace: Arc::from(target.namespace()),
             table: Arc::from(target.name()),
         },
         projection.facts.source_revision().target_object_id.clone(),
-        budget.clone(),
         context.clone(),
-    )
-    .map_err(|error| error.to_string())?;
-    // The repository is discovery only. This sealed read neither enters Current
-    // management nor installs readiness, and no retained cache payload is proof.
-    let frozen = observe_frozen_publication_documents(
-        &documents,
-        request,
-        PersistenceDecodeBudget::default(),
-    )
-    .map_err(|error| format!("observe MV rewrite documents: {error}"))?;
-    if frozen.definition_revision() != projection.facts.source_revision().definition_revision {
+    );
+    let frozen = candidate_reader.observe_current(&documents, request)?;
+    let publication = frozen
+        .publication
+        .as_ref()
+        .ok_or("MV rewrite target has no current publication")?;
+    if frozen.versions.definition_revision()
+        != projection.facts.source_revision().definition_revision
+    {
         return Err(
             "MV rewrite discovery definition changed before its frozen publication read".into(),
         );
@@ -221,16 +209,15 @@ fn freeze_mv_rewrite_definition(
         .binding()
         .metadata()
         .rebind_table_object_binding(ConnectorTableObjectRebindRequest {
-            table: frozen.target().clone(),
-            expected_object_id: frozen.object_id().clone(),
+            table: frozen.view.table.clone(),
+            expected_object_id: frozen.view.object_id.clone(),
             resolution: ConnectorTableResolution::StrictBaseTable,
             selector: ConnectorTableObjectSelector::Current,
             context,
         })
         .map_err(|error| format!("bind frozen MV rewrite output object: {error}"))?;
     let snapshot = frozen
-        .output_version()
-        .snapshot_id()
+        .publication_snapshot
         .ok_or("MV rewrite output provider did not expose an exact snapshot selector")?;
     // The provider interprets its own typed output selector against the retained
     // object handle. Never decode output-version payloads or manufacture a fact.
@@ -242,11 +229,11 @@ fn freeze_mv_rewrite_definition(
             ConnectorReadSelector::SnapshotId(snapshot),
         )
         .map_err(|error| format!("resolve exact MV rewrite output revision: {error}"))?;
-    let definition = frozen.definition();
+    let definition = &frozen.definition;
     let sources = definition
         .relation_occurrences
         .iter()
-        .zip(&frozen.publication().inputs)
+        .zip(&publication.inputs)
         .map(|(occurrence, input)| {
             if occurrence.occurrence_id != input.relation_occurrence_id {
                 return Err("MV rewrite D/P occurrence order differs".into());
@@ -271,7 +258,7 @@ fn freeze_mv_rewrite_definition(
     let selection = freeze_mv_rewrite_selection(&frozen, target_revision)?;
     SqlMvRewriteDefinitionFacts::try_new(
         projection.mv_id,
-        *frozen.definition_revision().as_bytes(),
+        *frozen.versions.definition_revision().as_bytes(),
         parse_mv_select_query(&definition.query.effective_sql)?,
         SqlMvDefinitionResolutionContext::try_new(
             definition.query.resolution.default_catalog.clone(),
@@ -294,17 +281,20 @@ fn freeze_mv_rewrite_definition(
 }
 
 fn freeze_mv_rewrite_selection(
-    frozen: &MvFrozenPublicationReadView,
+    frozen: &MvKeyedObservedCurrentDocuments,
     target_revision: novarocks_spi::connector::ConnectorExactSemanticRevision,
 ) -> Result<SqlMvRewriteSelectionFacts, String> {
-    let publication = frozen.publication();
+    let publication = frozen
+        .publication
+        .as_ref()
+        .ok_or("MV rewrite target has no current publication")?;
     let publication_id = publication
         .publication_id
         .as_bytes()
         .try_into()
         .map_err(|_| "MV SQL rewrite requires a 16-byte publication identity".to_string())?;
     let inputs = frozen
-        .definition()
+        .definition
         .relation_occurrences
         .iter()
         .zip(&publication.inputs)
@@ -322,16 +312,22 @@ fn freeze_mv_rewrite_selection(
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let target = frozen.target();
+    let target = &frozen.view.table;
     SqlMvRewriteSelectionFacts::try_new_with_publication(
         publication_id,
-        *frozen.definition().computation_identity.as_bytes(),
-        *frozen.definition_revision().as_bytes(),
-        *frozen.interpretation_revision().as_bytes(),
+        *frozen.definition.computation_identity.as_bytes(),
+        *frozen.versions.definition_revision().as_bytes(),
+        *frozen.versions.interpretation_revision().as_bytes(),
         Arc::from(format!(
             "document:{}:output:{}",
-            hex::encode(frozen.publication_revision().as_bytes()),
-            hex::encode(frozen.output_version().digest())
+            hex::encode(
+                frozen
+                    .publication_revision
+                    .as_ref()
+                    .ok_or("MV rewrite target has no P revision")?
+                    .as_bytes()
+            ),
+            hex::encode(frozen.view.metadata_version.digest())
         )),
         inputs,
         SqlMvRewritePublicationRelation::new(

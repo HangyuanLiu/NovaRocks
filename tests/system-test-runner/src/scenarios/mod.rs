@@ -24,6 +24,7 @@ mod listing_real_rest;
 mod memory_attribution;
 mod mv_recovery;
 mod mv_uea7;
+mod mv_uea7_documents;
 mod mv_uea7_handover;
 mod mv_uea7_incarnation;
 mod mv_uea7_storage;
@@ -87,6 +88,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(catalog_publication::scenarios());
     scenarios.extend(mv_recovery::scenarios());
     scenarios.extend(mv_uea7::scenarios());
+    scenarios.extend(mv_uea7_documents::scenarios());
     scenarios.push(Box::new(mv_uea7_handover::MvOwnerHandover::default()));
     scenarios.push(Box::new(
         mv_uea7_incarnation::MvIncarnationMismatch::default(),
