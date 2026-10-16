@@ -58,7 +58,7 @@ fn task_state(
         execution_runtime: Some(runtime),
         query_memory: memory,
         task_identity: Some(task),
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         exchange_test_observer: None,
     })
 }

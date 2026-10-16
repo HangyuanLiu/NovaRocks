@@ -77,8 +77,7 @@ pub(super) fn held_sql(catalog: &str, database: &str, table: &str) -> String {
 
 pub(super) fn plan(
     cluster_size: usize,
-    ordinary_binary: &Path,
-    controlled_binary: Option<&Path>,
+    binary: &Path,
     original_deadline: Instant,
     authority: AuthorityIntent,
     queries: &[QueryIntent],
@@ -87,8 +86,6 @@ pub(super) fn plan(
         cluster_size == 3,
         "Storage credential consumers require native 1FE+3BE"
     );
-    let binary = controlled_binary
-        .context("Storage authority observation requires a test-controls binary")?;
     let mut plan = ClusterTestSessionPlan::new(original_deadline)?;
     let root = plan.reserve_transport("storage-authority")?;
     let bindings = plan.reserve_transport("storage-query-bindings")?;
@@ -130,7 +127,7 @@ pub(super) fn plan(
         }
     }
     if fe_grants.is_empty() {
-        plan.authorize_ordinary_launch(&frontend, ordinary_binary.to_path_buf())?;
+        plan.authorize_ordinary_launch(&frontend, binary.to_path_buf())?;
     } else {
         plan.set_launch_binary(&frontend, binary.to_path_buf())?;
         plan.authorize_launch(
@@ -145,7 +142,7 @@ pub(super) fn plan(
     }
     for (index, grants) in be_grants.into_iter().enumerate() {
         if grants.is_empty() {
-            plan.authorize_ordinary_launch(&backends[index], ordinary_binary.to_path_buf())?;
+            plan.authorize_ordinary_launch(&backends[index], binary.to_path_buf())?;
         } else {
             let mut owners = vec![
                 "novarocks-server",
@@ -770,14 +767,11 @@ mod tests {
     #[test]
     fn storage_only_plan_keeps_unrelated_roles_ordinary() {
         let directory = tempfile::tempdir().unwrap();
-        let ordinary = directory.path().join("ordinary");
-        let controlled = directory.path().join("controlled");
-        fs::write(&ordinary, []).unwrap();
-        fs::write(&controlled, []).unwrap();
+        let binary = directory.path().join("binary");
+        fs::write(&binary, []).unwrap();
         let (plan, _) = plan(
             3,
-            &ordinary,
-            Some(&controlled),
+            &binary,
             Instant::now() + Duration::from_secs(5),
             authority(false),
             &[],
@@ -786,6 +780,10 @@ mod tests {
         let summaries = plan.planned_launch_summaries();
         let roles = summaries.as_array().unwrap();
         assert_eq!(roles.len(), 4);
+        assert!(roles.iter().all(|role| role["binary"] == json!(binary)));
+        for role in roles.iter().filter(|role| role["ordinary"] == true) {
+            assert!(role["grants"].as_array().unwrap().is_empty());
+        }
         let observed = roles
             .iter()
             .filter(|role| role["ordinary"] == false)
@@ -806,7 +804,6 @@ mod tests {
         let (plan, inputs) = plan(
             3,
             &binary,
-            Some(&binary),
             deadline,
             authority(false),
             &[QueryIntent {
@@ -843,7 +840,6 @@ mod tests {
         let result = plan(
             3,
             &binary,
-            Some(&binary),
             Instant::now() + Duration::from_secs(5),
             authority(false),
             &[

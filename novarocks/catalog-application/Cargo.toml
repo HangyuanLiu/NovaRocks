@@ -28,7 +28,6 @@ workspace = true
 doctest = false
 
 [features]
-test-support = []
 
 [dependencies]
 chrono.workspace = true

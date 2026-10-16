@@ -21,7 +21,7 @@
 ///
 /// They live here because the carrier they build is this module's input; the
 /// decoder tests assert what the decoder does with exactly that carrier.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub mod test_support {
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_codec::connector_read::{ConnectorReadDecoder, encode_value_type};
@@ -1038,7 +1038,7 @@ mod tests {
             }),
             no_runtime_filter(),
             live_dynamic_filter_factory(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::default(),
@@ -1500,7 +1500,7 @@ mod tests {
                 novarocks_execution::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage)
                     .expect("complete test output schema")
             }),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
             crate::backend_test_support::test_scan_stream_runtime(),
         );

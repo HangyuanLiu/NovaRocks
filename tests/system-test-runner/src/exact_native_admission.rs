@@ -687,11 +687,13 @@ pub(crate) fn admit(
     binding_path: &Path,
     server: &Path,
     base_config: &Path,
+    build: &crate::build_information::BuildInformation,
 ) -> Result<AdmittedExactNativeRun> {
     admit_until(
         binding_path,
         server,
         base_config,
+        build,
         Instant::now() + Duration::from_millis(PREP_MS),
     )
 }
@@ -700,6 +702,7 @@ fn admit_until(
     binding_path: &Path,
     server: &Path,
     base_config: &Path,
+    build: &crate::build_information::BuildInformation,
     deadline: Instant,
 ) -> Result<AdmittedExactNativeRun> {
     check(deadline)?;
@@ -742,8 +745,8 @@ fn admit_until(
         "actual original binary/config/input differs from frozen admission"
     );
     require_compiled_runner(
-        novarocks_version::build_git_commit(),
-        novarocks_version::native_build_identity(),
+        build.source_commit,
+        build.native_build_identity,
         &before.revision,
     )?;
     server_owner.recheck(deadline)?;

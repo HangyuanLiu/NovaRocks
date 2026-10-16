@@ -37,7 +37,7 @@ use novarocks_spi::connector::write_stack::{WriteTargetOrdinal, validate_query_t
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::ExecNode;
 use crate::exec::node::table_write_aggregate::WriterFinalAggregatePlan;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
     AllowTableWriteAggregates, TableWriteAggregateGuard,
 };
@@ -56,14 +56,14 @@ pub struct TableFinishNode {
     writer_multiplex_schema: WriterMultiplexRelationSchema,
     root_result_schema: RootWriteResultRelationSchema,
     final_aggregate_plan: WriterFinalAggregatePlan,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 /// Runtime validation authority for a single Task instance of TableFinish.
 pub struct TableFinishRuntimeBinding {
     pub(crate) fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
@@ -72,13 +72,13 @@ impl TableFinishRuntimeBinding {
     pub fn new(fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>) -> Self {
         Self {
             fragment_validator,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::new(AllowTableWriteAggregates),
         }
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
         self.aggregate_guard = guard;
         self
@@ -139,13 +139,13 @@ impl TableFinishNode {
             writer_multiplex_schema,
             root_result_schema,
             final_aggregate_plan,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
         self.aggregate_guard = guard;
         self
@@ -195,7 +195,7 @@ impl TableFinishNode {
         (
             TableFinishRuntimeBinding {
                 fragment_validator: self.fragment_validator,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 aggregate_guard: self.aggregate_guard,
             },
             (
@@ -208,7 +208,7 @@ impl TableFinishNode {
         )
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
         &self.aggregate_guard
     }

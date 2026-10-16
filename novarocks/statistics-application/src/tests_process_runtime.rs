@@ -258,7 +258,7 @@ async fn submitted_is_a_phase_not_a_success_conclusion() {
     assert!(!job.state.is_terminal());
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 mod statement_observation_tests {
     use super::*;
     use novarocks_failpoint::target_binding::StatementWorkNomination;

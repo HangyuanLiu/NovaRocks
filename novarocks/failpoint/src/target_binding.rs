@@ -109,7 +109,7 @@ impl StatementExecutionBinding {
         file.write_all(&bytes)?;
         file.sync_all()
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn read_private(path: &Path) -> io::Result<Self> {
         use std::io::Read;
         let metadata = std::fs::symlink_metadata(path)?;
@@ -145,7 +145,7 @@ impl StatementExecutionBinding {
     }
 }
 
-#[cfg(all(test, feature = "test-controls"))]
+#[cfg(all(test, novarocks_dev_controls))]
 mod tests {
     use super::*;
     #[test]

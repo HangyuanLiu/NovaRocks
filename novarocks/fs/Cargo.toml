@@ -28,7 +28,7 @@ workspace = true
 doctest = false
 
 [dependencies]
-novarocks-failpoint = { workspace = true, optional = true }
+novarocks-failpoint = { workspace = true }
 anyhow.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
@@ -58,5 +58,3 @@ serde_json.workspace = true
 tempfile.workspace = true
 
 [features]
-normal-build = ["novarocks-failpoint?/normal-build"]
-test-controls = ["dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]

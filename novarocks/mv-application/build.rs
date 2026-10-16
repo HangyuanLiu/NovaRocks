@@ -3,6 +3,9 @@
 // with this work for additional information regarding copyright ownership.
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
+#[path = "../../build-support/development.rs"]
+mod development;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +17,7 @@ const PROTO_FILES: &[&str] = &[
 ];
 
 fn main() {
+    development::emit();
     for file in PROTO_FILES.iter().copied() {
         println!(
             "cargo:rerun-if-changed={}",

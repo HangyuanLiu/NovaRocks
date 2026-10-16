@@ -52,9 +52,7 @@ impl Scenario for ObservationFamilies {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let statements = OBSERVATION_QUERIES
@@ -71,8 +69,7 @@ impl Scenario for ObservationFamilies {
             statements,
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

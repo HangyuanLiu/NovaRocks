@@ -129,15 +129,12 @@ impl Scenario for FrozenReplayAndMembership {
         _launch: &ScenarioLaunchConfig,
         _root: &std::path::Path,
         cluster_size: usize,
-        _primary: &std::path::Path,
-        ordinary: &std::path::Path,
-        controlled: Option<&std::path::Path>,
+        binary: &std::path::Path,
         deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.observation.freeze(
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

@@ -59,31 +59,31 @@ pub use type_materialization::{
     TypeMaterializationHost, TypeMaterializationJournal, TypeMaterializationRefusal,
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub use type_materialization::materialize_package_types_for_test;
 
 pub use project_materialization::{
     ProjectMetadataHost, ProjectMetadataJournal, ProjectMetadataPhase,
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 mod project_metadata_test_support;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub use project_metadata_test_support::{
     PreparedProjectMetadataForTest, prepare_project_metadata_for_test,
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 mod window_metadata_test_support;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub use window_metadata_test_support::{
     PreparedWindowMetadataForTest, PreparedWindowMetadataGraphForTest,
     WindowSchemaOccurrenceForTest, prepare_window_metadata_for_test,
     prepare_window_metadata_graph_for_test,
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub use compiled_package::compile_native_package_with_funding_for_test;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub use compiled_package::with_native_type_construction_for_test;

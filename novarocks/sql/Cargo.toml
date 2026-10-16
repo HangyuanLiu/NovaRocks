@@ -28,7 +28,6 @@ workspace = true
 doctest = false
 
 [features]
-test-support = []
 
 [dependencies]
 arrow = { workspace = true, features = ["prettyprint", "ipc", "ipc_compression"] }

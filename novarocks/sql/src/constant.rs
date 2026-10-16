@@ -337,7 +337,7 @@ pub(crate) fn decimal_coefficient_observed(
     Ok(coefficient)
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_constant_policy() -> ConstantPolicy {
     ConstantPolicy {
         max_rows: 1 << 20,

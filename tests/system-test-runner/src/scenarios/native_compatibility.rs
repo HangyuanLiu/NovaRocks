@@ -59,6 +59,16 @@ struct MixedBuildSameIsland {
 }
 
 impl Scenario for MixedBuildSameIsland {
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn is_compatibility_stage(&self) -> bool {
+        true
+    }
+    fn binary_requirements(&self) -> &'static [ScenarioBinary] {
+        &[ScenarioBinary::Primary, ScenarioBinary::Compatible]
+    }
+
     fn name(&self) -> &'static str {
         "native-compatibility/mixed-build-same-island"
     }
@@ -84,8 +94,6 @@ impl Scenario for MixedBuildSameIsland {
         _: &std::path::Path,
         cluster_size: usize,
         _: &std::path::Path,
-        _: &std::path::Path,
-        _: Option<&std::path::Path>,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         ensure!(
@@ -168,6 +176,16 @@ struct TargetIslandCutover {
 }
 
 impl Scenario for RawEstablishCompatibilityAdmission {
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn is_compatibility_stage(&self) -> bool {
+        true
+    }
+    fn binary_requirements(&self) -> &'static [ScenarioBinary] {
+        &[ScenarioBinary::Primary]
+    }
+
     fn name(&self) -> &'static str {
         "native-compatibility/raw-establish-compatibility-admission"
     }
@@ -178,8 +196,6 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         _: &std::path::Path,
         cluster_size: usize,
         _: &std::path::Path,
-        _: &std::path::Path,
-        _: Option<&std::path::Path>,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         ensure!(
@@ -485,6 +501,20 @@ fn admission_reservation_used(client: &reqwest::blocking::Client, port: u16) -> 
 }
 
 impl Scenario for OtherIslandHardCut {
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn is_compatibility_stage(&self) -> bool {
+        true
+    }
+    fn binary_requirements(&self) -> &'static [ScenarioBinary] {
+        &[
+            ScenarioBinary::Primary,
+            ScenarioBinary::Compatible,
+            ScenarioBinary::OtherIsland,
+        ]
+    }
+
     fn name(&self) -> &'static str {
         "native-compatibility/other-island-hard-cut"
     }
@@ -510,8 +540,6 @@ impl Scenario for OtherIslandHardCut {
         _: &std::path::Path,
         cluster_size: usize,
         _: &std::path::Path,
-        _: &std::path::Path,
-        _: Option<&std::path::Path>,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         ensure!(
@@ -585,12 +613,22 @@ impl Scenario for OtherIslandHardCut {
 }
 
 impl Scenario for TargetIslandCutover {
-    fn name(&self) -> &'static str {
-        "native-compatibility/target-island-cutover"
-    }
-
     fn is_explicit_stage(&self) -> bool {
         true
+    }
+    fn is_compatibility_stage(&self) -> bool {
+        true
+    }
+    fn binary_requirements(&self) -> &'static [ScenarioBinary] {
+        &[
+            ScenarioBinary::Primary,
+            ScenarioBinary::Compatible,
+            ScenarioBinary::OtherIsland,
+        ]
+    }
+
+    fn name(&self) -> &'static str {
+        "native-compatibility/target-island-cutover"
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -614,8 +652,6 @@ impl Scenario for TargetIslandCutover {
         _: &std::path::Path,
         cluster_size: usize,
         _: &std::path::Path,
-        _: &std::path::Path,
-        _: Option<&std::path::Path>,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         ensure!(
@@ -726,6 +762,20 @@ impl Scenario for TargetIslandCutover {
 }
 
 impl Scenario for IslandDrainAndReplacement {
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn is_compatibility_stage(&self) -> bool {
+        true
+    }
+    fn binary_requirements(&self) -> &'static [ScenarioBinary] {
+        &[
+            ScenarioBinary::Primary,
+            ScenarioBinary::Compatible,
+            ScenarioBinary::OtherIsland,
+        ]
+    }
+
     fn name(&self) -> &'static str {
         "native-compatibility/island-drain-and-replacement"
     }
@@ -751,8 +801,6 @@ impl Scenario for IslandDrainAndReplacement {
         _: &std::path::Path,
         cluster_size: usize,
         _: &std::path::Path,
-        _: &std::path::Path,
-        _: Option<&std::path::Path>,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         ensure!(

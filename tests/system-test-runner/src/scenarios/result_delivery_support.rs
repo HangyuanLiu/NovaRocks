@@ -128,7 +128,7 @@ fn idle_snapshot(context: &mut ScenarioContext, client: &Client) -> Result<(Valu
         );
         idle &= reserved == 0;
         let mut ingress = Vec::new();
-        for class in [Some("ordinary"), Some("control"), root_class]
+        for class in [Some("binary"), Some("control"), root_class]
             .into_iter()
             .flatten()
         {

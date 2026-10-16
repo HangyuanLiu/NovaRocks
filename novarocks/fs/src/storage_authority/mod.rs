@@ -47,9 +47,9 @@ use tokio::sync::watch;
 
 use crate::{FileError, FileErrorKind, FileResult};
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 mod debug_close;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub use debug_close::StorageAuthorityCloseControls;
 mod executor;
 mod registry;

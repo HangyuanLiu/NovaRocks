@@ -563,7 +563,7 @@ fn consult_dynamic_filter(
 /// The marker carries the scheduled-split sequence, the row-group ordinal, and
 /// the checkpoint that decided. It never carries a bound, a value, or anything
 /// else derived from the filter's key material.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_row_group_pruned_marker(
     binding: &IcebergReadBinding,
     row_group: DynamicFilterRowGroupId,
@@ -1645,7 +1645,7 @@ impl IcebergParquetPageSource {
     fn record_pruned(&mut self, ordinals: &[u32], _checkpoint: DynamicFilterCheckpoint) {
         for ordinal in ordinals {
             let row_group = self.dynamic_filter.row_group(*ordinal);
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             emit_row_group_pruned_marker(&self.access_binding, row_group, _checkpoint);
             self.pruned_row_groups.push(row_group);
         }

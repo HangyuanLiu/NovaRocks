@@ -203,7 +203,7 @@ impl SqlWriteSinkContract {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) mod test_support {
     use std::num::{NonZeroU32, NonZeroU64};
 

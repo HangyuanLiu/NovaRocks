@@ -16,14 +16,19 @@
 // under the License.
 
 use super::*;
+use arrow::datatypes::DataType;
 use novarocks_execution::runtime::kernel_memory::{
     KernelMemoryRequest, request, request_complete_operation,
 };
-use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, FundingDomain, MemoryAuthority};
+use novarocks_memory::{
+    AccountHandle, AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, OWNER_METADATA_BYTES,
+};
 use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
-use novarocks_proto_models::{physical_package_v2 as package, physical_type_v2 as wire, plan};
+use novarocks_proto_models::{
+    physical_package_v2 as package, physical_type_v2 as wire, plan, value_type as logical,
+};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
 use novarocks_types::{
     QueryId,
@@ -41,7 +46,7 @@ impl PureCompileControl for Control {
 
 struct BoundedFirstQualification<'a> {
     host: TypeMaterializationHost<'a>,
-    occupied: Option<FundingDomain>,
+    pressure_account: Option<AccountHandle>,
     admissions: usize,
     body_calls: &'a Cell<usize>,
 }
@@ -73,7 +78,7 @@ impl PackageTypeMaterializationScope for BoundedFirstQualification<'_> {
         C: From<TypeCodecError>,
         B: FnOnce() -> Result<DecodedTypeTable, C>,
     {
-        let occupied = &mut self.occupied;
+        let pressure_account = &mut self.pressure_account;
         let admissions = &mut self.admissions;
         let calls = self.body_calls;
         self.host.materialize_with_request(facts, || {
@@ -81,18 +86,54 @@ impl PackageTypeMaterializationScope for BoundedFirstQualification<'_> {
             body()
         }, |binding, peak| {
             *admissions += 1;
-            if let Some(domain) = occupied.take() {
-                // A real zero-budget sweep is deterministically incomplete.
-                // No ScopeLease is held here or across the original host wait.
+            if let Some(other) = pressure_account.take() {
+                // Establish real authorization only after the preceding namespace has exited.
+                // No writer or allocation observation is needed for this owned reservation.
+                binding.account().return_slack(u64::MAX);
+                other.return_slack(u64::MAX);
+                binding.authority().root().return_slack(u64::MAX);
+                let root_committed_before = binding.authority().root().committed_bytes();
+                let capacity = binding.authority().capacity_bytes();
+                let pressure_bytes = capacity
+                    .checked_sub(root_committed_before)
+                    .and_then(|available| available.checked_sub(OWNER_METADATA_BYTES))
+                    .expect("capacity admits a real pressure domain and its metadata");
+                assert!(pressure_bytes > 0 && peak > 0);
+                let domain = other.create_domain(pressure_bytes).unwrap();
+                let reserved = domain.snapshot();
+                assert_eq!(reserved.authorized, pressure_bytes);
+                assert_eq!(reserved.committed, pressure_bytes);
+                assert_eq!((reserved.live, reserved.external, reserved.active), (0, 0, false));
+                assert_eq!(binding.authority().root().committed_bytes(), capacity);
+                // The real request first encounters occupied capacity; its zero-budget
+                // maintenance cannot reclaim the reservation before returning Pending.
                 let outcome = request(Some(binding), KernelMemoryRequest {
                     workset_bytes: peak as u64,
                     stock_bytes: peak as u64,
                     threshold_bytes: 0,
                     maintenance_budget: 0,
                 });
-                assert!(matches!(&outcome, KernelMemoryAdmission::SettlementPending(receipt) if !receipt.complete));
+                let actual_kind = match &outcome {
+                    KernelMemoryAdmission::MissingQueryMemory => "MissingQueryMemory",
+                    KernelMemoryAdmission::Granted(_) => "Granted",
+                    KernelMemoryAdmission::SettlementPending(_) => "SettlementPending",
+                    KernelMemoryAdmission::SharedShortage(_) => "SharedShortage",
+                    KernelMemoryAdmission::Refused(_) => "Refused",
+                };
+                assert!(
+                    matches!(&outcome, KernelMemoryAdmission::SettlementPending(receipt) if !receipt.complete),
+                    "expected incomplete Pending: actual={actual_kind}, peak={peak}, capacity={capacity}, root_committed_before={root_committed_before}, root_committed_after={}",
+                    binding.authority().root().committed_bytes(),
+                );
                 assert_eq!(calls.get(), 0);
+                // Release all idle rights before the original host waits and requalifies.
                 domain.stop_producing().unwrap();
+                assert_eq!(domain.snapshot().authorized, 0);
+                assert_eq!(
+                    binding.authority().root().committed_bytes(),
+                    root_committed_before + OWNER_METADATA_BYTES,
+                );
+                drop(domain);
                 outcome
             } else {
                 request_complete_operation(Some(binding), peak)
@@ -116,9 +157,6 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
     let other = authority
         .create_account(AccountKind::Work, ExternalRef::NONE)
         .unwrap();
-    let occupied = other
-        .create_domain(TARGET - authority.root().committed_bytes() - 1024)
-        .unwrap();
     let binding = QueryMemoryBinding::try_new(
         QueryExecutionId::new(QueryId::new(37, 2), AttemptId::new(1).unwrap()).unwrap(),
         authority,
@@ -126,7 +164,31 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
     )
     .unwrap();
     let source = package::FragmentPackage {
-        types: Some(wire::TypeTable::default()),
+        // Author the writer's execution type independently of source attributes.
+        types: Some(wire::TypeTable {
+            carriers: vec![wire::CarrierTypeDefinition {
+                id: 0,
+                kind: Some(wire::carrier_type_definition::Kind::Primitive(
+                    plan::ArrowPrimitiveType::Int64 as i32,
+                )),
+            }],
+            fields: vec![],
+            value_types: vec![wire::ValueTypeDefinition {
+                id: 0,
+                carrier_type_id: Some(0),
+                logical_type_id: Some(0),
+            }],
+            logical_types: vec![logical::LogicalTypeDefinition {
+                id: Some(0),
+                nullable: false,
+                kind: Some(logical::logical_type_definition::Kind::Scalar(
+                    logical::ScalarValue {
+                        kind: logical::ScalarKind::Int64 as i32,
+                        ..Default::default()
+                    },
+                )),
+            }],
+        }),
         source_fields: Some(wire::SourceFieldTable {
             shape: Some(wire::TypeTable {
                 carriers: vec![wire::CarrierTypeDefinition {
@@ -155,8 +217,8 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
                     package::ConnectorWriteDataInput {
                         fields: vec![package::ConnectorWriteFieldBinding {
                             source_field_id: Some(2),
-                            value_type_id: None,
-                            field_token: vec![],
+                            value_type_id: Some(0),
+                            field_token: vec![37; 32],
                         }],
                     },
                 )),
@@ -171,7 +233,7 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
     let mut journal = TypeMaterializationJournal::default();
     let mut scope = BoundedFirstQualification {
         host: TypeMaterializationHost::new(&binding, &loan, &mut journal),
-        occupied: Some(occupied),
+        pressure_account: Some(other),
         admissions: 0,
         body_calls: &calls,
     };
@@ -189,7 +251,14 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
     work.finish().unwrap();
     assert_eq!(scope.admissions, 2);
     assert_eq!(calls.get(), 1);
-    assert_eq!(table.source_field(2).unwrap().name(), "original");
+    assert_eq!(
+        table.value_type(0),
+        Some(&FunctionValueType::new(DataType::Int64, false)),
+    );
+    let field = table.source_field(2).unwrap();
+    assert_eq!(field.name(), "original");
+    assert_eq!(field.data_type(), &DataType::Int64);
+    assert!(!field.is_nullable());
     drop(scope);
     assert!(!journal.pending.unwrap().complete);
     assert!(journal.shortage.is_none() && journal.capacity.is_none());

@@ -73,7 +73,7 @@ const MAX_WRITE_UNPIVOT_MAPPINGS: usize = 4_096;
 const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::connector_write_data_plane::QueryScopedTableWriteAggregateGuard;
 use crate::connector_write_data_plane::{
     NativeConnectorWriteObservationPort, RoleBoundCommitFragmentEncoder,
@@ -1119,7 +1119,7 @@ pub(super) fn lower_table_writer_node(
                 ctx.backend_process_id()
                     .map_err(|error| error.into_native(path.clone()))?,
             );
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             let observer = if let Some(controls) = ctx.test_controls() {
                 observer.with_test_controls(controls)
             } else {
@@ -1127,7 +1127,7 @@ pub(super) fn lower_table_writer_node(
             };
             observer
         }),
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         ctx.observation_controls()
             .map(|controls| controls.observation_for("writer-marker", execution_id))
             .transpose()
@@ -1136,7 +1136,7 @@ pub(super) fn lower_table_writer_node(
     ));
     let fragment_encoder =
         RoleBoundCommitFragmentEncoder::new(binding.fragment_encoder(), execution_id, node_id);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let fragment_encoder = if let Some(controls) = ctx.test_controls() {
         fragment_encoder.with_test_controls(controls)
     } else {
@@ -1164,7 +1164,7 @@ pub(super) fn lower_table_writer_node(
             format!("native node_id={node_id} table writer: {error}"),
         )
     })?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let lowered = if let Some(controls) = ctx.test_controls() {
         lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
             execution_id,
@@ -1288,7 +1288,7 @@ pub(super) fn lower_table_finish_node(
             )
         })?;
     let validator = RootCommitFragmentCarrierValidator::new(execution_id, node_id);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let validator = if let Some(controls) = ctx.test_controls() {
         validator.with_test_controls(controls)
     } else {
@@ -1312,7 +1312,7 @@ pub(super) fn lower_table_finish_node(
             format!("native node_id={node_id} table finish: {error}"),
         )
     })?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let lowered = if let Some(controls) = ctx.test_controls() {
         lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
             execution_id,

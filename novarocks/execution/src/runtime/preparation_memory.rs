@@ -104,7 +104,7 @@ impl<'a> SynchronousPreparationMemory<'a> {
 
     /// Exercise the same loop with real bounded qualification in contract tests.
     /// Production uses only the strict complete-operation entry above.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn materialize_with_request_for_test<T, E, R>(
         &mut self,
         facts: CompleteMetadataRequestFacts,

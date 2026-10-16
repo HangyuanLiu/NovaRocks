@@ -88,8 +88,7 @@ impl DirectIntentOwner {
         targets: &[(usize, usize, Option<u32>)],
         shared_backend_token: bool,
         cluster_size: usize,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
         let mut owner = self
@@ -108,11 +107,9 @@ impl DirectIntentOwner {
             !targets.is_empty() && targets.len() <= 64,
             "Native direct grant count outside finite bound"
         );
-        let controlled =
-            controlled.context("Native holds require an explicit --test-control-binary")?;
         let mut plan = ClusterTestSessionPlan::new(deadline)?;
         let fe = plan.reserve_launch(RoleSlot::Frontend)?;
-        plan.authorize_ordinary_launch(&fe, ordinary.to_path_buf())?;
+        plan.authorize_ordinary_launch(&fe, binary.to_path_buf())?;
         ensure!(
             query_count > 0 && query_count <= 64,
             "Native direct query count outside finite bound"
@@ -180,10 +177,10 @@ impl DirectIntentOwner {
                     grants,
                     vec![("novarocks-native-adapter".into(), "test-controls".into())],
                 )?;
-                plan.set_launch_binary(&reference, controlled.to_path_buf())?;
+                plan.set_launch_binary(&reference, binary.to_path_buf())?;
                 references.insert(index, reference);
             } else {
-                plan.authorize_ordinary_launch(&reference, ordinary.to_path_buf())?;
+                plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
             }
         }
         plan.validate_selected_intents(cluster_size)?;
@@ -327,32 +324,25 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         let targets = (0..8).map(|query| (0, query, None)).collect::<Vec<_>>();
         let plan = owner
-            .freeze(
-                "ingress-hold",
-                8,
-                &targets,
-                false,
-                3,
-                &binary,
-                Some(&binary),
-                deadline,
-            )
+            .freeze("ingress-hold", 8, &targets, false, 3, &binary, deadline)
             .unwrap();
+        let roles = plan.planned_launch_summaries();
+        for role in roles.as_array().unwrap() {
+            assert_eq!(role["binary"], json!(binary));
+            if role["role"] == "be-0" {
+                assert_eq!(role["ordinary"], false);
+                assert_eq!(role["grants"].as_array().unwrap().len(), 8);
+            } else {
+                assert_eq!(role["ordinary"], true);
+                assert!(role["grants"].as_array().unwrap().is_empty());
+            }
+        }
         let intent = owner.get().unwrap();
         assert_eq!(intent.holds.len(), 8);
         assert_eq!(intent.deadline, plan.deadline());
         assert!(
             owner
-                .freeze(
-                    "ingress-hold",
-                    8,
-                    &targets,
-                    false,
-                    3,
-                    &binary,
-                    Some(&binary),
-                    deadline
-                )
+                .freeze("ingress-hold", 8, &targets, false, 3, &binary, deadline)
                 .is_err()
         );
         let reference = &intent.references[&0];
@@ -386,7 +376,6 @@ mod tests {
                     true,
                     3,
                     &binary,
-                    Some(&binary),
                     Instant::now() + std::time::Duration::from_secs(10)
                 )
                 .is_err()

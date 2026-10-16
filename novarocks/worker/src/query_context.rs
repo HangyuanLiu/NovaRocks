@@ -413,7 +413,7 @@ impl QueryContextManager {
         manager
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn new_for_test() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(QueryContextManagerInner::default()),

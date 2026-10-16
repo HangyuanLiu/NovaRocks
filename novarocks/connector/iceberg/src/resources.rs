@@ -96,7 +96,7 @@ pub struct IcebergMetadataResources {
 }
 
 impl IcebergMetadataResources {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
         mut self,
         slot: crate::test_observation::IcebergObservationSlot,
@@ -158,12 +158,12 @@ pub struct IcebergExecutionResources {
 }
 
 impl IcebergExecutionResources {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn test_storage_authority_registry(&self) -> Arc<novarocks_fs::StorageAuthorityRegistry> {
         self.read_binding.test_storage_authority_registry().clone()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
         mut self,
         slot: crate::test_observation::IcebergObservationSlot,

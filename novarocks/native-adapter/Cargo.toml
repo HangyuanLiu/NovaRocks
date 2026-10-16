@@ -9,9 +9,6 @@ build = "build.rs"
 workspace = true
 
 [features]
-normal-build = ["novarocks-execution/normal-build", "novarocks-failpoint/normal-build", "novarocks-version/normal-build", "novarocks-worker/normal-build"]
-test-controls = ["novarocks-execution/test-controls", "novarocks-failpoint/test-controls", "novarocks-version/test-controls", "novarocks-worker/test-controls"]
-test-support = ["dep:novarocks-secret", "novarocks-execution/test-support"]
 
 [dependencies]
 novarocks-result-contract.workspace = true
@@ -31,7 +28,7 @@ novarocks-plan-codec.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true
-novarocks-secret = { workspace = true, optional = true }
+novarocks-secret = { workspace = true }
 novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
 novarocks-version.workspace = true
@@ -61,10 +58,10 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-novarocks-execution = { workspace = true, features = ["test-support"] }
-novarocks-plan-codec = { workspace = true, features = ["test-support"] }
+novarocks-execution = { workspace = true }
+novarocks-plan-codec = { workspace = true }
 h2.workspace = true
 novarocks-sql.workspace = true
-novarocks-worker = { workspace = true, features = ["test-support"] }
+novarocks-worker = { workspace = true }
 novarocks-secret.workspace = true
 sha2.workspace = true

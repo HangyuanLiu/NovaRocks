@@ -117,9 +117,9 @@ pub(crate) fn load_iceberg_mv_target_binding_typed(
     storage_observation: &dyn MvStorageObservationPort,
     target: &IcebergMvTarget,
     connector_context: &ConnectorRequestContext,
-    #[cfg(feature = "test-controls")] controls: Option<&crate::mv::test_controls::MvTestControls>,
+    #[cfg(novarocks_dev_controls)] controls: Option<&crate::mv::test_controls::MvTestControls>,
 ) -> Result<MvTargetBinding, ConnectorError> {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if let Some(controls) = controls {
         if controls
             .transient_preparation(&target.catalog, &target.namespace, &target.table)

@@ -11,8 +11,6 @@ workspace = true
 doctest = false
 
 [features]
-normal-build = ["novarocks-statistics-application/normal-build", "novarocks-execution/normal-build", "novarocks-failpoint/normal-build", "novarocks-fs/normal-build", "novarocks-mv-application/normal-build", "novarocks-mysql-adapter/normal-build", "novarocks-native-adapter/normal-build", "novarocks-query-application/normal-build", "novarocks-version/normal-build"]
-test-controls = ["novarocks-statistics-application/test-controls", "novarocks-execution/test-controls", "novarocks-failpoint/test-controls", "novarocks-fs/test-controls", "novarocks-mv-application/test-controls", "novarocks-mysql-adapter/test-controls", "novarocks-native-adapter/test-controls", "novarocks-query-application/test-controls", "novarocks-version/test-controls"]
 mem-1-m07-hms-listing-observe = []
 mem-1-m07-closing-pressure = ["novarocks-mysql-adapter/mem-1-m07-closing-pressure"]
 mem-1-m07-root-observation = []
@@ -82,15 +80,15 @@ novarocks-connector-iceberg-functions.workspace = true
 novarocks-connector-paimon.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
-novarocks-plan-codec = { workspace = true, features = ["test-support"] }
-novarocks-mv-application = { workspace = true, features = ["test-support"] }
-novarocks-catalog-application = { workspace = true, features = ["test-support"] }
+novarocks-plan-codec = { workspace = true }
+novarocks-mv-application = { workspace = true }
+novarocks-catalog-application = { workspace = true }
 novarocks-connector-starrocks.workspace = true
-novarocks-query-application = { workspace = true, features = ["test-support"] }
+novarocks-query-application = { workspace = true }
 novarocks-result-render.workspace = true
 novarocks-secret.workspace = true
 novarocks-state-store-testkit.workspace = true
-novarocks-sql = { workspace = true, features = ["test-support"] }
+novarocks-sql = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }

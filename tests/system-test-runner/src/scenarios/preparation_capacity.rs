@@ -78,9 +78,7 @@ impl Scenario for PreparationCapacity {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let targets = if self.bytes {
@@ -106,8 +104,7 @@ impl Scenario for PreparationCapacity {
             &targets,
             true,
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -164,9 +161,7 @@ impl Scenario for PreparationInterleaving {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let targets = if self.same_batch {
@@ -185,8 +180,7 @@ impl Scenario for PreparationInterleaving {
             &targets,
             true,
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

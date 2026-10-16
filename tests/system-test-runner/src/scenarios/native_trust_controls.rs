@@ -144,14 +144,7 @@ mod tests {
         let owner = SqlIntentOwner::default();
         let deadline = Instant::now() + Duration::from_secs(5);
         let plan = owner
-            .freeze(
-                baseline_statements(),
-                &[],
-                3,
-                &binary,
-                Some(&binary),
-                deadline,
-            )
+            .freeze(baseline_statements(), &[], 3, &binary, deadline)
             .unwrap();
         assert_eq!(plan.deadline(), deadline);
         let statements = (0..3)

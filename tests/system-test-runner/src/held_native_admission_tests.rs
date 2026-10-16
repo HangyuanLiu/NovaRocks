@@ -159,6 +159,7 @@ fn failed_binding_admission_precedes_any_command_or_native_role_launch() {
         &binding,
         &directory.path().join("not-a-server"),
         &directory.path().join("no-config"),
+        &crate::build_information::BuildInformation::fixture(),
     );
     assert!(result.is_err());
 }

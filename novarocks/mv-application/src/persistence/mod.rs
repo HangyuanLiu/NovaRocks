@@ -32,7 +32,7 @@ pub mod schema;
 pub mod semantic;
 pub mod validation;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[doc(hidden)]
 pub mod test_support;
 

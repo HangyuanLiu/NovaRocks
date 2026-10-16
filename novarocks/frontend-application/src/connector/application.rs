@@ -196,7 +196,7 @@ pub(crate) fn connector_request_context_for_execution_on_runtime(
             execution.cancellation().clone(),
         ),
     }?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if let Some(nomination) = execution.test_statement_nomination() {
         let actual = context.request_scope_extension_or_insert_with(|| nomination.as_ref().clone());
         if actual != *nomination {

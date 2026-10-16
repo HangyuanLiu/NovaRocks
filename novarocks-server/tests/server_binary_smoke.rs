@@ -458,7 +458,7 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
     let _lock = lock_server_binary_smoke();
     let mut pair = ConfigPair::new();
     let lifecycle_fault_dir = pair.lifecycle_fault_dir.clone();
-    // Legacy environment input must not activate diagnostics in either build kind.
+    // Legacy environment input must not activate diagnostics without authorization.
     let frontend_debug_env = [(
         novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
         lifecycle_fault_dir.as_path(),
@@ -529,17 +529,20 @@ fn binary_rejects_removed_and_ambiguous_launch_shapes() {
     );
 
     assert_rejected(&["standalone"], "missing required --role");
-    #[cfg(feature = "normal-build")]
-    assert_rejected(
-        &[
-            "standalone",
-            "--role",
-            "fe",
-            "--test-session",
-            "unread-declaration.json",
-        ],
-        "unknown standalone arg: --test-session",
-    );
+    // Release excludes the declaration parser; development includes it but
+    // still runs grantless roles without activating controls (the parity smoke).
+    if !cfg!(debug_assertions) {
+        assert_rejected(
+            &[
+                "standalone",
+                "--role",
+                "fe",
+                "--test-session",
+                "unread-declaration.json",
+            ],
+            "unknown standalone arg: --test-session",
+        );
+    }
     assert_rejected(
         &["standalone", "--role", "fe", "--port", "9030"],
         "--port is not supported",

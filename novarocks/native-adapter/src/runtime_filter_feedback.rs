@@ -69,9 +69,9 @@ pub struct TaskRuntimeFilterFeedbackEgress {
     /// their first reduction would both call it version one. The frontend's
     /// cursor is per task, so the version has to be per task as well.
     next_version: AtomicU64,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<std::sync::Arc<crate::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observation_controls:
         Option<std::sync::Arc<crate::test_observation_controls::NativeObservationControls>>,
 }
@@ -82,14 +82,14 @@ impl TaskRuntimeFilterFeedbackEgress {
             carrier,
             reporter,
             next_version: AtomicU64::new(DomainVersion::FIRST.get()),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_observation_controls(
         mut self,
         controls: Option<
@@ -100,7 +100,7 @@ impl TaskRuntimeFilterFeedbackEgress {
         self
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_controls(
         mut self,
         controls: std::sync::Arc<crate::test_controls::NativeTestControls>,
@@ -127,7 +127,7 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         // stream's feedback sink used to claim it. A claim left behind on the
         // retired carrier is armed and unconsumed: the query succeeds
         // untouched and the case waits out its budget.
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let outcome = if self.test_controls.as_ref().is_some_and(|controls| {
             crate::task_protocol_fault::force_feedback_unavailable(controls, self.carrier)
         }) {
@@ -135,7 +135,7 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         } else {
             outcome
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let deployment_epoch = if self.test_controls.as_ref().is_some_and(|controls| {
             crate::task_protocol_fault::forge_feedback_foreign_attempt(controls, self.carrier)
         }) {
@@ -172,7 +172,7 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         };
         let query_id = self.carrier.query_execution_id().query_id();
         let mut schema_digest = publication.contract_digest().to_vec();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if self.test_controls.as_ref().is_some_and(|controls| {
             crate::task_protocol_fault::corrupt_feedback_contract_digest(controls, self.carrier)
         }) {
@@ -226,7 +226,7 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
             );
             return;
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         emit_advertised_marker(
             self.observation_controls.as_deref(),
             self.carrier,
@@ -241,7 +241,7 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
 /// It fires at the publication, not where the sink is installed: a marker
 /// logged at install time would say only that a carrier exists, which is
 /// exactly the defect this loop had.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_advertised_marker(
     controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     carrier: TaskIdentity,

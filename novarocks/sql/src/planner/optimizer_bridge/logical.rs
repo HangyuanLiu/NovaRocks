@@ -58,7 +58,7 @@ pub(crate) fn try_to_optimizer_expr(
     Ok(expression)
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn to_optimizer_expr(plan: &LogicalPlanNode, scalars: &mut ScalarArena) -> OptExpr {
     try_to_optimizer_expr(plan, scalars, crate::optimizer::test_optimizer_control())
         .expect("invalid logical plan stage")

@@ -1249,13 +1249,12 @@ mod tests {
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyPort,
     };
     use novarocks_types::BackendProcessId;
-    use novarocks_version::native_build_identity;
     use std::net::SocketAddr;
     use std::sync::Arc;
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
         descriptor_with(
             endpoint,
-            native_build_identity(),
+            "fixture-build",
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         )
     }
@@ -1442,7 +1441,7 @@ mod tests {
         let compatible = descriptor("127.0.0.1:9070".parse().unwrap());
         let other = descriptor_with(
             "127.0.0.1:9071".parse().unwrap(),
-            native_build_identity(),
+            "fixture-build",
             novarocks_types::NativeCompatibilityId::new([0x72; 32]),
         );
         service

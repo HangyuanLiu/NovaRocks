@@ -120,17 +120,14 @@ impl Scenario for AcceptedAfterAckDrop {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             vec![retry_spec()],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -155,17 +152,14 @@ impl Scenario for CancelWithTerminalAckReplay {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             vec![cancel_spec()],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -202,9 +196,7 @@ impl Scenario for Ncp5FeedbackContractDigestCorrupt {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
@@ -213,8 +205,7 @@ impl Scenario for Ncp5FeedbackContractDigestCorrupt {
             )],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -239,17 +230,14 @@ impl Scenario for Ncp5FeedbackUnavailable {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             vec![feedback_spec("runtime-filter-feedback-unavailable")],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -274,17 +262,14 @@ impl Scenario for Nid2ForeignAttemptRejection {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             vec![feedback_spec("runtime-filter-feedback-foreign-attempt")],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -317,17 +302,14 @@ impl Scenario for NativeTrustDirectional {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             vec![retry_spec(), cancel_spec()],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

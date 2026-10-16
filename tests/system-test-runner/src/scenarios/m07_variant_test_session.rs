@@ -17,7 +17,7 @@
 
 //! Finite declarations for the existing admitted M07 fixture owners.
 use crate::scenario::ScenarioContext;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
 use novarocks_failpoint::session::DomainGrant;
@@ -37,14 +37,8 @@ pub(in crate::scenarios) fn grant(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Keeps original role binaries, deadline and owner grants explicit."
-)]
 pub(in crate::scenarios) fn fixture_plan(
-    primary_binary: &Path,
-    ordinary_binary: &Path,
-    controlled_binary: Option<&Path>,
+    binary: &Path,
     cluster_size: usize,
     deadline: Instant,
     fixture_grants: Vec<DomainGrant>,
@@ -58,9 +52,8 @@ pub(in crate::scenarios) fn fixture_plan(
     );
     let mut plan = ClusterTestSessionPlan::new(deadline)?;
     let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
-    // Preserve the already admitted primary variant. The ordinary or base
-    // control binary must never silently replace this original FE identity.
-    plan.set_launch_binary(&frontend, primary_binary.to_path_buf())?;
+    // Every role uses the admitted primary variant; grants remain role-local.
+    plan.set_launch_binary(&frontend, binary.to_path_buf())?;
     let mut frontend_grants = fixture_grants;
     let mut frontend_capabilities = vec![
         ("novarocks-server".into(), "test-controls".into()),
@@ -84,12 +77,10 @@ pub(in crate::scenarios) fn fixture_plan(
     for index in 0..cluster_size {
         let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
         if statement_tokens.is_empty() {
-            plan.authorize_ordinary_launch(&backend, ordinary_binary.to_path_buf())?;
+            plan.authorize_ordinary_launch(&backend, binary.to_path_buf())?;
             continue;
         }
-        let controlled = controlled_binary
-            .context("M07 exact root evidence requires an explicit controlled BE binary")?;
-        plan.set_launch_binary(&backend, controlled.to_path_buf())?;
+        plan.set_launch_binary(&backend, binary.to_path_buf())?;
         let root = plan.reserve_transport(&format!("m07-root-be-{index}"))?;
         let mut backend_grants = Vec::new();
         for token in statement_tokens {
@@ -208,12 +199,44 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn exact_root_evidence_never_falls_back_to_an_ordinary_backend() {
+    fn exact_root_evidence_keeps_role_grants_on_the_selected_primary() {
         let binary = std::env::current_exe().unwrap();
         let result = fixture_plan(
             &binary,
-            &binary,
-            None,
+            3,
+            Instant::now() + Duration::from_secs(5),
+            vec![grant(
+                "mysql-fixture",
+                "exact",
+                json!({"action":"exact-write"}),
+            )],
+            "mem-1-m07-exact-mysql-write",
+            &["novarocks-mysql-adapter"],
+            &["original-target"],
+        );
+        let plan = result.unwrap();
+        let roles = plan.planned_launch_summaries();
+        let roles = roles.as_array().unwrap();
+        assert_eq!(roles.len(), 4);
+        assert!(roles.iter().all(|role| role["binary"] == json!(binary)));
+        let frontend = roles.iter().find(|role| role["role"] == "fe").unwrap();
+        assert!(frontend["grants"].as_array().unwrap().iter().any(|grant| {
+            grant["domain"] == "mysql-fixture" && grant["action"] == "exact-write"
+        }));
+        for backend in roles.iter().filter(|role| role["role"] != "fe") {
+            assert_eq!(backend["ordinary"], false);
+            let grants = backend["grants"].as_array().unwrap();
+            assert_eq!(grants.len(), 1);
+            assert_eq!(grants[0]["domain"], "native-observation");
+            assert_eq!(grants[0]["action"], "grpc-fragment");
+        }
+    }
+
+    #[test]
+    fn an_exact_fixture_requires_the_selected_primary_to_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = fixture_plan(
+            &directory.path().join("missing-primary"),
             3,
             Instant::now() + Duration::from_secs(5),
             vec![grant(
@@ -229,7 +252,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("explicit controlled BE binary")
+                .contains("binary is missing")
         );
     }
 
@@ -238,8 +261,6 @@ mod tests {
         let binary = std::env::current_exe().unwrap();
         let plan = fixture_plan(
             &binary,
-            &binary,
-            Some(&binary),
             3,
             Instant::now() + Duration::from_secs(5),
             vec![grant(
@@ -294,8 +315,6 @@ mod tests {
         let binary = std::env::current_exe().unwrap();
         let plan = fixture_plan(
             &binary,
-            &binary,
-            None,
             3,
             Instant::now() + Duration::from_secs(5),
             vec![grant(
@@ -309,6 +328,7 @@ mod tests {
         )
         .unwrap();
         for launch in plan.planned_launch_summaries().as_array().unwrap() {
+            assert_eq!(launch["binary"], json!(binary));
             if launch["role"] == "fe" {
                 assert_eq!(launch["grants"].as_array().unwrap().len(), 1);
                 assert_eq!(launch["grants"][0]["domain"], "hms-listing-observation");

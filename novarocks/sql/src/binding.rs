@@ -335,7 +335,7 @@ impl SqlTableBindingAllocator {
 
     /// Construct a named scope only for cross-crate fixtures whose sealed SQL
     /// plan already contains deterministic binding tokens.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn try_new_for_test(scope_seed: NonZeroU64) -> Result<Self, String> {
         Ok(Self {
             scope: SqlTableBindingScopeId::new(scope_seed),

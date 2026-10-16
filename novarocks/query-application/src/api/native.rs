@@ -409,7 +409,7 @@ pub type NativeActiveAttemptConvergenceFuture<'a> =
 pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
     /// Only the controlled role adapter can supply a live, exact placement preference.
     /// It is absent from ordinary builds and never travels on the Native wire.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_preferred_backend_process(
         &self,
         _execution: QueryExecutionId,

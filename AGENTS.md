@@ -131,6 +131,10 @@ SQL client
 - `novarocks-server/src/main.rs`
   Native top-level command dispatch. The only server command is `standalone`;
   it chooses `fe`, `be`, or `all-in-one` before startup side effects.
+  Server application composition and role runners live in
+  `novarocks-server/library/src/**` (`novarocks-server-application`); the root
+  `novarocks-server` package owns the thin CLI; the application library owns
+  process allocator installation.
 
 - `novarocks/frontend-application/src/**`
   FE application composition, SQL admission, catalog projection, native query
@@ -315,7 +319,7 @@ Execution, and do not recreate a Backend facade around it.
   per-poll `AttributedFuture` and R1 `ExplicitOwner` helpers. Observation grants
   no capacity; publish one fact per actual block, never both manually and through
   wrapper/helper. R1 zero-sized requests publish no physical fact.
-- `novarocks-server/src/memory_observation.rs` installs
+- `novarocks-server/library/src/memory_observation.rs` installs
   `AttributingAllocator<Jemalloc>` (System without default features). Process
   request counts, responsibility, allocator/cgroup/RSS and metadata estimates
   remain separate. Q×sampled pins excludes in-flight work and is not a physical
@@ -706,30 +710,16 @@ the guide supplies NovaRocks locations and operational responsibilities.
 
 ### 8.2 Build Mode
 
-Three profiles trade compile time against query speed (numbers are from a 10-core
-machine — treat as relative, not absolute):
+日常构建使用唯一 `dev` 配置和当前 worktree 的 `target/`。规范检查点先执行
+`tools/ci/dev-test.sh prepare logs/<attempt>/artifacts.json`，同次准备 workspace tests 和真实 bins；
+定向运行用 `tools/ci/dev-test.sh test FILTER -- --test-threads=1`，最终按影响面运行
+`tools/ci/dev-test.sh test --no-fail-fast -- --test-threads=1`，doctest 单独 `dev-test.sh doc`。
+release 用于必要的产品接线/发布检查，不再维护第二套日常功能矩阵。
 
-- **Debug build (`cargo build`, profile `dev`)**: opt-level 0. Fastest incremental
-  rebuild (~18s) but slow query execution (~5-10x slower than release).
-  **Use when**: checking correctness or running targeted queries where runtime does
-  not matter.
-- **Balanced build (`cargo build --profile dev-opt`, artifacts in `target/dev-opt/`)**:
-  opt-level 1, `debug = 1`, `codegen-units = 256`, `incremental = true`, `lto = false`.
-  Incremental rebuild ~32s (vs ~6 min for release on the same one-line lib edit) while
-  query execution matches release. On engine-CPU-bound SQL suites (many small queries)
-  it runs ~1.9x faster than debug; on object-store-I/O-bound bulk scans (SSB/TPC-H over
-  MinIO) the profile barely matters. First (cold) build is ~2x debug because all
-  dependencies are optimized too — a one-time cost.
-  **Use when**: iterating on the SQL/test loop and you want fast rebuilds *and*
-  near-release query speed. Default for running suites during development.
-- **Release build (`cargo build --release`)**: opt-level 3 + thin LTO + `codegen-units = 1`,
-  `incremental` off. Fastest execution, but incremental rebuilds are punishing
-  (~6 min for a one-line lib change), so it is unusable for iteration.
-  **Use when**: checking a release artifact or deployment build. 当前阶段不维护性能测量资产。
-
-**Rule of thumb**: `dev` for pure correctness iteration; `dev-opt` for the dev/test
-loop when query speed matters (fast rebuilds + release-class runtime); `--release`
-for release artifact checks; this is a Cargo build profile, not a performance test verdict.
+窄 `cargo test -p <owner>` 是允许的快速内循环；它可能改变 feature 统一和重链接集合，不能当完整规范图。
+新 worktree 的首次依赖编译、底层库编辑后多个测试/程序的必要链接、IDE 私有 check 缓存都是实际成本。
+旧 18s/32s 仅是历史观察；当前 opt 取舍须引用本轮原始构建材料，不承诺提速。
+IDE 测试按钮与私有 target 配置、清理责任见 [测试治理](docs/guides/development/test-governance.md#ide-与缓存维护)。
 
 ### 8.3 Code Quality
 
@@ -756,7 +746,7 @@ The two role configs are yours to create: copy `novarocks-fe.toml.example` and
 NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --role all-in-one \
   --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
 
-# Release: slow compile, fast query (for suite testing)
+# Release: check a release artifact; daily suite runs use dev
 NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --role all-in-one \
   --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
 ```
@@ -822,7 +812,7 @@ a full run is a deliberate step with a stated reason, not a safety reflex. Full
 runs belong at milestone convergence, at the final verification before claiming
 completion, and where the blast radius genuinely is the whole repository.
 
-**Rust: choose `-p` from the crate you edited.** Every first-party crate lives
+**Rust: choose the affected owner for the narrow edit loop.** Every first-party crate lives
 in the single root workspace, so `cargo test -p <crate>` always works; the
 packages under `vendor/` own separate workspaces and locks and are out of scope
 unless you edited them.
@@ -843,12 +833,10 @@ a single case covers the change. A change to array function declarations needs
 `complex-type` and `function`, not the corpus; outer-join nullability needs
 `join`; CUBE needs `aggregate`.
 
-**What a full run costs** (measured 2026-09-15; re-check rather than quote if it
-matters): `cargo test --workspace` builds and runs about 119 test binaries
-across 50 packages and roughly ten thousand cases, minutes per round even when
-little changed. `--suite all` selects 33 suites / 776 cases; one runner
-invocation owns one server lifecycle, so running suites one at a time pays a
-server start per suite and a full pass costs tens of minutes.
+**统计范围与成本。** 测试目标随 workspace 变化；用 `cargo metadata --locked --no-deps --format-version 1`
+统计当前成员和声明目标，用规范准备的 Cargo artifact 统计实际启用的测试与程序，二者不混为 case 数。
+SQL 用已准备 runner 的 `--list-suites` 与所选 suite manifest；成本记录实际拓扑、fixture 与退出，
+不沿用固定二进制、suite 或 case 数量作为当前事实。
 
 **Investigate timing failures with evidence.** Credential-expiration checks
 such as `provider_pool_evicts_vended_provider_at_credential_expiration`
@@ -1066,18 +1054,24 @@ authorization in `dev-workflow-finish`.
 
 相关 Rust owner/helper/input 改动沿既有单测链路；结果慢端/并发与 range/delete/planning/DOP 显式功能组由领域维护者每周手工运行，相关 owner/fixture 改动必跑。三套 SSB/TPC correctness 成本较高，runner/输入绑定改动必跑三套，每周手工完整轮次，不扩默认 CI。MV/OPTIMIZE 沿既有 suite。周期调度与共享证据服务尚未交付，G7a/G7b 已取消，不作未来交付承诺。详见 [测试治理](docs/guides/development/test-governance.md)。
 
-FE preparation 只保留带独立 secret 鉴权的 `/statement/{arm,peek,drain}` 功能观测；运行级 `/arm`、`/drain` 与专用计时钩子退出。内部 statement 观测编入 `test-controls`，还需本次实际角色会话的独立观察授权；普通产品没有该内部路由。
+FE preparation 只保留带独立 secret 鉴权的 `/statement/{arm,peek,drain}` 功能观测；运行级 `/arm`、`/drain` 与专用计时钩子退出。内部 statement 观测由实际开发 cfg 编入，还需本次实际角色会话的独立观察授权；普通产品没有该内部路由。
 
-### 普通与受控测试产物
+### 主测试产物与有限授权
 
-Server 默认 `normal-build`，沿实际依赖边排除测试控制；叶子 owner 拒绝与 `test-controls` 合并。不要对 Server 使用 `--all-features`，也不要在一次 Cargo 命令中选择普通 Server 和控制 owner 测试。编入 feature、debug/profile 或 `fault-scenario` 名称都不授予控制权。
+实际 `debug_assertions` 决定 `novarocks_dev_controls`，标准 dev 编入控制能力、标准 release 排除。
+编入能力不授予任何动作：普通及有限控制场景使用同一个显式主 Server，授权仍绑定本次角色会话和准确动作。
+SQL 仅传 `NOVAROCKS_BIN`，System 传 `--binary`；缺能力或授权明确失败，不能跳过断言或回退旧程序。
 
-CI 构建入口为 [build_capabilities.sh](tools/ci/lib/build_capabilities.sh)。普通、控制及兼容性变体使用独立 target，默认是 `target/normal`、`target/test-controls`、`target/variants`；`NOVA_CI_NORMAL_TARGET_DIR`、`NOVA_CI_CONTROL_TARGET_DIR`、`NOVA_CI_VARIANT_TARGET_DIR` 可指向已有 owner 管理的缓存根，三者不能相同或互相包含。缓存可复用，运行证据根仍每次独占，不为换产物清理已有缓存。`NOVA_CI_CARGO_PROFILE` 默认为 `dev-opt`，构建同时显式传 `--profile` 与 `NOVAROCKS_BUILD_PROFILE`；`dev` 的目录为 `debug`，另两个 profile 使用同名目录。
+[规范开发入口](tools/ci/dev-test.sh) 与 CI 共用 workspace/tests/bins/dev 主图和 worktree target；
+真实 Cargo JSON 绑定路径、自报与 hash，最后一次相关 Cargo 后刷新，消费前核对。
+Server CLI 保留 `novarocks-server`，SQL CLI 保留原 manifest/package；System CLI 为
+`novarocks-system-test-cli`，原 `novarocks-system-test-runner` 为库。来源仅薄入口冻结，库不监听 Git。
+不要用源码 HEAD、路径、identity 或 runner profile 代替实际 FE/BE 自报。
 
-`local-full-ci.sh` 保留普通 Rust workspace 测试，另有显式 `test-control owner tests` stage：failpoint（含 `typed`）、MV、FE、Native、Worker、fs、Execution 七 owner 的 `--lib` 控制配置，独立 control target，不选择 Server。HMS 与 MySQL exact/closing 的旧 feature 专属测试另外显式选 owner/feature，不能以基础七包通过代替；示例及边界见 [测试治理](docs/guides/development/test-governance.md)。
-
-System 传真实 `--binary`、`--ordinary-binary` 和 `--test-control-binary`；兼容性场景保留用户选择的 Primary/Compatible/OtherIsland 实际产物，CI 明确以 controls 作兼容性 Primary，同时单列 ordinary。SQL 传 `NOVAROCKS_BIN` 与 `NOVAROCKS_TEST_CONTROL_BIN`，按所选有限步骤建立必要会话，普通步骤仍用普通产物。旧环境变量不再激活产品控制，裸测试 CALL 不自动授予观察或擦除权。
-
-每个实际产物在启动前读取自身 `--build-info`，保留 stdout/stderr/实际退出、owner 能力、声明 profile、binary cfg 与 package 局部事实。未声明值及最终 LTO/codegen/dependency override/额外 flags 等未知项保留 unknown；自报不作发布认证。路径、源码 HEAD、build identity 或 runner profile 都不能代替实际 FE/BE 自报。这些接口说明不表示 G2 全部实现或验收已完成；历史私有 exact/held/HMS 矩阵缺输入时记 `NOT_RUN`。
+默认功能 CI 排除兼容专项且不准备变体；独立 [兼容入口](tools/ci/native-compatibility-ci.sh)
+按原生所选集合的完整生命周期需求准备 Compatible/OtherIsland，每种一次，然后恢复主输入并刷新产物。
+选择策略、IDE 与保留/回收见 [测试治理](docs/guides/development/test-governance.md#兼容专项的选择)，
+场景性质和 fixture 需求见 [System README](tests/system-test-runner/README.md#兼容专项与程序需求)。
+HMS/MySQL 私有完整矩阵缺输入仍记 `NOT_RUN`，局部单测不替代原输入与真实退出。
 
 现有 LNP-3A/LNP-3D、MV storage-contract 与 system MV 资产保留，旧指令/CALL 禁止扩展。7B3 承接非聚合冷恢复、配置/paused、Unknown 与管理接续；7B4 承接 SUM/COUNT、聚合状态和聚合冷恢复；7B5 承接 V/S 身份、发现/CREATE/DROP、路由与 materialized S/fallback；7B11 承接文档格式、独立 graph 与 shared-document-revisions。每个唯一产品 owner 在替代保护实际通过后逐项退役对应旧载体，不在 G2 新增启动期缓存缺失或通用擦除接口。

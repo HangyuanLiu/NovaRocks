@@ -21,15 +21,12 @@
 //! correctness. Connector implementations bind authorized storage access and
 //! ask this crate to read physical Parquet or ORC columns.
 
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
-
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
         ],
     )
@@ -122,5 +119,12 @@ pub use storage_authority::{
 
 // Design: ADR-0014 (docs/adr/ADR-0014-connector-neutral-file-foundation.md)
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub use storage_authority::StorageAuthorityCloseControls;
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

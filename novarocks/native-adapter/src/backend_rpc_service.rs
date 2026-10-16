@@ -49,7 +49,7 @@ pub struct BackendRpcService {
     exchange_data_plane: NativeExchangeDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
     control_executor: Arc<NativeControlExecutor>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
 }
 
@@ -75,11 +75,11 @@ impl BackendRpcService {
             ),
             runtime_filter_ingress,
             control_executor,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
         }
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_controls(
         mut self,
         controls: Arc<crate::test_controls::NativeTestControls>,
@@ -280,17 +280,17 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request).ok_or_else(|| {
             tonic::Status::internal("task operation request is missing native ingress ownership")
         })?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let hold_token = if let Some(controls) = self.test_controls.as_ref() {
             crate::task_protocol_fault::claim_native_ingress_hold(controls, &request)?
         } else {
             None
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let hold_deadline = ownership.deadline();
         let timing = TaskIngressTiming::new(ownership.arrival(), ownership.deadline());
         let raw = request.into_inner();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let registry_hold_token = if let Some(controls) = self.test_controls.as_ref() {
             crate::task_protocol_fault::claim_native_registry_hold(controls, &raw)?
         } else {
@@ -303,14 +303,14 @@ impl NovaRocksGrpc for BackendRpcService {
                 queued_at.elapsed(),
             );
             let _ownership = ownership;
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             if let Some(token) = hold_token {
                 crate::task_protocol_fault::hold_native_ingress_ordinary_closure(
                     token,
                     hold_deadline,
                 )?;
             }
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             if let Some(token) = registry_hold_token {
                 let mut token = Some(token);
                 ingress.with_registry_lock_for_test(&mut || {

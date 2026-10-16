@@ -218,7 +218,7 @@ fn materialize_control_blocking(
     // complete role group rather than a parallel FE registry.
     let captured_read = Arc::new(Mutex::new(None));
     let capture = Arc::clone(&captured_read);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let observation_slot = resources.planning_binding().test_observation().cloned();
     let factory = IcebergConnectorFactory::new(resources)
         .with_table_coordination(coordination)
@@ -319,7 +319,7 @@ fn materialize_control_blocking(
                 catalog_handle.clone(),
                 runtime,
             );
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             let session = session.with_test_observation(observation_slot.clone());
             let session = Arc::new(session);
             let adapter = build_write_adapter(descriptor, catalog_handle);

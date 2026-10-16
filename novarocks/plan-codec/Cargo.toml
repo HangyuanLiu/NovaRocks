@@ -29,7 +29,6 @@ doctest = false
 
 [features]
 # Generous whole-package limits for dependent crates' tests.
-test-support = []
 
 [dependencies]
 flatbuffers.workspace = true

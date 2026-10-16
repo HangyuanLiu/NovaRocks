@@ -262,6 +262,7 @@ pub(crate) fn admit(
     path: &Path,
     server: &Path,
     config: &Path,
+    build: &crate::build_information::BuildInformation,
 ) -> Result<(HmsBinding, Vec<u8>, Vec<u8>, Vec<u8>, Admission)> {
     let preparation = Instant::now() + Duration::from_millis(PREP_MS);
     let mut binding_owner = InputOwner::open(path, BINDING_BYTES, preparation)?;
@@ -298,8 +299,8 @@ pub(crate) fn admit(
         "HMS actual clean source differs from original freeze"
     );
     require_compiled_runner(
-        novarocks_version::build_git_commit(),
-        novarocks_version::native_build_identity(),
+        build.source_commit,
+        build.native_build_identity,
         &original_source.revision,
     )?;
     let mut files = vec![binding_owner];

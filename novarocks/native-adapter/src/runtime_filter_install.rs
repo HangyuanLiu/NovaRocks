@@ -32,7 +32,7 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
 };
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use novarocks_proto_codec::lifecycle::RuntimeFilterContribution;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
@@ -95,7 +95,7 @@ enum InstallTypeMode<'borrow, 'creator> {
     Strong(&'borrow mut NativeDecodeResources<'creator>),
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 fn with_fixture_resources<T>(
     operation: impl FnOnce(&mut NativeDecodeResources<'_>) -> NativeResult<T>,
 ) -> NativeResult<T> {
@@ -118,7 +118,7 @@ fn with_fixture_resources<T>(
     Ok(result)
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 fn fixture_protocol(error: NativeFragmentDecodeError) -> ProtocolError {
     match error {
         NativeFragmentDecodeError::Protocol(error) => error,
@@ -135,7 +135,7 @@ fn fixture_protocol(error: NativeFragmentDecodeError) -> ProtocolError {
 /// execution identity used here is the admitted one, not a restated copy.
 /// Every structural and cross-field rejection below therefore still runs on
 /// the exact bytes that were admitted.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn decode_runtime_filter_contribution(
     execution_id: QueryExecutionId,
     contribution: &RuntimeFilterContribution,
@@ -867,7 +867,7 @@ fn decode_lifecycle_options(
     })
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn decode_participant_install(
     request: &filter::InstallRuntimeFilterDeploymentRequest,
 ) -> CodecResult<DecodedRuntimeFilterParticipantInstall> {

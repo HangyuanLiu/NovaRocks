@@ -20,6 +20,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "$REPO_ROOT/tools/ci/lib/sql_suites.sh"
 
+# Consume the main preparation receipt; discovery never starts another build.
+: "${NOVA_CI_ARTIFACT_RECEIPT:?run dev-test.sh prepare and export its artifact receipt first}"
 discovered="$(ci_discover_sql_suites "$REPO_ROOT")"
 
 grep -qx 'filter' <<<"$discovered"

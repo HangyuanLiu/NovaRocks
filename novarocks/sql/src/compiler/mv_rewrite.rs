@@ -122,7 +122,7 @@ pub struct SqlMvRewriteSelectionFacts {
 }
 
 impl SqlMvRewriteSelectionFacts {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn try_new(
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
@@ -136,7 +136,7 @@ impl SqlMvRewriteSelectionFacts {
         )
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn try_new_for_target(
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
@@ -155,7 +155,7 @@ impl SqlMvRewriteSelectionFacts {
         )
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn try_new_for_target_with_occurrences(
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
@@ -1633,7 +1633,7 @@ impl SqlImvRewriteSnapshot {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_target_binding() -> SqlTableBindingId {
     use std::num::{NonZeroU32, NonZeroU64};
 
@@ -1643,7 +1643,7 @@ pub(crate) fn test_target_binding() -> SqlTableBindingId {
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 fn test_object_id(value: &str) -> ConnectorTableObjectId {
     ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(value.as_bytes()))
         .expect("test object ID")
@@ -1655,7 +1655,7 @@ fn test_object_id(value: &str) -> ConnectorTableObjectId {
 /// The prior and admitted snapshots deliberately describe one exact
 /// incremental window. Tests that exercise delta or version rewriting must
 /// never rely on a synthetic first-refresh fallback.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     let base = novarocks_types::naming::TableIdentity::new("ice", "db", "b");
     let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
@@ -1710,7 +1710,7 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[allow(
     dead_code,
     reason = "The snapshot-handle fixture remains available to focused SQL MV rewrite tests."
@@ -1722,7 +1722,7 @@ pub(crate) fn test_incremental_snapshot_handle() -> SqlImvRewriteSnapshotHandle 
 /// SQL-only scan fixture for rewrite-rule tests.  Test plans must exercise the
 /// same tokenized scan vocabulary as production compiler artifacts; connector
 /// table metadata belongs to application-owned preparation tests.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[allow(
     dead_code,
     reason = "The generic tokenized scan fixture remains available to focused SQL MV rewrite tests."
@@ -1734,7 +1734,7 @@ pub(crate) fn test_scan_source(kind: crate::planner::table::SqlScanKind) -> Scan
 /// SQL-only scan fixture with an explicit canonical table identity. Tests
 /// comparing physical table identity must not collapse unrelated tables into
 /// the shared default fixture identity.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[allow(
     dead_code,
     reason = "The explicit-table scan fixture remains available to physical identity rewrite tests."
@@ -1763,7 +1763,7 @@ pub(crate) fn test_scan_source_for(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[allow(
     dead_code,
     reason = "The current-version scan fixture remains available to focused SQL MV rewrite tests."
@@ -1774,7 +1774,7 @@ pub(crate) fn test_data_scan_source() -> ScanSource {
     })
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[allow(
     dead_code,
     reason = "The named current-version scan fixture remains available to identity rewrite tests."
@@ -1790,7 +1790,7 @@ pub(crate) fn test_data_scan_source_for(catalog: &str, namespace: &str, table: &
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[allow(
     dead_code,
     reason = "The delta scan fixture remains available to incremental SQL MV rewrite tests."
@@ -1804,7 +1804,7 @@ pub(crate) fn test_delta_scan_source(from_snapshot_id: i64, to_snapshot_id: i64)
 
 /// Build aggregate-refresh facts without persisted records or connector
 /// metadata. Rule tests vary these compiler-facing values directly.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[allow(
     dead_code,
     reason = "The aggregate snapshot fixture remains available to aggregate rewrite-rule tests."
@@ -1985,7 +1985,7 @@ pub(crate) fn test_aggregate_snapshot(
 
 /// SQL-owned join fixture for rewrite rules. It has no persistence, provider,
 /// or application-context dependency.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> {
     let qualified =
         |table_fqn: &str, qualifier_at_create: &str, field_id: u32| SqlImvQualifiedFieldLineage {

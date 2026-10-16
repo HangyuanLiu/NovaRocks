@@ -821,9 +821,9 @@ impl LogicalExecutionNativePort for FrontendLogicalExecutionNativePort {
 /// manifest through these handles and cannot reacquire policy from globals.
 #[derive(Clone)]
 pub(crate) struct FrontendNativeLogicalExecutionRuntime {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observations:
         Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
     topology: BackendTopologyService,
@@ -857,7 +857,7 @@ impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
 }
 
 impl FrontendNativeLogicalExecutionRuntime {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
         controls: Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
@@ -890,9 +890,9 @@ impl FrontendNativeLogicalExecutionRuntime {
         >,
     ) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observations: None,
             topology,
             process_observation,
@@ -930,7 +930,7 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
         read: PreparedLogicalRead,
         owner: WorkOwner,
         result_window: Option<novarocks_workload_control::ResultWindowAlias>,
-        #[cfg(feature = "test-controls")] observation: Option<
+        #[cfg(novarocks_dev_controls)] observation: Option<
             crate::preparation_diagnostics::StatementObservationHandle,
         >,
     ) -> QueryExecutionFuture {
@@ -984,11 +984,11 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
             template,
             Arc::clone(&self.runtime.topology),
             factory,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             self.runtime.test_controls.clone(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             self.runtime.observations.clone(),
         );
         let replacement_port = match description.recovery() {
@@ -1755,7 +1755,7 @@ struct SnapshotBoundDormantAttemptOwner<B, I = SnapshotBoundDormantAttemptInputs
 where
     I: RetainedAttemptInputs,
 {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_placement: Option<(
         Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
         novarocks_failpoint::target_binding::StatementWorkNomination,
@@ -1786,7 +1786,7 @@ where
 {
     fn new(inputs: I, behavior: B) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_placement: None,
             dormant_inputs: Some(inputs),
             manifest_inputs: None,
@@ -1797,7 +1797,7 @@ where
     #[cfg(test)]
     fn from_manifest(inputs: I::Manifest, behavior: B) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_placement: None,
             dormant_inputs: None,
             manifest_inputs: Some(inputs),
@@ -1956,7 +1956,7 @@ impl<B> DormantNativeAttemptOwner for SnapshotBoundDormantAttemptOwner<B>
 where
     B: FrontendDormantAttemptBehavior,
 {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_preferred_backend_process(
         &self,
         execution: novarocks_types::QueryExecutionId,
@@ -2008,11 +2008,11 @@ struct FrontendNativeAttemptPreparationState<F> {
     template: PreparedDistributedAttemptTemplate,
     topology: BackendTopologyService,
     dormant_factory: F,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     controls: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observations:
         Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
 }
@@ -2036,13 +2036,13 @@ where
         template: PreparedDistributedAttemptTemplate,
         topology: BackendTopologyService,
         dormant_factory: F,
-        #[cfg(feature = "test-controls")] observation: Option<
+        #[cfg(novarocks_dev_controls)] observation: Option<
             crate::preparation_diagnostics::StatementObservationHandle,
         >,
-        #[cfg(feature = "test-controls")] controls: Option<
+        #[cfg(novarocks_dev_controls)] controls: Option<
             Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
         >,
-        #[cfg(feature = "test-controls")] observations: Option<
+        #[cfg(novarocks_dev_controls)] observations: Option<
             Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>,
         >,
     ) -> Self {
@@ -2051,11 +2051,11 @@ where
                 template,
                 topology,
                 dormant_factory,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 observation,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 controls,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 observations,
             })),
         }
@@ -2085,7 +2085,7 @@ where
                 }
                 state = state.lock() => state,
             };
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             if let Some(observation) = &state.observation {
                 observation.bind_attempt(request.execution());
             }
@@ -2099,12 +2099,12 @@ where
                 &cancellation,
             )
             .await?;
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             let nominated_execution = state
                 .observation
                 .as_ref()
                 .and_then(|handle| handle.nomination_for_exact_execution(request.execution()));
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             if let Some(nomination) = &nominated_execution {
                 for target in snapshot.targets() {
                     let process = target.process_id().map_err(|error| {
@@ -2173,7 +2173,7 @@ where
                     })?;
             let behavior = state.dormant_factory.create()?;
             let owner = SnapshotBoundDormantAttemptOwner::new(inputs, behavior);
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             let owner = {
                 let mut owner = owner;
                 owner.test_placement = state.controls.clone().zip(nominated_execution);

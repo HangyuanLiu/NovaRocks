@@ -33,7 +33,7 @@ use super::exchange_metrics::observe_exchange_shuffle_bytes;
 use super::{ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection};
 
 pub struct ExchangeSendTracker {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_observer: Mutex<Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>>,
     inflight_tasks: AtomicUsize,
     inflight_bytes: AtomicUsize,
@@ -43,7 +43,7 @@ pub struct ExchangeSendTracker {
 }
 
 impl ExchangeSendTracker {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn install_test_observer(
         &self,
         observer: Arc<dyn crate::runtime::exchange::TestEventObserver>,
@@ -61,7 +61,7 @@ impl ExchangeSendTracker {
         *slot = Some(observer);
         Ok(())
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn test_observer(
         &self,
     ) -> Option<Arc<dyn crate::runtime::exchange::TestEventObserver>> {
@@ -69,7 +69,7 @@ impl ExchangeSendTracker {
     }
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observer: Mutex::new(None),
             inflight_tasks: AtomicUsize::new(0),
             inflight_bytes: AtomicUsize::new(0),
@@ -415,9 +415,9 @@ impl ExchangeSendQueue {
 
     fn enqueue_task(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) -> bool {
         let key = ExchangeSendKey::from_task(&task);
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let test_observer = task.tracker.test_observer();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let eos_marker = (task.frame.eos
             && test_observer
                 .as_ref()
@@ -464,10 +464,10 @@ impl ExchangeSendQueue {
             return !owner_cancelled;
         }
 
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some((sender_finst, sender_ordinal, sender_count, be_number, sequence)) = eos_marker
         {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             crate::runtime::exchange::emit_exchange_snapshot_marker(
                 test_observer.as_deref(),
                 || {
@@ -525,7 +525,7 @@ impl ExchangeSendQueue {
             tracker,
             edge_gate,
         } = task;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let test_observer = tracker.test_observer();
         let destination = frame.destination.host().to_string();
         let destination_fragment_instance_id = frame.destination_fragment_instance_id;
@@ -564,7 +564,7 @@ impl ExchangeSendQueue {
         match result {
             Ok(()) => {
                 if eos {
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     crate::runtime::exchange::emit_exchange_snapshot_marker(
                         test_observer.as_deref(),
                         || {
@@ -611,7 +611,7 @@ impl ExchangeSendQueue {
                         ) =>
                 {
                     if eos {
-                        #[cfg(feature = "test-controls")]
+                        #[cfg(novarocks_dev_controls)]
                         crate::runtime::exchange::emit_exchange_snapshot_marker(
                             test_observer.as_deref(),
                             || {
@@ -647,7 +647,7 @@ impl ExchangeSendQueue {
                 }
                 _ => {
                     if eos {
-                        #[cfg(feature = "test-controls")]
+                        #[cfg(novarocks_dev_controls)]
                         crate::runtime::exchange::emit_exchange_snapshot_marker(
                             test_observer.as_deref(),
                             || {
@@ -687,7 +687,7 @@ impl ExchangeSendQueue {
             },
             Err(ExchangeTransmitRejection::Failed(err)) => {
                 if eos {
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     crate::runtime::exchange::emit_exchange_snapshot_marker(
                         test_observer.as_deref(),
                         || {

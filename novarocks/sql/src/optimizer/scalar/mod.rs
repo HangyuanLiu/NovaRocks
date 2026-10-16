@@ -228,7 +228,7 @@ impl ScalarArena {
         self.nodes.len()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn new() -> Self {
         Self::with_constant_policy(crate::constant::test_constant_policy())
     }
@@ -261,7 +261,7 @@ impl ScalarArena {
         interner::intern(self, node, value_type, control)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn intern(&mut self, node: ScalarNode, value_type: FunctionValueType) -> ScalarId {
         self.intern_observed(node, value_type, crate::optimizer::test_optimizer_control())
             .expect("explicit test scalar interning control")

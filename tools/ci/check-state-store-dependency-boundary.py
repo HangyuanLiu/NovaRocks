@@ -104,6 +104,7 @@ APPLICATION_OWNER = Capability(
         "novarocks-execution",
         "novarocks-frontend-application",
         "novarocks-server",
+        "novarocks-server-application",
         "novarocks-sql",
     },
     prefixes=("novarocks-connector-",),

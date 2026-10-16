@@ -330,7 +330,7 @@ pub trait TableMaintenanceEngine: Send + Sync {
         capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<Arc<dyn TableMaintenanceEngine>, String>;
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_statement_nomination(
         &self,
     ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
@@ -979,7 +979,7 @@ impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
 }
 
 impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_statement_nomination(
         &self,
     ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {

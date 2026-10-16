@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../novarocks/version/build_support.rs"]
-mod build_support;
+#[path = "../build-support/provenance.rs"]
+mod provenance;
 
 fn main() {
-    build_support::emit();
+    provenance::emit("NOVAROCKS_SERVER_BUILD_IDENTITY");
 }

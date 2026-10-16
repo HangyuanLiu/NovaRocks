@@ -77,10 +77,10 @@ pub(crate) fn decode_fragment_submission(
     exchange_wait: Duration,
     typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    #[cfg(feature = "test-controls")] test_controls: Option<
+    #[cfg(novarocks_dev_controls)] test_controls: Option<
         Arc<crate::test_controls::NativeTestControls>,
     >,
-    #[cfg(feature = "test-controls")] observation_controls: Option<
+    #[cfg(novarocks_dev_controls)] observation_controls: Option<
         Arc<crate::test_observation_controls::NativeObservationControls>,
     >,
     type_creation: &crate::native_type_construction::NativeTypeConstruction,
@@ -174,7 +174,7 @@ pub(crate) fn decode_fragment_submission(
     .with_function_catalog(Arc::clone(&function_catalog))
     .with_original_requests(context_requests)
     .with_writer_parameters(writer_parameters);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let context = context
         .with_test_controls(test_controls)
         .with_observation_controls(observation_controls);
@@ -515,9 +515,9 @@ mod tests {
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()
                     .expect("builtin function catalog"),
             ),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
             &creator,
         )

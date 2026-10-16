@@ -362,7 +362,7 @@ impl FrontendQueryCompiler {
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
-        #[cfg(feature = "test-controls")] rewrite_statement: Option<
+        #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
             &crate::mv::test_controls::MvRewriteStatementTarget,
         >,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
@@ -511,7 +511,7 @@ impl FrontendQueryCompiler {
                     context.execution(),
                     context,
                     scope,
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     rewrite_statement,
                 )
             }
@@ -673,7 +673,7 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
-        #[cfg(feature = "test-controls")] rewrite_statement: Option<
+        #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
             &crate::mv::test_controls::MvRewriteStatementTarget,
         >,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
@@ -764,7 +764,7 @@ impl FrontendQueryCompiler {
                 completed.candidate(),
             )
             .map_err(FrontendQueryCompilerError::Engine)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let selected_mv_rewrite = completed
             .candidate()
             .plan()
@@ -807,7 +807,7 @@ impl FrontendQueryCompiler {
                 ),
             )
             .map_err(FrontendQueryCompilerError::Engine)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.mv_readiness.test_controls() {
             controls
                 .rewrite(
@@ -980,7 +980,7 @@ impl FrontendQueryCompiler {
             execution.sql_semantics().clone(),
         )
         .with_optional_fold_dependency_observer(execution.fold_dependency_observer().cloned());
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let statement = statement
             .with_test_statement_nomination(execution.test_statement_nomination().cloned())
             .map_err(FrontendQueryCompilerError::Engine)?;

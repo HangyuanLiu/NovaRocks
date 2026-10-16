@@ -71,15 +71,12 @@ impl Scenario for MvStorageContract {
         _launch: &ScenarioLaunchConfig,
         scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
         control_plan::plan(
             cluster_size,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             original_deadline,
             vec![
                 FeLaunchIntent::ObservedMvActions(vec![control_plan::rewrite(

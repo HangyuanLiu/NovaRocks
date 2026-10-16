@@ -15,21 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
-#[cfg(all(
-    feature = "mem-1-m07-hms-listing-observe",
-    not(feature = "test-controls")
-))]
+#[cfg(all(feature = "mem-1-m07-hms-listing-observe", not(novarocks_dev_controls)))]
 compile_error!("mem-1-m07-hms-listing-observe requires test-controls");
-#[cfg(all(feature = "mem-1-m07-closing-pressure", not(feature = "test-controls")))]
+#[cfg(all(feature = "mem-1-m07-closing-pressure", not(novarocks_dev_controls)))]
 compile_error!("mem-1-m07-closing-pressure requires test-controls");
-#[cfg(all(feature = "mem-1-m07-root-observation", not(feature = "test-controls")))]
+#[cfg(all(feature = "mem-1-m07-root-observation", not(novarocks_dev_controls)))]
 compile_error!("mem-1-m07-root-observation requires test-controls");
-#[cfg(all(
-    feature = "mem-1-m07-exact-mysql-write",
-    not(feature = "test-controls")
-))]
+#[cfg(all(feature = "mem-1-m07-exact-mysql-write", not(novarocks_dev_controls)))]
 compile_error!("mem-1-m07-exact-mysql-write requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
@@ -37,7 +29,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
             "mem-1-m07-hms-listing-observe",
@@ -70,7 +62,7 @@ pub use mv::management_audit::FileManagementAuditSink;
 pub use mv::startup_isolation_file::StartupIsolationSource;
 mod native;
 pub use query_execution::package_freeze::{CompiledPackageCarrier, StaticPlanCarrier};
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 mod preparation_diagnostics;
 pub(crate) mod query;
 mod query_execution;
@@ -100,5 +92,12 @@ pub use topology::ClusterBackendOpenConfig;
 mod view;
 pub(crate) mod workload_lifecycle;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod test_session;
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

@@ -58,7 +58,7 @@ fn by_runtime_memory_ready_actual_compiled_window_operator_borrows_prepared_task
         execution_runtime: Some(runtime),
         query_memory: Some(binding.clone()),
         task_identity: Some(task),
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         exchange_test_observer: None,
     })
     .unwrap();

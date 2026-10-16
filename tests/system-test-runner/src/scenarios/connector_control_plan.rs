@@ -169,8 +169,7 @@ impl Owner {
         fe_restart: bool,
         be_restarts: &[usize],
         size: usize,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
         ensure!(size == 3, "connector controls require native 1FE+3BE");
@@ -178,8 +177,7 @@ impl Owner {
             !specs.is_empty() && specs.len() <= 64,
             "connector statement set exceeds finite bound"
         );
-        let controlled =
-            controlled.context("connector observations require explicit test-controls binary")?;
+        let controlled = binary;
         let mut owner = self
             .0
             .lock()
@@ -306,7 +304,7 @@ impl Owner {
                 novarocks_failpoint::session::MAX_GRANTS
             );
             if grants.is_empty() {
-                plan.authorize_ordinary_launch(&reference, ordinary.to_path_buf())?;
+                plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
             } else {
                 let owners = if role == RoleSlot::Frontend {
                     &[
@@ -933,7 +931,7 @@ mod tests {
             let (specs, fe, restarts) = specs(name).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             let plan = owner
-                .freeze(specs, fe, &restarts, 3, &binary, Some(&binary), deadline)
+                .freeze(specs, fe, &restarts, 3, &binary, deadline)
                 .unwrap();
             plan.validate_selected_intents(3).unwrap();
             assert_eq!(plan.deadline(), deadline);
@@ -1020,7 +1018,6 @@ mod tests {
                 &restarts,
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .unwrap();
@@ -1048,7 +1045,6 @@ mod tests {
                 &[],
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .err()
@@ -1069,7 +1065,6 @@ mod tests {
                 &restarts,
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .unwrap();
@@ -1106,7 +1101,6 @@ mod tests {
                 &[],
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .unwrap();
@@ -1127,7 +1121,6 @@ mod tests {
                 &[],
                 3,
                 &binary,
-                Some(&binary),
                 Instant::now() + Duration::from_secs(5),
             )
             .unwrap();

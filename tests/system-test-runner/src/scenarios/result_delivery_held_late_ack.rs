@@ -138,9 +138,7 @@ impl Scenario for HeldLateAck {
         launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         self.run.validate_shape()?;
@@ -153,9 +151,7 @@ impl Scenario for HeldLateAck {
             "held root observation cannot adopt exact fixture or ambient control inputs"
         );
         Ok(Some(super::variant_sessions::fixture_plan(
-            primary_binary,
-            ordinary_binary,
-            controlled_binary,
+            binary,
             cluster_size,
             original_deadline,
             vec![super::variant_sessions::grant(

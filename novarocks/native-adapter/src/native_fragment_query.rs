@@ -46,9 +46,9 @@ use novarocks_worker::sink_commit::WorkerSinkCommitPort;
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
     manager: Arc<QueryContextManager>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observation_controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     /// Clones must publish one current manager snapshot in a single order.
     resource_metrics_publish: Arc<Mutex<()>>,
@@ -70,7 +70,7 @@ pub struct NativeFragmentQueryRuntime {
 }
 
 impl NativeFragmentQueryRuntime {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_controls(
         mut self,
         controls: Option<Arc<crate::test_controls::NativeTestControls>>,
@@ -78,11 +78,11 @@ impl NativeFragmentQueryRuntime {
         self.test_controls = controls;
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
         self.test_controls.clone()
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_observation_controls(
         mut self,
         controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
@@ -90,7 +90,7 @@ impl NativeFragmentQueryRuntime {
         self.observation_controls = controls;
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn observation_controls(
         &self,
     ) -> Option<Arc<crate::test_observation_controls::NativeObservationControls>> {
@@ -126,9 +126,9 @@ impl NativeFragmentQueryRuntime {
     pub fn global(memory_authority: Arc<MemoryAuthority>) -> Self {
         Self {
             manager: query_context_manager(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             resource_metrics_publish: Arc::new(Mutex::new(())),
             #[cfg(test)]
@@ -137,16 +137,16 @@ impl NativeFragmentQueryRuntime {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn new_for_test(
         manager: Arc<QueryContextManager>,
         memory_authority: Arc<MemoryAuthority>,
     ) -> Self {
         Self {
             manager,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             resource_metrics_publish: Arc::new(Mutex::new(())),
             #[cfg(test)]

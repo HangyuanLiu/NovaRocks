@@ -16,5 +16,21 @@
 // under the License.
 
 fn main() -> anyhow::Result<()> {
-    novarocks_sql_test_runner::run_correctness()
+    novarocks_sql_test_library::run_correctness(
+        novarocks_sql_test_library::build_information::BuildInformation {
+            package: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            source_commit: env!("NOVAROCKS_BUILDINFO_SOURCE_COMMIT"),
+            explicit_identity: env!("NOVAROCKS_BUILDINFO_EXPLICIT_IDENTITY"),
+            native_build_identity: env!("NOVAROCKS_BUILDINFO_NATIVE_IDENTITY"),
+            short_version: env!("NOVAROCKS_BUILDINFO_SHORT_VERSION"),
+            full_version: env!("NOVAROCKS_BUILDINFO_FULL_VERSION"),
+            opt_level: env!("NOVAROCKS_BUILDINFO_PACKAGE_OPT_LEVEL"),
+            debug_info: env!("NOVAROCKS_BUILDINFO_PACKAGE_DEBUG_INFO"),
+            target: env!("NOVAROCKS_BUILDINFO_TARGET"),
+            rustc_identity: env!("NOVAROCKS_BUILDINFO_RUSTC_IDENTITY"),
+            debug_assertions: cfg!(debug_assertions),
+            panic_unwind: cfg!(panic = "unwind"),
+        },
+    )
 }

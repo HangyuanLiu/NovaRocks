@@ -843,7 +843,7 @@ impl Scenario for DistributedStatisticsDataflow {
         let source_snapshots_before = snapshot_count(&mut control, &source)?;
         let analyze_tasks_before = task_admission_counts(context)?;
 
-        context.action("run ordinary ANALYZE across all three backend processes");
+        context.action("run binary ANALYZE across all three backend processes");
         control
             .query_drop(format!("ANALYZE TABLE {source}"))
             .context("run native distributed ANALYZE")?;
@@ -2214,17 +2214,14 @@ impl Scenario for DistributedWriterFaults {
         _: &ScenarioLaunchConfig,
         _: &Path,
         cluster_size: usize,
-        _: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
             writer_fault_specs(cluster_size),
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

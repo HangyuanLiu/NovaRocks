@@ -370,7 +370,7 @@ fn prepare_compiled_fragment_in(
             execution_runtime: context.execution_runtime.clone(),
             query_memory: context.query_memory.clone(),
             task_identity: context.result_identity,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: context.exchange_test_observer.clone(),
         })
         .map_err(|error| {

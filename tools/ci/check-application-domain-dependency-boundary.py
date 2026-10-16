@@ -50,26 +50,31 @@ WIRE = {
 QUERY_FORBIDDEN = PRODUCTS | ROLE_IMPLEMENTATIONS | ADAPTERS | WIRE | {
     WORKER,
     "novarocks-server",
+    "novarocks-server-application",
 }
 WORKER_FORBIDDEN = PRODUCTS | ROLE_IMPLEMENTATIONS | ADAPTERS | WIRE | {
     QUERY,
     "novarocks-server",
+    "novarocks-server-application",
 }
 EXECUTION_FORBIDDEN = PRODUCTS | ROLE_IMPLEMENTATIONS | ADAPTERS | {
     QUERY,
     WORKER,
     "novarocks-server",
+    "novarocks-server-application",
 }
 WORKLOAD_FORBIDDEN = PRODUCTS | ROLE_IMPLEMENTATIONS | ADAPTERS | WIRE | {
     QUERY,
     WORKER,
     EXECUTION,
     "novarocks-server",
+    "novarocks-server-application",
 }
 CATALOG_FORBIDDEN = PRODUCTS | ROLE_IMPLEMENTATIONS | ADAPTERS | WIRE | {
     QUERY,
     WORKER,
     "novarocks-server",
+    "novarocks-server-application",
 }
 
 
@@ -132,7 +137,7 @@ def verify_products(metadata):
             fail(f"{product} normal dependency closure must contain {QUERY}")
         forbidden = sorted(
             closure
-            & (ROLE_IMPLEMENTATIONS | ADAPTERS | WIRE | {WORKER, "novarocks-server"})
+            & (ROLE_IMPLEMENTATIONS | ADAPTERS | WIRE | {WORKER, "novarocks-server", "novarocks-server-application"})
         )
         if forbidden:
             fail(f"{product} normal dependency closure contains forbidden owners: " + ", ".join(forbidden))
@@ -146,7 +151,7 @@ def verify_mysql_adapter(metadata):
         fail(f"{MYSQL_ADAPTER} normal dependency closure must contain {QUERY}")
     forbidden = sorted(
         closure
-        & (PRODUCTS | ROLE_IMPLEMENTATIONS | WIRE | {WORKER, EXECUTION, "novarocks-server"})
+        & (PRODUCTS | ROLE_IMPLEMENTATIONS | WIRE | {WORKER, EXECUTION, "novarocks-server", "novarocks-server-application"})
     )
     if forbidden:
         fail(
@@ -162,7 +167,7 @@ def verify_native_adapter(metadata):
     if WORKER not in closure:
         fail(f"{NATIVE_ADAPTER} normal dependency closure must contain {WORKER}")
     forbidden = sorted(
-        closure & (PRODUCTS | ROLE_IMPLEMENTATIONS | {QUERY, "novarocks-server"})
+        closure & (PRODUCTS | ROLE_IMPLEMENTATIONS | {QUERY, "novarocks-server", "novarocks-server-application"})
     )
     if forbidden:
         fail(

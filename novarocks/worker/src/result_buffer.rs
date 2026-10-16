@@ -719,7 +719,7 @@ pub fn insert_typed(finst_id: UniqueId, payload: Vec<u8>) -> Result<ResultPublic
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn insert_task_typed(
     identity: TaskIdentity,
     payload: Vec<u8>,
@@ -764,7 +764,7 @@ pub(crate) fn close_ok(finst_id: UniqueId) -> ResultPublication {
     close_ok_for_key(ResultBufferKey::LegacyFragment(finst_id))
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn close_task_ok(identity: TaskIdentity) -> ResultPublication {
     close_ok_for_key(ResultBufferKey::Task(identity))
 }
@@ -879,7 +879,7 @@ pub(crate) fn create_typed_sender(finst_id: UniqueId) {
     block.fail_mode_mismatch(ResultBufferMode::Typed);
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn create_task_typed_sender(identity: TaskIdentity) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
@@ -916,7 +916,7 @@ fn try_create_sender_with_key_mode(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn discard(finst_id: UniqueId) -> ResultPublication {
     discard_key(ResultBufferKey::LegacyFragment(finst_id))
 }

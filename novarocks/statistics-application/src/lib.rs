@@ -280,7 +280,7 @@ impl std::error::Error for StatisticsRepositoryError {}
 /// Move-only receipt for one independently admitted statistics business root.
 /// All three inputs must name the exact host/root; no capacity is acquired here.
 pub struct StatisticsJobAdmission {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     owner: WorkOwner,
@@ -313,14 +313,14 @@ impl StatisticsJobAdmission {
             owner,
             query_concurrency,
             result_capacity,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
         })
     }
 
     /// Preserve only the explicitly originating ANALYZE statement's evidence.
     /// This carries no cancellation, capacity, execution binding or new grant.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_statement_nomination(
         mut self,
         nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
@@ -349,7 +349,7 @@ impl StatisticsJobAdmission {
 /// A phase's cancellation/attribution scope and the independently owned job's
 /// original capacity are separate facts. Preparation may exit before collect.
 pub struct StatisticsAttemptContext {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Mutex<Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>>,
     stage_scope: WorkScope,
@@ -357,7 +357,7 @@ pub struct StatisticsAttemptContext {
 }
 impl StatisticsAttemptContext {
     /// Move the one preparation nomination into its actual collection request.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn take_test_statement_nomination(
         &self,
     ) -> Result<
@@ -384,7 +384,7 @@ impl StatisticsAttemptContext {
 }
 
 struct LiveJob {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     job: StatisticsJob,
@@ -434,7 +434,7 @@ impl StatisticsJobRepository {
             owner,
             query_concurrency,
             result_capacity,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination,
         } = admission;
         let mut state = self.lock()?;
@@ -448,7 +448,7 @@ impl StatisticsJobRepository {
         state.active.insert(
             job.id,
             LiveJob {
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 test_statement_nomination,
                 job: job.clone(),
                 owner: Some(owner),
@@ -589,7 +589,7 @@ impl StatisticsJobRepository {
                 execution_resources_released: true,
                 provider_session_closed: true,
             };
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             drop(entry.test_statement_nomination.take());
             drop(entry.query_concurrency.take());
             drop(entry.result_capacity.take());
@@ -648,7 +648,7 @@ impl StatisticsJobRepository {
                 execution_resources_released: true,
                 provider_session_closed: true,
             };
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             drop(entry.test_statement_nomination.take());
             drop(entry.query_concurrency.take());
             drop(entry.result_capacity.take());
@@ -784,7 +784,7 @@ impl StatisticsJobRepository {
             convergence.execution_resources_released;
         entry.job.convergence.provider_session_closed |= convergence.provider_session_closed;
         entry.job.updated_at_ms = at_ms;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if entry.job.convergence.is_complete() {
             drop(entry.test_statement_nomination.take());
         }
@@ -927,13 +927,13 @@ impl StatisticsWorker {
             return Ok(None);
         };
         let (root_scope, result_capacity) = self.root_scope_and_capacity(job.id)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let nomination = self.take_preparation_nomination(job.id)?;
         let preparation = root_scope
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
         let preparation_scope = StatisticsAttemptContext {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: Mutex::new(nomination),
             stage_scope: preparation.scope(),
             root_result_capacity: result_capacity.clone(),
@@ -959,7 +959,7 @@ impl StatisticsWorker {
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
         let collection_scope = StatisticsAttemptContext {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: Mutex::new(None),
             stage_scope: collection.scope(),
             root_result_capacity: result_capacity.clone(),
@@ -1006,7 +1006,7 @@ impl StatisticsWorker {
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
         let publication_scope = StatisticsAttemptContext {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: Mutex::new(None),
             stage_scope: publication.scope(),
             root_result_capacity: result_capacity.clone(),
@@ -1095,7 +1095,7 @@ impl StatisticsWorker {
         Ok(Some(terminal))
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn take_preparation_nomination(
         &self,
         id: StatisticsJobId,
@@ -2076,3 +2076,10 @@ mod tests {
         assert!(terminal.convergence.is_complete());
     }
 }
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

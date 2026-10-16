@@ -45,7 +45,7 @@ pub struct RuntimeState {
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
     execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     exchange_test_observer: Option<std::sync::Arc<dyn crate::runtime::exchange::TestEventObserver>>,
 }
 
@@ -140,7 +140,7 @@ impl Default for RuntimeState {
             runtime_filter_session: None,
             execution_runtime: None,
             query_memory: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
         }
     }
@@ -162,14 +162,14 @@ impl Clone for RuntimeState {
             runtime_filter_session: self.runtime_filter_session.clone(),
             execution_runtime: self.execution_runtime.clone(),
             query_memory: self.query_memory.clone(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: self.exchange_test_observer.clone(),
         }
     }
 }
 
 impl RuntimeState {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_exchange_test_observer(
         mut self,
         observer: Option<std::sync::Arc<dyn crate::runtime::exchange::TestEventObserver>>,
@@ -177,7 +177,7 @@ impl RuntimeState {
         self.exchange_test_observer = observer;
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn exchange_test_observer(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::runtime::exchange::TestEventObserver>> {
@@ -226,7 +226,7 @@ impl RuntimeState {
             runtime_filter_session: None,
             execution_runtime,
             query_memory: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
         }
     }

@@ -104,8 +104,7 @@ impl SqlIntentOwner {
         specs: Vec<StatementSpec>,
         replacements: &[usize],
         cluster_size: usize,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
         let mut owner = self
@@ -117,8 +116,6 @@ impl SqlIntentOwner {
             cluster_size == 3 && !specs.is_empty() && specs.len() <= 64,
             "Native SQL requires finite native 1FE+3BE statements"
         );
-        let controlled =
-            controlled.context("Native SQL controls require explicit --test-control-binary")?;
         let mut plan = ClusterTestSessionPlan::new(deadline)?;
         let root = plan.reserve_transport("query-lifecycle-faults")?;
         let mut launches = BTreeMap::new();
@@ -211,7 +208,7 @@ impl SqlIntentOwner {
             .collect();
         for (role, launch) in launches {
             if launch.grants.is_empty() {
-                plan.authorize_ordinary_launch(&launch.reference, ordinary.to_path_buf())?;
+                plan.authorize_ordinary_launch(&launch.reference, binary.to_path_buf())?;
             } else {
                 let owner = match role {
                     RoleSlot::Frontend => "novarocks-frontend-application",
@@ -225,7 +222,7 @@ impl SqlIntentOwner {
                         (owner.into(), "test-controls".into()),
                     ],
                 )?;
-                plan.set_launch_binary(&launch.reference, controlled.to_path_buf())?;
+                plan.set_launch_binary(&launch.reference, binary.to_path_buf())?;
             }
         }
         let mut unique = BTreeSet::new();
@@ -236,7 +233,7 @@ impl SqlIntentOwner {
                 "invalid or duplicate Native replacement role"
             );
             let reference = plan.reserve_launch(RoleSlot::Backend(index))?;
-            plan.authorize_ordinary_launch(&reference, ordinary.to_path_buf())?;
+            plan.authorize_ordinary_launch(&reference, binary.to_path_buf())?;
             replacement_references.push(reference);
         }
         plan.validate_selected_intents(cluster_size)?;
@@ -295,7 +292,6 @@ mod tests {
                 &[],
                 3,
                 &binary,
-                Some(&binary),
                 deadline(),
             )
             .unwrap();
@@ -333,15 +329,28 @@ mod tests {
         let mut statement = spec("SELECT 1");
         statement.observations = vec![(0, "grpc-fragment", Some(1)), (0, "grpc-fragment", Some(2))];
         let plan = owner
-            .freeze(
-                vec![statement],
-                &[0, 1, 2],
-                3,
-                &binary,
-                Some(&binary),
-                deadline(),
-            )
+            .freeze(vec![statement], &[0, 1, 2], 3, &binary, deadline())
             .unwrap();
+        let summaries = plan.planned_launch_summaries();
+        let launches = summaries.as_array().unwrap();
+        assert!(
+            launches
+                .iter()
+                .all(|launch| launch["binary"] == json!(binary))
+        );
+        for index in 0..3 {
+            let backend_launches = launches
+                .iter()
+                .filter(|launch| launch["role"] == format!("be-{index}"))
+                .collect::<Vec<_>>();
+            assert_eq!(backend_launches.len(), 2);
+            assert_ne!(
+                backend_launches[0]["session_id"],
+                backend_launches[1]["session_id"]
+            );
+            assert_eq!(backend_launches[1]["ordinary"], true);
+            assert!(backend_launches[1]["grants"].as_array().unwrap().is_empty());
+        }
         let frozen = owner.0.lock().unwrap();
         assert_eq!(frozen.as_ref().unwrap()._replacement_references.len(), 3);
         assert_eq!(
@@ -354,7 +363,7 @@ mod tests {
         mixed.observations = vec![(0, "grpc-fragment", None), (0, "grpc-fragment", Some(2))];
         assert!(
             owner
-                .freeze(vec![mixed], &[], 3, &binary, Some(&binary), deadline())
+                .freeze(vec![mixed], &[], 3, &binary, deadline())
                 .is_err()
         );
         assert!(owner.take(0).is_err());
@@ -373,7 +382,7 @@ mod tests {
             .collect();
         assert!(
             owner
-                .freeze(statements, &[], 3, &binary, Some(&binary), deadline())
+                .freeze(statements, &[], 3, &binary, deadline())
                 .is_err()
         );
         assert!(owner.take(0).is_err());

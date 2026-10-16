@@ -141,9 +141,7 @@ impl Scenario for TerminalReleasesSlot {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let statement = StatementSpec {
@@ -157,8 +155,7 @@ impl Scenario for TerminalReleasesSlot {
             vec![statement],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -253,9 +250,7 @@ impl Scenario for RemoteCleanupRetires {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let statement = StatementSpec {
@@ -269,8 +264,7 @@ impl Scenario for RemoteCleanupRetires {
             vec![statement],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }
@@ -352,9 +346,7 @@ impl Scenario for LateWorkLeaseExpiry {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let statement = StatementSpec {
@@ -368,8 +360,7 @@ impl Scenario for LateWorkLeaseExpiry {
             vec![statement],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

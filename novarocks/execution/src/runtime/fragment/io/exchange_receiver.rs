@@ -86,7 +86,7 @@ pub trait ExchangeReceiverPort: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct ExecutionRuntimeExchangeReceiverPort {
     runtime: Arc<ExecutionRuntime>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
 }
 
@@ -94,12 +94,12 @@ impl ExecutionRuntimeExchangeReceiverPort {
     pub fn new(runtime: Arc<ExecutionRuntime>) -> Self {
         Self {
             runtime,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_observer: None,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_observer(
         mut self,
         observer: Arc<dyn crate::runtime::exchange::TestEventObserver>,
@@ -129,7 +129,7 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
                 registration.column_binding,
                 registration.creation_factory,
             )?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(observer) = self.test_observer.clone() {
             self.runtime
                 .exchange_registry()

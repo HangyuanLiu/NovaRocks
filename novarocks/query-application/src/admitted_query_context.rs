@@ -77,7 +77,7 @@ impl RequestAdmission {
 /// to manufacture a later round by modifying an already prepared request.
 #[derive(Clone)]
 pub struct StatementAdmissionContext {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     session: RequestSessionContext,
@@ -88,7 +88,7 @@ pub struct StatementAdmissionContext {
 }
 
 impl StatementAdmissionContext {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_statement_nomination(
         mut self,
         nomination: Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
@@ -114,7 +114,7 @@ impl StatementAdmissionContext {
         sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
             session: RequestSessionContext::new(
                 current_catalog,
@@ -168,7 +168,7 @@ impl StatementAdmissionContext {
             Some(observer) => execution.with_fold_dependency_observer(Arc::clone(observer)),
             None => execution,
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let execution = {
             let mut execution = execution;
             execution.test_statement_nomination = self.test_statement_nomination.clone();
@@ -294,7 +294,7 @@ impl QueryResultCapacityBinding {
 /// receive it as a parameter. Those consumers leave with CLS-R3 and CLS-R5.
 #[derive(Clone)]
 pub struct QueryExecutionContext {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     result_capacity: Option<QueryResultCapacityBinding>,
@@ -308,7 +308,7 @@ pub struct QueryExecutionContext {
 }
 
 impl QueryExecutionContext {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_statement_nomination(
         mut self,
         nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
@@ -324,7 +324,7 @@ impl QueryExecutionContext {
         self.test_statement_nomination = Some(nomination);
         Ok(self)
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn test_statement_nomination(
         &self,
     ) -> Option<&Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
@@ -346,7 +346,7 @@ impl QueryExecutionContext {
             optimizer_settings.effective_backend_count = Some(topology.targets().len() as f64);
         }
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
             result_capacity: None,
             role,
@@ -429,7 +429,7 @@ pub struct RequestContext {
     reason = "Retained for target-specific frontend integration and regression coverage."
 )]
 impl RequestContext {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_statement_nomination(
         mut self,
         nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,

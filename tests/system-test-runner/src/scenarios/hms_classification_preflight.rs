@@ -216,9 +216,7 @@ impl Scenario for HmsClassificationPreflight {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        _controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
@@ -230,10 +228,10 @@ impl Scenario for HmsClassificationPreflight {
         let mut plan =
             ClusterTestSessionPlan::new(original_deadline.min(self.assertions_deadline))?;
         let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
-        plan.authorize_ordinary_launch(&frontend, ordinary_binary.to_path_buf())?;
+        plan.authorize_ordinary_launch(&frontend, binary.to_path_buf())?;
         for index in 0..cluster_size {
             let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
-            plan.authorize_ordinary_launch(&backend, ordinary_binary.to_path_buf())?;
+            plan.authorize_ordinary_launch(&backend, binary.to_path_buf())?;
         }
         // This small correctness preflight grants no HMS collector, root marker
         // or fault action and cannot stand in for the independent bulk input.

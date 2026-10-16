@@ -183,7 +183,7 @@ impl QueryApplicationControl {
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl QueryApplicationControl {
     /// Reads this owner's current session; it neither registers nor keeps it alive.
     pub fn current_session_for_test_controls(
@@ -644,6 +644,40 @@ mod tests {
                 principal,
             ))
             .expect("register session")
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn session_observation_tracks_the_service_owner_without_retaining_sessions() {
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        assert!(control.current_session_for_test_controls(7).is_err());
+
+        let first = service
+            .register_session(SessionIdentity::new(
+                ClientConnectionToken::new(7, 1).expect("valid connection token"),
+                "root",
+            ))
+            .expect("register first session");
+        let first_token = first.token();
+        assert_eq!(
+            control.current_session_for_test_controls(7).unwrap(),
+            first_token
+        );
+        drop(first);
+        assert!(control.current_session_for_test_controls(7).is_err());
+
+        let second = service
+            .register_session(SessionIdentity::new(
+                ClientConnectionToken::new(7, 2).expect("valid connection token"),
+                "root",
+            ))
+            .expect("register replacement session");
+        assert_ne!(second.token(), first_token);
+        assert_eq!(
+            control.current_session_for_test_controls(7).unwrap(),
+            second.token()
+        );
     }
 
     #[test]

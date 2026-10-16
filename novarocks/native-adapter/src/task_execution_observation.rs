@@ -31,17 +31,17 @@ use novarocks_worker::{
 
 #[derive(Debug)]
 struct NativeTaskExecutionPorts {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
 }
 
 impl TaskProtocolObserver for NativeTaskExecutionPorts {
     fn observe(&self, event: TaskProtocolEvent) {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.observations.as_deref() {
             emit(controls, event);
         }
-        #[cfg(not(feature = "test-controls"))]
+        #[cfg(not(novarocks_dev_controls))]
         let _ = event;
     }
 }
@@ -64,12 +64,12 @@ impl TaskExecutionMetrics for NativeTaskExecutionPorts {
 
 /// Builds the Native role-local effects injected into the Worker task owner.
 pub fn backend_task_execution_ports(
-    #[cfg(feature = "test-controls")] observations: Option<
+    #[cfg(novarocks_dev_controls)] observations: Option<
         Arc<crate::test_observation_controls::NativeObservationControls>,
     >,
 ) -> TaskExecutionPorts {
     let adapter = Arc::new(NativeTaskExecutionPorts {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         observations,
     });
     let observer: Arc<dyn TaskProtocolObserver> = adapter.clone();
@@ -78,7 +78,7 @@ pub fn backend_task_execution_ports(
     TaskExecutionPorts::new(observer, result_lifecycle, metrics)
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_context(
     observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
     name: &str,
@@ -87,7 +87,7 @@ fn emit_context(
     emit_context_with(observer, name, context, "");
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_context_with(
     observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
     name: &str,
@@ -106,7 +106,7 @@ fn emit_context_with(
     ));
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit_task(
     observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
     name: &str,
@@ -127,7 +127,7 @@ fn emit_task(
 /// Test-only observation of the exact effective DOP admitted with a task.
 /// The execution kernel uses this positive descriptor value unchanged as its
 /// base graph DOP; this marker carries no scheduling authority.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub(crate) fn emit_prepared_task_dop(
     controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     identity: TaskIdentity,
@@ -154,7 +154,7 @@ pub(crate) fn emit_prepared_task_dop(
 
 /// Test-only identity of a successfully prepared ClientRows root. This
 /// renders the exact bound channel contract, with no installation authority.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub(crate) fn emit_prepared_client_root(
     controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     identity: TaskIdentity,
@@ -175,7 +175,7 @@ pub(crate) fn emit_prepared_client_root(
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn emit(
     controls: &crate::test_observation_controls::NativeObservationControls,
     event: TaskProtocolEvent,
@@ -314,7 +314,7 @@ fn emit(
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn resolve_observer(
     controls: &crate::test_observation_controls::NativeObservationControls,
     execution: novarocks_types::QueryExecutionId,
@@ -327,7 +327,7 @@ fn resolve_observer(
         }
     }
 }
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 fn task_observer(
     controls: &crate::test_observation_controls::NativeObservationControls,
     identity: TaskIdentity,

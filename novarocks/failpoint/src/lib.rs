@@ -20,15 +20,12 @@
 //! The role receiver and finite action scopes exist only with `test-controls`;
 //! domain owners retain exact target matching and product lifecycle ownership.
 
-#[cfg(all(feature = "normal-build", feature = "test-controls"))]
-compile_error!("normal-build cannot include test-controls");
-
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
     (
         env!("CARGO_PKG_NAME"),
         &[
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             "test-controls",
         ],
     )
@@ -36,7 +33,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 
 #[cfg(all(unix, feature = "typed"))]
 pub mod liveness;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod scope;
 pub mod session;
 #[cfg(feature = "typed")]
@@ -1245,5 +1242,12 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix, feature = "test-controls"))]
+#[cfg(all(test, unix, novarocks_dev_controls))]
 mod session_tests;
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

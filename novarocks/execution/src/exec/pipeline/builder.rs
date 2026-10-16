@@ -45,7 +45,7 @@ pub(crate) use compiled::{compiled_statistics_finish_fixture, compiled_statistic
 mod local;
 #[cfg(test)]
 pub(crate) use compiled::build_compiled_pipeline_graph;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub use compiled::build_compiled_pipeline_graph_for_test;
 pub(crate) use compiled::{CompiledOrderedFilterContext, build_compiled_pipeline_graph_typed};
 pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;

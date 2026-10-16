@@ -22,7 +22,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::OpenOptions;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use std::io::Read;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -168,7 +168,7 @@ impl SessionDeclaration {
         file.sync_all()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn read_bounded(path: &Path) -> io::Result<Self> {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_file() {

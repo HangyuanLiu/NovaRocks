@@ -1,0 +1,16 @@
+[package]
+name = "novarocks-system-test-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "novarocks-system-tests"
+path = "src/main.rs"
+
+[dependencies]
+novarocks-system-test-runner = { path = ".." }

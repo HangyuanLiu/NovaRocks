@@ -20,7 +20,8 @@ use std::{env, process::Command};
 mod byte_request_model_profile;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-changed=build.rs");
+    // Cargo fingerprints the compiler; RUSTC is its build-script input, not a user override.
     println!("cargo:rerun-if-changed=../../rust-toolchain.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed=src/owned_resources/bytes_profile.rs");

@@ -50,7 +50,7 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 /// while the application-owned guard decides whether a query-scoped test fault
 /// rejects that work. A guard may reject; it cannot manufacture a partial or
 /// final value and therefore cannot become a data fallback.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TableWriteAggregateBoundary {
     PartialUpdate,
@@ -60,16 +60,16 @@ pub enum TableWriteAggregateBoundary {
 }
 
 /// Application-supplied rejection guard for composite-write aggregate work.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub trait TableWriteAggregateGuard: Send + Sync {
     fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError>;
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[derive(Debug, Default)]
 pub struct AllowTableWriteAggregates;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl TableWriteAggregateGuard for AllowTableWriteAggregates {
     fn check(&self, _boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
         Ok(())

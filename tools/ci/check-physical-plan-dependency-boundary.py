@@ -143,6 +143,7 @@ APPLICATION_OWNER = Capability(
         "novarocks-execution",
         "novarocks-frontend",
         "novarocks-server",
+        "novarocks-server-application",
         "novarocks-sql",
     },
 )

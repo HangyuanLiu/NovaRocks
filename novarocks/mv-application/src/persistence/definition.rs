@@ -109,7 +109,7 @@ impl MvAcceleratorSourceRevision {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 #[doc(hidden)]
 pub fn test_source_revision(
     target_catalog: &str,

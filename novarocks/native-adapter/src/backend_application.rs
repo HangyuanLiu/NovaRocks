@@ -81,7 +81,9 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const TASK_DEADLINE_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct BackendServerConfig {
-    #[cfg(feature = "test-controls")]
+    /// Executable-frozen diagnostic source identity. It does not select an island.
+    pub build_identity: String,
+    #[cfg(novarocks_dev_controls)]
     pub test_session: Option<crate::backend_test_session::BackendTestSessionConfig>,
     pub bind_host: String,
     pub grpc_port: u16,
@@ -260,7 +262,7 @@ impl fmt::Display for BackendApplicationError {
 impl std::error::Error for BackendApplicationError {}
 
 pub struct BackendApplicationHost {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_session: Option<crate::backend_test_session::BackendTestSession>,
     ready_marker: String,
     grpc_server: NativeRpcServerHandle,
@@ -450,7 +452,7 @@ fn compose_backend_application_services(
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
     static_plan_interpreter: BackendStaticPlanInterpreter,
-    #[cfg(feature = "test-controls")] test_session: Option<
+    #[cfg(novarocks_dev_controls)] test_session: Option<
         &crate::backend_test_session::BackendTestSession,
     >,
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -500,12 +502,12 @@ fn compose_backend_application_services(
     let queries = crate::native_fragment_query::NativeFragmentQueryRuntime::global(Arc::clone(
         &memory_authority,
     ));
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let queries = match test_session {
         Some(session) => queries.with_test_controls(Some(session.native.clone())),
         None => queries,
     };
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let queries = match test_session.and_then(|session| session.observation.as_ref()) {
         Some(observation) => queries.with_observation_controls(Some(observation.clone())),
         None => queries,
@@ -519,12 +521,12 @@ fn compose_backend_application_services(
         }),
         data_runtime.clone(),
     );
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let context_host = match test_session {
         Some(session) => context_host.with_test_controls(Some(session.native.clone())),
         None => context_host,
     };
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let context_host = match test_session.and_then(|session| session.observation.as_ref()) {
         Some(observation) => context_host.with_observation_controls(Some(observation.clone())),
         None => context_host,
@@ -583,7 +585,7 @@ fn compose_backend_application_services(
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
             Duration::from_millis(execution_runtime.config().exchange_wait_ms),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_session.and_then(|session| session.observation.clone()),
         ),
         native_result_writer(
@@ -601,7 +603,7 @@ fn compose_backend_application_services(
         scan_stream_host,
         Arc::clone(&task_completion_supervisor),
     );
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let execution_host = match test_session {
         Some(session) => execution_host.with_test_controls(session.native.clone()),
         None => execution_host,
@@ -612,7 +614,7 @@ fn compose_backend_application_services(
     });
     let task_creation_gate: Arc<dyn novarocks_worker::TaskCreationGate> =
         Arc::new(novarocks_worker::NoopTaskCreationGate);
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     let task_creation_gate = match test_session {
         Some(session) => Arc::new(
             crate::task_protocol_fault::RestartAfterEstablishTaskCreationGate(
@@ -626,7 +628,7 @@ fn compose_backend_application_services(
         Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
         execution_host,
         backend_task_execution_ports(
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_session.and_then(|session| session.observation.clone()),
         ),
         task_creation_gate,
@@ -642,7 +644,7 @@ fn compose_backend_application_services(
             admission,
         ),
     };
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if let Some(session) = test_session {
         task_execution_ingress
             .install_test_controls(session.native.clone())
@@ -761,7 +763,7 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let controls_result = self
             .test_session
             .as_mut()
@@ -778,7 +780,7 @@ impl BackendApplicationHost {
         // Completion of this join does not free pool backings; their owner is
         // still retained here until Host destruction.
         let producer_result = self.root_producer_pool.shutdown();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let producer_result = combine_shutdown_results(controls_result, producer_result);
         let execution_result = self.execution_runtime.shutdown_driver_execution();
         // Driver shutdown publishes every actual-stop fact. Only after that
@@ -804,7 +806,8 @@ impl BackendApplicationHost {
         readiness_timeout: Duration,
     ) -> Result<Self, BackendApplicationError> {
         let BackendServerConfig {
-            #[cfg(feature = "test-controls")]
+            build_identity,
+            #[cfg(novarocks_dev_controls)]
             test_session,
             bind_host,
             grpc_port,
@@ -960,7 +963,7 @@ impl BackendApplicationHost {
                     format!("compose Native channel cache: {error}"),
                 )
             })?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let test_session = test_session
             .as_ref()
             .map(|config| config.bind(backend_process_id))
@@ -988,7 +991,7 @@ impl BackendApplicationHost {
             catalog_manager_config,
             &execution_role_binding_factories,
             static_plan_interpreter,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_session.as_ref(),
         )?;
         let process_descriptor = BackendProcessDescriptor::try_new(
@@ -1014,7 +1017,7 @@ impl BackendApplicationHost {
                 )
             })?,
             native_trust.deployment_id().as_str(),
-            novarocks_version::native_build_identity(),
+            &build_identity,
             native_compatibility_id,
             preparation_limits.per_context(),
         )
@@ -1085,7 +1088,7 @@ impl BackendApplicationHost {
         > = services.query_context_host.clone();
         let runtime_filter_ingress =
             native_runtime_filter_envelope_ingress(runtime_filter_authority);
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(session) = &test_session {
             runtime_filter_ingress
                 .install_test_controls(session.native.clone())
@@ -1127,7 +1130,7 @@ impl BackendApplicationHost {
             ),
             control_executor,
         );
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let service = match &test_session {
             Some(session) => service.with_test_controls(session.native.clone()),
             None => service,
@@ -1235,7 +1238,7 @@ impl BackendApplicationHost {
         );
 
         Ok(Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_session,
             ready_marker: format!(
                 "NOVAROCKS_READY role=be grpc_port={grpc_port} control_grpc_port={control_grpc_port} advertise_host={} pid={}",
@@ -1395,7 +1398,7 @@ mod tests {
             Arc::new(UnroutedQueryContextHost),
             Arc::new(UnroutedTaskExecutionHost),
             novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None,
             ),
         );
@@ -1455,7 +1458,8 @@ mod tests {
     fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         let control_grpc_port = unused_port();
         BackendServerConfig {
-            #[cfg(feature = "test-controls")]
+            build_identity: "fixture-backend-build".to_owned(),
+            #[cfg(novarocks_dev_controls)]
             test_session: None,
             memory_authority: novarocks_native_adapter::backend_test_support::test_memory_authority(
             ),
@@ -1603,7 +1607,7 @@ mod tests {
             CatalogManagerConfig::default(),
             &[],
             BackendStaticPlanInterpreter::PlanTree,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
         )
         .expect("compose backend application services");
@@ -2091,7 +2095,7 @@ mod tests {
             CatalogManagerConfig::default(),
             &[],
             BackendStaticPlanInterpreter::CompiledPackage(plan),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
         )
         .expect("compose compiled-package backend services");

@@ -62,7 +62,7 @@ use tokio_stream::Stream;
 
 use crate::native_ingress::NativeIngressOwnership;
 use crate::static_package_admission::StaticPackageAdmission;
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 use crate::task_protocol_fault;
 use novarocks_worker::{
     AdmissionTicketObservation, CoveredObservationFact, CoveredObservationFrame,
@@ -213,7 +213,7 @@ pub trait TaskObservationReader: Send + Sync {
 /// Role-local authority over the observation channel for one held query
 /// context. The channel and every retained status fact remain role-owned.
 pub trait TaskStatusSubscriptionReader: Send + Sync {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
         None
     }
@@ -535,7 +535,7 @@ pub fn subscribe_task_status(
             novarocks_task_codec::status::MAX_SUBSCRIPTION_CURSORS,
         )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if if let Some(controls) = reader.test_controls() {
         task_protocol_fault::task_status_subscription_dropped(&controls, decoded.context)?
     } else {
@@ -551,7 +551,7 @@ pub fn subscribe_task_status(
         decoded.context,
         decoded.generation.get(),
         covered,
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         reader.test_controls(),
     )))
 }
@@ -848,7 +848,7 @@ fn covered_frame_task_identity(frame: &CoveredObservationFrame) -> Option<TaskId
 /// ordered stream. A selected source frame becomes covered only when this
 /// stream returns it to the transport; periodic bookmarks use the same order.
 struct CoveredTaskStatusSubscription {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     generation: u64,
     position: Arc<CoveredSubscription>,
@@ -861,7 +861,7 @@ impl CoveredTaskStatusSubscription {
         context: QueryContextRef,
         generation: u64,
         position: CoveredSubscription,
-        #[cfg(feature = "test-controls")] test_controls: Option<
+        #[cfg(novarocks_dev_controls)] test_controls: Option<
             Arc<crate::test_controls::NativeTestControls>,
         >,
     ) -> Self {
@@ -871,7 +871,7 @@ impl CoveredTaskStatusSubscription {
         let first = tokio::time::Instant::now() + Duration::from_millis(250) + stagger;
         Self {
             generation,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls,
             position: Arc::new(position),
             wake: None,
@@ -948,7 +948,7 @@ impl Stream for CoveredTaskStatusSubscription {
                             "covered observation frame exceeds the native message bound",
                         ))));
                     }
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     if let (Some(task_identity), Some(controls)) =
                         (task_identity, this.test_controls.as_ref())
                     {
@@ -999,7 +999,7 @@ impl Stream for CoveredTaskStatusSubscription {
 #[tonic::async_trait]
 pub trait TaskExecutionIngress: Send + Sync {
     /// Test-only rendezvous under the actual Worker registry mutex.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn with_registry_lock_for_test(
         &self,
         callback: &mut dyn FnMut() -> Result<(), tonic::Status>,

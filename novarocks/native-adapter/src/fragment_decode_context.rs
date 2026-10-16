@@ -22,12 +22,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use crate::fragment_instance::decode_scan_range_params;
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::exchange::ExchangeKey;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -65,9 +65,9 @@ pub struct NativePlanDecodeContext {
     /// finds it absent fails closed rather than inventing a registry.
     typed_scan_runtime: Option<TypedScanRuntime>,
     function_catalog: Option<Arc<EngineFunctionCatalog>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observation_controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     original_requests: Option<Arc<crate::fragment_original_requests::NativeOriginalRequests>>,
     writer_parameters:
@@ -89,9 +89,9 @@ impl Default for NativePlanDecodeContext {
             exchange_wait: Duration::from_millis(120_000),
             typed_scan_runtime: None,
             function_catalog: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             original_requests: None,
             writer_parameters: None,
@@ -127,16 +127,16 @@ impl NativePlanDecodeContext {
             exchange_wait,
             typed_scan_runtime: None,
             function_catalog: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_controls: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             original_requests: None,
             writer_parameters: None,
         }
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_controls(
         mut self,
         controls: Option<Arc<crate::test_controls::NativeTestControls>>,
@@ -144,12 +144,12 @@ impl NativePlanDecodeContext {
         self.test_controls = controls;
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
         self.test_controls.clone()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_observation_controls(
         mut self,
         controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
@@ -157,7 +157,7 @@ impl NativePlanDecodeContext {
         self.observation_controls = controls;
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn observation_controls(
         &self,
     ) -> Option<Arc<crate::test_observation_controls::NativeObservationControls>> {
@@ -270,7 +270,7 @@ impl NativePlanDecodeContext {
         std::mem::take(&mut self.captured_static_scans.borrow_mut())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn captured_ranges_for_test(&self, node_id: i32) -> Option<BoundScanRanges> {
         self.captured_scan_ranges
             .borrow()
@@ -334,7 +334,7 @@ impl NativePlanDecodeContext {
         ))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn with_exchange_sender_count(mut self, key: ExchangeKey, count: usize) -> Self {
         let count = std::num::NonZeroUsize::new(count).expect("test sender count must be positive");
         self.fragment_instance_id = FragmentInstanceId::new(novarocks_types::UniqueId::new(
@@ -348,31 +348,31 @@ impl NativePlanDecodeContext {
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn with_connector_stop(mut self, stop: ConnectorStopView) -> Self {
         self.connector_stop = Some(stop);
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn with_query_id(mut self, query_id: QueryId) -> Self {
         self.query_id = Some(query_id);
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn with_fragment_instance_id(mut self, id: novarocks_types::UniqueId) -> Self {
         self.fragment_instance_id = FragmentInstanceId::new(id);
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn with_query_options(mut self, query_options: Option<QueryOptions>) -> Self {
         self.query_options = query_options;
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn with_scan_ranges(
         mut self,
         node_id: i32,

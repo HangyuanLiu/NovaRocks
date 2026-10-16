@@ -51,7 +51,7 @@ pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
 #[cfg(test)]
 #[path = "runtime_kernel_memory_tests.rs"]
 mod runtime_kernel_memory_tests;
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 #[path = "runtime_scalar_memory_test_support.rs"]
 pub(crate) mod runtime_scalar_memory_test_support;
 
@@ -547,7 +547,7 @@ pub(crate) fn project_chunk_with_source_observer(
         .ok_or_else(|| "source fixture Project has no output".into())
 }
 impl Operator for CompiledProjectProcessor {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> {
         self.output.clone()
     }
@@ -939,7 +939,7 @@ impl ProcessorOperator for CompiledFilterProcessor {
 
 /// Select the same runtime factory for component fixtures. Typed schema creation
 /// still occurs only under the factory installed on the actual operator.
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub fn prepare_project_factory_for_test(
     program: Arc<LocalProgram>,
     node: Option<ProgramNodeId>,

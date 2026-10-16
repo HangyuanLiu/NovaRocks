@@ -804,7 +804,7 @@ impl FrontendCatalogRoleRuntime {
 }
 
 pub struct FrontendApplicationHost {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) test_session: Option<crate::test_session::FrontendTestSession>,
     catalog_role_runtime: Option<FrontendCatalogRoleRuntime>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
@@ -894,7 +894,7 @@ impl FrontendLogicalExecutionRuntimeConfig {
 
 #[derive(Clone)]
 pub struct FrontendExecutionConfig {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_session: Option<crate::test_session::FrontendTestSessionConfig>,
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
@@ -952,7 +952,7 @@ pub struct FrontendExecutionConfig {
 }
 
 impl FrontendExecutionConfig {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_session(
         mut self,
         config: crate::test_session::FrontendTestSessionConfig,
@@ -969,7 +969,7 @@ impl FrontendExecutionConfig {
         constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_session: None,
             runtime_filter_worker_count,
             native_compatibility_id,
@@ -1303,7 +1303,7 @@ impl FrontendApplicationHost {
             .map_err(|error| {
                 FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
             })?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let test_session = execution
             .test_session
             .as_ref()
@@ -1338,7 +1338,7 @@ impl FrontendApplicationHost {
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
         )?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(owner) = test_session
             .as_ref()
             .and_then(|session| session.statement.as_ref())
@@ -1366,7 +1366,7 @@ impl FrontendApplicationHost {
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test_session,
             catalog_role_runtime: None,
             catalog_runtime_projection,
@@ -1414,7 +1414,7 @@ impl FrontendApplicationHost {
                     .await);
             }
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(session) = &mut host.test_session {
             if let Err(error) = session.start_cleanup(
                 host.execution_runtime_owner.lifecycle_diagnostics(),
@@ -1925,7 +1925,7 @@ impl FrontendApplicationHost {
             self.execution_runtime_owner.internal_result_cpu(),
         )
         .map_err(FrontendApplicationError::server)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let coordinator = match &self.test_session {
             Some(session) => coordinator.with_test_controls(
                 session.native.clone(),
@@ -1984,7 +1984,7 @@ impl FrontendApplicationHost {
             config.abort_capacity,
             self.execution_runtime_owner.lifecycle_diagnostics(),
         );
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let native_runtime = match &self.test_session {
             Some(session) => native_runtime
                 .with_test_controls(session.native.clone(), session.observation.clone()),
@@ -2100,13 +2100,13 @@ impl FrontendApplicationHost {
         &mut self,
         deadline: Instant,
     ) -> Result<(), FrontendApplicationError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let controls = match &mut self.test_session {
             Some(session) => session.close_and_join(),
             None => Ok(()),
         };
         let resources = self.release_resources_until(deadline).await;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let resources = match (controls, resources) {
             (Ok(()), result) => result,
             (Err(error), Ok(())) => Err(error),

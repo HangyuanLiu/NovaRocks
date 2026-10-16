@@ -33,5 +33,5 @@ pub(crate) mod startup_restore;
 
 pub use service::FrontendMvProductAdapter;
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub mod test_controls;

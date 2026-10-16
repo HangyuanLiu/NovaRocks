@@ -457,7 +457,7 @@ mod tests {
 }
 
 /// Original owner seams for isolated Server GLOBAL integration tests.
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub mod test_support {
     pub use crate::exec::operators::compiled_expression::runtime_scalar_memory_test_support::{
         RuntimeInvocationWrapperForTest, RuntimeInvocationWrapperReceiptForTest,

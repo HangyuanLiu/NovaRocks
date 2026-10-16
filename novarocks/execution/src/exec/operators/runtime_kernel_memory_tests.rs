@@ -102,7 +102,7 @@ fn by_runtime_memory_ready_actual_task_state_installs_exact_account_without_gran
         execution_runtime: Some(runtime),
         query_memory: Some(binding.clone()),
         task_identity: Some(task),
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         exchange_test_observer: None,
     })
     .unwrap();

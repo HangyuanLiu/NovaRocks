@@ -737,7 +737,7 @@ impl StateStoreMvRepository {
     }
 }
 impl StateStoreMvRepository {
-    #[cfg(any(test, feature = "test-controls"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub async fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
         let records = self
             .scan_prefix(accelerator_prefix().map_err(corruption)?)
@@ -773,5 +773,5 @@ impl StateStoreMvRepository {
     }
 }
 
-#[cfg(any(test, feature = "test-controls"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use self::key::accelerator_prefix;

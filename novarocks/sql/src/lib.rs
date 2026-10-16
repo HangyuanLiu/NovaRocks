@@ -109,3 +109,10 @@ mod common_tests {
         assert_eq!(ImvVersionRef::default().role, ImvVersionRole::To);
     }
 }
+
+// Refuse flags that would make capability reporting disagree with compiled seams.
+#[cfg(any(
+    all(novarocks_dev_controls, not(debug_assertions)),
+    all(not(novarocks_dev_controls), debug_assertions)
+))]
+compile_error!("novarocks_dev_controls must match debug_assertions");

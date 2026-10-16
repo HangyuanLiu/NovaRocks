@@ -233,7 +233,7 @@ fn original_failure<C>(
 
 /// Thin test entry through the SAME production type host and original decoder.
 /// The caller supplies explicit source/limits/control and owns ordinary footer.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn materialize_package_types_for_test(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source_retained_bytes: usize,

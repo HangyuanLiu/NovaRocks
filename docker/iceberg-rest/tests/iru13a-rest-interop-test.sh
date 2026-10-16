@@ -89,8 +89,7 @@ for family in IRU5 IRU13A IRU13B; do
     export "$namespace_key" "$artifact_key"
     mkdir "${!artifact_key}"
 done
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target/normal}"
-export NOVAROCKS_BUILD_PROFILE=dev-opt
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
 python3 - "$publication/manifest.json" "$interop_root/fixture.json" "$publication" <<'PY'
 import json
 from pathlib import Path
@@ -147,12 +146,12 @@ facts = {
     'diff': subprocess.check_output(['git', 'diff', 'HEAD'], text=True),
     'cargo': subprocess.check_output(['cargo', '--version'], text=True).strip(),
     'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
-    'profile': 'dev-opt', 'target_dir': os.environ['CARGO_TARGET_DIR'],
+    'profile': 'dev', 'target_dir': os.environ['CARGO_TARGET_DIR'],
     'lock_sha256': hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest(),
 }
 (root / 'source-build-facts.json').write_text(json.dumps(facts, indent=2) + '\n')
 output = run('build', [
-    'cargo', 'test', '--locked', '--offline', '--profile', 'dev-opt', '-j2',
+    'cargo', 'test', '--locked', '--offline', '--profile', 'dev', '-j2',
     '-p', 'novarocks-connector-iceberg', '--lib', '--no-run', '--message-format=json',
 ])
 executables = set()

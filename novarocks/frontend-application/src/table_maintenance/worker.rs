@@ -421,7 +421,7 @@ fn cleanup_candidate_locations(
 pub(crate) struct FrontendOptimizeTargetCapturePort<'a> {
     engine: &'a dyn TableMaintenanceEngine,
     statement: bool,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     receipt: Option<&'a super::test_controls::SubmissionReceipt>,
 }
 
@@ -430,7 +430,7 @@ impl<'a> FrontendOptimizeTargetCapturePort<'a> {
         Self {
             engine,
             statement: false,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             receipt: None,
         }
     }
@@ -439,13 +439,13 @@ impl<'a> FrontendOptimizeTargetCapturePort<'a> {
         Self {
             engine,
             statement: true,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             receipt: None,
         }
     }
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl<'a> FrontendOptimizeTargetCapturePort<'a> {
     pub(crate) fn with_test_receipt(
         mut self,
@@ -471,7 +471,7 @@ impl OptimizeTargetCapturePort for FrontendOptimizeTargetCapturePort<'_> {
                     "OPTIMIZE requires the admitted statement cancellation scope".to_string(),
                 );
             }
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             if let Some(receipt) = self.receipt {
                 receipt.capture(&captured.object_id)?;
             }
@@ -624,7 +624,7 @@ impl Drop for FrontendOptimizeJobScope {
 pub(crate) struct FrontendOptimizeJobExecutionPort {
     engine: Weak<dyn TableMaintenanceEngine>,
     product: Weak<TableMaintenanceProduct>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     controls: Option<Arc<super::test_controls::MaintenanceTestControls>>,
 }
 
@@ -632,14 +632,14 @@ impl FrontendOptimizeJobExecutionPort {
     pub(crate) fn new(
         engine: Weak<dyn TableMaintenanceEngine>,
         product: Weak<TableMaintenanceProduct>,
-        #[cfg(feature = "test-controls")] controls: Option<
+        #[cfg(novarocks_dev_controls)] controls: Option<
             Arc<super::test_controls::MaintenanceTestControls>,
         >,
     ) -> Self {
         Self {
             engine,
             product,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             controls,
         }
     }
@@ -661,7 +661,7 @@ impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
         Ok(Some(Box::new(FrontendOptimizeJobExecution {
             engine,
             product,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             test: self
                 .controls
                 .as_ref()
@@ -677,17 +677,17 @@ impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
 struct FrontendOptimizeJobExecution {
     engine: Arc<dyn TableMaintenanceEngine>,
     product: Arc<TableMaintenanceProduct>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test: Option<MaintenanceExecutionControls>,
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 struct MaintenanceExecutionControls {
     owner: Arc<super::test_controls::MaintenanceTestControls>,
     capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     observation: Mutex<Option<super::test_controls::AuthorizedJob>>,
 }
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl FrontendOptimizeJobExecution {
     fn record_test_dispatch(
         &self,
@@ -709,7 +709,7 @@ impl FrontendOptimizeJobExecution {
 
 impl OptimizeJobExecution for FrontendOptimizeJobExecution {
     fn rebind_target(&self, job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(test) = &self.test {
             let observation = test.owner.before_rebind(job, &test.capacity)?;
             *test
@@ -739,7 +739,7 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             .engine
             .for_admitted_execution(capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         self.record_test_dispatch(job, capacity)
             .map_err(OptimizeTerminalError::failed)?;
         self.product.execute_rewrite_terminal(
@@ -759,7 +759,7 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             .engine
             .for_admitted_execution(capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         self.record_test_dispatch(job, capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         self.product.execute_automatic_rewrite_terminal(

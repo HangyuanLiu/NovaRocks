@@ -556,7 +556,7 @@ impl MvKeyedReadinessService {
             publication_id,
         })
     }
-    #[cfg(any(test, feature = "test-controls"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn ensure_no_active_publications(&self) -> Result<(), MvRepositoryError> {
         if self.runtime.has_active_publications() {
             Err(MvRepositoryError::new(
@@ -567,7 +567,7 @@ impl MvKeyedReadinessService {
             Ok(())
         }
     }
-    #[cfg(any(test, feature = "test-controls"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvProjectionError> {
         self.ensure_no_active_publications()?;
         for target in self.runtime.projection_targets() {
@@ -885,7 +885,7 @@ impl MvKeyedReadinessService {
             MvKeyedProjectionInstallOutcome::Installed(loaded)
         })
     }
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub async fn seed_projection(
         &self,
         operation: Uuid,

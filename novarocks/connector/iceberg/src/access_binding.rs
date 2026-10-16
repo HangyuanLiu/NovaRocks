@@ -152,7 +152,7 @@ enum IcebergStorageAccess {
 
 #[derive(Clone)]
 pub struct IcebergReadBinding {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observation_slot: Option<crate::test_observation::IcebergObservationSlot>,
     resources: FsAccessResources,
     range_service: Option<Arc<novarocks_fs::FileRangeService>>,
@@ -211,14 +211,14 @@ impl std::fmt::Debug for IcebergReadBinding {
 }
 
 impl IcebergReadBinding {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn test_storage_authority_registry(
         &self,
     ) -> &Arc<novarocks_fs::StorageAuthorityRegistry> {
         self.resources.storage_authority_registry()
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_test_observation(
         mut self,
         slot: crate::test_observation::IcebergObservationSlot,
@@ -226,7 +226,7 @@ impl IcebergReadBinding {
         self.observation_slot = Some(slot);
         self
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn test_observation(
         &self,
     ) -> Option<&crate::test_observation::IcebergObservationSlot> {
@@ -246,7 +246,7 @@ impl IcebergReadBinding {
             data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: None,
         }
     }
@@ -267,7 +267,7 @@ impl IcebergReadBinding {
             data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: None,
         }
     }
@@ -288,7 +288,7 @@ impl IcebergReadBinding {
             data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: None,
         }
     }
@@ -405,7 +405,7 @@ impl IcebergReadBinding {
             data_credential_vending_declared: vending_reference(properties).is_some(),
             request_context: None,
             catalog_runtime: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: None,
         })
     }
@@ -425,7 +425,7 @@ impl IcebergReadBinding {
         )?;
         Ok(Self {
             catalog_runtime: self.catalog_runtime.clone(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: self.observation_slot.clone(),
             range_service: self.range_service.clone(),
             ..bound
@@ -532,7 +532,7 @@ impl IcebergReadBinding {
             data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: None,
         }
     }
@@ -554,7 +554,7 @@ impl IcebergReadBinding {
             data_credential_vending_declared: self.data_credential_vending_declared,
             request_context: Some(request_context),
             catalog_runtime: self.catalog_runtime.clone(),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             observation_slot: self.observation_slot.clone(),
         }
     }

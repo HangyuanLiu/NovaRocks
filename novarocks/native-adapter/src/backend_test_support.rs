@@ -22,19 +22,19 @@
 //! the runtime handle and channel cache instance-owned; no Core or process
 //! global runtime participates in Backend transport work.
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use novarocks_native_trust::NativeTrust;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use novarocks_memory::MemoryAuthority;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 use crate::{BackendDataRuntime, BackendNativeTransport};
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn test_backend_data_runtime() -> BackendDataRuntime {
     static TEST_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
         std::sync::LazyLock::new(|| {
@@ -53,7 +53,7 @@ pub fn test_backend_data_runtime() -> BackendDataRuntime {
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn test_backend_native_trust() -> Arc<NativeTrust> {
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, ValidatedSharedSecret,
@@ -72,7 +72,7 @@ pub fn test_backend_native_trust() -> Arc<NativeTrust> {
 /// The process memory observation a test backend reports: it has no probed
 /// cgroup or allocator of its own, so every physical source stays unknown and
 /// nothing is exported as zero.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn test_process_memory() -> crate::backend_metrics::ProcessMemoryObservation {
     crate::backend_metrics::ProcessMemoryObservation {
         allocator: "test",
@@ -89,7 +89,7 @@ pub fn test_process_memory() -> crate::backend_metrics::ProcessMemoryObservation
 
 /// The runtime Native adapter tests poll typed scan streams in, standing in
 /// for the Server's scan I/O runtime.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn test_scan_stream_runtime() -> tokio::runtime::Handle {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME
@@ -107,7 +107,7 @@ pub fn test_scan_stream_runtime() -> tokio::runtime::Handle {
 
 /// A real, small memory authority for Native adapter tests and Backend role
 /// tests that construct the adapter's query runtime.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, novarocks_dev_controls))]
 pub fn test_memory_authority() -> Arc<MemoryAuthority> {
     const BOUND: u64 = 64 * 1024 * 1024;
     Arc::new(

@@ -15,14 +15,14 @@ use crate::{BackendDataRuntime, NativeRpcClient};
 pub fn grpc_exchange_transmitter(
     runtime: BackendDataRuntime,
     send_timeout: Duration,
-    #[cfg(feature = "test-controls")] observations: Option<
+    #[cfg(novarocks_dev_controls)] observations: Option<
         Arc<crate::test_observation_controls::NativeObservationControls>,
     >,
 ) -> Arc<dyn ExchangeFrameTransmitter> {
     Arc::new(GrpcExchangeFrameTransmitter {
         runtime,
         send_timeout,
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         observations,
     })
 }
@@ -37,7 +37,7 @@ fn failed(kind: FragmentIoErrorKind, detail: impl Into<String>) -> ExchangeTrans
 }
 
 struct GrpcExchangeFrameTransmitter {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     runtime: BackendDataRuntime,
     send_timeout: Duration,
@@ -94,7 +94,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             Some(proof) => validate_normal_close(
                 &frame,
                 &proof,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 self.observations
                     .as_deref()
                     .map(|controls| {
@@ -112,7 +112,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
 fn validate_normal_close(
     frame: &ExchangeFrame,
     proof: &proto::ExchangeNormalClosed,
-    #[cfg(feature = "test-controls")] observer: Option<
+    #[cfg(novarocks_dev_controls)] observer: Option<
         &dyn novarocks_execution::runtime::exchange::TestEventObserver,
     >,
 ) -> Result<(), ExchangeTransmitRejection> {
@@ -149,7 +149,7 @@ fn validate_normal_close(
             "normal-close response does not match frozen exchange destination and sender",
         ));
     }
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     if let Some(observer) = observer {
         observer.observe(&format!(
             "NOVAROCKS_EXCHANGE_SNAPSHOT event=normal_close_validated destination_task={} attempt={} dest_finst={} node_id={} sender_finst={} sender_ordinal={} sender_count={} seq={} eos={}",
@@ -237,7 +237,7 @@ mod tests {
         let transmitter = super::grpc_exchange_transmitter(
             crate::backend_test_support::test_backend_data_runtime(),
             std::time::Duration::from_secs(1),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             None,
         );
         let error = transmitter.transmit(frame).unwrap_err();
@@ -258,7 +258,7 @@ mod tests {
             validate_normal_close(
                 &frame,
                 &proof,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None
             ),
             Err(ExchangeTransmitRejection::DestinationCanceled(
@@ -275,7 +275,7 @@ mod tests {
             validate_normal_close(
                 &frame,
                 &proof,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None
             )
             .unwrap_err()
@@ -290,7 +290,7 @@ mod tests {
             validate_normal_close(
                 &frame,
                 &proof,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None
             )
             .unwrap_err()
@@ -305,7 +305,7 @@ mod tests {
             validate_normal_close(
                 &frame,
                 &proof,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None
             )
             .unwrap_err()
@@ -324,7 +324,7 @@ mod tests {
             validate_normal_close(
                 &frame,
                 &proof,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None
             )
             .unwrap_err()
@@ -338,7 +338,7 @@ mod tests {
             validate_normal_close(
                 &frame,
                 &proof,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 None
             )
             .unwrap_err()

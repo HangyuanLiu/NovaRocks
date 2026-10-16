@@ -70,6 +70,7 @@ enum Exit {
 pub(super) async fn serve<F>(
     mut fixture: ClosingPressureFixture,
     mysql_listener: ResolvedMysqlListenerSettings,
+    server_version: String,
     session_factory: Arc<dyn QuerySessionFactory>,
     client_connections: Arc<MysqlClientConnectionRegistry>,
     shutdown: F,
@@ -108,7 +109,7 @@ where
     let ready_user = mysql_listener.user().to_string();
     let mysql_server = novarocks_mysql_adapter::closing_pressure_fixture_listener(
         mysql_listener,
-        version::short_version().to_string(),
+        server_version,
         Arc::clone(&session_factory),
         Arc::clone(&client_connections),
         wait_for_signal(drain_rx),

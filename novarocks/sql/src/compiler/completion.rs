@@ -3432,7 +3432,7 @@ where
 /// has to be provable on its own - whether an absent relation becomes a fact or
 /// an error is a decision with no plan in it - so these mint one directly.
 /// They exist only under `test-support`, so no product build can reach them.
-#[cfg(feature = "test-support")]
+#[cfg(novarocks_dev_controls)]
 pub mod fixtures {
     use super::{
         CatalogLookupTarget, CatalogRelationNeed, CompileNeedId, CompletionProtocolError,

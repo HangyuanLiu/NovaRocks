@@ -22,13 +22,13 @@ use std::time::{Duration, Instant};
 
 /// A live, bounded test observation supplied by the exact application owner.
 /// This interface knows no action vocabulary and grants no authority itself.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub trait TestEventObserver: Send + Sync + std::fmt::Debug {
     fn is_active(&self) -> bool;
     fn observe(&self, event: &str);
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub(crate) fn emit_exchange_snapshot_marker(
     observer: Option<&dyn TestEventObserver>,
     build: impl FnOnce() -> String,
@@ -323,7 +323,7 @@ struct DecodedExchangePayload<'a> {
 #[derive(Default)]
 struct ReceiverState {
     expected_senders: usize,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     test_observer: Option<Arc<dyn TestEventObserver>>,
     expected: Option<ExpectedReceiverSchema>,
     sender_wire_meta: HashMap<ExchangeSenderIdentity, Arc<GuardedExchangeWireMeta>>,
@@ -374,7 +374,7 @@ fn get_or_create(registry: &ExecutionExchangeRegistry, key: ExchangeKey) -> Arc<
 /// Adds tombstones so late-arriving sender data is rejected, but does NOT
 /// wake any blocked waiters (none should exist on the success path).
 impl ExecutionExchangeRegistry {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn install_test_observer(
         &self,
         key: ExchangeKey,
@@ -711,7 +711,7 @@ impl ExecutionExchangeRegistry {
                 st.expected_senders
             );
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let eos_snapshot = if eos {
             st.test_observer
                 .clone()
@@ -735,7 +735,7 @@ impl ExecutionExchangeRegistry {
         r.cv.notify_all();
         drop(st);
         let hold_time = hold_start.elapsed();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some((
             observer,
             expected_senders,

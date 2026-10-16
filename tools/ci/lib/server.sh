@@ -22,9 +22,9 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build_capabilities.sh"
 CI_SERVER_PID=""
 
 ci_novarocks_binary_path() {
-  local cargo_profile="${1:-dev-opt}"
+  local cargo_profile="${1:-dev}"
 
-  ci_artifact_path "$(ci_target_directory normal)" "$cargo_profile" novarocks
+  ci_bound_binary novarocks
 }
 
 ci_start_all_in_one_server() {
@@ -32,7 +32,7 @@ ci_start_all_in_one_server() {
   local be_config_path="$2"
   local log_path="$3"
   local timeout_seconds="$4"
-  local cargo_profile="${5:-dev-opt}"
+  local cargo_profile="${5:-dev}"
   local binary_path
   local i
 

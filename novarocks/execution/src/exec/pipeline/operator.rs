@@ -142,7 +142,7 @@ pub trait Operator: Send {
         None
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, novarocks_dev_controls))]
     fn prepared_schema_for_test(&self) -> Option<crate::exec::chunk::ChunkSchemaRef> {
         None
     }

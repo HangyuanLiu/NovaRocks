@@ -51,9 +51,7 @@ impl Scenario for LimitZeroUnknownSender {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary: &Path,
-        ordinary: &Path,
-        controlled: Option<&Path>,
+        binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let mut statement = fault_statement(QUERY, FAULT);
@@ -64,8 +62,7 @@ impl Scenario for LimitZeroUnknownSender {
             vec![statement],
             &[],
             cluster_size,
-            ordinary,
-            controlled,
+            binary,
             deadline,
         )?))
     }

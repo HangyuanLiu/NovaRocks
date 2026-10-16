@@ -859,9 +859,9 @@ impl EventScheduler {
         generation: u64,
         deadline: Option<DriverBlockDeadline>,
     ) -> Result<(), Box<DriverTask>> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let test_observer = task.exchange_test_observer();
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let emit_exchange_marker = test_observer
             .as_ref()
             .is_some_and(|observer| observer.is_active())
@@ -919,7 +919,7 @@ impl EventScheduler {
             aborted
         };
 
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if emit_exchange_marker {
             crate::runtime::exchange::emit_exchange_snapshot_marker(
                 test_observer.as_deref(),
@@ -1180,12 +1180,12 @@ impl EventScheduler {
     }
 
     fn try_schedule_key(self: &Arc<Self>, key: DriverKey) {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let mut exchange_marker = None;
         let task = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             let entry = blocked.remove(&key);
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             if let Some(entry) = entry.as_ref() {
                 if entry.task.source_name().contains("EXCHANGE") {
                     if let Some(observer) = entry
@@ -1223,7 +1223,7 @@ impl EventScheduler {
             }
             entry.map(|entry| (entry.task, origin))
         };
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some((observer, blocked_generation, current_generation, block_epoch)) =
             exchange_marker
         {

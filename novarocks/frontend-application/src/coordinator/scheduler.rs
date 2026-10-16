@@ -126,7 +126,7 @@ impl FrontendBackendSnapshot {
 
 #[derive(Clone)]
 pub struct FrontendFragmentScheduler {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     nomination: Option<(
         std::sync::Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
         std::sync::Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
@@ -135,7 +135,7 @@ pub struct FrontendFragmentScheduler {
 }
 
 impl FrontendFragmentScheduler {
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_nomination(
         mut self,
         controls: std::sync::Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
@@ -148,7 +148,7 @@ impl FrontendFragmentScheduler {
     pub const fn new(backends: FrontendBackendSnapshot) -> Self {
         Self {
             backends,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             nomination: None,
         }
     }
@@ -195,7 +195,7 @@ impl FrontendFragmentScheduler {
         facts: &FragmentSchedulingFacts,
         execution_id: QueryExecutionId,
     ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let test_execution = novarocks_types::QueryExecutionId::new(
             execution_id.query_id(),
             novarocks_types::AttemptId::new(execution_id.attempt_id().get())
@@ -276,7 +276,7 @@ impl FrontendFragmentScheduler {
         counts.insert(root_fragment_id, 1);
 
         let fault_preferred = None::<usize>;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let fault_preferred = if let Some((controls, nomination)) = &self.nomination {
             match controls.preferred_backend_process(nomination, test_execution).map_err(contract_error)? {
                 Some(process) => Some(self.backends.entries.iter().position(|target| target.process_id().ok() == Some(process)).ok_or_else(|| contract_error("the exact nominated backend process is absent from the frozen live topology"))?),
@@ -314,7 +314,7 @@ impl FrontendFragmentScheduler {
             draft.assign_fragment(fragment_id, placements)?;
         }
         let schedule = ValidatedFragmentSchedule::validate(facts, execution_id, draft)?;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some((controls, nomination)) = &self.nomination {
             let attempt = novarocks_types::AttemptId::new(execution_id.attempt_id().get())
                 .map_err(|error| contract_error(error.to_string()))?;

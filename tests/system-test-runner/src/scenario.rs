@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScenarioBinary {
     #[default]
     Primary,
@@ -48,6 +48,16 @@ pub trait Scenario: Send + Sync {
         false
     }
 
+    /// Independent compatibility stages are discoverable but outside default functionality.
+    fn is_compatibility_stage(&self) -> bool {
+        false
+    }
+
+    /// Complete lifecycle demand, including later replacement or target-island launches.
+    fn binary_requirements(&self) -> &'static [ScenarioBinary] {
+        &[ScenarioBinary::Primary]
+    }
+
     fn child_environment(&self) -> CrossProcessChildEnvironment {
         CrossProcessChildEnvironment::default()
     }
@@ -66,9 +76,7 @@ pub trait Scenario: Send + Sync {
         _launch: &ScenarioLaunchConfig,
         _scenario_root: &Path,
         _cluster_size: usize,
-        _primary_binary: &Path,
-        _ordinary_binary: &Path,
-        _controlled_binary: Option<&Path>,
+        _binary: &Path,
         _original_deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(None)
@@ -139,6 +147,7 @@ pub struct ScenarioLaunchConfig {
 }
 
 pub struct ScenarioContext {
+    build: crate::build_information::BuildInformation,
     name: &'static str,
     handle: CrossProcessServerHandle,
     scenario_root: PathBuf,
@@ -237,9 +246,11 @@ impl ScenarioContext {
         base_config_path: PathBuf,
         cluster_size: usize,
         launch_profile: LaunchProfile,
+        build: crate::build_information::BuildInformation,
         exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
     ) -> Self {
         Self {
+            build,
             name,
             handle,
             scenario_root,
@@ -478,7 +489,7 @@ impl ScenarioContext {
             source_revision: source.revision,
             source_dirty: source.dirty,
             source_tree_sha256: source.tree_sha256,
-            runner_native_build_identity: novarocks_version::native_build_identity().to_string(),
+            runner_native_build_identity: self.build.native_build_identity.to_string(),
             runner_executable,
             cargo_lock_sha256: sha256_file(&repository.join("Cargo.lock"))?,
             platform: scenario_platform_identity()?,

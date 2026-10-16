@@ -177,7 +177,7 @@ impl FrontendStatisticsApplicationPort {
         command: application::StatisticsApplicationCommand,
         submitted_at_ms: i64,
         connector_context: Option<novarocks_spi::connector::ConnectorRequestContext>,
-        #[cfg(feature = "test-controls")] nomination: Option<
+        #[cfg(novarocks_dev_controls)] nomination: Option<
             Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
         >,
     ) -> Result<StatisticsStatementResult, application::StatisticsApplicationError> {
@@ -196,7 +196,7 @@ impl FrontendStatisticsApplicationPort {
                     .begin_statistics_job()
                     .map_err(application::StatisticsApplicationError::new)?;
                 let admission = admit_statistics_job_root(root, &context).await?;
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 let admission = match nomination {
                     Some(nomination) => admission
                         .with_test_statement_nomination(nomination)
@@ -312,7 +312,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
                     command,
                     at_ms,
                     connector_context,
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     execution
                         .and_then(|execution| execution.test_statement_nomination())
                         .cloned(),

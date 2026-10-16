@@ -1,3 +1,6 @@
+#[path = "../../../build-support/development.rs"]
+mod development;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -5,6 +8,7 @@ const IDL_DIR: &str = "idl";
 const PROTO_FILES: &[&str] = &["common.proto", "read.proto", "write.proto"];
 
 fn main() {
+    development::emit();
     for file in PROTO_FILES.iter().copied() {
         println!(
             "cargo:rerun-if-changed={}",

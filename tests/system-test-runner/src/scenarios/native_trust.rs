@@ -118,9 +118,7 @@ impl Scenario for NativeTrustPositive {
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         self.intent
@@ -128,8 +126,7 @@ impl Scenario for NativeTrustPositive {
                 native_trust_controls::baseline_statements(),
                 &[],
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -488,9 +485,7 @@ token = "${{ENV:{environment_name}}}"
         _launch: &ScenarioLaunchConfig,
         _root: &Path,
         cluster_size: usize,
-        _primary_binary: &Path,
-        ordinary_binary: &Path,
-        controlled_binary: Option<&Path>,
+        binary: &Path,
         original_deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         self.intent
@@ -500,8 +495,7 @@ token = "${{ENV:{environment_name}}}"
                 )],
                 &[],
                 cluster_size,
-                ordinary_binary,
-                controlled_binary,
+                binary,
                 original_deadline,
             )
             .map(Some)
@@ -1002,8 +996,6 @@ mod tests {
                         Path::new("/unused"),
                         REQUIRED_BACKENDS,
                         Path::new("/unused/primary"),
-                        Path::new("/unused/ordinary"),
-                        None,
                         deadline,
                     )
                     .unwrap()

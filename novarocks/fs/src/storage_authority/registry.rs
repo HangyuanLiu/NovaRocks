@@ -117,7 +117,7 @@ pub struct StorageAuthorityRegistry {
     misses: AtomicU64,
     capacity_evictions: AtomicU64,
     idle_expirations: AtomicU64,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     close_controls: Mutex<Option<super::StorageAuthorityCloseControls>>,
 }
 
@@ -145,7 +145,7 @@ impl StorageAuthorityRegistry {
             misses: AtomicU64::new(0),
             capacity_evictions: AtomicU64::new(0),
             idle_expirations: AtomicU64::new(0),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             close_controls: Mutex::new(None),
         })
     }
@@ -165,14 +165,14 @@ impl StorageAuthorityRegistry {
             misses: AtomicU64::new(0),
             capacity_evictions: AtomicU64::new(0),
             idle_expirations: AtomicU64::new(0),
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             close_controls: Mutex::new(None),
         }
     }
 
     /// Installed by role composition before authority consumers are opened.
     /// Existing authorities are registered under their exact owner identity.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn attach_test_close_controls(
         &self,
         controls: super::StorageAuthorityCloseControls,
@@ -223,7 +223,7 @@ impl StorageAuthorityRegistry {
             Arc::clone(&self.executor),
             self.policy,
         ));
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self
             .close_controls
             .lock()

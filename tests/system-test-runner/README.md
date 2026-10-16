@@ -14,58 +14,48 @@ ignored report directories and the commands below remain supported. Preserve
 unresolved failure materials and record the actual output location; a local
 path is not a shared evidence handoff.
 
-List all registered scenarios (including explicit stages):
+先准备主图并绑定真实程序：
 
 ```bash
-NOVAROCKS_BUILD_PROFILE=dev-opt cargo run -p novarocks-system-test-runner \
-  --locked --profile dev-opt --target-dir "${NOVA_CI_NORMAL_TARGET_DIR:-$PWD/target/normal}" -- --list
-```
-
-List the default functional baseline:
-
-```bash
-NOVAROCKS_BUILD_PROFILE=dev-opt cargo run -p novarocks-system-test-runner \
-  --locked --profile dev-opt --target-dir "${NOVA_CI_NORMAL_TARGET_DIR:-$PWD/target/normal}" -- --list-default
-```
-
-The default list uses the same registry classification as a run without
-`--only`. Explicit functional stages with external fixtures or higher cost remain
-discoverable through `--list` and selectable by exact `--only`, except disabled
-scenarios: Paimon connector scenes and all mixed UEA4 catalog-planning/scan-readiness
-scenes retain their assets, appear with `DISABLED` in `--list`, and refuse explicit
-selection before fixture preparation or role launch. They are suspended pending
-detailed Paimon design; the production provider remains registered. 当前阶段不维护
-测量基线；`performance` launch profile只选择clean harness配置，不表示性能实验。
-
-Run one scenario against the native 1FE+3BE default:
-
-```bash
-normal_target="${NOVA_CI_NORMAL_TARGET_DIR:-$PWD/target/normal}"
-control_target="${NOVA_CI_CONTROL_TARGET_DIR:-$PWD/target/test-controls}"
-export NOVAROCKS_BUILD_PROFILE=dev-opt
-cargo build --workspace --locked --profile dev-opt --target-dir "$normal_target"
-cargo build -p novarocks-server --bin novarocks --no-default-features \
-  --features jemalloc,test-controls --locked --profile dev-opt --target-dir "$control_target"
-cargo run -p novarocks-system-test-runner --locked --profile dev-opt --target-dir "$normal_target" -- \
-  --binary "$normal_target/dev-opt/novarocks" \
-  --ordinary-binary "$normal_target/dev-opt/novarocks" \
-  --test-control-binary "$control_target/dev-opt/novarocks" \
+tools/ci/dev-test.sh prepare logs/system-attempt/artifacts.json
+source tools/ci/lib/build_capabilities.sh
+export NOVA_CI_ARTIFACT_RECEIPT="$PWD/logs/system-attempt/artifacts.json"
+server="$(ci_bound_binary novarocks)"
+runner="$(ci_bound_binary novarocks-system-tests)"
+"$runner" --list
+"$runner" --list-default
+"$runner" --binary "$server" \
   --config tools/ci/fixtures/system-scenarios-base.toml \
-  --artifact-root "$(mktemp -d)" \
-  --cluster-size 3 \
-  --timeout-secs 300 \
+  --artifact-root "$(mktemp -d)" --cluster-size 3 --timeout-secs 300 \
   --only query-lifecycle/distributed-baseline
 ```
 
+CLI package 为 `novarocks-system-test-cli`，原 package `novarocks-system-test-runner` 为库，保留原 `CARGO_MANIFEST_DIR`。完整 `--list` 包括显式与暂停场景；默认 `--list-default` 与无 selector 使用同一集合，排除兼容场景与其它显式专项。Paimon 及 mixed UEA4 暂停项继续显示 DISABLED 并在 fixture/launch 前拒绝显式选择，production provider 仍注册。`performance` launch profile 选择 clean harness 配置，不表示测量实验。
+
 ## 产物与有限授权
 
-普通、控制及兼容性变体使用独立 target，默认 `target/normal`、`target/test-controls`、`target/variants`；CI 的三种 `NOVA_CI_*_TARGET_DIR` 可复用已有 owner 管理的互斥缓存根，运行 artifact root 仍每次独占。构建同时声明 `--profile` 与 `NOVAROCKS_BUILD_PROFILE`，`dev` 映射到 `debug` 目录；不能用目录、feature 或 runner profile 代替实际 FE/BE 自报。[构建 helper](../../tools/ci/lib/build_capabilities.sh) 统一现有 CI 选择，不维护第二份能力目录。
+普通与受控步骤使用唯一显式 `--binary` 主 Server，原生 owner 按实际选中动作冻结角色需求、会话和 statement。dev 编入能力但不授予动作，标准 release 排除能力；缺能力/授权在 spawn 前失败。无授权角色也可运行同一 dev Server。兼容变体从实际 Cargo artifact 独立复制，启动及 restart 前保持准确程序与 grants 绑定。路径、identity、runner profile 不代替实际 FE/BE 自报，unknown 保留；原始 stdout/stderr、退出、清理失败和重跑材料分开保留。详见 [构建与授权](../../docs/guides/development/test-governance.md#构建选择与控制授权)。
 
-`--binary` 是场景 Primary，`--ordinary-binary` 是普通对照/普通后继，`--test-control-binary` 是具有所需内部能力的产物。场景从本次所选有限动作冻结必要角色需求；缺能力在 spawn 前失败，旧环境、FaultScenario 名称与 feature 编入都不发授权。内部 statement 观察独立授权，观察不触发注入；正常 READY、MySQL、公开 metrics 不需要内部观察权。普通场景可只提供普通产物；上例的 distributed-baseline 同场景追加普通 peer 的三次 public SQL/资源收敛，随后完整执行受控三 statement 的 typed namespace/sequence/attempt 与 Native 断言，两个阶段各自记录实际产物。
+## 兼容专项与程序需求
 
-兼容性场景的 `Primary/Compatible/OtherIsland` 使用启动前解析的实际选中产物，包括 peer 和 replacement；不能用基础 controls 自动替换用户选中的兼容性变体。CI 明确给 `native-compatibility/*` 选择 controls Primary，仍传独立 ordinary 及 compatible/other-island 路径，普通 workspace binary 不被覆写后恢复。
+原生 `--list-compatibility [--only <exact>]` 列举兼容集合，`--list-binary-requirements --only <exact>` 输出所选场景完整生命周期的需求并集。shell 不维护另一张场景注册表。独立入口为：
 
-`--build-info` 不依赖 config/fixture；harness 保留真实自报双流、实际退出和各角色 launch/restart 映射。声明 profile、binary `actual_cfg`、package 局部事实与 null/unknown 分列；最终 LTO/codegen/dependency override/额外 flags 等仍未知，`not-certified-by-self-report` 不构成发布认证。本文的接口说明不宣称 G2 全部完成或验收通过。历史私有 exact/held/HMS 原输入缺失时完整矩阵记 `NOT_RUN`，局部机制、明确授权动作与实际退出证据另列，不能伪造历史 receipt。
+```bash
+tools/ci/native-compatibility-ci.sh
+tools/ci/native-compatibility-ci.sh --only native-compatibility/mixed-build-same-island
+```
+
+| 场景（均在 native-compatibility/） | 性质与主 Server 以外的程序 |
+|---|---|
+| mixed-build-same-island | Compatible 共存；诊断 identity 不改变兼容材料 |
+| raw-establish-compatibility-admission | 原生准入/拒绝，无额外程序 |
+| other-island-hard-cut | Compatible 与 OtherIsland 的硬拒绝 |
+| target-island-cutover | Compatible、OtherIsland；后续目标岛启动也需要 OtherIsland |
+| island-drain-and-replacement | Compatible、OtherIsland；预冻结 replacement 程序与 grants，实际 restart |
+
+上述场景消费本地 SQLite/动态 catalog 基础配置、harness 私有端口/目录和 Native trust，无 REST/MinIO/Spark/外部 MySQL 前置。cutover 同时两套 1FE+3BE，需要容量和 peer 授权；drain/replacement 需要 Unix SIGTERM。缺前置保留失败或 required-but-not-run，不用 fake 编排结果替代。原生 owner 为新增场景声明实际 fixture 和后继 launch 需求。
+
+默认功能 CI 不准备变体；专项按需求并集每种只准备一次，不运行普通全量。何时选择专项与维护责任见 [兼容选择策略](../../docs/guides/development/test-governance.md#兼容专项的选择)。
 
 Most scenarios build their Iceberg warehouse on the local filesystem under
 the harness runtime directory. The vended credential scenarios and the default
@@ -84,7 +74,7 @@ do not read.
 `connector/vended-credential-targeted-deadline`、`connector/vended-credential-late-close`
 与 `connector/vended-credential-unreachable`。逐个用准确 `--only` 和
 `--cluster-size 3 --timeout-secs 180` 运行。fixture 识别真实 BE principal，
-仅在对应刷新请求到达后 hold；late-close 在 BE[0] 使用 test-controls 下
+仅在对应刷新请求到达后 hold；late-close 在 BE[0] 使用开发能力下
 显式授权的 exact-authority trigger。
 
 Scenarios run sequentially. On failure the runner prints action history,

@@ -281,7 +281,7 @@ fn lower_typed_connector_scan(
                 Arc::clone(&output_schema),
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 ctx.observation_controls()
                     .as_deref()
                     .map(|controls| controls.observation_for("reader-marker", execution_id))
@@ -323,7 +323,7 @@ fn lower_typed_connector_scan(
                 node.node_id,
                 read_slot_ids,
                 Arc::clone(&output_schema),
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 ctx.observation_controls()
                     .as_deref()
                     .map(|controls| controls.observation_for("reader-marker", execution_id))
