@@ -81,7 +81,10 @@ export NR_JAVA_REST_INTEROP_RUN_ROOT="$interop_root"
 for family in IRU5 IRU13A IRU13B; do
     namespace_key="NR_${family}_INTEROP_NAMESPACE"
     artifact_key="NR_${family}_INTEROP_ARTIFACT_DIR"
-    printf -v "$namespace_key" '%s' "java_rest_${run_id}_${family}"
+    # Provider catalog names are normalized; the independent Java oracle must
+    # address that same namespace rather than a differently cased identifier.
+    family_slug=$(printf '%s' "$family" | tr '[:upper:]' '[:lower:]')
+    printf -v "$namespace_key" '%s' "java_rest_${run_id}_${family_slug}"
     printf -v "$artifact_key" '%s' "$interop_root/$family"
     export "$namespace_key" "$artifact_key"
     mkdir "${!artifact_key}"
