@@ -6063,34 +6063,10 @@ pub fn percentile_raw_private_test_catalog() -> EngineFunctionCatalog {
     builder.seal().unwrap()
 }
 
-/// Private runtime test catalogue. Public production BY definitions retain
-/// AggregateV1 until the complete original invocation schedule is validated.
+/// Existing test entry delegates to the same installed public BY owners.
 #[cfg(any(test, novarocks_dev_controls))]
 pub fn by_window_private_test_catalog() -> EngineFunctionCatalog {
-    let original = build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    for declaration in builtin_aggregate_declarations()
-        .into_iter()
-        .filter(|item| matches!(item.name, "max_by" | "min_by"))
-    {
-        let binding = original
-            .definition(declaration.name, FunctionKind::Aggregate)
-            .unwrap()
-            .binding_declaration()
-            .unwrap()
-            .clone();
-        let name = declaration.name;
-        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
-        builder
-            .register(
-                super::aggregate_by_owner::private_window_definition_for_test(
-                    name, binding, resolver,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
-    builder.seal().unwrap()
+    build_builtin_engine_function_catalog().unwrap()
 }
 
 /// Private Union capability for original full-domain binding/runtime probes.
