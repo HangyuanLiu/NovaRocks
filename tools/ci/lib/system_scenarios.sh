@@ -70,7 +70,7 @@ ci_prepare_system_scenario_binaries() {
     [ "$requirement" != primary ] || continue
     built=true
     destination="$(ci_target_directory variants)/$requirement/novarocks"
-    mkdir -p "$(dirname "$destination")" || return $?
+    mkdir -p "$(dirname "$destination")" || { code=$?; break; }
     case "$requirement" in
       compatible)
         printf '%s\n' "NOVAROCKS_SERVER_BUILD_IDENTITY=ci-compatible-$build_suffix cargo build --workspace --tests --bins --profile dev --locked --target-dir $(ci_target_directory main) --message-format=json" >"$fixture_root/$requirement.cargo.command"

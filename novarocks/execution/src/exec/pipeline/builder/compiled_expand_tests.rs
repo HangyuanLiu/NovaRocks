@@ -522,23 +522,36 @@ fn compiled_unpivot_retains_original_column_metadata_through_actual_input_exit()
         let tracker = MemTracker::new_root("unpivot-input-column-owner");
         let chunk = super::family_fixture::paid_input(&program, &tracker);
         let charged = tracker.current();
+        assert!(charged > 0, "the actual input owns tracked column metadata");
+        let state = RuntimeState::default();
         let factory = CompiledUnpivotProcessorFactory::try_new(
             Arc::clone(&program),
             ProgramNodeId::new(1),
-            Arc::new(RuntimeErrorState::default()),
+            state.error_state(),
         )
         .unwrap();
         let mut operator = factory.create(1, 0);
-        let state = RuntimeState::default();
+        // Construction has its own owner; the tracker above observes input metadata.
+        let construction_tracker = MemTracker::new_root("unpivot-typed-construction-fixture");
+        let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            construction_tracker.clone(),
+            state.error_state(),
+        )
+        .unwrap();
+        operator.set_mem_tracker(construction_tracker);
+        operator.set_construction_factory(construction);
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
         let processor = operator.as_processor_mut().unwrap();
         processor.push_chunk(&state, chunk).unwrap();
         assert_eq!(tracker.current(), charged);
+        let mut output = Vec::new();
         if drain {
-            let mut output = Vec::new();
             while processor.has_output() {
                 output.push(processor.pull_chunk(&state).unwrap().unwrap());
             }
-            assert_eq!(tracker.current(), 0);
+            assert_eq!(tracker.current(), charged);
             assert_eq!(
                 output.iter().map(Chunk::len).sum::<usize>(),
                 UNPIVOT_ROWS.len() * 2,
@@ -546,6 +559,12 @@ fn compiled_unpivot_retains_original_column_metadata_through_actual_input_exit()
             );
         }
         drop(operator);
+        if drain {
+            // Expanded outputs retain the original source storage independently
+            // of the exhausted processor and its construction owner.
+            assert_eq!(tracker.current(), charged);
+        }
+        drop(output);
         assert_eq!(tracker.current(), 0);
     }
 }

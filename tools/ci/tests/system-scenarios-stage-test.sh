@@ -172,6 +172,38 @@ ci_prepare_system_scenario_binaries "$binary" dev "$tmpdir/failed-variant" test 
 [ "$code" = 17 ] && [ "$(cat "$tmpdir/failed-variant/main-restore.exit")" = 0 ]
 ci_bound_binary novarocks >/dev/null
 unset FAKE_CARGO_FAIL_VARIANT
+# A later destination failure must restore the main graph after Compatible built.
+(
+  : >"$FAKE_CARGO_CALLS"
+  ci_select_system_scenarios "$runner" compatibility "$tmpdir/mkdir-selected" "$tmpdir/mkdir-requirements" native-compatibility/cutover
+  before_binding="$(python3 - "$NOVA_CI_ARTIFACT_RECEIPT" <<'BINDING'
+import json, sys
+print(json.load(open(sys.argv[1]))["novarocks"]["sha256"])
+BINDING
+)"
+  failed_destination="$(ci_target_directory variants)/other-island"
+  mkdir() {
+    if [ "$#" -eq 2 ] && [ "$1" = -p ] && [ "$2" = "$failed_destination" ]; then
+      echo 'synthetic later variant directory failure' >&2
+      return 28
+    fi
+    command mkdir "$@"
+  }
+  code=0
+  ci_prepare_system_scenario_binaries "$binary" dev "$tmpdir/mkdir-failure" test "$tmpdir/mkdir-failure.log" "$tmpdir/mkdir-requirements" || code=$?
+  [ "$code" = 28 ]
+  [ "$(cat "$tmpdir/mkdir-failure/main-restore.exit")" = 0 ]
+  [ "$(wc -l <"$FAKE_CARGO_CALLS" | tr -d ' ')" = 2 ]
+  grep -q '^ci-compatible-' "$FAKE_CARGO_CALLS"
+  if grep -q '^ci-other-island-' "$FAKE_CARGO_CALLS"; then exit 1; fi
+  ci_bound_binary novarocks >/dev/null
+  "$binary" --build-info >"$tmpdir/mkdir-failure/restored-info.json"
+  python3 - "$NOVA_CI_ARTIFACT_RECEIPT" "$before_binding" "$tmpdir/mkdir-failure/restored-info.json" <<'RESTORED'
+import json, sys
+assert json.load(open(sys.argv[1]))["novarocks"]["sha256"] == sys.argv[2]
+assert json.load(open(sys.argv[3]))["explicit_build_identity"] is None
+RESTORED
+)
 cat >"$tmpdir/failed-info" <<'INFO'
 #!/usr/bin/env bash
 echo 'actual report failure' >&2

@@ -197,13 +197,14 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
         panic!("select");
     };
     let expected = [
-        ("__array_element_at", DataType::Int8, DataType::Int64),
-        ("__array_element_at", DataType::Int8, DataType::Int32),
-        ("__map_element_at", DataType::Int64, DataType::Int64),
-        ("__map_element_at", DataType::Int64, DataType::Int64),
+        ("__array_element_at", DataType::Int8, DataType::Int64, false),
+        // Bracket syntax narrows the authored BIGINT literal to a nullable INT32.
+        ("__array_element_at", DataType::Int8, DataType::Int32, true),
+        ("__map_element_at", DataType::Int64, DataType::Int64, false),
+        ("__map_element_at", DataType::Int64, DataType::Int64, false),
     ];
     assert_eq!(select.projection.len(), expected.len());
-    for (project, (name, result, index)) in select.projection.iter().zip(expected) {
+    for (project, (name, result, index, index_nullable)) in select.projection.iter().zip(expected) {
         let ExprKind::FunctionCall {
             name: actual,
             binding,
@@ -232,7 +233,24 @@ fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_gu
             binding.selected.result_type,
             FunctionResultType::Scalar(result)
         );
-        assert_eq!(args[1].value_type, FunctionValueType::new(index, false));
+        assert_eq!(
+            args[1].value_type,
+            FunctionValueType::new(index, index_nullable)
+        );
+        if index_nullable {
+            let ExprKind::Cast { expr, target, .. } = &args[1].kind else {
+                panic!("array bracket index retains its actual narrowing cast");
+            };
+            assert_eq!(target, &DataType::Int32);
+            assert_eq!(
+                expr.value_type,
+                FunctionValueType::new(DataType::Int64, false)
+            );
+            assert!(matches!(
+                expr.kind,
+                ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
+            ));
+        }
         assert!(matches!(args[0].kind, ExprKind::FunctionCall { .. }));
     }
 }

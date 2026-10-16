@@ -111,7 +111,7 @@ Native build identity 的来源在薄 CLI build.rs 冻结并注入 Version，不
 
 规范 helper 从 Cargo JSON 的真实 bin artifact 绑定 Server、SQL/System runner 和 error-manifest 的可执行路径与 SHA-256。最后一次相关 Cargo 后重新采集，并在消费前检查内容；缺路径、缺 required bin 或内容变化失败，不能回退旧程序。SQL 列举、执行和 error-manifest 检查直接使用已准备程序，不另起 `cargo run`。自报保存 stdout/stderr/实际退出；capabilities 据实际编译事实保留，`declared_profile=null` 与其它 unknown 不补造。自报不认证依赖最终 profile 或发布资格。
 
-普通 SQL 和有有限控制需求的 SQL/System 使用同一个显式主 Server。SQL 只接受 `NOVAROCKS_BIN`，System 使用 `--binary`。原生 owner 按本次实际选中动作冻结角色会话、statement、目标和授权，启动后控制仍需准确匹配；编入能力、debug/profile、`fault-scenario` 名称、旧环境或裸测试 CALL 均不授予动作权。非破坏观察也不授予 wipe。HMS/MySQL exact/closing 模块参与 dev 编译；其外部 fixture、私有历史矩阵和 required-but-not-run 仍独立报告，主图单测通过不代替完整原输入。
+普通 SQL 和有有限控制需求的 SQL/System 使用同一个显式主 Server。SQL 只接受 `NOVAROCKS_BIN`，System 使用 `--binary`。原生 owner 按本次实际选中动作冻结角色会话、statement、目标和授权，启动后控制仍需准确匹配；编入能力、debug/profile、`fault-scenario` 名称、旧环境或裸测试 CALL 均不授予动作权。非破坏观察也不授予 wipe。开发 cfg 使通用控制接缝可见，不会自动启用 HMS/MySQL exact/closing/root 专项；这些模块仍需显式选择各自的 `mem-1-m07-*` feature，运行时还需准确授权及对应 fixture/binding。外部 fixture、私有历史矩阵和 required-but-not-run 仍独立报告，主图单测通过不代替完整原输入。
 
 ### 兼容专项的选择
 

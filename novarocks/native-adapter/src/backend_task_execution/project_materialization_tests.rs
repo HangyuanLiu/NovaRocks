@@ -19,7 +19,7 @@ use super::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_type_contract::{
-    CompileControlError, FunctionValueType,
+    CompileControlError, FunctionValueType, ValueTypeStorageLifetime,
     owned_resources::metadata_materialization::{
         MaterializedFieldNamespace, OriginalFieldMaterialization, TypedSchemaMaterializations,
         materialize_value_field,
@@ -72,6 +72,27 @@ fn positive(count: usize) -> StaticLayout {
     )
     .unwrap()
 }
+fn typed_positive(count: usize) -> StaticLayout {
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    let fields = (0..count)
+        .map(|index| Field::new(format!("field_{index}"), DataType::Int64, false))
+        .collect::<Vec<_>>();
+    StaticLayout::try_new_typed_for_compile(
+        Arc::new(Schema::new(fields)),
+        (0..count)
+            .map(|index| SlotId::new(u32::try_from(index).unwrap() + 1))
+            .collect::<Vec<_>>()
+            .into(),
+        (0..count)
+            .map(|_| (ty.typed_binding().clone(), None))
+            .collect(),
+        ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
+        &Control::good(),
+    )
+    .unwrap()
+}
+
 fn mixed() -> StaticLayout {
     let source = TypedSchemaMaterializations::from_original_fields(
         vec![OriginalFieldMaterialization::Plain(Field::new(
@@ -97,8 +118,19 @@ fn project_metadata_route_uses_actual_namespace_loans_and_preserves_open_constru
             original_schema_route(&layout, &Control::good()),
             Ok(OriginalSchemaRoute::NormalPositive)
         );
-        assert!(original_compiled_schema_metadata_request(&layout, &Control::good()).is_ok());
+        assert!(!layout.is_typed());
+        assert_eq!(
+            original_compiled_schema_metadata_request(&layout, &Control::good()),
+            Err(MetadataRequestError::SourceModel(
+                "compiled schema request requires its exact typed execution layout",
+            ))
+        );
         ChunkSchema::from_compiled_layout(&layout).unwrap();
+
+        let typed = typed_positive(count);
+        assert!(typed.is_typed());
+        original_compiled_schema_metadata_request(&typed, &Control::good()).unwrap();
+        ChunkSchema::from_compiled_layout(&typed).unwrap();
     }
     let foreign = StaticLayout::try_new(
         Arc::new(Schema::new(vec![Field::new(

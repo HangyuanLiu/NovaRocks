@@ -243,8 +243,8 @@ fn check_array_source(
                 assert_eq!(decoded.fragment().values().get(id).unwrap().ty, original.ty);
             }
             assert_eq!(
-                format!("{:?}", decoded.fragment().call_requests()),
-                format!("{:?}", package.fragment().call_requests())
+                decoded.fragment().call_requests(),
+                package.fragment().call_requests()
             );
             let program = match compile_fragment(
                 validate_package(decoded),

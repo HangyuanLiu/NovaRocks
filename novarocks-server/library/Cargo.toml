@@ -77,7 +77,7 @@ jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
 native-compatibility-test-fixture = ["novarocks-version/native-compatibility-test-fixture"]
 # Debug-only candidate island for physical wire v2: every role in the binary
 # composes the compiled-package static plan interpreter instead of the plan
-# tree, on its own compatibility island. Only debug and dev-opt builds accept
+# tree, on its own compatibility island. Only builds with debug assertions accept
 # it; a build without debug assertions refuses it at compile time. No
 # dependency may enable it, and the one-shot flip deletes it together with the
 # plan-tree interpreter.

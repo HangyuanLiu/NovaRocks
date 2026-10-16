@@ -268,6 +268,8 @@ mod tests {
             None,
             Arc::new(authority),
             None,
+            #[cfg(novarocks_dev_controls)]
+            None,
             Some(handler),
         )
         .unwrap();

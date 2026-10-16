@@ -342,14 +342,26 @@ fn compiled_sort_retains_original_column_metadata_until_input_or_processor_exit(
         let chunk = super::family_fixture::paid_input(&program, &tracker);
         let charged = tracker.current();
         assert!(charged > 0);
+        let state = RuntimeState::default();
         let factory = CompiledSortProcessorFactory::try_new(
             Arc::clone(&program),
             ProgramNodeId::new(1),
-            Arc::new(RuntimeErrorState::default()),
+            state.error_state(),
         )
         .unwrap();
         let mut operator = factory.create(1, 0);
-        let state = RuntimeState::default();
+        // Construction has its own owner; the tracker above observes input metadata.
+        let construction_tracker = MemTracker::new_root("sort-typed-construction-fixture");
+        let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            construction_tracker.clone(),
+            state.error_state(),
+        )
+        .unwrap();
+        operator.set_mem_tracker(construction_tracker);
+        operator.set_construction_factory(construction);
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
         let processor = operator.as_processor_mut().unwrap();
         processor.push_chunk(&state, chunk).unwrap();
         assert_eq!(

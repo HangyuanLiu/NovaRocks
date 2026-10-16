@@ -282,6 +282,9 @@ fn project_and_writer_entries_reach_original_checked_slot_without_capture() {
         let expected_array = Arc::as_ptr(chunk.record_batch().column(1)) as *const () as usize;
         let seen = Arc::new(Mutex::new(0));
         let observed = Arc::clone(&seen);
+        // Project already holds the input for its output storage lifetime.
+        // The Slot loan itself must add no owner on either entry path.
+        let expected_source_holders = if writer { 1 } else { 2 };
         let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
             let (array, source) = column.into_parts();
             assert_eq!(Arc::as_ptr(array) as *const () as usize, expected_array);
@@ -289,7 +292,10 @@ fn project_and_writer_entries_reach_original_checked_slot_without_capture() {
                 panic!("production entry lost the Chunk source")
             };
             assert_eq!(source.owner_identity(), expected_owner);
-            assert_eq!(source.strong_counts(), (Some(1), None));
+            assert_eq!(
+                source.strong_counts(),
+                (Some(expected_source_holders), None)
+            );
             *observed.lock().unwrap() += 1;
         });
         let output = if writer {
@@ -312,6 +318,8 @@ fn project_and_writer_entries_reach_original_checked_slot_without_capture() {
         };
         assert!(*seen.lock().unwrap() > 0);
         assert_eq!(output.len(), 3);
+        assert_eq!(tracker.current(), if writer { 0 } else { bytes });
+        drop(output);
         assert_eq!(tracker.current(), 0);
     }
     assert_eq!(tracker.allocated(), tracker.deallocated());

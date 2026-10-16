@@ -470,20 +470,35 @@ fn runtime_invocation_memory_original_early_and_validate_only_paths_do_not_quali
 #[test]
 fn runtime_invocation_memory_whole_data_latches_and_failed_replay_reads_no_stopped_account() {
     use arrow::{
-        array::{ArrayRef, LargeListArray, StringArray},
+        array::{ArrayRef, LargeListArray, new_empty_array},
         buffer::{OffsetBuffer, ScalarBuffer},
         datatypes::{DataType, Field},
     };
     let binding = json_binding();
     let (control, tracker) = json_control(Some(&binding), "actual-query");
     let host = control.allocator().unwrap();
+    // List item names are anonymous in the selected type. Keep the long
+    // diagnostic name on a semantic Struct field and use the declared layout
+    // for the actual array, so the original LargeList Data failure is reached.
+    let declared = novarocks_type_contract::FunctionValueType::new(
+        DataType::LargeList(Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Field::new("long\0µ".repeat(100), DataType::Utf8, true)].into()),
+            true,
+        ))),
+        true,
+    );
+    let DataType::LargeList(item) = declared.data_type() else {
+        panic!("the declared unsupported carrier remains a LargeList");
+    };
     let unsupported: ArrayRef = Arc::new(LargeListArray::new(
-        Arc::new(Field::new("long\0µ".repeat(100), DataType::Utf8, true)),
+        item.clone(),
         OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 0])),
-        Arc::new(StringArray::from(Vec::<&str>::new())),
+        new_empty_array(item.data_type()),
         None,
     ));
-    let mut instance = actual_json(&[unsupported.data_type().clone()], &host);
+    assert_eq!(unsupported.data_type(), declared.data_type());
+    let mut instance = actual_json(std::slice::from_ref(declared.data_type()), &host);
     let arguments = [EvaluatedArgument::Scalar(&unsupported)];
     let mut journal = RuntimeScalarMemoryJournal::default();
     let result = RuntimeScalarMemoryScope::new(&control, &mut journal).evaluate_invocation(
@@ -494,14 +509,20 @@ fn runtime_invocation_memory_whole_data_latches_and_failed_replay_reads_no_stopp
         Some(&host),
         &control,
     );
-    let Err(RuntimeScalarEvaluationFailure::Data(data)) = result else {
-        panic!("original full Data")
+    let data = match result {
+        Err(RuntimeScalarEvaluationFailure::Data(data)) => data,
+        Err(error) => panic!("original full Data; actual failure: {error:?}"),
+        Ok(_) => panic!("original full Data; actual result was unexpected success"),
     };
     assert!(
         data.message()
             .starts_with("unsupported scalar type: LargeList")
     );
     assert!(data.message().len() > 512);
+    assert_eq!(
+        data.message(),
+        format!("unsupported scalar type: {:?}", unsupported.data_type())
+    );
     assert_eq!(data.source_row(0), Some(1));
     assert_eq!(data.source_row(1), Some(3));
     assert!(instance.is_failed());
