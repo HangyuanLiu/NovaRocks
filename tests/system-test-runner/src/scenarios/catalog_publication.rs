@@ -174,7 +174,8 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
                     }
                     Ok(())
                 }
-            }
+            }?;
+            require_catalog_activity(context)
         })
     }
     fn teardown(&self) -> Result<()> {
@@ -188,6 +189,38 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
         }
         Ok(())
     }
+}
+
+fn require_catalog_activity(context: &ScenarioContext) -> Result<()> {
+    let activity = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(format!(
+            "http://127.0.0.1:{}/v1/catalogs/activity",
+            context.fe_http_port()
+        ))
+        .send()?
+        .error_for_status()?
+        .json::<Value>()?;
+    save(context, "catalog-activity-active-source.json", &activity)?;
+    ensure!(
+        activity["schema_version"] == 1,
+        "unexpected catalog activity schema"
+    );
+    let catalogs = activity["catalogs"]
+        .as_array()
+        .context("catalog activity has no source rows")?;
+    ensure!(
+        catalogs.iter().any(|row| {
+            row["catalog"] == CATALOG
+                && row["provider_id"] == "iceberg"
+                && row["current"] == true
+                && row["observation"].is_object()
+        }),
+        "active publication catalog has no provider observation: {activity}"
+    );
+    Ok(())
 }
 
 fn catalog_sql(fixture: &PublicationFixture, catalog: &str, budget: u64) -> String {

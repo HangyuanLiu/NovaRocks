@@ -898,7 +898,7 @@ pub fn start_frontend_management_server(
         management_island_reader,
         Some(management_convergence_reader),
         Arc::clone(&config.memory_authority),
-        Some(host.catalog_application_port()),
+        Some(host.catalog_activity_observer()),
         #[cfg(feature = "test-controls")]
         statement_observation,
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]

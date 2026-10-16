@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use novarocks_memory::MemoryAuthority;
 
@@ -45,7 +45,7 @@ struct FrontendManagementState {
     serving_reader: Arc<dyn FrontendServingSnapshotReader>,
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
     memory_authority: Arc<MemoryAuthority>,
-    catalog_activity: Option<Arc<dyn novarocks_catalog_application::CatalogApplicationPort>>,
+    catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
     #[cfg(feature = "test-controls")]
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
 }
@@ -241,21 +241,23 @@ struct CatalogActivityManagementSnapshot {
 async fn catalog_activity_snapshot(
     State(state): State<FrontendManagementState>,
 ) -> axum::response::Response {
-    let Some(reader) = &state.catalog_activity else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Catalog activity observation is unavailable",
-        )
-            .into_response();
-    };
-    let sources = match reader.catalog_activity_sources() {
-        Ok(sources) => sources,
-        Err(_) => {
+    let sources = {
+        let Some(reader) = state.catalog_activity.as_ref().and_then(Weak::upgrade) else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Catalog activity observation is unavailable",
             )
                 .into_response();
+        };
+        match reader.catalog_activity_sources() {
+            Ok(sources) => sources,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Catalog activity observation is unavailable",
+                )
+                    .into_response();
+            }
         }
     };
     let mut phases = novarocks_spi::connector::CatalogActivityPhase::ALL
@@ -316,7 +318,7 @@ pub(crate) fn frontend_management_router_with_readers(
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
     convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
     memory_authority: Arc<MemoryAuthority>,
-    catalog_activity: Option<Arc<dyn novarocks_catalog_application::CatalogApplicationPort>>,
+    catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
     debug_enabled: bool,
     #[cfg(feature = "test-controls")] statement_observation: Option<
         Arc<crate::preparation_diagnostics::StatementObservationOwner>,
@@ -721,16 +723,23 @@ mod tests {
         }
         let lifecycle = Arc::new(FrontendServingLifecycle::new());
         let island = Arc::new(TestIslandReader::new(island_snapshot(0, 0, 0, 0)));
+        let owner: Arc<dyn novarocks_catalog_application::CatalogApplicationPort> =
+            Arc::new(ActivityCatalogPort { sources });
         let app = frontend_management_router_with_readers(
             FrontendMetricsRegistry::new().unwrap(),
             lifecycle,
             island,
             None,
             test_memory_authority(),
-            Some(Arc::new(ActivityCatalogPort { sources })),
+            Some(Arc::downgrade(&owner)),
             false,
             #[cfg(feature = "test-controls")]
             None,
+        );
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the router must not retain the catalog service"
         );
         let response = app
             .clone()
@@ -786,7 +795,13 @@ mod tests {
             }
         }
         assert_no_sensitive_fields(&document);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the completed snapshot must release its service upgrade"
+        );
         let ready = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -799,6 +814,21 @@ mod tests {
             ready.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "activity does not make a booting FE ready"
+        );
+        drop(owner);
+        let retired = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/catalogs/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retired.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a retired owner must not be reported as an empty activity snapshot"
         );
         let unavailable = router(
             false,

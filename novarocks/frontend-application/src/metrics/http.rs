@@ -17,7 +17,7 @@
 
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::JoinHandle;
 
 use tokio::net::TcpListener as TokioTcpListener;
@@ -84,7 +84,7 @@ impl MetricsHttpServer {
         island_reader: Arc<dyn BackendIslandSnapshotReader>,
         convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
         memory_authority: Arc<novarocks_memory::MemoryAuthority>,
-        catalog_activity: Option<Arc<dyn novarocks_catalog_application::CatalogApplicationPort>>,
+        catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
         #[cfg(feature = "test-controls")] statement_observation: Option<
             Arc<crate::preparation_diagnostics::StatementObservationOwner>,
         >,
