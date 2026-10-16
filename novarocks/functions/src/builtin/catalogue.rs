@@ -3022,9 +3022,19 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             }
         }
         "variant_get" | "try_variant_get" => {
-            if value(0)?.logical_type() != ValueLogicalType::Variant
-                && value(0)?.data_type() != &DataType::Null
-            {
+            // The original runner has two input modes: nominal Variant bytes,
+            // or Utf8 JSON text parsed and validated by json_to_variant. Text
+            // keeps its actual Physical/Json domain; it never signs Variant.
+            let document = value(0)?;
+            let admitted = match document.logical_type() {
+                ValueLogicalType::Variant => document.data_type() == &DataType::LargeBinary,
+                ValueLogicalType::Json => document.data_type() == &DataType::Utf8,
+                ValueLogicalType::Physical => {
+                    matches!(document.data_type(), DataType::Utf8 | DataType::Null)
+                }
+                _ => false,
+            };
+            if !admitted {
                 return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             if value(1)?.logical_type() != ValueLogicalType::Physical
