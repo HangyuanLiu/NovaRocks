@@ -821,11 +821,16 @@ fn rest_client() -> Result<reqwest::blocking::Client> {
         .timeout(Duration::from_secs(5))
         .build()?)
 }
-fn seed(context: &ScenarioContext, fixture: &PublicationFixture, table: &str) -> Result<Value> {
+fn seed(
+    context: &ScenarioContext,
+    fixture: &PublicationFixture,
+    table: &str,
+    format_version: u8,
+) -> Result<Value> {
     sql(
         context,
         &format!(
-            "CREATE TABLE publication_setup.ns.{table} (k INT) TBLPROPERTIES (\"format-version\"=\"2\", \"history.expire.min-snapshots-to-keep\"=\"1\")"
+            "CREATE TABLE publication_setup.ns.{table} (k INT) TBLPROPERTIES (\"format-version\"=\"{format_version}\", \"history.expire.min-snapshots-to-keep\"=\"1\")"
         ),
     )?;
     for value in 1..=3 {
@@ -968,7 +973,10 @@ fn finish_proxy<T>(
 fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture) -> Result<()> {
     for case in ["ref_move", "new_branch", "lost_tag"] {
         let table = format!("expiry_{case}");
-        let mut before = seed(context, fixture, &table)?;
+        // Branch writes are admitted only for format v3; the other races
+        // deliberately retain their existing format-v2 fixture.
+        let format_version = if case == "new_branch" { 3 } else { 2 };
+        let mut before = seed(context, fixture, &table, format_version)?;
         let candidate = oldest(&before)?;
         let candidate_list = snapshot_list(&before, candidate)?;
         let source = register_source(fixture, &table)?;
@@ -1203,7 +1211,7 @@ fn local_expiry_serialization(
     fixture: &PublicationFixture,
 ) -> Result<()> {
     let table = "expiry_local_serial";
-    let before = seed(context, fixture, table)?;
+    let before = seed(context, fixture, table, 2)?;
     let candidate = oldest(&before)?;
     let control = fixture.proxy()?;
     let initial_count = control.mutation_counts("ns", table).table_commit_forwarded;
@@ -1293,7 +1301,7 @@ fn local_expiry_serialization(
     // Unknown releases the same logical catalog lock. A new local ref can
     // publish before the original, already dispatched request takes effect.
     let table = "expiry_unknown_window";
-    let before = seed(context, fixture, table)?;
+    let before = seed(context, fixture, table, 2)?;
     let candidate = oldest(&before)?;
     let list = snapshot_list(&before, candidate)?;
     let source = register_source(fixture, table)?;
