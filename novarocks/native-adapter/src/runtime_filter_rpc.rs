@@ -17,10 +17,11 @@
 
 //! Native Runtime Filter envelope codec and ingress adapter.
 
+use prost::Message;
 use std::sync::Arc;
 
 use novarocks_execution::runtime_filter::{
-    PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
+    CanonicalContributionBytes, PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
 };
 #[cfg(feature = "test-controls")]
 use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
@@ -209,7 +210,7 @@ pub struct BackendNativeRuntimeFilterEnvelope {
     producer_open: Option<BackendProducerOpenMetadata>,
     accept_status: Option<BackendAcceptStatus>,
     schema_digest: [u8; 32],
-    payload: Arc<[u8]>,
+    payload: CanonicalContributionBytes,
 }
 
 #[allow(
@@ -226,7 +227,7 @@ impl BackendNativeRuntimeFilterEnvelope {
         producer_open: Option<BackendProducerOpenMetadata>,
         accept_status: Option<BackendAcceptStatus>,
         schema_digest: [u8; 32],
-        payload: impl Into<Arc<[u8]>>,
+        payload: impl Into<CanonicalContributionBytes>,
     ) -> Result<Self, String> {
         validate_native_route(kind, route_identity)?;
         validate_native_presence(kind, producer_open.is_some(), accept_status.is_some())?;
@@ -291,6 +292,10 @@ impl BackendNativeRuntimeFilterEnvelope {
 
     pub fn payload(&self) -> &[u8] {
         self.payload.as_ref()
+    }
+
+    pub(crate) fn payload_carrier(&self) -> &CanonicalContributionBytes {
+        &self.payload
     }
 }
 
@@ -375,6 +380,20 @@ fn validate_native_presence(
 pub fn encode_runtime_filter_envelope(
     envelope: &BackendNativeRuntimeFilterEnvelope,
 ) -> proto::filter::RuntimeFilterEnvelope {
+    project_runtime_filter_envelope(
+        envelope,
+        envelope.schema_digest().to_vec(),
+        envelope.payload().to_vec(),
+    )
+}
+
+// Keep all field values and presence with the actual wire author. Length-only
+// callers borrow the sizes of both bytes fields; all other fields are inline.
+fn project_runtime_filter_envelope(
+    envelope: &BackendNativeRuntimeFilterEnvelope,
+    schema_digest: Vec<u8>,
+    payload: Vec<u8>,
+) -> proto::filter::RuntimeFilterEnvelope {
     proto::filter::RuntimeFilterEnvelope {
         kind: encode_kind(envelope.kind()) as i32,
         query_id: Some(proto::common::UniqueId {
@@ -384,14 +403,54 @@ pub fn encode_runtime_filter_envelope(
         channel_id: envelope.channel_id().get(),
         deployment_epoch: envelope.deployment_epoch(),
         route_identity: Some(encode_route_identity(envelope.route_identity())),
-        schema_digest: envelope.schema_digest().to_vec(),
-        payload: envelope.payload().to_vec(),
+        schema_digest,
+        payload,
         producer_open: envelope.producer_open().map(|metadata| {
             proto::filter::RuntimeFilterProducerOpenMetadata {
                 local_partition_count: metadata.local_partition_count().get(),
             }
         }),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterEnvelopeLengthOverflow;
+impl std::fmt::Display for RuntimeFilterEnvelopeLengthOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("runtime filter envelope encoded length overflows usize")
+    }
+}
+impl std::error::Error for RuntimeFilterEnvelopeLengthOverflow {}
+
+/// Exact protobuf bytes, not canonical payload stock or a memory grant. The
+/// generated inline metadata and Prost's original length primitives remain
+/// authors. No bytes are scanned/copied and no heap backing is created. Empty
+/// plain bytes are omitted, as in the generated Message implementation.
+pub(crate) fn runtime_filter_envelope_encoded_len(
+    envelope: &BackendNativeRuntimeFilterEnvelope,
+) -> Result<usize, RuntimeFilterEnvelopeLengthOverflow> {
+    const DIGEST_FIELD_NUMBER: u32 = 6;
+    const PAYLOAD_FIELD_NUMBER: u32 = 7;
+    let metadata = project_runtime_filter_envelope(envelope, Vec::new(), Vec::new()).encoded_len();
+    let digest = bytes_field_encoded_len(DIGEST_FIELD_NUMBER, envelope.schema_digest().len())?;
+    let payload = bytes_field_encoded_len(PAYLOAD_FIELD_NUMBER, envelope.payload().len())?;
+    metadata
+        .checked_add(digest)
+        .and_then(|n| n.checked_add(payload))
+        .ok_or(RuntimeFilterEnvelopeLengthOverflow)
+}
+
+fn bytes_field_encoded_len(
+    tag: u32,
+    len: usize,
+) -> Result<usize, RuntimeFilterEnvelopeLengthOverflow> {
+    if len == 0 {
+        return Ok(0);
+    }
+    prost::encoding::key_len(tag)
+        .checked_add(prost::length_delimiter_len(len))
+        .and_then(|n| n.checked_add(len))
+        .ok_or(RuntimeFilterEnvelopeLengthOverflow)
 }
 
 pub(crate) fn decode_runtime_filter_envelope_response(
@@ -830,10 +889,50 @@ mod tests {
         BackendNativeRuntimeFilterEnvelope as RuntimeFilterEnvelope,
         BackendRuntimeFilterEnvelopeIngress as RuntimeFilterEnvelopeIngress, decode_route_identity,
         decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
-        handle_runtime_filter_envelope,
+        handle_runtime_filter_envelope, runtime_filter_envelope_encoded_len,
     };
     #[cfg(feature = "test-controls")]
     use super::{drop_accepted_contribution_response, runtime_filter_fault_execution_id};
+
+    /// Owner-local wire length oracle: generated Prost encoding and actual
+    /// encoded bytes, with real field presence and delimiter transitions. This
+    /// short isolated test owns no runtime, service, or lifecycle controller.
+    #[test]
+    fn runtime_filter_exact_borrowed_payload_length_matches_the_original_wire_author() {
+        use prost::Message;
+        use proto::filter::RuntimeFilterEnvelopeKind as Kind;
+        for kind in [
+            Kind::Contribution,
+            Kind::Artifact,
+            Kind::FinalArtifact,
+            Kind::ProducerUnavailable,
+            Kind::Unavailable,
+            Kind::DegradedLogical,
+            Kind::ProducerClosed,
+            Kind::CompletedWithoutArtifact,
+        ] {
+            let mut wire = valid_wire_envelope(kind);
+            let lengths: &[usize] = if wire.payload.is_empty() {
+                &[0]
+            } else {
+                &[1, 127, 128, 16383, 16384]
+            };
+            for len in lengths {
+                wire.payload = vec![0xA5; *len];
+                let ingress =
+                    Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+                handle_runtime_filter_envelope(ingress.clone(), wire.clone()).unwrap();
+                let envelope = ingress.take().pop().unwrap();
+                let pointer = envelope.payload().as_ptr();
+                let encoded = encode_runtime_filter_envelope(&envelope);
+                assert_eq!(encoded, wire);
+                let exact = runtime_filter_envelope_encoded_len(&envelope).unwrap();
+                assert_eq!(exact, encoded.encoded_len());
+                assert_eq!(exact, encoded.encode_to_vec().len());
+                assert_eq!(envelope.payload().as_ptr(), pointer);
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct RecordingIngress {

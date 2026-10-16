@@ -83,6 +83,7 @@ pub enum ExecutionFailureCause {
     Pipeline(String),
     Construction(ConstructionFailure),
     Kernel(KernelFailure),
+    RuntimeFilter(crate::runtime_filter::RuntimeFilterFailure),
     RuntimeScalarSource(novarocks_functions::ScalarResourceError),
     RuntimeScalarMemory(crate::runtime::scalar_memory::RuntimeScalarMemoryRefusal),
     InvocationData(novarocks_functions::InvocationData),
@@ -124,6 +125,7 @@ impl ExecutionFailure {
         match &self.cause {
             ExecutionFailureCause::Pipeline(message) => message,
             ExecutionFailureCause::Construction(error) => error.detail(),
+            ExecutionFailureCause::RuntimeFilter(error) => error.detail(),
             ExecutionFailureCause::RequiredRow(error) => error.error().message(),
             ExecutionFailureCause::InvocationData(error) => error.message(),
             ExecutionFailureCause::ScalarInvocationData(error) => error.message(),
@@ -223,6 +225,14 @@ impl From<crate::runtime::exchange::ExchangeReceiveFailure> for ExecutionFailure
         }
     }
 }
+impl From<crate::runtime_filter::RuntimeFilterFailure> for ExecutionFailure {
+    fn from(error: crate::runtime_filter::RuntimeFilterFailure) -> Self {
+        Self {
+            cause: ExecutionFailureCause::RuntimeFilter(error),
+            context: None,
+        }
+    }
+}
 impl From<novarocks_functions::EvaluationFailure> for ExecutionFailure {
     fn from(error: novarocks_functions::EvaluationFailure) -> Self {
         match error {
@@ -298,6 +308,7 @@ impl fmt::Display for ExecutionFailure {
             ExecutionFailureCause::Pipeline(message) => f.write_str(message),
             ExecutionFailureCause::Construction(error) => error.fmt(f),
             ExecutionFailureCause::Kernel(error) => error.fmt(f),
+            ExecutionFailureCause::RuntimeFilter(error) => error.fmt(f),
             ExecutionFailureCause::RuntimeScalarSource(error) => error.fmt(f),
             ExecutionFailureCause::RuntimeScalarMemory(error) => error.fmt(f),
             ExecutionFailureCause::RequiredRow(error) => error.fmt(f),
@@ -314,6 +325,7 @@ impl Error for ExecutionFailure {
             ExecutionFailureCause::Pipeline(_) => None,
             ExecutionFailureCause::Construction(error) => Some(error),
             ExecutionFailureCause::Kernel(error) => Some(error),
+            ExecutionFailureCause::RuntimeFilter(error) => Some(error),
             ExecutionFailureCause::RuntimeScalarSource(error) => Some(error),
             ExecutionFailureCause::RuntimeScalarMemory(error) => Some(error),
             ExecutionFailureCause::RequiredRow(error) => Some(error),
@@ -328,6 +340,139 @@ impl Error for ExecutionFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::operators::OwnedTopNBoundaryError;
+    use crate::runtime_filter::contribution::{
+        ContributionCodecError, ControlledContributionCodecError, ControlledOrderedTupleError,
+        OrderedTupleError,
+    };
+    use crate::runtime_filter::{
+        AggregateTopNBoundaryError, RuntimeFilterContractViolation,
+        RuntimeFilterContractViolationKind, RuntimeFilterFailure,
+    };
+
+    /// Short owner-local presentation/source-chain oracle; messages are literal
+    /// original contract texts. There is no service, fixture, or controller.
+    #[test]
+    fn typed_failure_runtime_filter_keeps_original_raw_source_formatter_and_context() {
+        let contract = RuntimeFilterContractViolation::new(
+            RuntimeFilterContractViolationKind::ContractMismatch,
+            "ResourceExhausted: kernel evaluation was cancelled",
+        );
+        let cases: [(ExecutionFailure, RuntimeFilterFailure, &str); 4] = [
+            (
+                contract.clone().into(),
+                RuntimeFilterFailure::Contract(contract),
+                "runtime-filter contract violation ContractMismatch: ResourceExhausted: kernel evaluation was cancelled",
+            ),
+            (
+                AggregateTopNBoundaryError::BoundLoosened.into(),
+                RuntimeFilterFailure::Boundary(AggregateTopNBoundaryError::BoundLoosened),
+                "aggregate TopN cumulative boundary unexpectedly loosened",
+            ),
+            (
+                OrderedTupleError::ArityMismatch.into(),
+                RuntimeFilterFailure::Tuple(OrderedTupleError::ArityMismatch),
+                "ArityMismatch",
+            ),
+            (
+                ContributionCodecError::Malformed.into(),
+                RuntimeFilterFailure::Codec(ContributionCodecError::Malformed),
+                "invalid runtime filter contribution: Malformed",
+            ),
+        ];
+        for (failure, original, text) in cases {
+            assert_eq!(
+                failure.cause(),
+                &ExecutionFailureCause::RuntimeFilter(original.clone())
+            );
+            assert_eq!(failure.context(), None);
+            assert_eq!(failure.to_string(), text);
+            let failure = failure
+                .at_operator(7, PipelineOperation::Push)
+                .at_operator(41, PipelineOperation::Pull);
+            assert_eq!(failure.to_string(), format!("operator[7] Push: {text}"));
+            let source = failure
+                .source()
+                .unwrap()
+                .downcast_ref::<RuntimeFilterFailure>()
+                .unwrap();
+            assert_eq!(source, &original);
+            let raw = source.source().unwrap();
+            match original {
+                RuntimeFilterFailure::Contract(original) => {
+                    assert_eq!(
+                        raw.downcast_ref::<RuntimeFilterContractViolation>(),
+                        Some(&original)
+                    );
+                    assert_eq!(failure.detail(), original.detail());
+                }
+                RuntimeFilterFailure::Boundary(original) => assert_eq!(
+                    raw.downcast_ref::<AggregateTopNBoundaryError>(),
+                    Some(&original)
+                ),
+                RuntimeFilterFailure::Tuple(original) => {
+                    assert_eq!(raw.downcast_ref::<OrderedTupleError>(), Some(&original))
+                }
+                RuntimeFilterFailure::Codec(original) => assert_eq!(
+                    raw.downcast_ref::<ContributionCodecError>(),
+                    Some(&original)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn typed_failure_runtime_filter_control_refusals_remain_the_original_kernel_category() {
+        for original in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            let failures: [ExecutionFailure; 3] = [
+                OwnedTopNBoundaryError::Kernel(original.clone()).into(),
+                ControlledOrderedTupleError::Kernel(original.clone()).into(),
+                ControlledContributionCodecError::Kernel(original.clone()).into(),
+            ];
+            for failure in failures {
+                assert_eq!(
+                    failure.cause(),
+                    &ExecutionFailureCause::Kernel(original.clone())
+                );
+                assert_eq!(
+                    failure.source().unwrap().downcast_ref::<KernelFailure>(),
+                    Some(&original)
+                );
+            }
+        }
+        let nested =
+            AggregateTopNBoundaryError::CandidateContractMismatch(OrderedTupleError::TypeMismatch);
+        let failure: ExecutionFailure = OwnedTopNBoundaryError::Boundary(nested.clone()).into();
+        assert_eq!(
+            failure.cause(),
+            &ExecutionFailureCause::RuntimeFilter(RuntimeFilterFailure::Boundary(nested))
+        );
+        assert_eq!(
+            failure.to_string(),
+            "aggregate TopN candidate does not match its order contract: TypeMismatch"
+        );
+        let tuple: ExecutionFailure =
+            ControlledOrderedTupleError::Tuple(OrderedTupleError::TypeMismatch).into();
+        assert_eq!(
+            tuple.cause(),
+            &ExecutionFailureCause::RuntimeFilter(RuntimeFilterFailure::Tuple(
+                OrderedTupleError::TypeMismatch
+            ))
+        );
+        let codec: ExecutionFailure =
+            ControlledContributionCodecError::Codec(ContributionCodecError::ResourceLimit).into();
+        assert_eq!(
+            codec.cause(),
+            &ExecutionFailureCause::RuntimeFilter(RuntimeFilterFailure::Codec(
+                ContributionCodecError::ResourceLimit
+            ))
+        );
+    }
+
     #[test]
     fn typed_failure_text_cannot_impersonate_a_kernel_category_or_replace_context() {
         let failure = ExecutionFailure::from("ResourceExhausted: kernel evaluation was cancelled")

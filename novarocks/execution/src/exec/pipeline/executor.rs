@@ -40,7 +40,7 @@ use crate::runtime::runtime_state::RuntimeState;
 use tracing::{info, warn};
 
 use super::builder::{
-    PipelineGraph, build_compiled_pipeline_graph,
+    CompiledOrderedFilterContext, PipelineGraph, build_compiled_pipeline_graph_typed,
     build_native_pipeline_graph_for_exec_plan_with_runtime_settings,
     build_native_pipeline_graph_for_local_program_with_runtime_settings,
 };
@@ -682,7 +682,8 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
         .execution_runtime()
         .ok_or_else(|| "compiled program execution requires an execution runtime".to_string())?;
     let terminal_scan_ops = scan_bindings.terminal_ops();
-    let graph = build_compiled_pipeline_graph(
+    let ordered = CompiledOrderedFilterContext::for_program(&program, &runtime_state)?;
+    let graph = build_compiled_pipeline_graph_typed(
         &program,
         exchange_bindings,
         scan_bindings,
@@ -693,6 +694,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
         root_sink_dop,
         execution_runtime.function_set().clone(),
         runtime_state.error_state(),
+        ordered.as_ref(),
     )?;
     prepare_pipeline_execution_from_graph(
         graph,

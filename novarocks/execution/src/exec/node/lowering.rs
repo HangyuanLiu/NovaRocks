@@ -729,7 +729,7 @@ impl<H> Lowering<'_, '_, H> {
                     node_id,
                     P::Scan {
                         source: source.into(),
-                        runtime_filters,
+                        runtime_filters: runtime_filters.into(),
                         residuals: conjunct_predicate.map(expr).into_iter().collect(),
                         limit,
                     },
@@ -747,7 +747,7 @@ impl<H> Lowering<'_, '_, H> {
                     n.node_id,
                     P::ExchangeSource {
                         timeout: n.timeout,
-                        runtime_filters,
+                        runtime_filters: runtime_filters.into(),
                         hash_partition_exprs: n
                             .hash_partition_exprs
                             .into_iter()
@@ -803,7 +803,8 @@ impl<H> Lowering<'_, '_, H> {
                             producer: freeze_producer(&producer.contract)?,
                         })
                     })
-                    .collect::<CreationResult<_, H>>()?;
+                    .collect::<CreationResult<Vec<_>, H>>()?
+                    .into();
                 (n.node_id, P::Aggregate { input, group_by: n.group_by.into_iter().map(expr).collect(), functions,
                     need_finalize: n.need_finalize, input_is_intermediate: n.input_is_intermediate, topn_filters,
                     streaming_preaggregation_mode: n.streaming_preaggregation_mode.map(|mode| match mode {

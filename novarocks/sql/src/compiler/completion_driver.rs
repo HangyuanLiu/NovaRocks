@@ -856,9 +856,10 @@ fn provider_or_ready_step(
     // Retain the exact catalogue snapshot that authored optimizer bindings,
     // rather than the earlier request snapshot whose outer owner may differ.
     common.functions = functions;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         &common.session.optimizer_settings,
+        common.emission_mode,
     );
     let offer_predicates = common
         .session
@@ -2983,6 +2984,23 @@ mod tests {
         mode: super::super::SqlPhysicalEmissionMode,
         disable_preagg: bool,
     ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
+        grouped_state_topn_sequence_fixture_with_options(sql, mode, disable_preagg, &[])
+    }
+
+    fn grouped_state_topn_sequence_fixture_with_observed_metrics(
+        sql: &str,
+        mode: super::super::SqlPhysicalEmissionMode,
+        additional_metrics: &[(&str, u64, f64, f64)],
+    ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
+        grouped_state_topn_sequence_fixture_with_options(sql, mode, false, additional_metrics)
+    }
+
+    fn grouped_state_topn_sequence_fixture_with_options(
+        sql: &str,
+        mode: super::super::SqlPhysicalEmissionMode,
+        disable_preagg: bool,
+        additional_metrics: &[(&str, u64, f64, f64)],
+    ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
         use arrow::datatypes::TimeUnit;
         use novarocks_types::schema::{ColumnDef, SqlType};
 
@@ -3095,7 +3113,10 @@ mod tests {
             ("c1", 10_801, 0.7430171321911873, 129.0),
             ("c2", 1, 1.230151323245117, 201.0),
             ("c3", 1, 1.230151323245117, 201.0),
-        ] {
+        ]
+        .into_iter()
+        .chain(additional_metrics.iter().copied())
+        {
             for (metric, value, source, nature) in [
                 (
                     StatisticsMetric::NullCount {
@@ -3154,6 +3175,126 @@ mod tests {
             SqlFactBatch::ProviderReads(facts.into_boxed_slice()),
             &control,
         )
+    }
+
+    #[test]
+    fn ordered_aggregate_topn_compile_preserves_modes_and_exact_endpoints() {
+        let suite =
+            include_str!("../../../../tests/sql/correctness/aggregate/sql/compressed_key.sql");
+        let original = suite
+            .split("-- query 140\n")
+            .nth(1)
+            .expect("original query 140 is present")
+            .split("-- query 141\n")
+            .next()
+            .expect("original query 140 body is present")
+            .trim()
+            .strip_prefix("USE ${case_db};")
+            .expect("original query 140 selects its case namespace")
+            .trim();
+        // SQL owns this component regression; no external resource is used.
+        // Historical source statistics select a real preaggregation path, not
+        // a forced physical winner. Verify the actual filter and endpoints,
+        // since a successful compilation with no filter misses the regression.
+        let observed_c9 = [("c9", 2, 10.140857276181588, 30_002.0)];
+        let lanes: [(&str, &[(&str, u64, f64, f64)]); 2] =
+            [("Missing", &[]), ("HistoricalC9", &observed_c9)];
+        for (statistics, metrics) in lanes {
+            for mode in [
+                super::super::SqlPhysicalEmissionMode::OriginalNativeV1,
+                super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+            ] {
+                for (label, sql) in [
+                    (
+                        "inner-140",
+                        "SELECT c9, COUNT(*) AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100",
+                    ),
+                    ("original-140", original),
+                ] {
+                    let progress = grouped_state_topn_sequence_fixture_with_observed_metrics(
+                        sql, mode, metrics,
+                    )
+                    .unwrap_or_else(|error| panic!("{statistics} {mode:?} {label}: {error:#?}"));
+                    let SqlCompileProgress::Complete(completed) = progress else {
+                        panic!("unresolved completion needs for {statistics} {mode:?} {label}");
+                    };
+                    let owner = completed.into_plan();
+                    let plan = owner.plan();
+                    if metrics.is_empty() {
+                        assert!(plan.runtime_filters().is_empty(), "{mode:?} {label}");
+                        continue;
+                    }
+                    use novarocks_physical_plan::{
+                        AggregateGrouping, NodeKind, RuntimeFilterConsumerTarget,
+                        RuntimeFilterDomain, RuntimeFilterProducerTarget, TopNReduction,
+                    };
+                    assert_eq!(plan.runtime_filters().len(), 1, "{mode:?} {label}");
+                    let filter = plan.runtime_filters().values().next().unwrap();
+                    let RuntimeFilterDomain::Ordered { key, inclusive, .. } = &filter.domain else {
+                        panic!("expected the original ordered domain");
+                    };
+                    assert!(*inclusive);
+                    assert_eq!(key.ty.data_type(), &DataType::Utf8);
+                    assert!(key.ty.nullable());
+                    assert_eq!(filter.producers.len(), 1);
+                    assert_eq!(filter.consumers.len(), 1);
+                    let producer = &filter.producers[0];
+                    let fragment = &plan.fragments()[&producer.endpoint.fragment];
+                    let aggregate = &fragment.nodes()[&producer.endpoint.node];
+                    let NodeKind::Aggregate {
+                        grouping,
+                        group_by,
+                        calls,
+                    } = &aggregate.kind
+                    else {
+                        panic!("producer must remain on its original aggregate");
+                    };
+                    assert!(!calls.is_empty());
+                    assert_eq!(group_by.len(), 1);
+                    assert_eq!(
+                        fragment.expressions().get(group_by[0].0).unwrap().ty,
+                        key.ty
+                    );
+                    let RuntimeFilterProducerTarget::AggregateTopNKey {
+                        topn,
+                        limit,
+                        offset,
+                        ..
+                    } = producer.target
+                    else {
+                        panic!("expected the original Aggregate TopN target");
+                    };
+                    assert_eq!(limit, 100);
+                    assert_eq!(offset, 0);
+                    let parent = &fragment.nodes()[&topn];
+                    assert_eq!(parent.inputs.as_ref(), &[aggregate.id]);
+                    let NodeKind::TopN { reduction, .. } = &parent.kind else {
+                        panic!("expected the exact parent TopN");
+                    };
+                    let consumer = &filter.consumers[0];
+                    assert!(matches!(
+                        consumer.target,
+                        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+                    ));
+                    let scan_fragment = &plan.fragments()[&consumer.endpoint.fragment];
+                    let scan = &scan_fragment.nodes()[&consumer.endpoint.node];
+                    assert!(matches!(scan.kind, NodeKind::Scan { .. }));
+                    match mode {
+                        super::super::SqlPhysicalEmissionMode::OriginalNativeV1 => {
+                            assert_eq!(*grouping, AggregateGrouping::Complete);
+                            assert!(matches!(reduction, TopNReduction::Rows));
+                        }
+                        super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
+                            assert_eq!(*grouping, AggregateGrouping::Partial);
+                            assert!(matches!(reduction, TopNReduction::GroupedStates { .. }));
+                            assert_eq!(consumer.endpoint.fragment, producer.endpoint.fragment);
+                            assert_eq!(aggregate.inputs.as_ref(), &[scan.id]);
+                            assert_eq!(producer.endpoint.values, consumer.endpoint.values);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn assert_grouped_state_topn_sequence(mode: super::super::SqlPhysicalEmissionMode) {

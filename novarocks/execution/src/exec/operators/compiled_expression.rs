@@ -58,6 +58,7 @@ pub(crate) mod runtime_scalar_memory_test_support;
 /// Kernel control backed by the fragment's runtime error state: a recorded
 /// failure or cancellation refuses the next checkpoint, and waits are
 /// interruptible by the same state.
+#[derive(Clone)]
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
@@ -733,6 +734,7 @@ impl ProcessorOperator for CompiledProjectProcessor {
 /// Filter by the original ordered Filter or Scan TruthOnly predicate roots.
 /// Both preserve the exact
 /// input port and keep only rows whose complete predicate is TRUE.
+#[derive(Clone)]
 pub struct CompiledFilterProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
@@ -794,6 +796,63 @@ impl CompiledFilterProcessorFactory {
         })
     }
 }
+/// One synchronous predicate body. Pipeline buffering and source polling
+/// stay in their respective shells; both consume the same conjunction state.
+pub(crate) struct CompiledFilterBody {
+    program: Arc<LocalProgram>,
+    site: ProgramExpressionRootSite,
+    instance: Option<crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance>,
+}
+impl CompiledFilterBody {
+    pub(crate) fn evaluate(
+        &mut self,
+        input: CompiledInputLoan<'_>,
+        control: &RuntimeKernelControl,
+    ) -> ExecutionResult<BooleanArray> {
+        if self.instance.is_none() {
+            let ProgramExpressionRootSite::Node { node, .. } = self.site else {
+                return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                    "compiled Filter root is not a node",
+                ))
+                .into());
+            };
+            self.instance = Some(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new_with_allocator(
+                Arc::clone(&self.program), node, control, control.allocator(),
+            )?);
+        }
+        let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
+        let mut scope =
+            crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
+        let truth = self
+            .instance
+            .as_mut()
+            .expect("instance was created")
+            .evaluate_required_input_runtime(
+                input,
+                Selection::all(input.batch().num_rows()),
+                control,
+                &mut scope,
+            )?;
+        let truth = truth
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                ExecutionFailure::from(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                    "compiled Filter predicate is not Boolean",
+                )))
+            })?;
+        Ok(truth.clone())
+    }
+}
+impl CompiledFilterProcessorFactory {
+    pub(crate) fn create_body(&self) -> CompiledFilterBody {
+        CompiledFilterBody {
+            program: Arc::clone(&self.program),
+            site: self.site,
+            instance: None,
+        }
+    }
+}
 impl OperatorFactory for CompiledFilterProcessorFactory {
     fn name(&self) -> &str {
         &self.name
@@ -801,10 +860,8 @@ impl OperatorFactory for CompiledFilterProcessorFactory {
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
         Box::new(CompiledFilterProcessor {
             name: self.name.clone(),
-            program: Arc::clone(&self.program),
-            site: self.site,
+            body: self.create_body(),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
-            instance: None,
             pending: None,
             finishing: false,
             finished: false,
@@ -813,10 +870,8 @@ impl OperatorFactory for CompiledFilterProcessorFactory {
 }
 struct CompiledFilterProcessor {
     name: String,
-    program: Arc<LocalProgram>,
-    site: ProgramExpressionRootSite,
+    body: CompiledFilterBody,
     control: RuntimeKernelControl,
-    instance: Option<crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance>,
     pending: Option<Chunk>,
     finishing: bool,
     finished: bool,
@@ -853,46 +908,11 @@ impl ProcessorOperator for CompiledFilterProcessor {
         if self.pending.is_some() {
             return Err("compiled Filter received input while output is pending".into());
         }
-        if self.instance.is_none() {
-            let ProgramExpressionRootSite::Node { node, .. } = self.site else {
-                return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-                    "compiled Filter root is not a node",
-                ))
-                .into());
-            };
-            self.instance = Some(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new_with_allocator(
-                Arc::clone(&self.program), node, &self.control, self.control.allocator(),
-            )?);
-        }
-        let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
-        let mut scope = crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(
+        let truth = self.body.evaluate(
+            CompiledInputLoan::RecordBatch(chunk.record_batch()),
             &self.control,
-            &mut journal,
-        );
-        let truth = self
-            .instance
-            .as_mut()
-            .expect("instance was created")
-            .evaluate_required_runtime(
-                chunk.record_batch(),
-                Selection::all(chunk.record_batch().num_rows()),
-                &self.control,
-                &mut scope,
-            )?;
-        let truth = truth
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                ExecutionFailure::from(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-                    "compiled Filter predicate is not Boolean",
-                )))
-            })?;
-        // TruthOnly: NULL is not TRUE. Clear nulls before using the mask.
-        let mask = if truth.null_count() == 0 {
-            truth.clone()
-        } else {
-            BooleanArray::from_iter(truth.iter().map(|v| Some(v == Some(true))))
-        };
+        )?;
+        let mask = crate::exec::chunk::normalize_filter_mask_observed(&truth, || Ok(()))?;
         let batch = filter_record_batch(chunk.record_batch(), &mask)
             .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?;
         self.pending = Some(Chunk::try_new_with_chunk_schema(

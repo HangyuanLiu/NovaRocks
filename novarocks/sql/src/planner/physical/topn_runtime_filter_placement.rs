@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Ordered-bound placement for a Rows Partial TopN over complete global groups.
+//! Ordered-bound placement over complete global groups and explicitly admitted
+//! direct-scan partial groups in the computed-type path.
 
 use std::num::NonZeroU32;
 
@@ -41,16 +42,36 @@ struct ProvenSourceProbe {
     probe_expr: TypedExpr,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AggregateTopNPlacementPolicy {
+    GlobalGroups,
+    GlobalAndDirectPartialUtf8,
+}
+
 pub(super) fn place_aggregate_topn_runtime_filters(
     root: &mut PhysicalPlanNode,
     next_filter_id: &mut i32,
     max_count: usize,
 ) {
+    place_aggregate_topn_runtime_filters_with_policy(
+        root,
+        next_filter_id,
+        max_count,
+        AggregateTopNPlacementPolicy::GlobalGroups,
+    );
+}
+
+pub(super) fn place_aggregate_topn_runtime_filters_with_policy(
+    root: &mut PhysicalPlanNode,
+    next_filter_id: &mut i32,
+    max_count: usize,
+    policy: AggregateTopNPlacementPolicy,
+) {
     let mut candidates = Vec::new();
     collect_topn_candidates(root, &mut Vec::new(), &mut candidates);
 
     for candidate_path in candidates {
-        let Some(mut proof) = prove_topn_placement(root, &candidate_path) else {
+        let Some(mut proof) = prove_topn_placement(root, &candidate_path, policy) else {
             continue;
         };
         let Ok(filter_id) = usize::try_from(*next_filter_id) else {
@@ -119,6 +140,7 @@ fn collect_topn_candidates(
 fn prove_topn_placement(
     root: &PhysicalPlanNode,
     candidate_path: &[usize],
+    policy: AggregateTopNPlacementPolicy,
 ) -> Option<TopNPlacementProof> {
     let topn_node = node_at_path(root, candidate_path)?;
     let PhysicalPlanKind::TopN(topn) = &topn_node.kind else {
@@ -153,7 +175,9 @@ fn prove_topn_placement(
     let PhysicalPlanKind::HashAggregate(aggregate) = &aggregate_node.kind else {
         return None;
     };
-    if aggregate.mode != AggMode::Global
+    let direct_partial = aggregate.mode == AggMode::Local
+        && policy == AggregateTopNPlacementPolicy::GlobalAndDirectPartialUtf8;
+    if (aggregate.mode != AggMode::Global && !direct_partial)
         || aggregate_node.children.len() != 1
         || aggregate.group_by.len() != 1
         || aggregate.output_layout.group_key_columns.len() != 1
@@ -181,6 +205,47 @@ fn prove_topn_placement(
         &aggregate.group_by[0],
         &aggregate_node.children.first()?.output_columns,
     )?;
+    if direct_partial {
+        let scan = &aggregate_node.children[0];
+        // Local lowers to Partial; distribution facts cannot promote it to
+        // Complete. The lowered state/parent proof remains mandatory.
+        if !topn.is_split
+            || aggregate.aggregates.is_empty()
+            || aggregate.is_merge.len() != aggregate.aggregates.len()
+            || aggregate.is_merge.iter().any(|is_merge| *is_merge)
+            || aggregate.aggregates.iter().any(|call| call.distinct)
+            || !matches!(scan.kind, PhysicalPlanKind::Scan(_))
+            || !scan.children.is_empty()
+            || !scan.output_columns.iter().all(|column| {
+                novarocks_local_program::is_ordered_filter_flat_payload_type(&column.value_type)
+            })
+            || !matches!(group_input.value_type.data_type(), DataType::Utf8)
+            || !novarocks_local_program::is_ordered_filter_flat_payload_type(
+                &group_input.value_type,
+            )
+            || group_input.value_type != group_output.value_type
+            || order_expr.value_type != group_output.value_type
+            || scan
+                .output_columns
+                .iter()
+                .filter(|column| {
+                    is_exact_column_ref(&group_input, column)
+                        && column.value_type == group_input.value_type
+                })
+                .count()
+                != 1
+            || aggregate_node.output_columns.iter().any(|column| {
+                column.column_id == group_output.column_id
+                    && column.value_type != group_output.value_type
+            })
+            || aggregate.output_columns.iter().any(|column| {
+                column.column_id == group_output.column_id
+                    && column.value_type != group_output.value_type
+            })
+        {
+            return None;
+        }
+    }
     let probes = trace_exact_source_probes(
         aggregate_node.children.first()?,
         &group_input,
@@ -409,7 +474,7 @@ mod tests {
     };
     use crate::planner::physical::runtime_filter::AggregateTopNRuntimeFilterBuildIntent;
     use crate::planner::physical::runtime_filter_placement::{
-        RUNTIME_FILTER_RULE, place_runtime_filters,
+        RUNTIME_FILTER_RULE, place_runtime_filters, place_runtime_filters_for_emission,
     };
     use crate::planner::physical::{
         AggMode, AggregateOutputLayout, HashSource, PhysicalHashAggregateNode,
@@ -421,6 +486,225 @@ mod tests {
     use crate::planner::runtime_filter::contract::{NullOrder, SortDirection};
     use crate::planner::table::{SqlScanKind, TableDef};
     use novarocks_types::schema::ColumnDef;
+
+    #[test]
+    fn candidate_places_direct_partial_utf8_with_complete_key_and_order() {
+        use crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration;
+        for nullable in [false, true] {
+            for asc in [false, true] {
+                for nulls_first in [false, true] {
+                    let mut plan =
+                        eligible_direct_partial_plan(DataType::Utf8, nullable, asc, nulls_first);
+                    place_runtime_filters_for_emission(
+                        &mut plan,
+                        &SessionOptimizerSettings::default(),
+                        ExactComputedWithOriginalDeclaration,
+                    );
+                    let builds = aggregate_topn_builds(&plan);
+                    let probes = source_probes(&plan);
+                    assert_eq!(builds.len(), 1);
+                    assert_eq!(probes.len(), 1);
+                    assert_eq!(builds[0].filter_id, probes[0].filter_id);
+                    assert_eq!(
+                        builds[0].group_key_expr.value_type,
+                        probes[0].probe_expr.value_type
+                    );
+                    assert_eq!(builds[0].group_key_expr.value_type.nullable(), nullable);
+                    assert_eq!(
+                        builds[0].direction,
+                        if asc {
+                            SortDirection::Ascending
+                        } else {
+                            SortDirection::Descending
+                        }
+                    );
+                    assert_eq!(
+                        builds[0].null_order,
+                        if nulls_first {
+                            NullOrder::First
+                        } else {
+                            NullOrder::Last
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emission_policy_preserves_global_placement_and_legacy_local_refusal() {
+        use crate::compiler::SqlPhysicalEmissionMode::{
+            ExactComputedWithOriginalDeclaration, OriginalNativeV1,
+        };
+        for mode in [OriginalNativeV1, ExactComputedWithOriginalDeclaration] {
+            let mut global = eligible_topn_plan(DataType::Int32, true, false);
+            place_runtime_filters_for_emission(
+                &mut global,
+                &SessionOptimizerSettings::default(),
+                mode,
+            );
+            assert_eq!(aggregate_topn_builds(&global).len(), 1);
+            assert_eq!(source_probes(&global).len(), 1);
+        }
+        let mut local = eligible_direct_partial_plan(DataType::Utf8, true, true, false);
+        place_runtime_filters_for_emission(
+            &mut local,
+            &SessionOptimizerSettings::default(),
+            OriginalNativeV1,
+        );
+        assert!(aggregate_topn_builds(&local).is_empty());
+        assert!(source_probes(&local).is_empty());
+    }
+
+    #[test]
+    fn candidate_skips_ineligible_optional_partial_requests_atomically() {
+        use crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration;
+        type Mutation = Box<dyn Fn(&mut PhysicalPlanNode)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("unsplit", Box::new(|p| topn_mut(p).is_split = false)),
+            (
+                "empty calls",
+                Box::new(|p| {
+                    let kind = aggregate_mut(p);
+                    kind.aggregates.clear();
+                    kind.is_merge.clear();
+                    kind.output_layout.aggregate_columns.clear();
+                    kind.output_columns
+                        .retain(|column| column.column_id == ColumnId::new_for_test(1));
+                    aggregate_child_mut(p)
+                        .output_columns
+                        .retain(|column| column.column_id == ColumnId::new_for_test(1));
+                    p.output_columns
+                        .retain(|column| column.column_id == ColumnId::new_for_test(1));
+                }),
+            ),
+            ("merge", Box::new(|p| aggregate_mut(p).is_merge[0] = true)),
+            (
+                "absent merge contract",
+                Box::new(|p| aggregate_mut(p).is_merge.clear()),
+            ),
+            (
+                "distinct",
+                Box::new(|p| aggregate_mut(p).aggregates[0].distinct = true),
+            ),
+            (
+                "indirect scan",
+                Box::new(|p| {
+                    let aggregate = aggregate_child_mut(p);
+                    aggregate.children[0] = filter_node(aggregate.children[0].clone());
+                }),
+            ),
+            (
+                "full output domain mismatch",
+                Box::new(|p| {
+                    aggregate_mut(p).output_layout.group_key_columns[0].value_type =
+                        novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                            DataType::Utf8,
+                            true,
+                            novarocks_type_contract::ValueLogicalType::Json,
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "nested published payload",
+                Box::new(|p| {
+                    let source = &mut aggregate_child_mut(p).children[0];
+                    let payload = output(
+                        3,
+                        "payload",
+                        DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                            "item",
+                            DataType::Int64,
+                            true,
+                        ))),
+                        true,
+                    );
+                    let PhysicalPlanKind::Scan(scan) = &mut source.kind else {
+                        unreachable!()
+                    };
+                    scan.columns.push(payload.clone());
+                    scan.table.columns.push(ColumnDef {
+                        name: payload.name.clone(),
+                        data_type: payload.value_type.data_type().clone(),
+                        nullable: true,
+                        write_default: None,
+                        logical_type: None,
+                    });
+                    source.output_columns.push(payload);
+                }),
+            ),
+        ];
+        for (label, mutate) in cases {
+            let mut plan = eligible_direct_partial_plan(DataType::Utf8, true, true, true);
+            mutate(&mut plan);
+            place_runtime_filters_for_emission(
+                &mut plan,
+                &SessionOptimizerSettings::default(),
+                ExactComputedWithOriginalDeclaration,
+            );
+            assert!(aggregate_topn_builds(&plan).is_empty(), "{label}");
+            assert!(source_probes(&plan).is_empty(), "{label}");
+        }
+        let mut integer = eligible_direct_partial_plan(DataType::Int64, true, true, true);
+        place_runtime_filters_for_emission(
+            &mut integer,
+            &SessionOptimizerSettings::default(),
+            ExactComputedWithOriginalDeclaration,
+        );
+        assert!(aggregate_topn_builds(&integer).is_empty());
+        assert!(source_probes(&integer).is_empty());
+    }
+
+    fn eligible_direct_partial_plan(
+        data_type: DataType,
+        nullable: bool,
+        asc: bool,
+        nulls_first: bool,
+    ) -> PhysicalPlanNode {
+        let mut plan = eligible_topn_plan(data_type.clone(), asc, nulls_first);
+        topn_mut(&mut plan).is_split = true;
+        topn_mut(&mut plan).items[0].expr.value_type =
+            novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable);
+        let aggregate = aggregate_child_mut(&mut plan);
+        aggregate.children[0] = leaf(1, "key", data_type.clone(), nullable);
+        for column in &mut aggregate.output_columns {
+            column.value_type =
+                novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable);
+        }
+        let PhysicalPlanKind::HashAggregate(kind) = &mut aggregate.kind else {
+            unreachable!()
+        };
+        kind.mode = AggMode::Local;
+        kind.group_by[0].value_type =
+            novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable);
+        kind.output_layout.group_key_columns[0].value_type =
+            novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable);
+        kind.output_columns[0].value_type =
+            novarocks_type_contract::FunctionValueType::new(data_type, nullable);
+        kind.aggregates
+            .push(crate::planner::payload::AggregateCall {
+                name: "count".into(),
+                distinct: false,
+                result_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Int64,
+                    false,
+                ),
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    Vec::new(),
+                    Vec::new(),
+                    crate::functions::test_resolved_aggregate("count", &[], false),
+                ),
+                output_column_id: ColumnId::new_for_test(2),
+            });
+        kind.is_merge.push(false);
+        let count = output(2, "cnt", DataType::Int64, false);
+        kind.output_layout.aggregate_columns.push(count.clone());
+        kind.output_columns.push(count.clone());
+        aggregate.output_columns.push(count);
+        plan.output_columns = aggregate.output_columns.clone();
+        plan
+    }
 
     #[test]
     fn places_single_key_rows_partial_topn_on_global_aggregate_atomically() {

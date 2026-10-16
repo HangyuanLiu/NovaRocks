@@ -28,23 +28,27 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use crate::exec::expr::agg::AggregateVec;
 use crate::runtime_filter::contribution::{
-    OrderedScalar, OrderedTuple, OrderedTupleError, RuntimeOrderContract,
+    ControlledOrderedTupleError, OrderedScalar, OrderedTuple, OrderedTupleError,
+    RuntimeOrderContract,
 };
+use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedUtf8OrderKey};
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
     Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 
 use crate::exec::hash_table::key_table::KeyLookup;
 use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AggregateTopNCandidate {
-    tuple: OrderedTuple,
+pub(crate) struct AggregateTopNCandidate<K = OrderedTuple> {
+    tuple: K,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,7 +58,7 @@ pub(crate) enum AggregateTopNBoundarySnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AggregateTopNBoundaryError {
+pub enum AggregateTopNBoundaryError {
     UnsupportedKeyArity {
         actual: usize,
     },
@@ -148,80 +152,222 @@ impl From<OrderedTupleError> for AggregateTopNBoundaryError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AggregateTopNBoundaryState {
-    limit: usize,
-    contract: Arc<RuntimeOrderContract>,
-    best: Vec<AggregateTopNCandidate>,
-    observed_group_count: usize,
-    last_emitted_bound: Option<OrderedTuple>,
-    finished: bool,
+/// Storage owns real candidates; the ranking and publication state machine
+/// below is shared by both adapters. Pure storage is intentionally not Clone:
+/// whole key clones are cheap, while cloning a candidate vector is new work.
+pub(crate) trait TopNBoundaryStorage: std::fmt::Debug {
+    type Key: Clone + std::fmt::Debug + Eq;
+    type Error: From<AggregateTopNBoundaryError>;
+    fn candidates(&self) -> &[AggregateTopNCandidate<Self::Key>];
+    fn push(
+        &mut self,
+        key: Self::Key,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), Self::Error>;
+    fn replace(&mut self, index: usize, key: Self::Key);
+    fn compare(
+        contract: &RuntimeOrderContract,
+        a: &Self::Key,
+        b: &Self::Key,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Ordering, Self::Error>;
+    fn checkpoint(control: &dyn KernelEvaluationControl, units: u32) -> Result<(), Self::Error>;
 }
 
-impl AggregateTopNBoundaryState {
-    pub(crate) fn try_new(
-        limit: NonZeroU32,
-        contract: Arc<RuntimeOrderContract>,
-    ) -> Result<Self, AggregateTopNBoundaryError> {
-        validate_topn_boundary_contract(&contract)?;
-        Ok(Self {
-            limit: limit.get() as usize,
-            contract,
-            best: Vec::new(),
-            observed_group_count: 0,
-            last_emitted_bound: None,
-            finished: false,
-        })
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct LegacyTopNBoundaryStorage(Vec<AggregateTopNCandidate>);
+impl std::fmt::Debug for LegacyTopNBoundaryStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
+}
+impl TopNBoundaryStorage for LegacyTopNBoundaryStorage {
+    type Key = OrderedTuple;
+    type Error = AggregateTopNBoundaryError;
+    fn candidates(&self) -> &[AggregateTopNCandidate] {
+        &self.0
+    }
+    fn push(
+        &mut self,
+        tuple: OrderedTuple,
+        _: &dyn KernelEvaluationControl,
+    ) -> Result<(), Self::Error> {
+        self.0.push(AggregateTopNCandidate { tuple });
+        Ok(())
+    }
+    fn replace(&mut self, index: usize, tuple: OrderedTuple) {
+        self.0[index] = AggregateTopNCandidate { tuple };
+    }
+    fn compare(
+        contract: &RuntimeOrderContract,
+        a: &OrderedTuple,
+        b: &OrderedTuple,
+        _: &dyn KernelEvaluationControl,
+    ) -> Result<Ordering, Self::Error> {
+        contract.compare(a, b).map_err(Into::into)
+    }
+    fn checkpoint(_: &dyn KernelEvaluationControl, _: u32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
-    pub(crate) fn contract(&self) -> &Arc<RuntimeOrderContract> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OwnedTopNBoundaryError {
+    Boundary(AggregateTopNBoundaryError),
+    Kernel(KernelFailure),
+}
+impl From<AggregateTopNBoundaryError> for OwnedTopNBoundaryError {
+    fn from(cause: AggregateTopNBoundaryError) -> Self {
+        Self::Boundary(cause)
+    }
+}
+impl From<KernelFailure> for OwnedTopNBoundaryError {
+    fn from(cause: KernelFailure) -> Self {
+        Self::Kernel(cause)
+    }
+}
+impl From<ControlledOrderedTupleError> for OwnedTopNBoundaryError {
+    fn from(cause: ControlledOrderedTupleError) -> Self {
+        match cause {
+            ControlledOrderedTupleError::Tuple(cause) => Self::Boundary(cause.into()),
+            ControlledOrderedTupleError::Kernel(cause) => Self::Kernel(cause),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedTopNBoundaryStorage(AggregateVec<AggregateTopNCandidate<OwnedUtf8OrderKey>>);
+impl TopNBoundaryStorage for OwnedTopNBoundaryStorage {
+    type Key = OwnedUtf8OrderKey;
+    type Error = OwnedTopNBoundaryError;
+    fn candidates(&self) -> &[AggregateTopNCandidate<Self::Key>] {
+        &self.0
+    }
+    fn push(
+        &mut self,
+        tuple: Self::Key,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), Self::Error> {
+        control.checkpoint(0)?;
+        self.0
+            .try_reserve(1)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        control.checkpoint(0)?;
+        self.0.push(AggregateTopNCandidate { tuple });
+        Ok(())
+    }
+    fn replace(&mut self, index: usize, tuple: Self::Key) {
+        self.0[index] = AggregateTopNCandidate { tuple };
+    }
+    fn compare(
+        contract: &RuntimeOrderContract,
+        a: &Self::Key,
+        b: &Self::Key,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Ordering, Self::Error> {
+        contract
+            .compare_borrowed_controlled(a.borrowed(), b.borrowed(), control)
+            .map_err(Into::into)
+    }
+    fn checkpoint(control: &dyn KernelEvaluationControl, units: u32) -> Result<(), Self::Error> {
+        control.checkpoint(units).map_err(Into::into)
+    }
+}
+
+struct LegacyBoundaryControl;
+impl KernelEvaluationControl for LegacyBoundaryControl {
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        unreachable!("boundary selection never waits")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct AggregateTopNBoundaryCore<S: TopNBoundaryStorage> {
+    limit: usize,
+    contract: crate::runtime_filter::RuntimeOrderContractRef,
+    best: S,
+    observed_group_count: usize,
+    last_emitted_bound: Option<S::Key>,
+    finished: bool,
+}
+impl<S: TopNBoundaryStorage> std::fmt::Debug for AggregateTopNBoundaryCore<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AggregateTopNBoundaryState")
+            .field("limit", &self.limit)
+            .field("contract", &self.contract)
+            .field("best", &self.best)
+            .field("observed_group_count", &self.observed_group_count)
+            .field("last_emitted_bound", &self.last_emitted_bound)
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+pub(crate) type AggregateTopNBoundaryState = AggregateTopNBoundaryCore<LegacyTopNBoundaryStorage>;
+pub(crate) type OwnedAggregateTopNBoundaryState =
+    AggregateTopNBoundaryCore<OwnedTopNBoundaryStorage>;
+
+impl<S: TopNBoundaryStorage> AggregateTopNBoundaryCore<S> {
+    pub(crate) fn contract(&self) -> &crate::runtime_filter::RuntimeOrderContractRef {
         &self.contract
     }
 
-    pub(crate) fn observe_new_group(
+    fn observe_controlled(
         &mut self,
         group_id: usize,
-        tuple: OrderedTuple,
-    ) -> Result<(), AggregateTopNBoundaryError> {
+        tuple: S::Key,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), S::Error> {
+        S::checkpoint(control, 0)?;
         if self.finished {
-            return Err(AggregateTopNBoundaryError::Finished);
+            return Err(AggregateTopNBoundaryError::Finished.into());
         }
         if group_id != self.observed_group_count {
             return Err(AggregateTopNBoundaryError::GroupIdentityOutOfSequence {
                 expected: self.observed_group_count,
                 actual: group_id,
-            });
+            }
+            .into());
         }
-        self.contract.compare(&tuple, &tuple)?;
-
-        if self.best.len() < self.limit {
-            self.best.push(AggregateTopNCandidate { tuple });
+        S::compare(&self.contract, &tuple, &tuple, control)?;
+        if self.best.candidates().len() < self.limit {
+            self.best.push(tuple, control)?;
         } else {
-            let worst = self.worst_candidate_index()?;
-            if self.contract.compare(&tuple, &self.best[worst].tuple)? == Ordering::Less {
-                self.best[worst] = AggregateTopNCandidate { tuple };
+            let worst = self.worst_candidate_index_controlled(control)?;
+            if S::compare(
+                &self.contract,
+                &tuple,
+                &self.best.candidates()[worst].tuple,
+                control,
+            )? == Ordering::Less
+            {
+                S::checkpoint(control, 0)?;
+                self.best.replace(worst, tuple);
             }
         }
         self.observed_group_count += 1;
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self) -> AggregateTopNBoundarySnapshot {
-        if self.best.len() < self.limit {
-            return AggregateTopNBoundarySnapshot::NotReady;
+    fn snapshot_controlled(
+        &self,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Option<S::Key>, S::Error> {
+        S::checkpoint(control, 0)?;
+        if self.best.candidates().len() < self.limit {
+            return Ok(None);
         }
-        let worst = self
-            .worst_candidate_index()
-            .expect("validated aggregate TopN candidates must remain comparable");
-        AggregateTopNBoundarySnapshot::Ready {
-            nth_best_inclusive: self.best[worst].tuple.clone(),
-        }
+        let worst = self.worst_candidate_index_controlled(control)?;
+        Ok(Some(self.best.candidates()[worst].tuple.clone()))
     }
 
-    pub(crate) fn take_pending_tightening(
+    pub(crate) fn take_pending_controlled(
         &mut self,
-    ) -> Result<Option<OrderedTuple>, AggregateTopNBoundaryError> {
-        let AggregateTopNBoundarySnapshot::Ready { nth_best_inclusive } = self.snapshot() else {
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Option<S::Key>, S::Error> {
+        let Some(nth_best_inclusive) = self.snapshot_controlled(control)? else {
             return Ok(None);
         };
         match self.last_emitted_bound.as_ref() {
@@ -229,38 +375,130 @@ impl AggregateTopNBoundaryState {
                 self.last_emitted_bound = Some(nth_best_inclusive.clone());
                 Ok(Some(nth_best_inclusive))
             }
-            Some(previous) => match self.contract.compare(&nth_best_inclusive, previous)? {
-                Ordering::Less => {
-                    self.last_emitted_bound = Some(nth_best_inclusive.clone());
-                    Ok(Some(nth_best_inclusive))
+            Some(previous) => {
+                match S::compare(&self.contract, &nth_best_inclusive, previous, control)? {
+                    Ordering::Less => {
+                        self.last_emitted_bound = Some(nth_best_inclusive.clone());
+                        Ok(Some(nth_best_inclusive))
+                    }
+                    Ordering::Equal => Ok(None),
+                    Ordering::Greater => Err(AggregateTopNBoundaryError::BoundLoosened.into()),
                 }
-                Ordering::Equal => Ok(None),
-                Ordering::Greater => Err(AggregateTopNBoundaryError::BoundLoosened),
-            },
+            }
         }
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Option<OrderedTuple>, AggregateTopNBoundaryError> {
+    pub(crate) fn finish_controlled(
+        &mut self,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Option<S::Key>, S::Error> {
         if self.finished {
             return Ok(None);
         }
-        let pending = self.take_pending_tightening()?;
+        let pending = self.take_pending_controlled(control)?;
         self.finished = true;
         Ok(pending)
     }
 
-    fn worst_candidate_index(&self) -> Result<usize, AggregateTopNBoundaryError> {
+    fn worst_candidate_index_controlled(
+        &self,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<usize, S::Error> {
         let mut worst = 0;
-        for candidate in 1..self.best.len() {
-            if self
-                .contract
-                .compare(&self.best[candidate].tuple, &self.best[worst].tuple)?
-                == Ordering::Greater
+        for candidate in 1..self.best.candidates().len() {
+            if S::compare(
+                &self.contract,
+                &self.best.candidates()[candidate].tuple,
+                &self.best.candidates()[worst].tuple,
+                control,
+            )? == Ordering::Greater
             {
                 worst = candidate;
             }
+            S::checkpoint(control, 1)?;
         }
         Ok(worst)
+    }
+}
+
+impl AggregateTopNBoundaryState {
+    pub(crate) fn try_new(
+        limit: NonZeroU32,
+        contract: impl Into<crate::runtime_filter::RuntimeOrderContractRef>,
+    ) -> Result<Self, AggregateTopNBoundaryError> {
+        let contract = contract.into();
+        validate_topn_boundary_contract(&contract)?;
+        Ok(Self {
+            limit: limit.get() as usize,
+            contract,
+            best: LegacyTopNBoundaryStorage(Vec::new()),
+            observed_group_count: 0,
+            last_emitted_bound: None,
+            finished: false,
+        })
+    }
+    pub(crate) fn observe_new_group(
+        &mut self,
+        group_id: usize,
+        tuple: OrderedTuple,
+    ) -> Result<(), AggregateTopNBoundaryError> {
+        self.observe_controlled(group_id, tuple, &LegacyBoundaryControl)
+    }
+    pub(crate) fn snapshot(&self) -> AggregateTopNBoundarySnapshot {
+        match self
+            .snapshot_controlled(&LegacyBoundaryControl)
+            .expect("validated aggregate TopN candidates must remain comparable")
+        {
+            None => AggregateTopNBoundarySnapshot::NotReady,
+            Some(nth_best_inclusive) => AggregateTopNBoundarySnapshot::Ready { nth_best_inclusive },
+        }
+    }
+    pub(crate) fn take_pending_tightening(
+        &mut self,
+    ) -> Result<Option<OrderedTuple>, AggregateTopNBoundaryError> {
+        self.take_pending_controlled(&LegacyBoundaryControl)
+    }
+    pub(crate) fn finish(&mut self) -> Result<Option<OrderedTuple>, AggregateTopNBoundaryError> {
+        self.finish_controlled(&LegacyBoundaryControl)
+    }
+}
+
+impl OwnedAggregateTopNBoundaryState {
+    pub(crate) fn try_new_owned(
+        limit: NonZeroU32,
+        contract: crate::runtime_filter::RuntimeOrderContractRef,
+        host: &OrderedTopNAllocationHost,
+    ) -> Result<Self, OwnedTopNBoundaryError> {
+        validate_topn_boundary_contract(&contract)?;
+        let data_type = contract.keys()[0].data_type();
+        if data_type != &DataType::Utf8 {
+            return Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
+                actual: data_type.clone(),
+            }
+            .into());
+        }
+        Ok(Self {
+            limit: limit.get() as usize,
+            contract,
+            best: OwnedTopNBoundaryStorage(AggregateVec::new_in(host.vector_allocator())),
+            observed_group_count: 0,
+            last_emitted_bound: None,
+            finished: false,
+        })
+    }
+    pub(crate) fn observe_owned_group(
+        &mut self,
+        group_id: usize,
+        tuple: OwnedUtf8OrderKey,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), OwnedTopNBoundaryError> {
+        self.observe_controlled(group_id, tuple, control)
+    }
+    pub(crate) fn snapshot_owned(
+        &self,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Option<OwnedUtf8OrderKey>, OwnedTopNBoundaryError> {
+        self.snapshot_controlled(control)
     }
 }
 
@@ -278,7 +516,7 @@ impl AggregateTopNBoundaryBinding {
     pub(crate) fn try_new(
         group_key_ordinal: usize,
         limit: NonZeroU32,
-        contract: Arc<RuntimeOrderContract>,
+        contract: impl Into<crate::runtime_filter::RuntimeOrderContractRef>,
     ) -> Result<Self, AggregateTopNBoundaryError> {
         Ok(Self {
             group_key_ordinal,
@@ -292,7 +530,7 @@ impl AggregateTopNBoundaryBinding {
         let RuntimeFilterExecutionContract::Ordered(contract) = spec.contract().contract() else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
-        Self::try_new(spec.group_key_ordinal, spec.limit, Arc::clone(contract))
+        Self::try_new(spec.group_key_ordinal, spec.limit, contract.clone())
     }
 
     pub(crate) const fn state(&self) -> &AggregateTopNBoundaryState {
@@ -521,6 +759,10 @@ fn utf8_value(array: &ArrayRef, row: usize) -> Result<Option<&str>, AggregateTop
 }
 
 #[cfg(test)]
+#[path = "topn_boundary_owned_tests.rs"]
+mod owned_tests;
+
+#[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
     use std::num::NonZeroU32;
@@ -567,7 +809,7 @@ mod tests {
     fn execution_ordered_contract_for_test(
         contract: &RuntimeOrderContract,
     ) -> RuntimeFilterExecutionContract {
-        RuntimeFilterExecutionContract::Ordered(Arc::new(contract.clone()))
+        RuntimeFilterExecutionContract::Ordered(Arc::new(contract.clone()).into())
     }
 
     fn tuple(contract: &RuntimeOrderContract, value: Option<OrderedScalar>) -> OrderedTuple {

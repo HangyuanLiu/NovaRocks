@@ -263,7 +263,7 @@ fn checked_scans(
             vec![source_id(index)],
             ProgramNodeKind::Scan {
                 source,
-                runtime_filters: vec![],
+                runtime_filters: vec![].into(),
                 residuals: Vec::new(),
                 limit: None,
             },

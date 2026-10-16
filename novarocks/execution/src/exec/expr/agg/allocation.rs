@@ -35,6 +35,13 @@ use crate::runtime::mem_tracker::MemTracker;
 #[derive(Clone, Debug)]
 pub(crate) struct AggregateAllocator {
     tracker: Arc<MemTracker>,
+    admission: AggregateAllocationAdmission,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AggregateAllocationAdmission {
+    Legacy,
+    Nominal,
 }
 
 impl novarocks_functions::aggregate_scalar::ScalarStateAllocator for AggregateAllocator {
@@ -64,7 +71,19 @@ impl novarocks_functions::exact_percentile_core::ExactPercentileAllocator for Ag
 
 impl AggregateAllocator {
     pub(crate) fn new(tracker: Arc<MemTracker>) -> Self {
-        Self { tracker }
+        Self {
+            tracker,
+            admission: AggregateAllocationAdmission::Legacy,
+        }
+    }
+
+    /// Use the original tracker author without allocating a refusal message.
+    /// Containers still pay their actual Layout, including old + new growth.
+    pub(crate) fn new_nominal(tracker: Arc<MemTracker>) -> Self {
+        Self {
+            tracker,
+            admission: AggregateAllocationAdmission::Nominal,
+        }
     }
 
     pub(crate) fn allocation_error(&self, operation: &str) -> String {
@@ -98,7 +117,15 @@ impl AggregateAllocator {
         let Ok(bytes) = i64::try_from(bytes) else {
             return Err(AllocError);
         };
-        match self.tracker.consume_and_check_limit(bytes) {
+        let result = match self.admission {
+            AggregateAllocationAdmission::Legacy => {
+                self.tracker.consume_and_check_limit(bytes).map_err(|_| ())
+            }
+            AggregateAllocationAdmission::Nominal => {
+                self.tracker.consume_and_check_limit_nominal(bytes)
+            }
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(_) => {
                 self.tracker.release(bytes);
@@ -295,6 +322,41 @@ fn bytes_to_i64(bytes: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_topn_owned_nominal_vector_growth_keeps_live_backing_on_refusal() {
+        let tracker = MemTracker::new_root("ordered-topn-nominal-growth");
+        tracker.install_limit_once(16).unwrap();
+        let mut values =
+            AggregateVec::<u64>::new_in(AggregateAllocator::new_nominal(Arc::clone(&tracker)));
+        values.try_reserve_exact(2).unwrap();
+        values.extend_from_slice(&[7, 9]);
+        assert_eq!(tracker.current(), 16);
+        let capacity = values.capacity();
+        assert!(values.try_reserve_exact(1).is_err());
+        assert_eq!(values.capacity(), capacity);
+        assert_eq!(values.as_slice(), &[7, 9]);
+        assert_eq!(tracker.current(), 16);
+        drop(values);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn ordered_topn_owned_nominal_shrink_reserves_old_and_new_before_replacement() {
+        let tracker = MemTracker::new_root("ordered-topn-nominal-shrink");
+        tracker.install_limit_once(8).unwrap();
+        let allocator = AggregateAllocator::new_nominal(Arc::clone(&tracker));
+        let old = Layout::from_size_align(8, 8).unwrap();
+        let replacement = Layout::from_size_align(4, 8).unwrap();
+        let block = allocator.allocate(old).unwrap();
+        let pointer = NonNull::new(block.as_ptr() as *mut u8).unwrap();
+        // SAFETY: this allocator created the block with exactly `old`.
+        assert!(unsafe { allocator.shrink(pointer, old, replacement) }.is_err());
+        assert_eq!(tracker.current(), 8);
+        // SAFETY: failed shrink retained the original pointer and Layout.
+        unsafe { allocator.deallocate(pointer, old) };
+        assert_eq!(tracker.current(), 0);
+    }
 
     #[test]
     fn rejects_growth_before_allocation_and_releases_exact_layouts() {

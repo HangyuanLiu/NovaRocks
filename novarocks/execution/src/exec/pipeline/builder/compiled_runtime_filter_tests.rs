@@ -742,7 +742,7 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
             execution::RuntimeFilterBindingId::new(12),
             execution::RuntimeFilterChannelId::new(12),
             execution::RuntimeFilterLateApplyGranularity::Batch,
-            execution::RuntimeFilterExecutionContract::Ordered(Arc::new(order)),
+            execution::RuntimeFilterExecutionContract::Ordered(Arc::new(order).into()),
         )
         .unwrap();
         let frozen = freeze_installed_consumer(&declared, &installed);
@@ -846,7 +846,7 @@ fn scan_with_consumers(
     }
     let kind = ProgramNodeKind::Scan {
         source: source.clone(),
-        runtime_filters,
+        runtime_filters: runtime_filters.into(),
         residuals: residuals.clone(),
         limit: *limit,
     };
@@ -1521,11 +1521,13 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
             late_apply: FilterLateApplyGranularity::Batch,
         },
         StaticFilterContract::Ordered {
-            keys: Arc::from([FilterOrderKey {
-                value_type: FunctionValueType::new(DataType::Int64, true),
-                direction: FilterSortDirection::Ascending,
-                null_order: FilterNullOrder::First,
-            }]),
+            keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
+                FilterOrderKey {
+                    value_type: FunctionValueType::new(DataType::Int64, true),
+                    direction: FilterSortDirection::Ascending,
+                    null_order: FilterNullOrder::First,
+                },
+            ])),
             comparator_digest: [1; 32],
             contract_digest: [2; 32],
         },
@@ -1657,7 +1659,8 @@ fn compiled_runtime_filter_bindings_must_match_the_requirements_and_a_session() 
                 runtime_filters: vec![FilterConsumerAtExpr {
                     expr_id: definition,
                     consumer: blocking_consumer(7),
-                }],
+                }]
+                .into(),
                 residuals: Vec::new(),
                 limit: None,
             },
@@ -1970,11 +1973,13 @@ fn compiled_hash_join_producer_shapes_outside_m1_are_refused_by_name() {
                 11,
                 FilterProducerKind::TopKSummary,
                 StaticFilterContract::Ordered {
-                    keys: Arc::from([FilterOrderKey {
-                        value_type: FunctionValueType::new(DataType::Int64, true),
-                        direction: FilterSortDirection::Ascending,
-                        null_order: FilterNullOrder::First,
-                    }]),
+                    keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
+                        FilterOrderKey {
+                            value_type: FunctionValueType::new(DataType::Int64, true),
+                            direction: FilterSortDirection::Ascending,
+                            null_order: FilterNullOrder::First,
+                        },
+                    ])),
                     comparator_digest: [1; 32],
                     contract_digest: [2; 32],
                 },
@@ -2646,7 +2651,8 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
                 runtime_filters: vec![FilterConsumerAtExpr {
                     expr_id: definition,
                     consumer: consumer.clone(),
-                }],
+                }]
+                .into(),
             },
         ),
         Additions {
@@ -2724,6 +2730,14 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
             Some(Arc::new(consumers)),
         );
         let mut operator = factory.create(1, 0);
+        // Direct fixtures install the same creator and tracker as the real
+        // pipeline, before asserting the query-memory admission verdict.
+        let tracker = state.mem_tracker().expect("actual Task tracker");
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+            tracker,
+            state.error_state(),
+        ));
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
         let result = operator.as_processor_mut().unwrap().pull_chunk(&state);
@@ -2755,4 +2769,150 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
         );
         operator.close().unwrap();
     }
+}
+
+/// A checked component declaration over an original LocalCompiler program.
+/// This reuses this module's checked M1 rebuild author; it does not qualify a
+/// physical compiler mixed-filter route, a Worker artifact or Native feedback.
+/// The original ordered key/root remains full ordinal zero; the independent
+/// nullable Int64 membership key is the Scan's numeric second output at one.
+pub(crate) fn ordered_scan_with_numeric_membership_fixture(
+    program: &LocalProgram,
+) -> Result<
+    (
+        Arc<LocalProgram>,
+        ProgramNodeId,
+        execution::RuntimeFilterConsumerContract,
+    ),
+    String,
+> {
+    let scans = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            matches!(node.kind(), ProgramNodeKind::Scan { .. }).then_some(ProgramNodeId::new(index))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scans.len(),
+        1,
+        "the original ordered component has one Scan"
+    );
+    let scan = scans[0];
+    let ProgramNodeKind::Scan {
+        source,
+        runtime_filters,
+        residuals,
+        limit,
+    } = program.graph().nodes()[scan.index()].kind()
+    else {
+        unreachable!()
+    };
+    assert_eq!(runtime_filters.len(), 1);
+    assert!(matches!(
+        runtime_filters[0].consumer.contract(),
+        StaticFilterContract::Ordered { .. }
+    ));
+    let partials = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| match node.kind() {
+            ProgramNodeKind::Aggregate {
+                input,
+                functions,
+                need_finalize: false,
+                input_is_intermediate: false,
+                ..
+            } if *input == scan => {
+                assert_eq!(
+                    functions.len(),
+                    4,
+                    "the original COUNT/SUM/MIN/MAX declaration"
+                );
+                Some(ProgramNodeId::new(index))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(partials.len(), 1);
+    let like = site(
+        partials[0],
+        ProgramNodeExpressionRole::AggregateInput {
+            call: 1,
+            argument: 0,
+        },
+    );
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    let definition = snapshot.roots().sites()[&like].definition;
+    assert!(matches!(
+        program.graph().expressions().nodes()[definition.index()].kind(),
+        StaticExprKind::SlotId(slot)
+        if *slot == program.graph().nodes()[scan.index()].output_layout().slots()[1]
+    ));
+    let consumer = StaticFilterConsumer::try_new(
+        73,
+        74,
+        FilterConsumerActivation::BlockingSnapshot,
+        StaticFilterContract::membership(
+            &FunctionValueType::new(DataType::Int64, true),
+            FilterNullSemantics::NeverMatches,
+        )
+        .map_err(|error| error.to_string())?,
+        FilterReduction::SetUnion,
+    )
+    .map_err(|error| error.to_string())?;
+    assert_ne!(
+        consumer.binding_id(),
+        runtime_filters[0].consumer.binding_id()
+    );
+    assert_ne!(
+        consumer.channel_id(),
+        runtime_filters[0].consumer.channel_id()
+    );
+    let installed = super::runtime_filter_consumer_contract(&consumer)?;
+    let mut filters = runtime_filters.as_slice().to_vec();
+    filters.push(FilterConsumerAtExpr {
+        expr_id: definition,
+        consumer: consumer.clone(),
+    });
+    let rebuilt = rebuild(
+        program,
+        with_kind(
+            program,
+            scan,
+            ProgramNodeKind::Scan {
+                source: source.clone(),
+                runtime_filters: filters.into(),
+                residuals: residuals.clone(),
+                limit: *limit,
+            },
+        ),
+        Additions {
+            requirements: vec![requirement(consumer.binding_id())],
+            roots: vec![AddedRoot {
+                site: site(
+                    scan,
+                    ProgramNodeExpressionRole::RuntimeFilter { binding: 1 },
+                ),
+                like,
+                definition: None,
+                source: Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
+                    node: scan,
+                    role: ProgramChannelLayoutRole::NodeOutput,
+                    ordinal: 1,
+                })),
+            }],
+            ..Default::default()
+        },
+    )?;
+    Ok((rebuilt, scan, installed))
 }

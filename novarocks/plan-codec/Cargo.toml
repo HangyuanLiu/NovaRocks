@@ -42,6 +42,7 @@ arrow-buffer.workspace = true
 novarocks-functions.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-physical-plan.workspace = true
+novarocks-local-program.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true

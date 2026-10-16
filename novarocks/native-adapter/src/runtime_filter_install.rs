@@ -615,7 +615,8 @@ fn decode_contract_with_types(
                     keys,
                     comparator,
                     order_digest,
-                )),
+                ))
+                .into(),
             ))
         }
     }

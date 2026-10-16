@@ -733,9 +733,10 @@ pub fn begin_final_connector_write_plan(
     // Runtime filters are placed before the reads are stated, because a filter
     // a scan applies is part of what that scan asks its provider for.
     let mut physical = physical;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         settings,
+        emission_mode,
     );
     let (physical, needs) = crate::compiler::collect_provider_needs(
         physical,
@@ -855,9 +856,10 @@ fn complete_connector_write_plan(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         settings,
+        final_write.emission_mode(),
     );
     let (final_context, finalized_targets) = final_write.into_parts();
     let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
@@ -911,9 +913,10 @@ pub fn begin_final_dml_read_plan(
         .map_err(|_| "DML read intent did not produce optimized SQL facts".to_string())?;
     let mut physical =
         crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         settings,
+        emission_mode,
     );
     let (physical, needs) = crate::compiler::collect_provider_needs(
         physical,
@@ -1095,9 +1098,10 @@ pub fn begin_final_ctas_connector_write_plan(
         source.constant_policy,
         control,
     )?;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         settings,
+        source.emission_mode,
     );
     let (physical, needs) = crate::compiler::collect_provider_needs(
         physical,
@@ -1362,9 +1366,10 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
             },
         )?;
     }
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         &settings,
+        emission_mode,
     );
     let (physical, needs) = crate::compiler::collect_provider_needs(
         physical,
@@ -1620,9 +1625,10 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     if let Some(keyed_assert) = keyed_assert {
         crate::planner::pipeline::insert_pre_expand_keyed_assert(&mut physical, &keyed_assert)?;
     }
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         &settings,
+        context.final_write.emission_mode(),
     );
     let (final_context, finalized_targets) = context.final_write.into_parts();
     let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
@@ -2388,9 +2394,10 @@ pub fn build_final_statistics_connector_plan(
         constant_policy,
         control,
     )?;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         settings,
+        emission_mode,
     );
     let draft = crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
         &physical,

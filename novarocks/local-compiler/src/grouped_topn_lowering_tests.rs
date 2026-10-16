@@ -28,38 +28,20 @@ use crate::expressions::checked_reference_tests::values_lowering_tests::{
 use arrow_array::{ArrayRef, Int64Array};
 use novarocks_local_program::{ProgramAggregateCallScope, ProgramCallSite, ProgramStateTemplate};
 
-fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
-    let catalog = count_catalog();
-    let count = CountStar::bind(&catalog);
-    let pool = checked_pool(
-        Arc::new(Int64Array::from(vec![Some(7), None, Some(9)])) as ArrayRef,
-        true,
-        ValueLogicalType::Physical,
-    );
-    let base = build(
-        &[pool],
-        &[vec![(0, 0), (0, 2)], vec![(0, 1), (0, 0)]],
-        &[0, 0],
-        false,
-    );
-    let mut builder = FragmentBuilder::new(base.fragment().id());
-    for value in base.fragment().values().values() {
-        builder.insert_value(value.clone()).unwrap();
-    }
-    for (_, expression) in base.fragment().expressions().iter() {
-        builder.insert_expression(expression.clone()).unwrap();
-    }
-    for node in base.fragment().nodes().values() {
-        builder.insert_node_unchecked(node.clone()).unwrap();
-    }
-    let values = base.fragment().root();
-    let keys = base.fragment().nodes()[&values].output.columns.to_vec();
+fn append_count_chain(
+    builder: &mut FragmentBuilder,
+    source: NodeId,
+    keys: &[ValueId],
+    count: &CountStar,
+    ordering: &[(usize, SortDirection, NullOrdering)],
+    producer_distinct: bool,
+) -> NodeId {
     let partial = NodeId::new(201);
     let grouped = NodeId::new(202);
     let final_aggregate = NodeId::new(203);
     let final_topn = NodeId::new(204);
     let sequence = AggregateSequenceId::new(41);
-    let mut input = values;
+    let mut input = source;
     let mut prior = None;
     let mut intermediate = None;
     for (node, id, phase) in [
@@ -68,7 +50,7 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
         (final_aggregate, 53, AggregatePhase::Final { sequence }),
     ] {
         let mut groups = Vec::new();
-        for key in &keys {
+        for key in keys {
             let ty = builder.value(*key).unwrap().ty.clone();
             groups.push((
                 builder
@@ -100,27 +82,25 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
                 },
             )
             .unwrap();
-        let call = count.call(id, phase, arguments, output);
+        let mut call = count.call(id, phase, arguments, output);
+        if node == partial {
+            call.distinct = producer_distinct;
+        }
         let required = builder.node_output_properties(input).unwrap().clone();
         let mut produced = required.clone();
         produced.ordering = Box::default();
         let kind = if node == grouped {
-            let order = [1usize, 0].map(|ordinal| SortExpr {
-                expr: groups[ordinal].0,
-                direction: if ordinal == 1 {
-                    SortDirection::Descending
-                } else {
-                    SortDirection::Ascending
-                },
-                null_ordering: if ordinal == 1 {
-                    NullOrdering::First
-                } else {
-                    NullOrdering::Last
-                },
-            });
+            let order = ordering
+                .iter()
+                .map(|&(ordinal, direction, null_ordering)| SortExpr {
+                    expr: groups[ordinal].0,
+                    direction,
+                    null_ordering,
+                })
+                .collect::<Box<[_]>>();
             produced.ordering = order
                 .iter()
-                .zip([1usize, 0])
+                .zip(ordering.iter().map(|entry| entry.0))
                 .map(|(key, ordinal)| OrderingKey {
                     value: keys[ordinal],
                     direction: key.direction,
@@ -153,7 +133,7 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
                 },
             }
         };
-        let mut outputs = keys.clone();
+        let mut outputs = keys.to_vec();
         outputs.push(output);
         builder
             .insert_node_unchecked(PhysicalNode {
@@ -171,24 +151,19 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
         input = node;
         prior = Some(output);
     }
-    let order = [1usize, 0].map(|ordinal| {
-        let ty = builder.value(keys[ordinal]).unwrap().ty.clone();
-        SortExpr {
-            expr: builder
-                .add_expression(final_topn, ty, ExprKind::Value(keys[ordinal]))
-                .unwrap(),
-            direction: if ordinal == 1 {
-                SortDirection::Descending
-            } else {
-                SortDirection::Ascending
-            },
-            null_ordering: if ordinal == 1 {
-                NullOrdering::First
-            } else {
-                NullOrdering::Last
-            },
-        }
-    });
+    let order = ordering
+        .iter()
+        .map(|&(ordinal, direction, null_ordering)| {
+            let ty = builder.value(keys[ordinal]).unwrap().ty.clone();
+            SortExpr {
+                expr: builder
+                    .add_expression(final_topn, ty, ExprKind::Value(keys[ordinal]))
+                    .unwrap(),
+                direction,
+                null_ordering,
+            }
+        })
+        .collect::<Box<[_]>>();
     builder
         .add_top_n(
             final_topn,
@@ -201,6 +176,47 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
             },
         )
         .unwrap();
+    assert_ne!(intermediate.unwrap(), prior.unwrap());
+    final_topn
+}
+
+fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
+    let catalog = count_catalog();
+    let count = CountStar::bind(&catalog);
+    let pool = checked_pool(
+        Arc::new(Int64Array::from(vec![Some(7), None, Some(9)])) as ArrayRef,
+        true,
+        ValueLogicalType::Physical,
+    );
+    let base = build(
+        &[pool],
+        &[vec![(0, 0), (0, 2)], vec![(0, 1), (0, 0)]],
+        &[0, 0],
+        false,
+    );
+    let mut builder = FragmentBuilder::new(base.fragment().id());
+    for value in base.fragment().values().values() {
+        builder.insert_value(value.clone()).unwrap();
+    }
+    for (_, expression) in base.fragment().expressions().iter() {
+        builder.insert_expression(expression.clone()).unwrap();
+    }
+    for node in base.fragment().nodes().values() {
+        builder.insert_node_unchecked(node.clone()).unwrap();
+    }
+    let values = base.fragment().root();
+    let keys = base.fragment().nodes()[&values].output.columns.to_vec();
+    let final_topn = append_count_chain(
+        &mut builder,
+        values,
+        &keys,
+        &count,
+        &[
+            (1, SortDirection::Descending, NullOrdering::First),
+            (0, SortDirection::Ascending, NullOrdering::Last),
+        ],
+        false,
+    );
     let fragment = finish_with_requests(builder, final_topn, FragmentSink::Result);
     let (expression_uses, calls) = freeze_counts(&fragment, &catalog);
     let mut input = base.as_ref().clone().into_input();
@@ -227,8 +243,244 @@ fn grouped_package() -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
     input.calls = calls;
     let package =
         Arc::new(FragmentPackage::try_new(input, package_admission(), &FixtureControl).unwrap());
-    assert_ne!(intermediate.unwrap(), prior.unwrap());
     (package, catalog)
+}
+
+pub(crate) fn ordered_scan_package(
+    nullable: bool,
+    direction: SortDirection,
+    null_ordering: NullOrdering,
+) -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
+    ordered_scan_package_with_distinct(nullable, direction, null_ordering, false)
+}
+
+fn ordered_scan_plan(
+    nullable: bool,
+    direction: SortDirection,
+    null_ordering: NullOrdering,
+    producer_distinct: bool,
+) -> (PlanBuilder, PureEngineFunctionCatalog) {
+    let catalog = count_catalog();
+    let count = CountStar::bind(&catalog);
+    let ty = ValueType::new(DataType::Utf8, nullable);
+    let mut builder = FragmentBuilder::new(PROBE);
+    let keys = add_scan_typed(&mut builder, Distribution::Singleton, &[ty.clone()]);
+    let root = append_count_chain(
+        &mut builder,
+        SCAN,
+        &keys,
+        &count,
+        &[(0, direction, null_ordering)],
+        producer_distinct,
+    );
+    builder.attach_runtime_filter(FILTER).unwrap();
+    let fragment = finish_with_requests(builder, root, FragmentSink::Result);
+    let result = ResultPort {
+        scalar_schema: None,
+        fragment: PROBE,
+        output: fragment.nodes()[&root].output.clone(),
+        fields: fragment.nodes()[&root]
+            .output
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, value)| ResultField {
+                domain: ResultValueDomain::Plain,
+                name: format!("field-{ordinal}").into(),
+                alias: None,
+                value: *value,
+                ty: fragment.values()[value].ty.clone(),
+            })
+            .collect(),
+    };
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    plan.add_fragment(fragment).unwrap();
+    plan.set_result_port(result).unwrap();
+    plan.add_runtime_filter(ordered_filter(
+        PROBE,
+        NodeId::new(201),
+        SCAN,
+        NodeId::new(202),
+        TopNPhase::Partial {
+            sequence: TopNSequenceId::new(42),
+        },
+        keys[0],
+        ty,
+        direction,
+        null_ordering,
+        2,
+    ))
+    .unwrap();
+    (plan, catalog)
+}
+
+fn ordered_scan_package_with_distinct(
+    nullable: bool,
+    direction: SortDirection,
+    null_ordering: NullOrdering,
+    producer_distinct: bool,
+) -> (Arc<FragmentPackage>, PureEngineFunctionCatalog) {
+    let (plan, catalog) = ordered_scan_plan(nullable, direction, null_ordering, producer_distinct);
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
+    let fragment = &plan.fragments()[&PROBE];
+    let (uses, calls) = freeze_counts(fragment, &catalog);
+    let read = frozen_read_typed(
+        true,
+        &[ConnectorValueType::Varchar],
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "v0",
+            DataType::Utf8,
+            nullable,
+        )]),
+        vec![dynamic_filter()],
+    );
+    let mut packages = extract_fragment_packages(
+        &plan,
+        &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
+        &BTreeMap::new(),
+        &BTreeMap::from([(PROBE, uses)]),
+        &BTreeMap::from([(PROBE, calls)]),
+        &BTreeMap::from([(
+            PROBE,
+            FrozenFragmentPruning::try_new(PROBE, vec![], &FixtureControl).unwrap(),
+        )]),
+        &BTreeMap::from([(PROBE, package_admission())]),
+        &FixtureControl,
+    )
+    .unwrap();
+    (Arc::new(packages.remove(&PROBE).unwrap()), catalog)
+}
+
+#[test]
+fn ordered_topn_compiler_installs_exact_existing_roots_bindings_and_complete_types() {
+    use novarocks_local_program::{
+        FilterLateApplyGranularity, FilterNullOrder, FilterSortDirection,
+    };
+    for nullable in [false, true] {
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            for null_ordering in [NullOrdering::First, NullOrdering::Last] {
+                let (package, catalog) = ordered_scan_package(nullable, direction, null_ordering);
+                let validated =
+                    validate_fragment_providers(package.clone(), &providers(), &FixtureControl)
+                        .unwrap();
+                let program =
+                    compile_fragment(validated, &catalog, options(None), &FixtureControl).unwrap();
+                let (aggregate_id, aggregate) = program
+                    .graph()
+                    .nodes()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, node)| match node.kind() {
+                        ProgramNodeKind::Aggregate {
+                            group_by,
+                            topn_filters,
+                            ..
+                        } if !topn_filters.is_empty() => {
+                            Some((ProgramNodeId::new(id), (group_by, topn_filters)))
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(aggregate.1.len(), 1);
+                let filter = &aggregate.1[0];
+                assert_eq!(filter.group_key_ordinal, 0);
+                assert_eq!(filter.group_key_expr, aggregate.0[0]);
+                assert_eq!(filter.limit.get(), 2);
+                assert_eq!(filter.producer.kind(), FilterProducerKind::OrderedBound);
+                assert_eq!(
+                    filter.producer.reduction(),
+                    FilterReduction::TightenOrderedBound
+                );
+                let (scan_id, scan) = program
+                    .graph()
+                    .nodes()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, node)| match node.kind() {
+                        ProgramNodeKind::Scan {
+                            runtime_filters, ..
+                        } => Some((ProgramNodeId::new(id), runtime_filters)),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(scan.len(), 1);
+                let consumer = &scan[0];
+                assert_eq!(consumer.consumer.contract(), filter.producer.contract());
+                assert_eq!(
+                    consumer.consumer.activation(),
+                    FilterConsumerActivation::NonBlockingLive {
+                        late_apply: FilterLateApplyGranularity::Batch
+                    }
+                );
+                assert_eq!(consumer.consumer.channel_id(), FILTER.get());
+                for (role, actual) in [
+                    (
+                        RuntimeFilterBindingRole::Producer(0),
+                        filter.producer.binding_id(),
+                    ),
+                    (
+                        RuntimeFilterBindingRole::Consumer(0),
+                        consumer.consumer.binding_id(),
+                    ),
+                ] {
+                    let original = package
+                        .cuts()
+                        .runtime_filter_bindings
+                        .iter()
+                        .find(|binding| binding.role == role)
+                        .unwrap();
+                    assert_eq!(actual, original.binding_id);
+                    assert_ne!(actual, FILTER.get());
+                }
+                let StaticFilterContract::Ordered { keys, .. } = filter.producer.contract() else {
+                    unreachable!()
+                };
+                assert_eq!(keys[0].value_type, ValueType::new(DataType::Utf8, nullable));
+                assert_eq!(
+                    keys[0].direction,
+                    if direction == SortDirection::Ascending {
+                        FilterSortDirection::Ascending
+                    } else {
+                        FilterSortDirection::Descending
+                    }
+                );
+                assert_eq!(
+                    keys[0].null_order,
+                    if null_ordering == NullOrdering::First {
+                        FilterNullOrder::First
+                    } else {
+                        FilterNullOrder::Last
+                    }
+                );
+                let snapshot = program
+                    .checked()
+                    .channels()
+                    .expressions()
+                    .resolved_calls()
+                    .snapshot();
+                let group = ProgramExpressionRootSite::Node {
+                    node: aggregate_id,
+                    role: ProgramNodeExpressionRole::AggregateGroup { group: 0 },
+                };
+                let scan = ProgramExpressionRootSite::Node {
+                    node: scan_id,
+                    role: ProgramNodeExpressionRole::RuntimeFilter { binding: 0 },
+                };
+                assert_eq!(
+                    snapshot.flows()[&ProgramExpressionArena::Main].uses()
+                        [&snapshot.bindings()[&group]]
+                        .definition,
+                    filter.group_key_expr
+                );
+                assert_eq!(
+                    snapshot.flows()[&ProgramExpressionArena::Main].uses()
+                        [&snapshot.bindings()[&scan]]
+                        .definition,
+                    consumer.expr_id
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -321,5 +573,21 @@ fn grouped_topn_installs_intermediate_scope_independent_roots_and_fresh_state_ch
     assert_eq!(
         uses.iter().collect::<std::collections::BTreeSet<_>>().len(),
         5
+    );
+}
+
+#[test]
+fn ordered_topn_distinct_count_chain_is_refused_before_compilation() {
+    let (plan, _) = ordered_scan_plan(true, SortDirection::Ascending, NullOrdering::Last, true);
+    let error = plan.finish_observed(&FixtureControl).unwrap_err();
+    let diagnostic = format!("{error:?}");
+    assert!(
+        diagnostic.contains("aggregate_sequences[41]"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic
+            .contains("aggregate state paths do not reduce exactly into their matching final"),
+        "{diagnostic}"
     );
 }

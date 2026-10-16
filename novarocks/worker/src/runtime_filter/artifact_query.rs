@@ -22,9 +22,13 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter::{
-    RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterMembershipSchema,
-    RuntimeFilterNullSemantics, RuntimeFilterScalarRef,
-    contribution::{OrderedScalar, OrderedTuple, RuntimeOrderContract},
+    KernelEvaluationControl, RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError,
+    RuntimeFilterControlledQueryError, RuntimeFilterControlledScalarQuery,
+    RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterScalarRef,
+    contribution::{
+        ControlledOrderedTupleError, OrderedScalar, OrderedScalarRef, OrderedTuple,
+        OrderedTupleRef, RuntimeOrderContract,
+    },
 };
 use novarocks_spi::connector::ConnectorScalarValue;
 
@@ -33,7 +37,8 @@ use crate::runtime_filter::artifact::{
     ResidentMembershipIndex,
 };
 use crate::runtime_filter::codec::leaf::{
-    ArtifactCodecError, MembershipProbe, indexed_membership_contains,
+    ArtifactCodecError, ControlledMembershipProbeError, MembershipProbe,
+    indexed_membership_contains, indexed_membership_contains_controlled,
     indexed_membership_range_may_match,
 };
 
@@ -49,6 +54,20 @@ pub enum BackendRuntimeFilterArtifactQuery {
         artifact: Arc<PhysicalArtifact>,
         data_type: DataType,
     },
+}
+
+enum ScalarQueryMode<'a> {
+    Legacy,
+    Controlled(&'a dyn KernelEvaluationControl),
+}
+
+fn legacy_query_error(error: RuntimeFilterControlledQueryError) -> RuntimeFilterArtifactQueryError {
+    match error {
+        RuntimeFilterControlledQueryError::Artifact(error) => error,
+        RuntimeFilterControlledQueryError::Kernel(_) => {
+            unreachable!("the explicit legacy scalar query cannot refuse control")
+        }
+    }
 }
 
 impl BackendRuntimeFilterArtifactQuery {
@@ -93,7 +112,7 @@ impl BackendRuntimeFilterArtifactQuery {
 
     pub fn ordered(
         bundle: &ArtifactBundle,
-        contract: Arc<RuntimeOrderContract>,
+        contract: &RuntimeOrderContract,
     ) -> Result<Self, RuntimeFilterArtifactQueryError> {
         if contract.keys().len() != 1 {
             return Err(RuntimeFilterArtifactQueryError::Unsupported);
@@ -113,7 +132,7 @@ impl BackendRuntimeFilterArtifactQuery {
             || artifact.kind() != ArtifactKind::Range
             || artifact.version() != bundle.version()
             || artifact.schema_digest().bytes() != contract.digest()
-            || range.contract.as_ref() != contract.as_ref()
+            || range.contract.as_ref() != contract
             || range.contract.compare(&range.bound, &range.bound).is_err()
         {
             return Err(RuntimeFilterArtifactQueryError::ContractViolation);
@@ -122,6 +141,36 @@ impl BackendRuntimeFilterArtifactQuery {
             artifact: Arc::clone(artifact),
             data_type: contract.keys()[0].data_type().clone(),
         })
+    }
+
+    fn membership_matches_scalar(
+        artifact: &PhysicalArtifact,
+        data_type: &DataType,
+        value: RuntimeFilterScalarRef<'_>,
+        mode: ScalarQueryMode<'_>,
+    ) -> Result<bool, RuntimeFilterControlledQueryError> {
+        let index = artifact
+            .membership_index()
+            .ok_or(RuntimeFilterArtifactQueryError::ContractViolation)?;
+        let probe = membership_probe(value, data_type)?;
+        match mode {
+            ScalarQueryMode::Legacy => {
+                indexed_membership_contains(artifact.canonical_bytes(), index, probe)
+                    .map_err(|cause| map_query_error(cause).into())
+            }
+            ScalarQueryMode::Controlled(control) => indexed_membership_contains_controlled(
+                artifact.canonical_bytes(),
+                index,
+                probe,
+                control,
+            )
+            .map_err(|cause| match cause {
+                ControlledMembershipProbeError::Codec(cause) => map_query_error(cause).into(),
+                ControlledMembershipProbeError::Kernel(cause) => {
+                    RuntimeFilterControlledQueryError::Kernel(cause)
+                }
+            }),
+        }
     }
 
     fn ordered_range(&self) -> Result<&RangeResidentData, RuntimeFilterArtifactQueryError> {
@@ -145,6 +194,39 @@ impl BackendRuntimeFilterArtifactQuery {
             .map_err(|_| RuntimeFilterArtifactQueryError::ContractViolation)?
             != std::cmp::Ordering::Greater)
     }
+
+    fn ordered_matches_scalar(
+        &self,
+        value: Option<OrderedScalarRef<'_>>,
+        mode: ScalarQueryMode<'_>,
+    ) -> Result<bool, RuntimeFilterControlledQueryError> {
+        let range = self.ordered_range()?;
+        let value = OrderedTupleRef::Single(value);
+        let bound = OrderedTupleRef::Owned(&range.bound);
+        let ordering = match mode {
+            ScalarQueryMode::Legacy => {
+                range.contract.compare_borrowed(value, bound).map_err(|_| {
+                    RuntimeFilterControlledQueryError::Artifact(
+                        RuntimeFilterArtifactQueryError::ContractViolation,
+                    )
+                })?
+            }
+            ScalarQueryMode::Controlled(control) => range
+                .contract
+                .compare_borrowed_controlled(value, bound, control)
+                .map_err(|error| match error {
+                    ControlledOrderedTupleError::Tuple(_) => {
+                        RuntimeFilterControlledQueryError::Artifact(
+                            RuntimeFilterArtifactQueryError::ContractViolation,
+                        )
+                    }
+                    ControlledOrderedTupleError::Kernel(cause) => {
+                        RuntimeFilterControlledQueryError::Kernel(cause)
+                    }
+                })?,
+        };
+        Ok(ordering != std::cmp::Ordering::Greater)
+    }
 }
 
 impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
@@ -154,21 +236,27 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
         }
     }
 
+    fn controlled_scalar_query(&self) -> Option<&dyn RuntimeFilterControlledScalarQuery> {
+        match self {
+            Self::Membership { .. }
+            | Self::Ordered {
+                data_type: DataType::Utf8,
+                ..
+            } => Some(self),
+            _ => None,
+        }
+    }
+
     fn matches_null(&self) -> Result<bool, RuntimeFilterArtifactQueryError> {
         match self {
             Self::Membership {
                 artifact,
                 null_semantics,
                 ..
-            } => Ok(*null_semantics == RuntimeFilterNullSemantics::NullSafeEqual
-                && artifact.contains_null()),
-            Self::Ordered { .. } => {
-                let range = self.ordered_range()?;
-                self.ordered_matches_tuple(
-                    OrderedTuple::try_new(&range.contract, [None])
-                        .map_err(|_| RuntimeFilterArtifactQueryError::ContractViolation)?,
-                )
-            }
+            } => Ok(membership_matches_null(artifact, *null_semantics)),
+            Self::Ordered { .. } => self
+                .ordered_matches_scalar(None, ScalarQueryMode::Legacy)
+                .map_err(legacy_query_error),
         }
     }
 
@@ -191,21 +279,15 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
                 artifact,
                 data_type,
                 ..
-            } => indexed_membership_contains(
-                artifact.canonical_bytes(),
-                artifact
-                    .membership_index()
-                    .ok_or(RuntimeFilterArtifactQueryError::ContractViolation)?,
-                membership_probe(value, data_type)?,
-            )
-            .map_err(map_query_error),
+            } => {
+                Self::membership_matches_scalar(artifact, data_type, value, ScalarQueryMode::Legacy)
+                    .map_err(legacy_query_error)
+            }
             Self::Ordered { data_type, .. } => {
-                let range = self.ordered_range()?;
-                let scalar = ordered_scalar(value, data_type)?;
-                self.ordered_matches_tuple(
-                    OrderedTuple::try_new(&range.contract, [Some(scalar)])
-                        .map_err(|_| RuntimeFilterArtifactQueryError::ContractViolation)?,
-                )
+                self.ordered_range()?;
+                let scalar = ordered_scalar_ref(value, data_type)?;
+                self.ordered_matches_scalar(Some(scalar), ScalarQueryMode::Legacy)
+                    .map_err(legacy_query_error)
             }
         }
     }
@@ -245,6 +327,63 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
             }
         }
     }
+}
+
+impl RuntimeFilterControlledScalarQuery for BackendRuntimeFilterArtifactQuery {
+    fn matches_null_controlled(
+        &self,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<bool, RuntimeFilterControlledQueryError> {
+        control.checkpoint(0)?;
+        match self {
+            Self::Membership {
+                artifact,
+                null_semantics,
+                ..
+            } => Ok(membership_matches_null(artifact, *null_semantics)),
+            Self::Ordered {
+                data_type: DataType::Utf8,
+                ..
+            } => self.ordered_matches_scalar(None, ScalarQueryMode::Controlled(control)),
+            _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
+        }
+    }
+
+    fn non_null_value_may_match_controlled(
+        &self,
+        value: RuntimeFilterScalarRef<'_>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<bool, RuntimeFilterControlledQueryError> {
+        control.checkpoint(0)?;
+        match self {
+            Self::Membership {
+                artifact,
+                data_type,
+                ..
+            } => Self::membership_matches_scalar(
+                artifact,
+                data_type,
+                value,
+                ScalarQueryMode::Controlled(control),
+            ),
+            Self::Ordered {
+                data_type: DataType::Utf8,
+                ..
+            } => {
+                self.ordered_range()?;
+                let scalar = ordered_scalar_ref(value, &DataType::Utf8)?;
+                self.ordered_matches_scalar(Some(scalar), ScalarQueryMode::Controlled(control))
+            }
+            _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
+        }
+    }
+}
+
+fn membership_matches_null(
+    artifact: &PhysicalArtifact,
+    null_semantics: RuntimeFilterNullSemantics,
+) -> bool {
+    null_semantics == RuntimeFilterNullSemantics::NullSafeEqual && artifact.contains_null()
 }
 
 fn map_query_error(error: ArtifactCodecError) -> RuntimeFilterArtifactQueryError {
@@ -357,23 +496,25 @@ fn connector_membership_probe<'a>(
     }
 }
 
-fn ordered_scalar(
-    value: RuntimeFilterScalarRef<'_>,
+fn ordered_scalar_ref<'a>(
+    value: RuntimeFilterScalarRef<'a>,
     expected: &DataType,
-) -> Result<OrderedScalar, RuntimeFilterArtifactQueryError> {
+) -> Result<OrderedScalarRef<'a>, RuntimeFilterArtifactQueryError> {
     Ok(match (value, expected) {
         (RuntimeFilterScalarRef::Boolean(value), DataType::Boolean) => {
-            OrderedScalar::Boolean(value)
+            OrderedScalarRef::Boolean(value)
         }
-        (RuntimeFilterScalarRef::Int8(value), DataType::Int8) => OrderedScalar::Int8(value),
-        (RuntimeFilterScalarRef::Int16(value), DataType::Int16) => OrderedScalar::Int16(value),
-        (RuntimeFilterScalarRef::Int32(value), DataType::Int32) => OrderedScalar::Int32(value),
-        (RuntimeFilterScalarRef::Int64(value), DataType::Int64) => OrderedScalar::Int64(value),
+        (RuntimeFilterScalarRef::Int8(value), DataType::Int8) => OrderedScalarRef::Int8(value),
+        (RuntimeFilterScalarRef::Int16(value), DataType::Int16) => OrderedScalarRef::Int16(value),
+        (RuntimeFilterScalarRef::Int32(value), DataType::Int32) => OrderedScalarRef::Int32(value),
+        (RuntimeFilterScalarRef::Int64(value), DataType::Int64) => OrderedScalarRef::Int64(value),
         (RuntimeFilterScalarRef::LargeInt(value), DataType::FixedSizeBinary(16)) => {
-            OrderedScalar::LargeInt(value)
+            OrderedScalarRef::LargeInt(value)
         }
-        (RuntimeFilterScalarRef::Utf8(value), DataType::Utf8) => OrderedScalar::Utf8(value.into()),
-        (RuntimeFilterScalarRef::Date32(value), DataType::Date32) => OrderedScalar::Date32(value),
+        (RuntimeFilterScalarRef::Utf8(value), DataType::Utf8) => OrderedScalarRef::Utf8(value),
+        (RuntimeFilterScalarRef::Date32(value), DataType::Date32) => {
+            OrderedScalarRef::Date32(value)
+        }
         (
             RuntimeFilterScalarRef::TimestampSecond(value),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
@@ -389,9 +530,9 @@ fn ordered_scalar(
         | (
             RuntimeFilterScalarRef::TimestampNanosecond(value),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        ) => OrderedScalar::Timestamp(value),
+        ) => OrderedScalarRef::Timestamp(value),
         (RuntimeFilterScalarRef::Decimal128(value), DataType::Decimal128(_, _)) => {
-            OrderedScalar::Decimal128(value)
+            OrderedScalarRef::Decimal128(value)
         }
         _ => return Err(RuntimeFilterArtifactQueryError::Unsupported),
     })
@@ -430,3 +571,287 @@ fn connector_ordered_scalar(
         _ => Err(RuntimeFilterArtifactQueryError::Unsupported),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_filter::materializer::range::{decode_range_leaf, encode_range_leaf};
+
+    struct NoControl;
+    impl KernelEvaluationControl for NoControl {
+        fn checkpoint(
+            &self,
+            _: u32,
+        ) -> Result<(), novarocks_execution::runtime_filter::KernelFailure> {
+            Ok(())
+        }
+        fn wait(
+            &self,
+            _: std::time::Duration,
+        ) -> Result<(), novarocks_execution::runtime_filter::KernelFailure> {
+            panic!("ordered artifact query never waits")
+        }
+    }
+    use novarocks_execution::runtime_filter::LogicalVersion;
+    use novarocks_execution::runtime_filter::contribution::{
+        RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
+    };
+
+    fn ordered_query(
+        data_type: DataType,
+        direction: RuntimeOrderSortDirection,
+        null_order: RuntimeOrderNullOrder,
+        bound: Option<OrderedScalar>,
+    ) -> BackendRuntimeFilterArtifactQuery {
+        let contract = RuntimeOrderContract::from_frozen(
+            [RuntimeOrderKey::with_order(
+                data_type.clone(),
+                direction,
+                null_order,
+            )],
+            [3; 32],
+            [7; 32],
+        );
+        let bytes = encode_range_leaf(
+            &contract,
+            &OrderedTuple::new([bound]),
+            LogicalVersion::FIRST,
+        )
+        .unwrap();
+        let (artifact, _) =
+            decode_range_leaf(&bytes, &contract, LogicalVersion::FIRST, bytes.len()).unwrap();
+        BackendRuntimeFilterArtifactQuery::Ordered {
+            artifact,
+            data_type,
+        }
+    }
+
+    /// Frozen row-query oracle before extraction: actual range codec input,
+    /// independent std byte order, no service/thread or resource qualification.
+    #[test]
+    fn ordered_query_legacy_scalar_contract_oracle() {
+        let values = [
+            None,
+            Some(""),
+            Some("a"),
+            Some("m"),
+            Some("z"),
+            Some("é"),
+            Some("海港"),
+        ];
+        for direction in [
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderSortDirection::Descending,
+        ] {
+            for null_order in [RuntimeOrderNullOrder::First, RuntimeOrderNullOrder::Last] {
+                for bound in [None, Some("m"), Some("é")] {
+                    let query = ordered_query(
+                        DataType::Utf8,
+                        direction,
+                        null_order,
+                        bound.map(|s| OrderedScalar::Utf8(s.into())),
+                    );
+                    for value in values {
+                        let ordering = match (value, bound) {
+                            (None, None) => std::cmp::Ordering::Equal,
+                            (None, Some(_)) => {
+                                if null_order == RuntimeOrderNullOrder::First {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                }
+                            }
+                            (Some(_), None) => {
+                                if null_order == RuntimeOrderNullOrder::First {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            }
+                            (Some(value), Some(bound)) => {
+                                let ordering = value.as_bytes().cmp(bound.as_bytes());
+                                if direction == RuntimeOrderSortDirection::Descending {
+                                    ordering.reverse()
+                                } else {
+                                    ordering
+                                }
+                            }
+                        };
+                        let result = match value {
+                            None => query.matches_null(),
+                            Some(value) => {
+                                query.non_null_value_may_match(RuntimeFilterScalarRef::Utf8(value))
+                            }
+                        };
+                        assert_eq!(result, Ok(ordering != std::cmp::Ordering::Greater));
+                    }
+                    assert_eq!(
+                        query.non_null_value_may_match(RuntimeFilterScalarRef::Int64(0)),
+                        Err(RuntimeFilterArtifactQueryError::Unsupported)
+                    );
+                }
+            }
+        }
+        // Preserve the old query's narrower timezone domain independently
+        // of the comparator contract, which accepts frozen Timestamp metadata.
+        let query = ordered_query(
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderNullOrder::Last,
+            Some(OrderedScalar::Timestamp(7)),
+        );
+        assert_eq!(
+            query.non_null_value_may_match(RuntimeFilterScalarRef::TimestampMicrosecond(7)),
+            Err(RuntimeFilterArtifactQueryError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn ordered_query_controlled_scalar_preserves_inclusive_null_and_direction_contract() {
+        for (direction, null_order, expected_null, expected_a, expected_z) in [
+            (
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderNullOrder::First,
+                true,
+                true,
+                false,
+            ),
+            (
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderNullOrder::Last,
+                false,
+                true,
+                false,
+            ),
+            (
+                RuntimeOrderSortDirection::Descending,
+                RuntimeOrderNullOrder::First,
+                true,
+                false,
+                true,
+            ),
+            (
+                RuntimeOrderSortDirection::Descending,
+                RuntimeOrderNullOrder::Last,
+                false,
+                false,
+                true,
+            ),
+        ] {
+            let query = ordered_query(
+                DataType::Utf8,
+                direction,
+                null_order,
+                Some(OrderedScalar::Utf8("m".into())),
+            );
+            let controlled = query
+                .controlled_scalar_query()
+                .expect("the Utf8 port is installed");
+            assert_eq!(
+                controlled.matches_null_controlled(&NoControl),
+                Ok(expected_null)
+            );
+            for (value, expected) in [("a", expected_a), ("m", true), ("z", expected_z)] {
+                assert_eq!(
+                    controlled.non_null_value_may_match_controlled(
+                        RuntimeFilterScalarRef::Utf8(value),
+                        &NoControl
+                    ),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    query.non_null_value_may_match(RuntimeFilterScalarRef::Utf8(value)),
+                    Ok(expected)
+                );
+            }
+            assert_eq!(
+                controlled.non_null_value_may_match_controlled(
+                    RuntimeFilterScalarRef::Int64(0),
+                    &NoControl
+                ),
+                Err(RuntimeFilterControlledQueryError::Artifact(
+                    RuntimeFilterArtifactQueryError::Unsupported
+                ))
+            );
+        }
+        let query = ordered_query(
+            DataType::Int64,
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderNullOrder::Last,
+            Some(OrderedScalar::Int64(7)),
+        );
+        assert!(query.controlled_scalar_query().is_none());
+        assert_eq!(
+            query.non_null_value_may_match(RuntimeFilterScalarRef::Int64(7)),
+            Ok(true)
+        );
+    }
+
+    /// Existing control port, deterministic units, no wall-clock or private
+    /// controller. The Worker must forward the original cause from mid-value.
+    #[test]
+    fn ordered_query_controlled_scalar_forwards_long_prefix_and_null_refusals() {
+        use novarocks_execution::runtime_filter::KernelFailure;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        struct Control {
+            units: AtomicU32,
+            cause: KernelFailure,
+            refuse_null: bool,
+        }
+        impl KernelEvaluationControl for Control {
+            fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+                assert!(units <= 256);
+                let total = self.units.fetch_add(units, Ordering::Relaxed) + units;
+                if self.refuse_null || total >= 512 {
+                    Err(self.cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+                panic!("ordered artifact query never waits")
+            }
+        }
+        let value = "x".repeat(1 << 20);
+        let query = ordered_query(
+            DataType::Utf8,
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderNullOrder::Last,
+            Some(OrderedScalar::Utf8(value.clone())),
+        );
+        let controlled = query.controlled_scalar_query().unwrap();
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            let control = Control {
+                units: AtomicU32::new(0),
+                cause: cause.clone(),
+                refuse_null: false,
+            };
+            assert_eq!(
+                controlled.non_null_value_may_match_controlled(
+                    RuntimeFilterScalarRef::Utf8(&value),
+                    &control
+                ),
+                Err(RuntimeFilterControlledQueryError::Kernel(cause.clone()))
+            );
+            let units = control.units.load(Ordering::Relaxed);
+            assert!((512..1024).contains(&units));
+            let control = Control {
+                units: AtomicU32::new(0),
+                cause: cause.clone(),
+                refuse_null: true,
+            };
+            assert_eq!(
+                controlled.matches_null_controlled(&control),
+                Err(RuntimeFilterControlledQueryError::Kernel(cause))
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "controlled_membership_tests.rs"]
+mod controlled_membership_tests;

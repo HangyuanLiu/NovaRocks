@@ -25,8 +25,8 @@ use novarocks_connector_contract::{
     ConnectorReadProgramRecipe, ConnectorReadRelationKind, ConnectorReadWorkSource,
 };
 use novarocks_local_program::{
-    BindingRequirement, CompiledScanInput, FilterConsumerAtExpr, ProgramExprId, ProgramNodeId,
-    ProgramNodeKind, ProgramScanSource, ScanSourceKind, StaticLayout,
+    BindingRequirement, CompiledScanInput, ProgramExprId, ProgramNodeId, ProgramNodeKind,
+    ProgramScanSource, ScanSourceKind, StaticLayout,
 };
 use novarocks_physical_plan::{ExprId, NodeKind, PhysicalNode, PredicateGuaranteeKind, Relation};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
@@ -137,7 +137,7 @@ pub(crate) fn lower_scan_with_creation<H>(
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: ConnectorReadProgramRecipe,
-    runtime_filters: Vec<FilterConsumerAtExpr>,
+    runtime_filters: novarocks_local_program::ScanFilterConsumers,
     slots: &[SlotId],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     control: &dyn PureCompileControl,
@@ -161,7 +161,7 @@ fn lower_core_with_creation<H>(
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: ConnectorReadProgramRecipe,
-    runtime_filters: Vec<FilterConsumerAtExpr>,
+    runtime_filters: novarocks_local_program::ScanFilterConsumers,
     slots: &[SlotId],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,

@@ -501,13 +501,13 @@ pub enum ProgramNodeKind {
     },
     Scan {
         source: ProgramScanSource,
-        runtime_filters: Vec<FilterConsumerAtExpr>,
+        runtime_filters: crate::ScanFilterConsumers,
         residuals: Vec<ProgramExprId>,
         limit: Option<usize>,
     },
     ExchangeSource {
         timeout: Duration,
-        runtime_filters: Vec<FilterConsumerAtExpr>,
+        runtime_filters: crate::ScanFilterConsumers,
         hash_partition_exprs: Vec<ProgramExprId>,
     },
     Aggregate {
@@ -516,7 +516,7 @@ pub enum ProgramNodeKind {
         functions: Vec<StaticAggregateCall>,
         need_finalize: bool,
         input_is_intermediate: bool,
-        topn_filters: Vec<AggregateTopNFilter>,
+        topn_filters: crate::AggregateTopNFilters,
         streaming_preaggregation_mode: Option<StreamingPreaggregationMode>,
     },
     /// A complete-key budget over intermediate state contributions.
@@ -2408,7 +2408,7 @@ mod tests {
                     2,
                     ProgramNodeKind::ExchangeSource {
                         timeout: Duration::from_secs(1),
-                        runtime_filters: vec![],
+                        runtime_filters: vec![].into(),
                         hash_partition_exprs: vec![],
                     },
                     layout.clone(),
@@ -2429,7 +2429,7 @@ mod tests {
                 2,
                 ProgramNodeKind::ExchangeSource {
                     timeout: Duration::from_secs(1),
-                    runtime_filters: vec![],
+                    runtime_filters: vec![].into(),
                     hash_partition_exprs: vec![],
                 },
                 layout.clone(),
@@ -2591,7 +2591,7 @@ mod tests {
             7,
             ProgramNodeKind::ExchangeSource {
                 timeout: Duration::from_secs(1),
-                runtime_filters: vec![],
+                runtime_filters: vec![].into(),
                 hash_partition_exprs: if children {
                     vec![]
                 } else {

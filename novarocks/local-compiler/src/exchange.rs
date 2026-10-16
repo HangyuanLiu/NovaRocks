@@ -221,7 +221,7 @@ fn lower_core_with_creation<H>(
     Ok(LoweredExchangeSource {
         kind: ProgramNodeKind::ExchangeSource {
             timeout: exchange_wait,
-            runtime_filters: Vec::new(),
+            runtime_filters: Vec::new().into(),
             hash_partition_exprs: Vec::new(),
         },
         layout,

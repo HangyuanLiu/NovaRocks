@@ -25,6 +25,8 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 mod aggregate;
+pub use aggregate::topn_boundary::AggregateTopNBoundaryError;
+pub(crate) use aggregate::topn_boundary::OwnedTopNBoundaryError;
 pub(crate) mod analytic_shared;
 mod analytic_sink;
 mod analytic_source;
@@ -32,6 +34,7 @@ mod assert_num_rows_processor;
 mod blocked_duration;
 mod change_event_expand_processor;
 pub(crate) mod compiled_aggregate;
+mod compiled_aggregate_topn;
 pub(crate) mod compiled_change_events;
 pub(crate) mod compiled_expression;
 pub(crate) mod compiled_generate_series;

@@ -49,6 +49,7 @@ use super::*;
 use crate::exec::chunk::Chunk;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessorFactory;
+use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::operators::compiled_expression::{
     CompiledFilterProcessorFactory, CompiledProjectProcessorFactory,
 };
@@ -59,13 +60,74 @@ use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
 use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
 use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
-use crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers;
-use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::exec::operators::runtime_filter::{
+    CompiledOrderedScanFactory, CompiledRuntimeFilterConsumers,
+};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime_filter::OrderedTopNAllocationHost;
 use novarocks_local_program::{
     AssertRowsMode, BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr,
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind, RowAssertion, StaticFilterContract,
 };
+
+#[derive(Clone)]
+pub(crate) struct CompiledOrderedFilterContext {
+    pub host: OrderedTopNAllocationHost,
+    pub control: RuntimeKernelControl,
+}
+impl CompiledOrderedFilterContext {
+    pub(crate) fn for_program(
+        program: &LocalProgram,
+        state: &RuntimeState,
+    ) -> ExecutionResult<Option<Self>> {
+        let mut control = RuntimeKernelControl::new(state.error_state());
+        control.bind_runtime_memory(state);
+        let mut work = novarocks_functions::EvaluationCheckpoints::new(&control);
+        let mut needed = false;
+        let is_installed = |contract: &StaticFilterContract| {
+            matches!(contract, StaticFilterContract::Ordered { keys, .. }
+                if matches!(keys.as_slice(), [key] if key.value_type.data_type() == &arrow::datatypes::DataType::Utf8
+                    && novarocks_local_program::is_ordered_filter_flat_payload_type(&key.value_type)))
+        };
+        for node in program.graph().nodes() {
+            work.step()?;
+            match node.kind() {
+                ProgramNodeKind::Aggregate { topn_filters, .. } => {
+                    for filter in topn_filters {
+                        work.step()?;
+                        needed |= is_installed(filter.producer.contract());
+                    }
+                }
+                ProgramNodeKind::Scan {
+                    runtime_filters, ..
+                } => {
+                    for filter in runtime_filters {
+                        work.step()?;
+                        needed |= is_installed(filter.consumer.contract());
+                    }
+                }
+                _ => {}
+            }
+        }
+        work.finish()?;
+        if !needed {
+            return Ok(None);
+        }
+        let tracker = state.mem_tracker().ok_or_else(|| {
+            novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "compiled ordered runtime filters require the original Task memory tracker",
+                ),
+            )
+        })?;
+        Ok(Some(Self {
+            host: OrderedTopNAllocationHost::new(tracker),
+            control,
+        }))
+    }
+}
 
 /// Operator display identity for a compiled node: its local program index.
 /// Profiles keep the program's provenance as the source relation.
@@ -295,13 +357,44 @@ fn compiled_runtime_filter_consumers(
     ctx: &PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
 ) -> Result<Option<Arc<CompiledRuntimeFilterConsumers>>, String> {
+    compiled_runtime_filter_consumers_selected(
+        owner,
+        display_owner,
+        program,
+        id,
+        bindings,
+        ctx,
+        error,
+        false,
+    )
+}
+
+/// The ordered Scan keeps full-list root ordinals while sharing the original
+/// blocking membership gate and contract author.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This is the original builder context plus the explicit Scan selection policy"
+)]
+fn compiled_runtime_filter_consumers_selected(
+    owner: &'static str,
+    display_owner: &'static str,
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    bindings: &[FilterConsumerAtExpr],
+    ctx: &PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+    omit_ordered: bool,
+) -> Result<Option<Arc<CompiledRuntimeFilterConsumers>>, String> {
     if bindings.is_empty() {
         return Ok(None);
     }
     let mut contracts = Vec::with_capacity(bindings.len());
-    for binding in bindings {
+    for (ordinal, binding) in bindings.iter().enumerate() {
         let consumer = &binding.consumer;
         if matches!(consumer.contract(), StaticFilterContract::Ordered { .. }) {
+            if omit_ordered {
+                continue;
+            }
             return Err(format!(
                 "compiled {display_owner} at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
                 id.index(),
@@ -316,9 +409,16 @@ fn compiled_runtime_filter_consumers(
             ));
         }
         runtime_filter_session(&ctx.runtime_filter_execution, consumer.binding_id())?;
-        contracts.push(runtime_filter_consumer_contract(consumer)?);
+        contracts.push((
+            u32::try_from(ordinal)
+                .map_err(|_| "compiled runtime-filter binding count exceeds u32")?,
+            runtime_filter_consumer_contract(consumer)?,
+        ));
     }
-    CompiledRuntimeFilterConsumers::try_new(
+    if contracts.is_empty() {
+        return Ok(None);
+    }
+    CompiledRuntimeFilterConsumers::try_new_at_ordinals(
         owner,
         Arc::clone(program),
         id,
@@ -375,13 +475,48 @@ pub(crate) fn build_compiled_pipeline_graph(
     function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
 ) -> Result<PipelineGraph, String> {
+    build_compiled_pipeline_graph_typed(
+        program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_filter_session,
+        dep_manager,
+        pipeline_dop,
+        root_sink_dop,
+        function_set,
+        error,
+        None,
+    )
+    .map_err(ExecutionFailure::into_pipeline_message)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
+pub(crate) fn build_compiled_pipeline_graph_typed(
+    program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    dep_manager: DependencyManager,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    error: Arc<RuntimeErrorState>,
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineGraph> {
     let graph = program.graph();
     if graph
         .nodes()
         .iter()
         .any(|node| node.legacy_native_node_id().is_some())
     {
-        return Err("legacy-lowered nodes cannot enter the compiled pipeline".to_string());
+        return Err("legacy-lowered nodes cannot enter the compiled pipeline"
+            .to_string()
+            .into());
     }
     validate_compiled_exchange_bindings(program, &exchange_bindings)?;
     validate_compiled_scan_bindings(program, &scan_bindings)?;
@@ -404,7 +539,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         local_exchange_max_buffered_rows: 0,
         precomputed_keyed_assert_keys: std::collections::HashMap::new(),
     };
-    let mut build = build_node(program, graph.root(), &mut ctx, &error)?;
+    let mut build = build_node(program, graph.root(), &mut ctx, &error, ordered)?;
     // Statistics owns its specific original bounded materializer. Other root
     // purposes validate the actual computing root output at one final boundary.
     if let Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) = graph.sink()
@@ -424,9 +559,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         // The frozen profile places the root sink on one driver.
         Some(1) => build = gather_to_one(build, &mut ctx, ROOT_SINK_LOCAL_EXCHANGE_NODE_ID),
         Some(other) => {
-            return Err(format!(
-                "compiled root sink width {other} is not executable yet"
-            ));
+            return Err(format!("compiled root sink width {other} is not executable yet").into());
         }
     }
     build.pipeline.needs_sink = true;
@@ -441,7 +574,8 @@ fn build_node(
     id: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
     let node = program
         .graph()
         .nodes()
@@ -464,7 +598,7 @@ fn build_node(
             })
         }
         ProgramNodeKind::GenerateSeries { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             build.pipeline.factories.push(Box::new(
                 CompiledGenerateSeriesProcessorFactory::try_new(
                     Arc::clone(program),
@@ -475,7 +609,7 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::Project { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             build
                 .pipeline
                 .factories
@@ -487,7 +621,7 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::Filter { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             build
                 .pipeline
                 .factories
@@ -511,23 +645,42 @@ fn build_node(
                 return Err(format!(
                     "scan at local node {} carries no compiled provider read",
                     id.index()
-                ));
+                ).into());
             }
+            let ordered_binding = runtime_filters.iter().find(|binding| matches!(binding.consumer.contract(), StaticFilterContract::Ordered { .. }));
+            let ordered_factory = if let Some(binding) = ordered_binding {
+                if !matches!(binding.consumer.contract(), StaticFilterContract::Ordered { keys, .. }
+                    if matches!(keys.as_slice(), [key] if key.value_type.data_type() == &arrow::datatypes::DataType::Utf8
+                        && novarocks_local_program::is_ordered_filter_flat_payload_type(&key.value_type))) {
+                    return Err(format!(
+                        "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                        id.index(), binding.consumer.binding_id(),
+                    ).into());
+                }
+                let Some(context) = ordered else {
+                    // The original text-only test bridge installs no new
+                    // ordered resources. Production freezes its real context
+                    // before entering this typed builder.
+                    return Err(format!(
+                        "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                        id.index(), binding.consumer.binding_id(),
+                    ).into());
+                };
+                Some(CompiledOrderedScanFactory::try_new(
+                    Arc::clone(program), id,
+                    Arc::clone(runtime_filter_session(&ctx.runtime_filter_execution, binding.consumer.binding_id())?),
+                    &context.host, &context.control,
+                )?)
+            } else { None };
             // Consumers are built first, so a refused binding builds no driver.
-            let runtime_filters = compiled_runtime_filter_consumers(
-                "Scan",
-                "scan",
-                program,
-                id,
-                runtime_filters,
-                ctx,
-                error,
+            let runtime_filters = compiled_runtime_filter_consumers_selected(
+                "Scan", "scan", program, id, runtime_filters, ctx, error, ordered_factory.is_some(),
             )?;
-            if limit.is_some() {
+            if limit.is_some() && ordered_factory.is_none() {
                 return Err(format!(
                     "compiled scan at local node {} with a scan limit is not executable yet",
                     id.index()
-                ));
+                ).into());
             }
             let scan_node = scan_node_id(program, id)?;
             let op = ctx.scan_bindings.get(scan_node).ok_or_else(|| {
@@ -535,7 +688,7 @@ fn build_node(
             })?;
             // The residual is the scan's own TruthOnly root over its output;
             // it is built first so a refused root binds no driver.
-            let residual = (!residuals.is_empty())
+            let mut residual = (!residuals.is_empty())
                 .then(|| {
                     CompiledFilterProcessorFactory::try_new(
                         Arc::clone(program),
@@ -551,11 +704,15 @@ fn build_node(
             // downstream DOP without duplicating the Task's reader capability.
             // Its runtime filters gate the first read and filter every chunk
             // before the handoff.
-            let source: Box<dyn OperatorFactory> = Box::new(StreamScanSourceFactory::new_compiled(
-                node_id,
-                op,
-                runtime_filters,
-            ));
+            let source: Box<dyn OperatorFactory> = if let Some(factory) = ordered_factory {
+                let context = ordered.expect("validated original ordered Task context");
+                Box::new(StreamScanSourceFactory::new_compiled_ordered(
+                    node_id, op, runtime_filters, factory, residual.take(), *limit,
+                    context.host.clone(), context.control.clone(),
+                ))
+            } else {
+                Box::new(StreamScanSourceFactory::new_compiled(node_id, op, runtime_filters))
+            };
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             let mut build = PipelineBuildResult {
                 pipeline,
@@ -582,13 +739,13 @@ fn build_node(
                 return Err(format!(
                     "compiled exchange source at local node {} with runtime-filter consumers is not executable yet",
                     id.index()
-                ));
+                ).into());
             }
             if !hash_partition_exprs.is_empty() {
                 return Err(format!(
                     "compiled exchange source at local node {} with hash-key expressions is not executable yet",
                     id.index()
-                ));
+                ).into());
             }
             let receiver = receiver_node_id(program, id)?;
             let binding = ctx.exchange_bindings.get(receiver).ok_or_else(|| {
@@ -610,7 +767,7 @@ fn build_node(
             limit,
             offset,
         } => {
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, ordered)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build
                 .pipeline
@@ -636,14 +793,14 @@ fn build_node(
             // re-pruning them locally would evaluate a key twice.
             let factory =
                 CompiledSortProcessorFactory::try_new(Arc::clone(program), id, Arc::clone(error))?;
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, ordered)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
             Ok(build)
         }
         ProgramNodeKind::UnionAll { inputs } => {
-            build_union_all(program, id, node_id, inputs, ctx, error)
+            build_union_all(program, id, node_id, inputs, ctx, error, ordered)
         }
         ProgramNodeKind::GroupedTopN { input, .. } => {
             let factory = CompiledGroupedTopNProcessorFactory::try_new(
@@ -651,23 +808,45 @@ fn build_node(
                 id,
                 Arc::clone(error),
             )?;
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, ordered)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
             Ok(build)
         }
-        ProgramNodeKind::Aggregate { input, .. } => {
+        ProgramNodeKind::Aggregate { input, topn_filters, .. } => {
             // Preserve the original driver-local Partial -> exchange -> Final
             // chronology. Grouped states hash actual emitted key slots; a
             // group-less state uses the original Single exchange.
-            let factory = CompiledAggregateProcessorFactory::try_new(
-                Arc::clone(program),
-                id,
-                Arc::clone(error),
-            )?;
+            let mut ordered_input = None;
+            let factory = if let Some(ordered) = ordered.filter(|_| !topn_filters.is_empty()) {
+                // Only the installed ordered lane needs its actual child width
+                // before creating producer partitions. The reader's width is
+                // not the downstream Partial aggregate's width.
+                let build = build_node(program, *input, ctx, error, Some(ordered))?;
+                let session = ctx.runtime_filter_execution.session.as_ref().ok_or_else(|| {
+                    novarocks_functions::KernelFailure::InvalidProgram(
+                        novarocks_functions::KernelDiagnostic::new(
+                            "compiled ordered Aggregate TopN has no Task runtime-filter session",
+                        ),
+                    )
+                })?;
+                let factory = CompiledAggregateProcessorFactory::try_new_ordered(
+                    Arc::clone(program), id, Arc::clone(error), Arc::clone(session),
+                    build.pipeline.dop, &ordered.host, &ordered.control,
+                )?;
+                ordered_input = Some(build);
+                factory
+            } else {
+                CompiledAggregateProcessorFactory::try_new(
+                    Arc::clone(program), id, Arc::clone(error),
+                )?
+            };
             let complete = factory.completes_groups();
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = match ordered_input {
+                Some(build) => build,
+                None => build_node(program, *input, ctx, error, ordered)?,
+            };
             if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
                 let partition_slots = factory.local_group_partition_slots();
                 let (partial, final_stage) = factory.into_local_update_stages()?;
@@ -703,7 +882,7 @@ fn build_node(
                 id,
                 Arc::clone(error),
             )?;
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, ordered)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
@@ -715,7 +894,7 @@ fn build_node(
             // at most one row per key, so the assertion runs on one driver.
             // The keyed mode keeps the existing owner's key identity: a NULL
             // key equals a NULL key, and values compare by type and display.
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, ordered)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
@@ -723,7 +902,7 @@ fn build_node(
         }
         ProgramNodeKind::Repeat { input, .. } => {
             let factory = CompiledRepeatProcessorFactory::try_new(program, id)?;
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -737,7 +916,7 @@ fn build_node(
             max_output_rows,
             max_output_bytes,
         } => {
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             let statistics_root = id == program.graph().root()
                 && matches!(program.graph().sink(),
                 Some(novarocks_local_program::StaticSinkProgram::RootResult(contract))
@@ -812,7 +991,7 @@ fn build_node(
                 id,
                 Arc::clone(error),
             )?;
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -826,31 +1005,31 @@ fn build_node(
                 id,
                 Arc::clone(error),
             )?;
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             build.pipeline.factories.push(Box::new(factory));
             Ok(build)
         }
         ProgramNodeKind::TableWriter { input, .. } => {
-            writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error)
+            writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error, ordered)
         }
         ProgramNodeKind::TableFinish { inputs, .. } => {
-            writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error)
+            writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error, ordered)
         }
         // The probe is the left input and the build the right input.
         ProgramNodeKind::Join { left, right, .. } => {
-            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error)
+            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error, ordered)
         }
         ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
-            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error)
+            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error, ordered)
         }
         ProgramNodeKind::RuntimeFilterConsumer { .. } => Err(format!(
             "compiled join probe-key runtime-filter consumer at local node {} is not executable yet",
             id.index()
-        )),
+        ).into()),
         _ => Err(format!(
             "compiled node family at local node {} has no compiled processor yet",
             id.index()
-        )),
+        ).into()),
     }
 }
 
@@ -866,12 +1045,13 @@ fn build_union_all(
     inputs: &[ProgramNodeId],
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
     validate_union_branches(program, id, inputs)?;
     let mut builds = Vec::with_capacity(inputs.len());
     let mut producers = 0usize;
     for input in inputs {
-        let child = build_node(program, *input, ctx, error)?;
+        let child = build_node(program, *input, ctx, error, ordered)?;
         producers =
             producers.saturating_add(usize::try_from(child.pipeline.dop.max(1)).unwrap_or(1));
         builds.push(child);
@@ -1046,6 +1226,8 @@ mod join_tests;
 #[cfg(test)]
 #[path = "compiled_runtime_filter_tests.rs"]
 mod runtime_filter_tests;
+#[cfg(test)]
+pub(crate) use runtime_filter_tests::ordered_scan_with_numeric_membership_fixture;
 
 #[cfg(test)]
 #[path = "compiled_runtime_filter_compile_tests.rs"]

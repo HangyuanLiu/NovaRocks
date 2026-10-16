@@ -59,6 +59,7 @@ use novarocks_local_program::{
     ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramStateTemplate,
 };
 
+use super::compiled_aggregate_topn::{CompiledAggregateTopN, CompiledAggregateTopNFactory};
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
@@ -72,6 +73,9 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime_filter::{
+    OrderedTopNAllocationHost, RuntimeFilterProducerFailure, RuntimeFilterSessionRef,
+};
 
 /// Group keys use the table's specialized layouts where they apply.
 const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
@@ -269,6 +273,7 @@ pub struct CompiledAggregateProcessorFactory {
     output_role: AggregateSchemaRole,
     grouping: CompiledAggregateGrouping,
     direct_intermediate: bool,
+    topn: Option<CompiledAggregateTopNFactory>,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -277,6 +282,47 @@ impl CompiledAggregateProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
+    ) -> Result<Self, String> {
+        Self::try_new_parts(program, node, error, false)
+    }
+
+    pub(crate) fn try_new_ordered(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        session: RuntimeFilterSessionRef,
+        actual_dop: i32,
+        host: &OrderedTopNAllocationHost,
+        control: &RuntimeKernelControl,
+    ) -> ExecutionResult<Self> {
+        let mut factory = Self::try_new_parts(program, node, error, true)?;
+        if factory.grouping != CompiledAggregateGrouping::Partial
+            || factory.calls.is_empty()
+            || factory
+                .calls
+                .iter()
+                .any(|call| call.merge || call.contract.distinct())
+        {
+            return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "compiled ordered Aggregate TopN requires a non-distinct logical-input Partial aggregate",
+            )).into());
+        }
+        factory.topn = Some(CompiledAggregateTopNFactory::try_new(
+            &factory.program,
+            node,
+            session,
+            actual_dop,
+            host,
+            control,
+        )?);
+        Ok(factory)
+    }
+
+    fn try_new_parts(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        allow_ordered: bool,
     ) -> Result<Self, String> {
         let at = node.index();
         let graph_node = program
@@ -294,7 +340,7 @@ impl CompiledAggregateProcessorFactory {
         else {
             return Err(format!("compiled local node {at} is not an Aggregate"));
         };
-        if !topn_filters.is_empty() {
+        if !topn_filters.is_empty() && !allow_ordered {
             return Err(format!(
                 "compiled Aggregate at local node {at} with TopN runtime filters is not executable"
             ));
@@ -387,6 +433,7 @@ impl CompiledAggregateProcessorFactory {
             output_role: AggregateSchemaRole::Output,
             grouping,
             direct_intermediate: false,
+            topn: None,
             error,
         })
     }
@@ -446,6 +493,7 @@ impl CompiledAggregateProcessorFactory {
             output_role: AggregateSchemaRole::Intermediate,
             grouping: CompiledAggregateGrouping::Partial,
             direct_intermediate: false,
+            topn: None,
             error: Arc::clone(&self.error),
         };
         let final_stage = Self {
@@ -459,6 +507,7 @@ impl CompiledAggregateProcessorFactory {
             output_role: AggregateSchemaRole::Output,
             grouping: CompiledAggregateGrouping::Complete,
             direct_intermediate: true,
+            topn: None,
             error: self.error,
         };
         Ok((partial, final_stage))
@@ -478,7 +527,16 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
         &self.name
     }
 
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        let (topn, failed) = match self
+            .topn
+            .as_ref()
+            .map(|factory| factory.create_for_driver(&self.program, dop, driver_id))
+            .transpose()
+        {
+            Ok(topn) => (topn, None),
+            Err(error) => (None, Some(error)),
+        };
         Box::new(CompiledAggregateProcessor {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
@@ -501,7 +559,8 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
             pending: VecDeque::new(),
             finishing: false,
             finished: false,
-            failed: None,
+            failed,
+            topn,
         })
     }
 }
@@ -533,6 +592,7 @@ struct CompiledAggregateProcessor {
     finished: bool,
     /// The first failure owns its original typed category and diagnostic.
     failed: Option<ExecutionFailure>,
+    topn: Option<CompiledAggregateTopN>,
 }
 
 impl CompiledAggregateProcessor {
@@ -548,6 +608,7 @@ impl CompiledAggregateProcessor {
         self.states = None;
         self.key_table = None;
         self.instances = None;
+        self.topn = None;
         drop(std::mem::take(&mut self.pending));
         self.groups = 0;
     }
@@ -561,6 +622,9 @@ impl CompiledAggregateProcessor {
             Err(error) => {
                 if self.failed.is_none() {
                     self.failed = Some(error);
+                    if let Some(topn) = &mut self.topn {
+                        let _ = topn.fail(RuntimeFilterProducerFailure::ExecutionFailed);
+                    }
                     self.finishing = true;
                     self.finished = true;
                     // A failed update may have changed a prefix of the calls,
@@ -675,12 +739,15 @@ impl CompiledAggregateProcessor {
         }
         let mut group_ids = Vec::with_capacity(rows);
         let mut next = self.groups;
-        let mut record = |lookup: crate::exec::hash_table::key_table::KeyLookup| {
+        let mut record = |row, lookup: crate::exec::hash_table::key_table::KeyLookup| {
             if lookup.is_new {
                 if lookup.group_id != next {
                     return Err(ExecutionFailure::from(
                         "compiled aggregate key table created a group out of order",
                     ));
+                }
+                if let Some(topn) = &mut self.topn {
+                    topn.observe_new_group(&self.program, keys, row, lookup.group_id)?;
                 }
                 next += 1;
             }
@@ -698,6 +765,7 @@ impl CompiledAggregateProcessor {
                         .map(|bytes| bytes.as_slice())
                         .ok_or_else(|| ExecutionFailure::from("serialized group row missing"))?;
                     record(
+                        row,
                         table
                             .find_or_insert_from_row(&views, row, bytes, hash)
                             .map_err(key_error)?,
@@ -718,6 +786,7 @@ impl CompiledAggregateProcessor {
                     .map_err(key_error)?;
                 for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
                     record(
+                        row,
                         table
                             .find_or_insert_one_number(view, row, hash)
                             .map_err(key_error)?,
@@ -731,6 +800,7 @@ impl CompiledAggregateProcessor {
                 let hashes = table.build_group_hashes(&views, rows).map_err(key_error)?;
                 for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
                     record(
+                        row,
                         table
                             .find_or_insert_one_string_like(view, row, hash)
                             .map_err(key_error)?,
@@ -741,6 +811,7 @@ impl CompiledAggregateProcessor {
                 let hashes = table.build_group_hashes(&views, rows).map_err(key_error)?;
                 for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
                     record(
+                        row,
                         table
                             .find_or_insert_fixed_size(&views, row, hash)
                             .map_err(key_error)?,
@@ -779,7 +850,7 @@ impl CompiledAggregateProcessor {
                             .find_or_insert_from_row(&views, row, bytes, hash)
                             .map_err(key_error)?
                     };
-                    record(lookup)?;
+                    record(row, lookup)?;
                 }
             }
         }
@@ -1041,7 +1112,33 @@ impl Operator for CompiledAggregateProcessor {
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
-        Ok(())
+        let result = self
+            .topn
+            .as_mut()
+            .map_or(Ok(()), CompiledAggregateTopN::bind);
+        self.failure_result(result)
+    }
+    fn cancel(&mut self) {
+        let Some(topn) = &mut self.topn else {
+            return;
+        };
+        let _ = topn.fail(RuntimeFilterProducerFailure::Cancelled);
+        self.release_owned();
+    }
+    fn on_driver_failure(&mut self) {
+        let Some(topn) = &mut self.topn else {
+            return;
+        };
+        let _ = topn.fail(RuntimeFilterProducerFailure::ExecutionFailed);
+        self.release_owned();
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        let Some(topn) = &mut self.topn else {
+            return Ok(());
+        };
+        let result = topn.fail(RuntimeFilterProducerFailure::ExecutionFailed);
+        self.release_owned();
+        result
     }
     fn name(&self) -> &str {
         &self.name
@@ -1079,7 +1176,11 @@ impl ProcessorOperator for CompiledAggregateProcessor {
         } else if chunk.is_empty() {
             Ok(())
         } else {
-            self.consume(&chunk)
+            self.consume(&chunk).and_then(|()| {
+                self.topn
+                    .as_mut()
+                    .map_or(Ok(()), |topn| topn.after_successful_input(chunk.len()))
+            })
         };
         self.failure_result(result)
     }
@@ -1101,8 +1202,13 @@ impl ProcessorOperator for CompiledAggregateProcessor {
             return Ok(());
         }
         self.finishing = true;
-        let result = self.emit();
+        let result = self.emit().and_then(|()| {
+            self.topn
+                .as_mut()
+                .map_or(Ok(()), CompiledAggregateTopN::finish)
+        });
         self.failure_result(result)?;
+        self.topn = None;
         // The states and keys are released once their output is built.
         self.states = None;
         self.key_table = None;
@@ -1258,6 +1364,7 @@ mod failure_latch_tests {
             finishing: false,
             finished: false,
             failed: None,
+            topn: None,
         };
         processor.set_mem_tracker(Arc::clone(&tracker));
         processor.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(

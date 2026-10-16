@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod additional_buffers;
 mod chunk_impl;
 mod compiled_layout_metadata_request;
+mod filtered_output;
 mod hydrate;
 mod memory;
 mod output_metadata;
@@ -36,8 +38,10 @@ mod typed_array_normalization;
 #[cfg(test)]
 pub(crate) mod typed_fixture;
 
+pub(crate) use additional_buffers::AdditionalBufferLedger;
 pub use chunk_impl::{Chunk, ChunkBatchProjection};
 pub use compiled_layout_metadata_request::original_compiled_schema_metadata_request;
+pub(crate) use filtered_output::normalize_filter_mask_observed;
 pub use hydrate::dictionary_hydration_required_observed;
 pub use hydrate::hydrate_dictionary_columns_except;
 pub use hydrate::hydrate_dictionary_columns_observed;
@@ -45,9 +49,10 @@ pub use hydrate::hydrate_dictionary_columns_owned_observed;
 pub use memory::record_batch_bytes;
 pub(crate) use memory::{
     ChunkMemoryLease, TransferredChunkBytes, record_batch_additional_bytes,
-    record_batch_shared_owner_bytes,
+    record_batch_additional_bytes_observed, record_batch_shared_owner_bytes,
 };
 pub(crate) use output_metadata::OutputColumnMetadata;
+pub(crate) use output_metadata::retain_column_capacity;
 pub use root_array_storage::{
     ARROW_BUFFER_OWNER_METADATA_BOUND, RootArrayStorageError, RootArrayStorageLimits,
     borrowed_root_array_storage, borrowed_root_batch_storage,

@@ -31,12 +31,12 @@ use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
 };
 
-use super::{RuntimeFilterConsumerState, RuntimeFilterKeyProvider};
+use super::{RuntimeFilterApplication, RuntimeFilterConsumerState, RuntimeFilterKeyProvider};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 use crate::exec::operators::compiled_expression::{
-    RuntimeKernelControl, evaluate_all, instances, root_value_type,
+    RuntimeKernelControl, evaluate_all, evaluate_chunk_all, instances, root_value_type,
 };
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::RuntimeErrorState;
@@ -63,16 +63,38 @@ impl CompiledRuntimeFilterConsumers {
         contracts: Vec<execution::RuntimeFilterConsumerContract>,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
-        let sites = (0..contracts.len())
-            .map(|binding| {
-                let binding = u32::try_from(binding)
+        let contracts = contracts
+            .into_iter()
+            .enumerate()
+            .map(|(index, contract)| {
+                let ordinal = u32::try_from(index)
                     .map_err(|_| "compiled runtime-filter binding count exceeds u32")?;
-                Ok(ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::RuntimeFilter { binding },
-                })
+                Ok((ordinal, contract))
             })
-            .collect::<Result<Arc<[_]>, String>>()?;
+            .collect::<Result<Vec<_>, String>>()?;
+        Self::try_new_at_ordinals(owner, program, node, contracts, error)
+    }
+
+    /// A Scan splits ordered and membership consumers without changing any
+    /// root's ordinal in the original complete binding list.
+    pub(crate) fn try_new_at_ordinals(
+        owner: &'static str,
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        contracts: Vec<(u32, execution::RuntimeFilterConsumerContract)>,
+        error: Arc<RuntimeErrorState>,
+    ) -> Result<Self, String> {
+        let sites = contracts
+            .iter()
+            .map(|(binding, _)| ProgramExpressionRootSite::Node {
+                node,
+                role: ProgramNodeExpressionRole::RuntimeFilter { binding: *binding },
+            })
+            .collect::<Arc<[_]>>();
+        let contracts = contracts
+            .into_iter()
+            .map(|(_, contract)| contract)
+            .collect();
         let state = RuntimeFilterConsumerState::from_contracts(
             owner,
             contracts,
@@ -105,6 +127,17 @@ impl CompiledRuntimeFilterConsumers {
         })
     }
 
+    /// The original membership gate/state is retained; only this direct
+    /// ordered-scan route uses controlled row matching and source custody.
+    pub(crate) fn driver_keys_controlled(
+        &self,
+        host: Arc<dyn novarocks_functions::AggregateStateAllocator>,
+    ) -> CompiledRuntimeFilterKeys {
+        let mut keys = self.driver_keys();
+        keys.controlled_host = Some(host);
+        keys
+    }
+
     /// The consumer state every driver of the node shares.
     pub(crate) fn state(&self) -> &RuntimeFilterConsumerState {
         &self.state
@@ -118,6 +151,7 @@ impl CompiledRuntimeFilterConsumers {
             sites: Arc::clone(&self.sites),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
+            controlled_host: None,
         }
     }
 }
@@ -128,9 +162,17 @@ pub(crate) struct CompiledRuntimeFilterKeys {
     sites: Arc<[ProgramExpressionRootSite]>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
+    controlled_host: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
 }
 
 impl CompiledRuntimeFilterKeys {
+    pub(crate) fn bind_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.control.bind_construction_factory(factory);
+    }
+
     pub(crate) fn bind_runtime_state(
         &mut self,
         state: &crate::runtime::runtime_state::RuntimeState,
@@ -146,6 +188,47 @@ impl CompiledRuntimeFilterKeys {
 }
 impl RuntimeFilterKeyProvider for CompiledRuntimeFilterKeys {
     type Error = ExecutionFailure;
+
+    fn apply_snapshot(
+        &mut self,
+        input: Chunk,
+        array: &ArrayRef,
+        snapshot: &execution::RuntimeFilterSnapshot,
+    ) -> ExecutionResult<RuntimeFilterApplication> {
+        let Some(host) = &self.controlled_host else {
+            return super::apply_legacy_runtime_filter_snapshot(input, array, snapshot);
+        };
+        let outcome = execution::evaluator::evaluate_rows_controlled(
+            snapshot.binding_id(),
+            snapshot.logical_version(),
+            snapshot.artifact_query().as_ref(),
+            array,
+            Arc::clone(host),
+            &self.control,
+        )?;
+        let execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } =
+            outcome.outcome().evaluation()
+        else {
+            return Ok(RuntimeFilterApplication::NotEvaluated(input));
+        };
+        let effect = outcome.effect_controlled(&self.control)?.ok_or_else(|| {
+            ExecutionFailure::from(novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "evaluated runtime-filter row outcome has no effect",
+                ),
+            ))
+        })?;
+        let owner = self.control.construction_owner(input.chunk_schema())?;
+        let output = input.filter_ordered_scan_controlled(
+            mask,
+            Arc::clone(host),
+            &self.control,
+            owner.as_ref(),
+        )?;
+        // The borrowed mask and its original controlled stock stay together
+        // through the synchronous creator; only the complete output escapes.
+        Ok(RuntimeFilterApplication::Evaluated { output, effect })
+    }
 
     /// The frozen root port is exact: the chunk is evaluated as delivered.
     fn prepare_input(&mut self, chunk: Chunk) -> ExecutionResult<Chunk> {
@@ -168,6 +251,10 @@ impl RuntimeFilterKeyProvider for CompiledRuntimeFilterKeys {
             .as_mut()
             .and_then(|instances| instances.get_mut(binding))
             .ok_or("compiled runtime-filter key instance is missing")?;
-        evaluate_all(instance, site, &input.record_batch(), &self.control)
+        if self.controlled_host.is_some() {
+            evaluate_chunk_all(instance, site, input, &self.control)
+        } else {
+            evaluate_all(instance, site, &input.record_batch(), &self.control)
+        }
     }
 }

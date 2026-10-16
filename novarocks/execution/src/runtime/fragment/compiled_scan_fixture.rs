@@ -110,19 +110,229 @@ fn payload(
 /// The provider's own projected fields: names, field ids and schema metadata
 /// are provider facts the compiled scan layout keeps exactly.
 fn public_schema() -> Schema {
+    public_schema_with_types(&[int64(), int64()])
+}
+fn public_schema_with_types(types: &[ValueType]) -> Schema {
     Schema::new_with_metadata(
         ["v0", "v1"]
             .into_iter()
+            .zip(types)
             .enumerate()
-            .map(|(id, name)| {
-                Field::new(name, DataType::Int64, false).with_metadata(HashMap::from([(
-                    "provider.field-id".into(),
-                    (id + 1).to_string(),
-                )]))
+            .map(|(id, (name, ty))| {
+                Field::new(name, ty.data_type().clone(), ty.nullable()).with_metadata(
+                    HashMap::from([("provider.field-id".into(), (id + 1).to_string())]),
+                )
             })
             .collect::<Vec<_>>(),
         HashMap::from([("provider.schema".into(), "generation-1".into())]),
     )
+}
+
+/// The same two-column frozen provider author, with explicit complete types
+/// and the exact dynamic-filter assignments of its physical source.
+pub(crate) fn typed_frozen_read(
+    types: &[ValueType],
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+) -> FrozenConnectorRead {
+    typed_frozen_read_with_distribution(types, dynamic_filters, false)
+}
+
+fn typed_frozen_read_with_distribution(
+    types: &[ValueType],
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+    singleton: bool,
+) -> FrozenConnectorRead {
+    assert_eq!(types.len(), 2);
+    let binding = binding();
+    let relation_payload = ConnectorReadRelationPayload::new(
+        ConnectorReadRelationKind::Table,
+        payload(&binding, ConnectorCodecCategory::ReadTable, b"table"),
+        payload(&binding, ConnectorCodecCategory::ReadView, b"view"),
+    );
+    let columns = [b"c0" as &'static [u8], b"c1"].map(|bytes| ProviderColumnReference {
+        column_payload: payload(&binding, ConnectorCodecCategory::ReadColumn, bytes),
+    });
+    let draft = ConnectorReadRelationRecipeDraft::try_new(
+        binding.clone(),
+        relation_payload,
+        columns
+            .iter()
+            .map(|column| column.column_payload.clone())
+            .collect(),
+    )
+    .unwrap();
+    let scan = FrozenConnectorScan::try_new(
+        draft,
+        ["v0", "v1"]
+            .into_iter()
+            .zip(types)
+            .map(|(name, ty)| {
+                StaticScanAssignment::new(
+                    Arc::from(name),
+                    match ty.data_type() {
+                        DataType::Int64 => ConnectorValueType::BigInt,
+                        DataType::Utf8 => ConnectorValueType::Varchar,
+                        other => panic!("undeclared fixture scan type: {other:?}"),
+                    },
+                )
+            })
+            .collect(),
+        TupleDomain::all(),
+        TupleDomain::all(),
+        None,
+        dynamic_filters,
+        NonZeroU64::new(100).unwrap(),
+        NonZeroU64::new(4096).unwrap(),
+        ConnectorReadWorkSource::RuntimeSplits,
+    )
+    .unwrap();
+    let source = ConnectorReadStaticFacts::try_new(
+        ConnectorReadInputVersion::try_new([9]).unwrap(),
+        [7; 32],
+        ConnectorReadProperties::try_new(
+            if singleton {
+                ConnectorReadDistribution::Singleton
+            } else {
+                ConnectorReadDistribution::Unconstrained
+            },
+            vec![],
+        )
+        .unwrap(),
+        ConnectorReadArtifactCoverage::NoArtifactInputs,
+        vec![],
+    )
+    .unwrap();
+    // Independent provider facts keep their original attributes; only complete
+    // declarations author the metadata-free execution schema.
+    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+    let schema = Arc::new(Schema::new(
+        ["v0", "v1"]
+            .into_iter()
+            .zip(types)
+            .map(|(name, ty)| Field::new(name, ty.data_type().clone(), ty.nullable()))
+            .collect::<Vec<_>>(),
+    ));
+    let execution = ConnectorReadExecutionSchema::try_new(
+        schema.clone(),
+        types.to_vec().into_boxed_slice(),
+        storage.clone(),
+    )
+    .unwrap();
+    let original_source = public_schema_with_types(types);
+    let shape = ConnectorSourceSchemaShape::try_new(schema, storage.clone()).unwrap();
+    let source_fields = [0_u32, 1]
+        .into_iter()
+        .map(|ordinal| {
+            ConnectorSourceFieldFacts::try_new(
+                vec![ordinal].into_boxed_slice(),
+                Some((ordinal + 1) as i32),
+                None,
+                HashMap::from([("provider.field-id".into(), (ordinal + 1).to_string())]),
+                &[],
+                storage.clone(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let source_schema = ConnectorSourceSchemaFacts::try_new(
+        shape,
+        original_source.metadata().clone(),
+        source_fields,
+        storage.clone(),
+    )
+    .unwrap();
+    let public =
+        ConnectorReadPublicFacts::try_new_typed(source, None, execution, source_schema, storage)
+            .unwrap();
+    FrozenConnectorRead::try_new(scan, public).unwrap()
+}
+
+/// A real physical Scan under exactly the same frozen fixture provider facts.
+pub(crate) fn add_typed_scan(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    types: &[ValueType],
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+) -> (Vec<ValueId>, FrozenConnectorRead) {
+    add_typed_scan_with_residual(builder, node, types, dynamic_filters, |_, _| Box::default())
+}
+
+pub(crate) fn add_typed_scan_with_residual(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    types: &[ValueType],
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+    residual: impl FnOnce(&mut FragmentBuilder, &[ValueId]) -> Box<[ExprId]>,
+) -> (Vec<ValueId>, FrozenConnectorRead) {
+    // This scripted source declares one physical stream, as the original
+    // ordered Scan compiler fixture does. Partial driver DOP stays explicit.
+    let frozen = typed_frozen_read_with_distribution(types, dynamic_filters, true);
+    let recipe = frozen.scan().recipe();
+    let columns = recipe
+        .columns()
+        .iter()
+        .cloned()
+        .map(|column_payload| ProviderColumnReference { column_payload })
+        .collect::<Vec<_>>();
+    let values = types
+        .iter()
+        .zip(&columns)
+        .map(|(ty, field)| {
+            builder
+                .add_value(
+                    ty.clone(),
+                    ValueOrigin::ProviderField {
+                        scan_node: node,
+                        field: field.clone(),
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let residuals = residual(builder, &values);
+    let properties = PhysicalProperties {
+        distribution: Distribution::Singleton,
+        row_multiplicity: RowMultiplicity::SingleCopy,
+        ordering: Box::default(),
+    };
+    builder
+        .add_scan(
+            node,
+            NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
+                relation: Box::new(Relation::Data(DataRelation {
+                    read: ProviderReadReference {
+                        binding: recipe.binding().clone(),
+                        input_version: ExactInputVersion::try_new([9]).unwrap(),
+                        relation: recipe.relation().clone(),
+                    },
+                    work_source: ConnectorReadWorkSource::RuntimeSplits,
+                    selection_digest: [7; 32],
+                    schema: columns
+                        .iter()
+                        .cloned()
+                        .zip(types)
+                        .map(|(column, ty)| RelationField {
+                            column,
+                            ty: ty.clone(),
+                        })
+                        .collect(),
+                    predicate_guarantees: Box::default(),
+                    provided_properties: properties,
+                })),
+                read_budget: ScanReadBudget {
+                    max_batch_rows: 100,
+                    max_batch_bytes: 4096,
+                },
+                provider_outputs: columns.into_iter().zip(values.iter().copied()).collect(),
+                residuals,
+                derived_values: Box::default(),
+            },
+            values.clone().into_boxed_slice(),
+        )
+        .unwrap();
+    (values, frozen)
 }
 
 /// Compile the fixture fragment for `dop` drivers, with or without the
@@ -293,81 +503,9 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     .unwrap();
     let plan = plan.finish().unwrap();
 
-    let draft = ConnectorReadRelationRecipeDraft::try_new(
-        binding,
-        relation_payload,
-        columns
-            .iter()
-            .map(|column| column.column_payload.clone())
-            .collect(),
-    )
-    .unwrap();
-    let scan = FrozenConnectorScan::try_new(
-        draft,
-        ["v0", "v1"]
-            .into_iter()
-            .map(|name| StaticScanAssignment::new(Arc::from(name), ConnectorValueType::BigInt))
-            .collect(),
-        TupleDomain::all(),
-        TupleDomain::all(),
-        None,
-        vec![],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
-    )
-    .unwrap();
-    let source = ConnectorReadStaticFacts::try_new(
-        ConnectorReadInputVersion::try_new([9]).unwrap(),
-        [7; 32],
-        ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, vec![]).unwrap(),
-        ConnectorReadArtifactCoverage::NoArtifactInputs,
-        vec![],
-    )
-    .unwrap();
-    // Independent provider facts keep their original attributes; only complete
-    // declarations author the metadata-free execution schema.
-    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("v0", DataType::Int64, false),
-        Field::new("v1", DataType::Int64, false),
-    ]));
-    let execution = ConnectorReadExecutionSchema::try_new(
-        schema.clone(),
-        vec![int64(), int64()].into_boxed_slice(),
-        storage.clone(),
-    )
-    .unwrap();
-    let original_source = public_schema();
-    let shape = ConnectorSourceSchemaShape::try_new(schema, storage.clone()).unwrap();
-    let source_fields = [0_u32, 1]
-        .into_iter()
-        .map(|ordinal| {
-            ConnectorSourceFieldFacts::try_new(
-                vec![ordinal].into_boxed_slice(),
-                Some((ordinal + 1) as i32),
-                None,
-                HashMap::from([("provider.field-id".into(), (ordinal + 1).to_string())]),
-                &[],
-                storage.clone(),
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let source_schema = ConnectorSourceSchemaFacts::try_new(
-        shape,
-        original_source.metadata().clone(),
-        source_fields,
-        storage.clone(),
-    )
-    .unwrap();
-    let public =
-        ConnectorReadPublicFacts::try_new_typed(source, None, execution, source_schema, storage)
-            .unwrap();
     let scans = BTreeMap::from([(
         ProviderReadOccurrenceId::new(0),
-        FrozenConnectorRead::try_new(scan, public).unwrap(),
+        typed_frozen_read(&[int64(), int64()], vec![]),
     )]);
 
     let mut uses = BTreeMap::new();
@@ -408,7 +546,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
 }
 
 /// One complete eager use tree per physical root site in one root domain.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
+pub(crate) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     struct Author<'a> {
         fragment: &'a Fragment,
         next: u32,
@@ -420,8 +558,10 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.next += 1;
             let args = match &self.fragment.expressions().get(expr).unwrap().kind {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-                _ => panic!("the scan fixture has only comparisons, values and literals"),
+                ExprKind::Literal(_) | ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
+                _ => panic!(
+                    "the scan fixture has only binary expressions, values, literals and constants"
+                ),
             };
             let arguments = args
                 .iter()
@@ -508,7 +648,7 @@ impl ConnectorReadProgramCompiler for Port {
     }
 }
 
-fn providers() -> PureProviderProgramCatalog<ConnectorError> {
+pub(crate) fn providers() -> PureProviderProgramCatalog<ConnectorError> {
     let provider = ConnectorProviderId::parse("alpha").unwrap();
     PureProviderProgramCatalog::try_new(
         &[PureProviderManifestEntry::new(

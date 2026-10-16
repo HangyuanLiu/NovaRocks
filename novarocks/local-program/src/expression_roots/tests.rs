@@ -170,14 +170,14 @@ fn metadata_source_program(
             8,
             FilterProducerKind::OrderedBound,
             StaticFilterContract::Ordered {
-                keys: Arc::from([FilterOrderKey {
+                keys: crate::FilterOrderKeys::from_legacy(Arc::from([FilterOrderKey {
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,
                         false,
                     ),
                     direction: FilterSortDirection::Ascending,
                     null_order: FilterNullOrder::Last,
-                }]),
+                }])),
                 comparator_digest: [1; 32],
                 contract_digest: [2; 32],
             },
@@ -197,7 +197,8 @@ fn metadata_source_program(
                     group_key_ordinal: 0,
                     limit: NonZeroU32::new(3).unwrap(),
                     producer,
-                }],
+                }]
+                .into(),
                 streaming_preaggregation_mode: None,
             },
             layout.clone(),

@@ -28,6 +28,7 @@ use crate::{
 
 pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut lineage_indexes = RuntimeFilterLineageIndexes::default();
+    let mut parent_proof_work = SemanticTraceWorkBudget::new(errors.limits());
     let attachments = runtime_filter_attachment_index(plan);
     let inbound_edges = runtime_filter_inbound_edge_index(plan);
     for filter in plan.runtime_filters().values() {
@@ -84,6 +85,7 @@ pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut Validat
                     filter.reduction,
                     &path,
                     errors,
+                    &mut parent_proof_work,
                 );
                 validate_runtime_filter_join_coverage(fragment, filter, producer, &path, errors);
                 validate_runtime_filter_producer_progress(
@@ -1277,6 +1279,7 @@ pub(crate) fn validate_runtime_filter_producer_target(
     reduction: crate::RuntimeFilterReduction,
     path: &str,
     errors: &mut ValidationContext,
+    parent_proof_work: &mut SemanticTraceWorkBudget,
 ) {
     if matches!(
         producer.target,
@@ -1341,7 +1344,7 @@ pub(crate) fn validate_runtime_filter_producer_target(
                 limit: actual_limit,
                 offset: actual_offset,
                 phase: actual_phase,
-                reduction: crate::TopNReduction::Rows,
+                reduction: topn_reduction,
             } = &topn_node.kind
             else {
                 return errors.push(ValidationError::new(
@@ -1356,7 +1359,20 @@ pub(crate) fn validate_runtime_filter_producer_target(
                 crate::RuntimeFilterDomain::Ordered { key, .. }
                     if key.direction == direction && key.null_ordering == null_ordering
             );
-            producer.apply_point == (crate::RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 })
+            let parent_matches = match topn_reduction {
+                crate::TopNReduction::Rows => true,
+                crate::TopNReduction::GroupedStates { .. } => {
+                    aggregate::aggregate_topn_grouped_parent_matches(
+                        fragment,
+                        aggregate,
+                        topn_node,
+                        parent_proof_work,
+                    )
+                }
+            };
+            parent_matches
+                && producer.apply_point
+                    == (crate::RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 })
                 && aggregate.inputs.len() == 1
                 && group_by.len() == 1
                 && topn_node.inputs.as_ref() == [aggregate.id]

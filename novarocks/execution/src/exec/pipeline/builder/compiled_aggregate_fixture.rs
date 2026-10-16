@@ -26,8 +26,8 @@
 //! - its frozen effects, obtained from a fresh preparation by the installed
 //!   owner with the same inputs the BE compiler later uses.
 //!
-//! Every expression root here is a leaf (literal or value read), so each root
-//! gets one eager use in one shared expression domain.
+//! Expression roots reuse the original Scan fixture's eager use-tree author,
+//! including binary residuals. Relational calls retain their separate domains.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -551,25 +551,21 @@ pub(super) fn finish(
 fn freeze(
     fragment: &Fragment,
     catalog: &PureEngineFunctionCatalog,
+    parameters: &SemanticParameters,
 ) -> (PhysicalRootUses, FrozenFragmentCalls) {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
+    let expression_roots = crate::runtime::fragment::scan::compiled_fixture::root_uses(fragment);
     let expression_domain = EvaluationDomainId::new(0);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain: expression_domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
+    let mut uses = expression_roots
+        .flow()
+        .uses()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let bindings = expression_roots
+        .bindings()
+        .iter()
+        .map(|(site, id)| (*site, *id))
+        .collect();
     let mut domains = vec![ExpressionEvaluationDomain {
         id: expression_domain,
         parent: None,
@@ -621,7 +617,6 @@ fn freeze(
     )
     .unwrap();
     let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
-    let parameters = SemanticParameters::try_new([]).unwrap();
     let mut frozen = Vec::new();
     for (node, ordinal, context, call_site) in sites {
         let calls = match &fragment.nodes()[&node].kind {
@@ -776,10 +771,22 @@ pub(super) fn packages(
     plan: &PhysicalPlan,
     catalog: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, FragmentPackage> {
+    packages_with_reads(plan, catalog, &BTreeMap::new())
+}
+
+/// The same aggregate root/call author with explicitly frozen provider reads.
+pub(super) fn packages_with_reads(
+    plan: &PhysicalPlan,
+    catalog: &PureEngineFunctionCatalog,
+    reads: &BTreeMap<
+        novarocks_physical_plan::ProviderReadOccurrenceId,
+        novarocks_connector_contract::FrozenConnectorRead,
+    >,
+) -> BTreeMap<FragmentId, FragmentPackage> {
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
     for (id, fragment) in plan.fragments() {
-        let (root_uses, frozen) = freeze(fragment, catalog);
+        let (root_uses, frozen) = freeze(fragment, catalog, plan.parameters());
         uses.insert(*id, root_uses);
         calls.insert(*id, frozen);
     }
@@ -800,7 +807,7 @@ pub(super) fn packages(
         .collect::<BTreeMap<_, _>>();
     extract_fragment_packages(
         plan,
-        &BTreeMap::new(),
+        reads,
         &BTreeMap::new(),
         &uses,
         &calls,
@@ -820,8 +827,18 @@ pub(super) fn try_compile(
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();
-    let validated =
-        validate_fragment_providers(Arc::new(package), &providers, &FixtureControl).unwrap();
+    try_compile_with_providers(package, catalog, pipeline_dop, result, &providers)
+}
+
+fn try_compile_with_providers<E: std::error::Error + 'static>(
+    package: FragmentPackage,
+    catalog: &PureEngineFunctionCatalog,
+    pipeline_dop: usize,
+    result: bool,
+    providers: &PureProviderProgramCatalog<E>,
+) -> Result<Arc<LocalProgram>, String> {
+    let validated = validate_fragment_providers(Arc::new(package), providers, &FixtureControl)
+        .map_err(|error| error.to_string())?;
     let options = LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(pipeline_dop).unwrap(),
         // Only a Result root has a frozen placement; a stream sink has none.
@@ -843,6 +860,19 @@ pub(super) fn compile(
 ) -> Arc<LocalProgram> {
     try_compile(package, catalog, pipeline_dop, result)
         .unwrap_or_else(|error| panic!("aggregate fragment compiles: {error}"))
+}
+
+/// Preserve the original compile/options author while admitting the fixture's
+/// actual frozen Scan through its existing pure provider catalogue.
+pub(super) fn compile_with_providers<E: std::error::Error + 'static>(
+    package: FragmentPackage,
+    catalog: &PureEngineFunctionCatalog,
+    pipeline_dop: usize,
+    result: bool,
+    providers: &PureProviderProgramCatalog<E>,
+) -> Arc<LocalProgram> {
+    try_compile_with_providers(package, catalog, pipeline_dop, result, providers)
+        .unwrap_or_else(|error| panic!("aggregate scan fragment compiles: {error}"))
 }
 
 /// Delivers every encoded frame to the receiver port, as the native data

@@ -49,13 +49,27 @@ use super::typed_array_normalization::{
     ArrayNormalizationStep, normalize_execution_array_observed,
 };
 
+#[derive(Clone)]
+enum ChunkAccountingHandle {
+    WholeBatch(Arc<ChunkAccounting>),
+    AdditionalBuffers(super::AdditionalBufferLedger),
+}
+impl std::fmt::Debug for ChunkAccountingHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WholeBatch(owner) => std::fmt::Debug::fmt(owner, f),
+            Self::AdditionalBuffers(owner) => std::fmt::Debug::fmt(owner, f),
+        }
+    }
+}
+
 /// A chunk of data, consisting of multiple rows.
 /// Phase 2: Wrapper around Arrow RecordBatch.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     batch: Arc<RecordBatch>,
     chunk_schema: ChunkSchemaRef,
-    accounting: Option<Arc<ChunkAccounting>>,
+    accounting: Option<ChunkAccountingHandle>,
     /// A provider reservation that already charges the Arrow buffers in this
     /// chunk to the admitted fragment hierarchy.
     ///
@@ -77,7 +91,7 @@ pub struct Chunk {
 pub struct ChunkBatchProjection {
     batch: Arc<RecordBatch>,
     chunk_schema: ChunkSchemaRef,
-    accounting: Option<Arc<ChunkAccounting>>,
+    accounting: Option<ChunkAccountingHandle>,
     connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
@@ -88,7 +102,7 @@ pub struct ChunkBatchProjection {
 // references and finite creation holds. It carries no query/context capability.
 struct ChunkSourceStorageHold {
     schema: ChunkSchemaRef,
-    accounting: Option<Arc<ChunkAccounting>>,
+    accounting: Option<ChunkAccountingHandle>,
     connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
@@ -144,10 +158,19 @@ impl ChunkBatchProjection {
 
 impl Chunk {
     pub(crate) fn source_authority(&self) -> super::ChunkSourceAuthorityRef<'_> {
-        super::ChunkSourceAuthorityRef::from_attached(
-            self.accounting.as_ref(),
-            self.connector_output_memory.as_ref(),
-        )
+        match self.accounting.as_ref() {
+            Some(ChunkAccountingHandle::AdditionalBuffers(ledger)) => ledger.source_authority(),
+            Some(ChunkAccountingHandle::WholeBatch(owner)) => {
+                super::ChunkSourceAuthorityRef::from_attached(
+                    Some(owner),
+                    self.connector_output_memory.as_ref(),
+                )
+            }
+            None => super::ChunkSourceAuthorityRef::from_attached(
+                None,
+                self.connector_output_memory.as_ref(),
+            ),
+        }
     }
 
     /// Transfer existing finite buffer/type responsibility into an independent
@@ -562,8 +585,16 @@ impl Chunk {
     ) -> Result<(), super::root_schema_backing::RootSchemaBackingError> {
         inspection.charge(std::mem::size_of::<Self>())?;
         inspection.charge_arc(self.batch.as_ref())?;
-        if let Some(accounting) = &self.accounting {
-            inspection.charge_arc(accounting.as_ref())?;
+        match &self.accounting {
+            Some(ChunkAccountingHandle::WholeBatch(accounting)) => {
+                inspection.charge_arc(accounting.as_ref())?
+            }
+            Some(ChunkAccountingHandle::AdditionalBuffers(ledger)) => {
+                inspection.charge(ledger.holder_bytes().map_err(|_| {
+                    super::root_schema_backing::RootSchemaBackingError::UnsupportedType
+                })?)?
+            }
+            None => {}
         }
         if let Some(output_memory) = &self.connector_output_memory {
             inspection.charge_arc(output_memory.as_ref())?;
@@ -611,7 +642,11 @@ impl Chunk {
 
     pub fn slice(&self, offset: usize, length: usize) -> Self {
         assert!(
-            !self.chunk_schema.is_typed(),
+            !self.chunk_schema.is_typed()
+                && !matches!(
+                    self.accounting,
+                    Some(ChunkAccountingHandle::AdditionalBuffers(_))
+                ),
             "typed chunk slicing requires a supplied creation lifetime and observer"
         );
         let mut out = Self {
@@ -623,7 +658,7 @@ impl Chunk {
             construction_storage: ValueTypeStorageLifetime::pure(),
             output_column_metadata: self.output_column_metadata.clone(),
         };
-        if let Some(accounting) = self.accounting.as_ref() {
+        if let Some(ChunkAccountingHandle::WholeBatch(accounting)) = self.accounting.as_ref() {
             let tracker = accounting.tracker();
             out.transfer_to(&tracker);
         }
@@ -725,7 +760,9 @@ impl Chunk {
 
     pub fn transfer_to(&mut self, tracker: &Arc<MemTracker>) {
         if let Some(accounting) = self.accounting.as_ref() {
-            accounting.transfer_to(tracker);
+            if let ChunkAccountingHandle::WholeBatch(accounting) = accounting {
+                accounting.transfer_to(tracker);
+            }
             return;
         }
         if self.connector_output_memory.is_some() {
@@ -735,7 +772,9 @@ impl Chunk {
         if bytes <= 0 {
             return;
         }
-        self.accounting = Some(Arc::new(ChunkAccounting::new(bytes, tracker)));
+        self.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+            ChunkAccounting::new(bytes, tracker),
+        )));
     }
 
     /// Transfers this chunk's complete accounting lease while enforcing the
@@ -754,7 +793,12 @@ impl Chunk {
         tracker: &Arc<MemTracker>,
     ) -> Result<(), crate::runtime::mem_tracker::MemTrackerLimitExceeded> {
         if let Some(accounting) = self.accounting.as_ref() {
-            return accounting.try_transfer_to_typed(tracker);
+            return match accounting {
+                ChunkAccountingHandle::WholeBatch(accounting) => {
+                    accounting.try_transfer_to_typed(tracker)
+                }
+                ChunkAccountingHandle::AdditionalBuffers(_) => Ok(()),
+            };
         }
         if self.connector_output_memory.is_some() {
             return Ok(());
@@ -764,22 +808,33 @@ impl Chunk {
             return Ok(());
         }
         let result = tracker.consume_and_check_limit_typed(bytes);
-        self.accounting = Some(Arc::new(ChunkAccounting::from_charged(bytes, tracker)));
+        self.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+            ChunkAccounting::from_charged(bytes, tracker),
+        )));
         result
     }
 
     #[cfg(test)]
     pub(crate) fn memory_lease(&self) -> Option<ChunkMemoryLease> {
-        self.accounting
-            .as_ref()
-            .map(|accounting| ChunkMemoryLease::native(Arc::clone(accounting)))
+        match self.accounting.as_ref()? {
+            ChunkAccountingHandle::WholeBatch(accounting) => {
+                Some(ChunkMemoryLease::native(Arc::clone(accounting)))
+            }
+            ChunkAccountingHandle::AdditionalBuffers(_) => None,
+        }
     }
 
     /// Moves this chunk's accounting owner without cloning it. Consumers that
     /// retain only a zero-copy projection can then split the projected bytes
     /// from the unprojected remainder exactly.
     pub(crate) fn take_memory_lease(&mut self) -> Option<ChunkMemoryLease> {
-        if let Some(accounting) = self.accounting.take() {
+        if matches!(
+            self.accounting,
+            Some(ChunkAccountingHandle::AdditionalBuffers(_))
+        ) {
+            return None;
+        }
+        if let Some(ChunkAccountingHandle::WholeBatch(accounting)) = self.accounting.take() {
             return Some(ChunkMemoryLease::native(accounting));
         }
         let output_memory = self.connector_output_memory.take()?;
@@ -791,6 +846,27 @@ impl Chunk {
         // either Arrow view remains live.
         self.connector_output_memory = Some(output_memory);
         None
+    }
+
+    /// Attach only an initialized actual delta, keeping its original source
+    /// handles and creating host. No whole-batch lease is granted by this tag.
+    pub(super) fn attach_additional_buffers(
+        &mut self,
+        ledger: super::AdditionalBufferLedger,
+    ) -> Result<(), novarocks_functions::KernelFailure> {
+        if !self.chunk_schema.is_typed()
+            || !ledger.initialized()
+            || self.accounting.is_some()
+            || self.connector_output_memory.is_some()
+        {
+            return Err(novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "additional-buffer output requires an unowned typed batch and initialized extent",
+                ),
+            ));
+        }
+        self.accounting = Some(ChunkAccountingHandle::AdditionalBuffers(ledger));
+        Ok(())
     }
 
     /// Move an existing connector output reservation onto this chunk without
@@ -1088,7 +1164,9 @@ mod shared_batch_projection_tests {
         )
         .unwrap();
         let tracker = MemTracker::new_root("source-values-fixture");
-        chunk.accounting = Some(Arc::new(ChunkAccounting::new(12, &tracker)));
+        chunk.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+            ChunkAccounting::new(12, &tracker),
+        )));
         let neutral = chunk
             .source_storage_lifetime_observed::<LayoutResourceError>(
                 ValueTypeStorageLifetime::pure(),
@@ -1112,7 +1190,9 @@ mod shared_batch_projection_tests {
         )
         .unwrap();
         let tracker = MemTracker::new_root("source-values-refusal");
-        chunk.accounting = Some(Arc::new(ChunkAccounting::new(4, &tracker)));
+        chunk.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+            ChunkAccounting::new(4, &tracker),
+        )));
         assert!(matches!(
             chunk.source_storage_lifetime_observed::<LayoutResourceError>(
                 ValueTypeStorageLifetime::pure(),

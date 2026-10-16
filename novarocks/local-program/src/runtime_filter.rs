@@ -30,6 +30,13 @@ use arrow_schema::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Tim
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
 
+#[path = "runtime_filter/order_keys.rs"]
+mod order_keys;
+pub use order_keys::FilterOrderKeys;
+#[path = "runtime_filter/sites.rs"]
+mod sites;
+pub use sites::{AggregateTopNFilters, ScanFilterConsumers};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterNullSemantics {
     NeverMatches,
@@ -55,6 +62,74 @@ pub struct FilterOrderKey {
     pub null_order: FilterNullOrder,
 }
 
+/// The original v1 single-key comparator/order framing. Each caller supplies
+/// its existing type visitor and observes the same individual key bytes; the
+/// fixed headers and trailer retain the original observation boundaries.
+pub fn single_key_ordered_filter_digests_observed<E>(
+    direction: FilterSortDirection,
+    null_order: FilterNullOrder,
+    visit_key_type: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), E>) -> Result<(), E>,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<([u8; 32], [u8; 32]), E> {
+    let mut comparator = Sha256::new();
+    comparator.update(b"novarocks.runtime-filter.comparator");
+    comparator.update(1_u16.to_be_bytes());
+    let mut order = Sha256::new();
+    order.update(b"novarocks.runtime-filter.order-contract");
+    order.update(1_u16.to_be_bytes());
+    let mut emit = |bytes: &[u8]| {
+        for byte in bytes {
+            observe()?;
+            comparator.update([*byte]);
+            order.update([*byte]);
+        }
+        Ok::<_, E>(())
+    };
+    emit(&1_u32.to_be_bytes())?;
+    visit_key_type(&mut emit)?;
+    emit(&[match direction {
+        FilterSortDirection::Ascending => 1,
+        FilterSortDirection::Descending => 2,
+    }])?;
+    emit(&[match null_order {
+        FilterNullOrder::First => 1,
+        FilterNullOrder::Last => 2,
+    }])?;
+    let comparator: [u8; 32] = comparator.finalize().into();
+    order.update([1]);
+    order.update(comparator);
+    order.update(1_u16.to_be_bytes());
+    Ok((comparator, order.finalize().into()))
+}
+
+/// Static payload domain of a direct-scan ordered filter. This admits no
+/// array provenance, allocation capacity, or interpretation of nominal values.
+/// Preparation and optional planner placement must use this same contract.
+pub fn is_ordered_filter_flat_payload_type(
+    value_type: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    use novarocks_type_contract::ValueKind;
+    matches!(
+        value_type.value_type().kind(),
+        ValueKind::Scalar(_) | ValueKind::String | ValueKind::Binary
+    ) && matches!(
+        value_type.data_type(),
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::FixedSizeBinary(_)
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StaticFilterContract {
     Membership {
@@ -62,7 +137,7 @@ pub enum StaticFilterContract {
         value_type: novarocks_type_contract::FunctionValueType,
     },
     Ordered {
-        keys: Arc<[FilterOrderKey]>,
+        keys: FilterOrderKeys,
         comparator_digest: [u8; 32],
         contract_digest: [u8; 32],
     },
@@ -662,6 +737,104 @@ impl StaticFilterConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_key_ordered_digests_match_frozen_utf8_literals() {
+        // Frozen v1 bytes, also independently checked by the runtime's strict
+        // contract validator. The compiler uses this original type visitor.
+        let cases = [
+            (
+                FilterSortDirection::Ascending,
+                FilterNullOrder::First,
+                "77782fddf467caee0ce29343ed593a1acb8cf89a46ef1f6765730c4bdbabc51d",
+                "5137b9bc01ebb44e0f02e78917ef2e76a655d5320b360f7ec68ff2566970ca62",
+            ),
+            (
+                FilterSortDirection::Ascending,
+                FilterNullOrder::Last,
+                "c712d2a8677a0968f10c6e39490fcd77ab08fcd3ee9de29bb1df944a16223bae",
+                "a26b9e26239e0842aa3fd6016bcaf0d41d0f69d17b6a078ea57633f17e1eba26",
+            ),
+            (
+                FilterSortDirection::Descending,
+                FilterNullOrder::First,
+                "e75b9b677a5a21c827d830a9a56dc38d389f51314de51dc18cb6ce7dd186911f",
+                "63fd0c611009b809d3e952d66ce73e4a9b966b7f68b395eae784f35ca8331627",
+            ),
+            (
+                FilterSortDirection::Descending,
+                FilterNullOrder::Last,
+                "ea4e538a3a740e5c6813c79021f0b816aacd03a060a9741902504e4034bdcaae",
+                "2efde53cbc305da924d5b722ff253591fa2d9dfe6c137f319531b0108af51d6f",
+            ),
+        ];
+        fn digest(hex: &str) -> [u8; 32] {
+            std::array::from_fn(|index| {
+                u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap()
+            })
+        }
+        for (direction, null_order, comparator, order) in cases {
+            let actual = single_key_ordered_filter_digests_observed(
+                direction,
+                null_order,
+                |emit| visit_filter_key_type(&DataType::Utf8, emit),
+                || Ok::<_, FilterMembershipSchemaError>(()),
+            )
+            .unwrap();
+            assert_eq!(actual, (digest(comparator), digest(order)));
+        }
+    }
+
+    #[test]
+    fn ordered_filter_flat_payload_keeps_the_declared_scalar_domain() {
+        use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType};
+        let accepted = [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::FixedSizeBinary(7),
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Shanghai".into())),
+            DataType::Decimal128(20, 3),
+        ];
+        for nullable in [false, true] {
+            for data_type in &accepted {
+                let ty = V::new(data_type.clone(), nullable);
+                assert!(is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
+                assert_eq!(ty.data_type(), data_type);
+                assert_eq!(ty.nullable(), nullable);
+            }
+            for data_type in [
+                DataType::Null,
+                DataType::UInt32,
+                DataType::LargeUtf8,
+                DataType::LargeBinary,
+                DataType::Utf8View,
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+            ] {
+                let ty = V::new(data_type, nullable);
+                assert!(!is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
+            }
+            for (data_type, logical) in [
+                (DataType::Utf8, ValueLogicalType::Json),
+                (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+                (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+            ] {
+                let ty = V::try_with_logical_type(data_type, nullable, logical).unwrap();
+                assert!(!is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
+            }
+        }
+    }
 
     #[test]
     fn complete_domain_and_original_canonical_are_paired_without_semantic_inference() {

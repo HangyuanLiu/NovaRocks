@@ -357,6 +357,187 @@ pub fn aggregate_bindings_match_observed(
     }
 }
 
+/// The RF author and validator borrow this exact direct-parent proof. It
+/// proves state/key correspondence, not runtime installation or source custody.
+fn aggregate_topn_grouped_parent_matches_with(
+    fragment: &Fragment,
+    aggregate: &crate::PhysicalNode,
+    topn: &crate::PhysicalNode,
+    charge: &mut impl FnMut(usize) -> Result<(), StateSignatureComparisonError>,
+) -> Result<bool, StateSignatureComparisonError> {
+    charge(1)?;
+    let NodeKind::Aggregate {
+        group_by: producer_keys,
+        calls: producer_calls,
+        grouping: crate::AggregateGrouping::Partial,
+    } = &aggregate.kind
+    else {
+        return Ok(false);
+    };
+    let NodeKind::TopN {
+        order_by,
+        limit,
+        offset,
+        phase: crate::TopNPhase::Partial { .. },
+        reduction:
+            crate::TopNReduction::GroupedStates {
+                group_by,
+                calls,
+                comparator,
+            },
+    } = &topn.kind
+    else {
+        return Ok(false);
+    };
+    if aggregate.inputs.len() != 1
+        || topn.inputs.as_ref() != [aggregate.id]
+        || producer_keys.len() != 1
+        || group_by.len() != 1
+        || order_by.len() != 1
+        || producer_calls.is_empty()
+        || calls.len() != producer_calls.len()
+        || *limit == 0
+        || *offset != 0
+        || *comparator != crate::OrderedComparisonAlgorithm::NativeScalarOrderV1
+        || aggregate.output_properties.row_multiplicity != crate::RowMultiplicity::SingleCopy
+        || aggregate.output.columns.len().checked_sub(1) != Some(producer_calls.len())
+        || topn.output.columns.len().checked_sub(1) != Some(calls.len())
+    {
+        return Ok(false);
+    }
+    let (producer_expression, key) = producer_keys[0];
+    let Some(expression) = fragment.expressions().get(producer_expression) else {
+        return Ok(false);
+    };
+    let crate::ExprKind::Value(input) = expression.kind else {
+        return Ok(false);
+    };
+    let Some(input_definition) = fragment.values().get(&input) else {
+        return Ok(false);
+    };
+    let Some(key_definition) = fragment.values().get(&key) else {
+        return Ok(false);
+    };
+    if group_by[0].1 != key
+        || crate::expression_value(fragment.expressions(), group_by[0].0) != Some(key)
+        || crate::expression_value(fragment.expressions(), order_by[0].expr) != Some(key)
+        || aggregate.output.columns[0] != key
+        || topn.output.columns[0] != key
+        || !state_value_types_match(&expression.ty, &input_definition.ty, false, charge)?
+        || !state_value_types_match(&expression.ty, &key_definition.ty, false, charge)?
+        || !comparator.supports_value_type(&key_definition.ty)
+    {
+        return Ok(false);
+    }
+    for expression_id in [group_by[0].0, order_by[0].expr] {
+        let Some(expression) = fragment.expressions().get(expression_id) else {
+            return Ok(false);
+        };
+        if !state_value_types_match(&expression.ty, &key_definition.ty, false, charge)? {
+            return Ok(false);
+        }
+    }
+    for (ordinal, (producer, consumer)) in producer_calls.iter().zip(calls).enumerate() {
+        charge(1)?;
+        let AggregatePhase::Partial { sequence } = producer.binding.phase else {
+            return Ok(false);
+        };
+        if consumer.binding.phase != (AggregatePhase::Intermediate { sequence })
+            || consumer.distinct
+            || !consumer.order_by.is_empty()
+            || consumer.arguments.len() != 1
+            || crate::expression_value(fragment.expressions(), consumer.arguments[0])
+                != Some(producer.output)
+            || producer.output == consumer.output
+            || aggregate.output.columns[ordinal + 1] != producer.output
+            || topn.output.columns[ordinal + 1] != consumer.output
+            || !aggregate_bindings_match_with(&producer.binding, &consumer.binding, charge)?
+        {
+            return Ok(false);
+        }
+        for call in [producer, consumer] {
+            let Some(definition) = fragment.values().get(&call.output) else {
+                return Ok(false);
+            };
+            if definition.origin
+                != (crate::ValueOrigin::AggregateState {
+                    call: call.id,
+                    phase: call.binding.phase,
+                })
+                || !state_value_types_match(
+                    &definition.ty,
+                    &call.binding.intermediate_type,
+                    false,
+                    charge,
+                )?
+            {
+                return Ok(false);
+            }
+        }
+        let Some(argument) = fragment.expressions().get(consumer.arguments[0]) else {
+            return Ok(false);
+        };
+        if !state_value_types_match(
+            &argument.ty,
+            &producer.binding.intermediate_type,
+            false,
+            charge,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn aggregate_topn_grouped_parent_matches(
+    fragment: &Fragment,
+    aggregate: &crate::PhysicalNode,
+    topn: &crate::PhysicalNode,
+    budget: &mut SemanticTraceWorkBudget,
+) -> bool {
+    aggregate_topn_grouped_parent_matches_with(fragment, aggregate, topn, &mut |units| {
+        if budget.charge(units) {
+            Ok(())
+        } else {
+            Err(StateSignatureComparisonError::WorkExhausted)
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Use the original state/type comparison and the SQL author's control. The
+/// rest of plan validation and authenticated call sources remain mandatory.
+pub fn aggregate_topn_grouped_parent_matches_observed(
+    fragment: &Fragment,
+    aggregate: &crate::PhysicalNode,
+    topn: &crate::PhysicalNode,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, novarocks_type_contract::CompileControlError> {
+    work.flush()?;
+    let result =
+        aggregate_topn_grouped_parent_matches_with(fragment, aggregate, topn, &mut |units| {
+            for _ in 0..units {
+                work.step()
+                    .map_err(StateSignatureComparisonError::Control)?;
+            }
+            Ok(())
+        });
+    match result {
+        Ok(matches) => {
+            work.flush()?;
+            Ok(matches)
+        }
+        Err(StateSignatureComparisonError::Control(cause)) => Err(cause),
+        Err(StateSignatureComparisonError::WorkExhausted) => {
+            Err(novarocks_type_contract::CompileControlError::ResourceExhausted)
+        }
+        Err(StateSignatureComparisonError::InvalidType) => {
+            work.flush()?;
+            Ok(false)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_aggregate_sequence_inputs(
     plan: &PhysicalPlan,

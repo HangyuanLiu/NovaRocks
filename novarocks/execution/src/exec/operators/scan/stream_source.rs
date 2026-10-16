@@ -41,7 +41,8 @@ use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 use tracing::warn;
 
 use super::output_filter::{
-    ScanDriverFilter, ScanLimitDecision, ScanOutputFilter, record_rows_read, scan_limit_decision,
+    CompiledOrderedOutputFactory, ScanDriverFilter, ScanLimitDecision, ScanOutputFilter,
+    record_rows_read, scan_limit_decision,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
@@ -192,6 +193,34 @@ impl StreamScanSourceFactory {
         })
     }
 
+    /// The direct ordered lane owns residual/live/membership/limit before
+    /// the original whole-chunk handoff; no downstream residual is installed.
+    pub(crate) fn new_compiled_ordered(
+        display_id: i32,
+        op: Arc<dyn ScanOp>,
+        runtime_filters: Option<Arc<CompiledRuntimeFilterConsumers>>,
+        ordered: crate::exec::operators::runtime_filter::CompiledOrderedScanFactory,
+        residual: Option<
+            crate::exec::operators::compiled_expression::CompiledFilterProcessorFactory,
+        >,
+        limit: Option<usize>,
+        host: crate::runtime_filter::OrderedTopNAllocationHost,
+        control: crate::exec::operators::compiled_expression::RuntimeKernelControl,
+    ) -> Self {
+        let mut factory = Self::new_compiled(display_id, op, runtime_filters.clone());
+        factory.limit = limit;
+        factory.filter = ScanOutputFilter::compiled_ordered(
+            runtime_filters,
+            CompiledOrderedOutputFactory {
+                ordered,
+                residual,
+                host,
+                control,
+            },
+        );
+        factory
+    }
+
     /// Build the source of a compiled Scan (local-compiler output). It owns
     /// no legacy expression arena and no conjunct: a compiled residual runs
     /// as a compiled filter after the source, and a compiled scan has no
@@ -326,6 +355,7 @@ impl Operator for StreamScanSourceOperator {
         &mut self,
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) {
+        self.filter.bind_construction_factory(Arc::clone(&factory));
         self.construction = Some(factory);
     }
 
@@ -345,7 +375,7 @@ impl Operator for StreamScanSourceOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        self.filter.bind_runtime_state(state);
+        self.filter.bind_runtime_state(state)?;
         if let Some(consumers) = self.filter.blocking() {
             consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
             consumers.bind(state)?;
@@ -484,14 +514,32 @@ impl ProcessorOperator for StreamScanSourceOperator {
                     self.end_delivery();
                     return Err(error.into());
                 }
-                Poll::Ready(Some(Ok(chunk))) => {
+                Poll::Ready(Some(Ok(mut chunk))) => {
                     self.wake_generation = None;
+                    if self.filter.requires_input_accounting() {
+                        let tracker = self.output_tracker.as_ref().ok_or(
+                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                        )?;
+                        // Use the original whole-source author before any
+                        // ordered transformation borrows or retains this input.
+                        // An existing provider charge remains its sole owner.
+                        chunk.try_transfer_to_typed(tracker).map_err(
+                            crate::exec::pipeline::operator::ConstructionFailure::Memory,
+                        )?;
+                    }
                     self.filter.poll_live_updates()?;
                     let Some(chunk) =
                         self.filter
                             .apply(chunk, self.profiles.as_ref(), &self.event_sink)?
                     else {
                         continue;
+                    };
+                    let Some(chunk) =
+                        self.filter
+                            .restrict_limit(chunk, self.limit, self.rows_emitted)?
+                    else {
+                        self.end_delivery();
+                        return Ok(None);
                     };
                     let rows = chunk.len();
                     match scan_limit_decision(self.limit, self.rows_emitted, rows) {

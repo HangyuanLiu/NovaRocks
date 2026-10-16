@@ -23,7 +23,8 @@
 //! remaining key domains and variable state resources have separate gates.
 
 use super::aggregate_fixture::{
-    CallSpec, add_aggregate, aggregate_catalog, bind, compile, finish, packages, values,
+    CallSpec, add_aggregate, aggregate_catalog, bind, compile, compile_with_providers, finish,
+    packages, packages_with_reads, values,
 };
 use super::family_fixture::{FixtureControl, cell, int64};
 use super::*;
@@ -136,6 +137,76 @@ fn fixture_with_independent_limits(
     n_lists: bool,
     independent_n_limits: bool,
 ) -> Fixture {
+    fixture_with_source(
+        key_types,
+        rows,
+        ranking,
+        limit,
+        n_lists,
+        independent_n_limits,
+        false,
+    )
+}
+
+fn fixture_with_source(
+    key_types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+    ranking: &[(usize, bool, bool)],
+    limit: usize,
+    n_lists: bool,
+    independent_n_limits: bool,
+    ordered_scan: bool,
+) -> Fixture {
+    fixture_with_source_residual(
+        key_types,
+        rows,
+        ranking,
+        limit,
+        n_lists,
+        independent_n_limits,
+        ordered_scan,
+        None,
+    )
+}
+
+type ScanResidualAuthor = fn(
+    &mut FragmentBuilder,
+    NodeId,
+    &[novarocks_physical_plan::ValueId],
+) -> Box<[novarocks_physical_plan::ExprId]>;
+fn fixture_with_source_residual(
+    key_types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+    ranking: &[(usize, bool, bool)],
+    limit: usize,
+    n_lists: bool,
+    independent_n_limits: bool,
+    ordered_scan: bool,
+    residual: Option<ScanResidualAuthor>,
+) -> Fixture {
+    fixture_with_source_parameters(
+        key_types,
+        rows,
+        ranking,
+        limit,
+        n_lists,
+        independent_n_limits,
+        ordered_scan,
+        residual,
+        novarocks_type_contract::SemanticParameters::try_new([]).unwrap(),
+    )
+}
+fn fixture_with_source_parameters(
+    key_types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+    ranking: &[(usize, bool, bool)],
+    limit: usize,
+    n_lists: bool,
+    independent_n_limits: bool,
+    ordered_scan: bool,
+    residual: Option<ScanResidualAuthor>,
+    parameters: novarocks_type_contract::SemanticParameters,
+) -> Fixture {
     assert!(!independent_n_limits || n_lists);
     let groups = key_types.len();
     assert_eq!(ranking.len(), groups);
@@ -177,7 +248,34 @@ fn fixture_with_independent_limits(
     } else {
         types.push(int64(true));
     }
-    let (columns, constants) = declared_values(&mut builder, source, &types, rows);
+    let (columns, constants, reads) = if ordered_scan {
+        assert!(!n_lists && !independent_n_limits);
+        assert_eq!(key_types, &[FunctionValueType::new(DataType::Utf8, true)]);
+        let (columns, read) =
+            crate::runtime::fragment::scan::compiled_fixture::add_typed_scan_with_residual(
+                &mut builder,
+                source,
+                &types,
+                vec![novarocks_connector_contract::StaticScanDynamicFilter::new(
+                    ordered_tests::FILTER.get(),
+                    Arc::from("v0"),
+                )],
+                |builder, values| {
+                    residual.map_or_else(Box::default, |author| author(builder, source, values))
+                },
+            );
+        (
+            columns,
+            ConstantPools::empty(),
+            BTreeMap::from([(
+                novarocks_physical_plan::ProviderReadOccurrenceId::new(0),
+                read,
+            )]),
+        )
+    } else {
+        let (columns, constants) = declared_values(&mut builder, source, &types, rows);
+        (columns, constants, BTreeMap::new())
+    };
     let sequence = |ordinal: usize| AggregateSequenceId::new(41 + ordinal as u32);
     let partial_calls = bounds
         .iter()
@@ -353,6 +451,11 @@ fn fixture_with_independent_limits(
             },
         )
         .unwrap();
+    if ordered_scan {
+        builder
+            .attach_runtime_filter(ordered_tests::FILTER)
+            .unwrap();
+    }
     let definition = finish(builder, topn, FragmentSink::Result, 2);
     let output = definition.nodes()[&topn].output.clone();
     let fields = output
@@ -367,8 +470,9 @@ fn fixture_with_independent_limits(
             ty: definition.values()[value].ty.clone(),
         })
         .collect();
-    let mut plan =
-        PlanBuilder::new(PlanVersionId::try_new([121; 16]).unwrap()).with_constant_pools(constants);
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([121; 16]).unwrap())
+        .with_constant_pools(constants)
+        .with_semantic_parameters(parameters);
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -377,11 +481,41 @@ fn fixture_with_independent_limits(
         fields,
     })
     .unwrap();
-    let plan = plan.finish_observed(&FixtureControl).unwrap();
-    let package = packages(&plan, &catalog)
-        .remove(&FragmentId::new(1))
+    if ordered_scan {
+        plan.add_runtime_filter(ordered_tests::physical_filter(
+            FragmentId::new(1),
+            partial,
+            source,
+            grouped,
+            TopNPhase::Partial {
+                sequence: TopNSequenceId::new(42),
+            },
+            columns[0],
+            key_types[0].clone(),
+            direction(ranking[0].1),
+            null_ordering(ranking[0].2),
+            u64::try_from(limit).unwrap(),
+        ))
         .unwrap();
-    let program = compile(package, &catalog, 2, true);
+    }
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
+    let program = if ordered_scan {
+        let package = packages_with_reads(&plan, &catalog, &reads)
+            .remove(&FragmentId::new(1))
+            .unwrap();
+        compile_with_providers(
+            package,
+            &catalog,
+            2,
+            true,
+            &crate::runtime::fragment::scan::compiled_fixture::providers(),
+        )
+    } else {
+        let package = packages(&plan, &catalog)
+            .remove(&FragmentId::new(1))
+            .unwrap();
+        compile(package, &catalog, 2, true)
+    };
     let mut source = None;
     let mut partial = None;
     let mut grouped = None;
@@ -393,6 +527,35 @@ fn fixture_with_independent_limits(
                     values.batch().unwrap().clone(),
                     ChunkSchema::from_compiled_layout(node.output_layout()).unwrap(),
                 ))
+            }
+            ProgramNodeKind::Scan { .. } if ordered_scan => {
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(StringArray::from(
+                        rows.iter()
+                            .map(|row| match &row[0] {
+                                LiteralValue::Utf8(value) => Some(value.as_ref()),
+                                LiteralValue::Null => None,
+                                other => panic!("ordered scan key: {other:?}"),
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter()
+                            .map(|row| match &row[1] {
+                                LiteralValue::Int64(value) => Some(*value),
+                                LiteralValue::Null => None,
+                                other => panic!("ordered scan payload: {other:?}"),
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                ];
+                let batch =
+                    RecordBatch::try_new(node.output_layout().schema().clone(), columns).unwrap();
+                source = Some(crate::exec::chunk::typed_fixture::chunk(
+                    batch,
+                    node.output_layout().slots(),
+                    &types,
+                ));
             }
             ProgramNodeKind::Aggregate { need_finalize, .. } => {
                 if *need_finalize {
@@ -1090,3 +1253,6 @@ mod exchange_tests;
 
 #[path = "compiled_grouped_topn_error_tests.rs"]
 mod error_tests;
+
+#[path = "compiled_grouped_topn_ordered_tests.rs"]
+mod ordered_tests;

@@ -398,12 +398,10 @@ impl AggregateStreamingSinkOperator {
     }
 
     fn try_submit_native_topn_bound(&mut self) -> Result<(), String> {
-        const PUBLISH_THRESHOLD: usize = 4096;
-
         let Some(session) = self.native_topn_session.as_mut() else {
             return Ok(());
         };
-        if self.topn_rf_rows_since_publish < PUBLISH_THRESHOLD {
+        if self.topn_rf_rows_since_publish < super::AGGREGATE_TOPN_PUBLISH_ROWS {
             return Ok(());
         }
         session.submit_pending(&mut self.topn_boundary_bindings)?;

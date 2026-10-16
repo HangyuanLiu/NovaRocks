@@ -28,13 +28,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tracing::warn;
 
-use prost::Message;
-
 use novarocks_proto_models::filter::RuntimeFilterEnvelopeResponse;
 
 use crate::runtime_filter_rpc::{
     BackendNativeRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
+    runtime_filter_envelope_encoded_len,
 };
 use crate::{BackendDataRuntime, NativeRpcClient};
 use novarocks_worker::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
@@ -480,7 +479,16 @@ async fn process_request(
     let (envelope, policy) = request.envelope.into_parts();
     let identity = *envelope.route_identity();
     let started = Instant::now();
-    let retained_bytes = encode_runtime_filter_envelope(envelope.as_ref()).encoded_len();
+    let retained_bytes = match runtime_filter_envelope_encoded_len(envelope.as_ref()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Some(BackendRuntimeFilterSinkCompletion::TransportFailure(
+                identity,
+                BackendRuntimeFilterUnaryError::contract(error.to_string()),
+                BackendRuntimeFilterTransportFailureReason::ContractRejected,
+            ));
+        }
+    };
     let mut state = ReliableTransportState::new(policy);
     match state.send(identity, Arc::clone(&envelope), retained_bytes, started) {
         Ok(ReliableTransportSendOutcome::Buffered) => {}

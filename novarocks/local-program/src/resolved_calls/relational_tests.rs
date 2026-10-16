@@ -987,7 +987,7 @@ pub(crate) fn aggregate_node(
                     }],
                     need_finalize: finalize,
                     input_is_intermediate: intermediate,
-                    topn_filters: vec![],
+                    topn_filters: vec![].into(),
                     streaming_preaggregation_mode: None,
                 },
                 output,

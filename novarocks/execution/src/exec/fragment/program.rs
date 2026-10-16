@@ -484,7 +484,7 @@ mod tests {
                 7,
                 lp::ProgramNodeKind::Scan {
                     source: recipe.into(),
-                    runtime_filters: vec![],
+                    runtime_filters: vec![].into(),
                     residuals: Vec::new(),
                     limit: None,
                 },

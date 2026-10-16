@@ -351,7 +351,7 @@ mod tests {
             RuntimeFilterBindingId::new(7),
             RuntimeFilterChannelId::new(11),
             k,
-            RuntimeFilterExecutionContract::Ordered(Arc::clone(&order)),
+            RuntimeFilterExecutionContract::Ordered(Arc::clone(&order).into()),
         )
         .expect("TopK producer contract is valid");
         let policy = BackendInstallPolicy::new(
@@ -533,7 +533,7 @@ mod tests {
             (BackendReductionApply::SequenceAdvancedEqual, None)
         );
 
-        let digest_mismatch = RuntimeFilterContribution::new(
+        let digest_mismatch = RuntimeFilterContribution::from_shared(
             RuntimeFilterContributionKind::TopKSummary,
             [0xF1; 32],
             first.canonical_bytes().clone(),
