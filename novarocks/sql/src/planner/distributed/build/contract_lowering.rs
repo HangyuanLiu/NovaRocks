@@ -13087,6 +13087,65 @@ mod tests {
     }
 
     #[test]
+    fn binary_result_labels_keep_selected_display_and_original_statement_alias() {
+        use arrow::array::{Array, BinaryArray};
+        use novarocks_constant_contract::ConstantPool;
+        use std::sync::Arc;
+        for (selected, expected) in [
+            (None, "NULL"),
+            (Some(b"".as_slice()), "X''"),
+            (Some([0x00, 0xab, 0xff].as_slice()), "X'00ABFF'"),
+        ] {
+            let ty = novarocks_type_contract::FunctionValueType::new(DataType::Binary, true);
+            let pool = ConstantPool::try_new(
+                Arc::new(ty.try_to_field("provider.binary").unwrap()),
+                ty.clone(),
+                BinaryArray::from(vec![Some(b"poison.unselected".as_slice()), selected]).to_data(),
+                crate::constant::test_constant_policy(),
+                CompilePhase::Validate,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let mut source = selected_result_label_fixture();
+            let PhysicalPlanKind::Project(project) = &mut source.kind else {
+                unreachable!()
+            };
+            project.items[0].expr = TypedExpr {
+                kind: ExprKind::Constant(pool.value(1).unwrap()),
+                value_type: ty,
+            };
+            project.items[0].output_name = "to_binary('', 'hex')".into();
+            source.output_columns =
+                vec![column(801, "to_binary('', 'hex')", DataType::Binary, true)];
+            let plan = finish_for_test(&source).unwrap();
+            let field = &plan.result_port().unwrap().fields[0];
+            assert_eq!(field.name.as_ref(), expected);
+            assert_eq!(field.alias.as_deref(), Some("to_binary('', 'hex')"));
+            let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+            let reference = fragment
+                .expressions()
+                .iter()
+                .find_map(|(_, definition)| {
+                    if let ContractExprKind::Constant(reference) = &definition.kind {
+                        Some((*reference, definition.ty.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+            let actual = plan
+                .constants()
+                .resolve_observed(reference.0, &reference.1, &mut work)
+                .unwrap();
+            work.finish().unwrap();
+            assert_eq!(actual.ordinal(), 1);
+            assert_eq!(actual.pool().backing_identity(), pool.backing_identity());
+        }
+    }
+
+    #[test]
     fn result_labels_preserve_original_control_at_every_callback() {
         #[derive(Default)]
         struct Control {
