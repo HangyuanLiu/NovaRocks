@@ -2153,3 +2153,63 @@ fn default_real_sql_variant_typeof_keeps_declared_json_and_original_variant_prof
         );
     }
 }
+
+#[test]
+fn default_real_sql_union_of_json_and_typed_variant_null_completes() {
+    use novarocks_physical_plan::ScanReadBudget;
+    use novarocks_sql::compiler::*;
+    for sql in [
+        r#"WITH source_values AS (
+            SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
+            UNION ALL SELECT 2, parse_json('{"a":99,"b":"y"}')
+            UNION ALL SELECT 3, parse_json('{"b":"no-a"}')
+            UNION ALL SELECT 4, parse_json('{"a":1.5}')
+            UNION ALL SELECT 5, CAST(NULL AS VARIANT)
+            UNION ALL SELECT 6, parse_json('{"a":"abc"}')
+        ) SELECT id, try_variant_get(v, '$.a', 'bigint') FROM source_values ORDER BY id"#,
+        r#"SELECT parse_json('{"a":1}') AS v UNION ALL SELECT CAST(NULL AS VARIANT)"#,
+    ] {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([98; 16]).unwrap(),
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: None,
+                current_database: "fixture".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    enable_materialized_view_rewrite: Some(false),
+                    enable_common_subexpr_reuse: Some(false),
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            catalog.snapshot(),
+            noop_constant_evaluator(),
+            policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: 64,
+                max_batch_bytes: 1 << 20,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+        .try_into_completion()
+        .unwrap();
+        let owner = SqlCompiler::start(request, &control)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+            .into_complete()
+            .unwrap()
+            .into_plan();
+        assert!(!owner.plan().fragments().is_empty(), "{sql}");
+    }
+}
