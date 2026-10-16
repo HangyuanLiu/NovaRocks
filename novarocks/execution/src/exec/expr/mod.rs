@@ -143,6 +143,7 @@ pub struct ExprArena {
     types: Vec<DataType>,
     field_schemas: Vec<Option<ChunkFieldSchema>>,
     complete_types: Vec<Option<novarocks_functions::FunctionValueType>>,
+    regexp_count_sources: Vec<Option<novarocks_type_contract::RegexpCountPatternSource>>,
     allow_throw_exception: bool,
     query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
     session_time_zone: Option<String>,
@@ -208,6 +209,7 @@ impl ExprArena {
         self.types.push(data_type);
         self.field_schemas.push(None);
         self.complete_types.push(None);
+        self.regexp_count_sources.push(None);
         id
     }
 
@@ -276,6 +278,72 @@ impl ExprArena {
 
     pub fn value_type(&self, id: ExprId) -> Option<&novarocks_functions::FunctionValueType> {
         self.complete_types.get(id.0).and_then(Option::as_ref)
+    }
+
+    /// Attach an existing emitted-source fact to this exact legacy call.
+    /// Raw Literal/Constant construction never creates such a fact.
+    pub fn set_regexp_count_pattern_source(
+        &mut self,
+        id: ExprId,
+        source: novarocks_type_contract::RegexpCountPatternSource,
+    ) -> Result<(), String> {
+        self.validate_regexp_count_pattern_source(id, source)?;
+        let slot = &mut self.regexp_count_sources[id.0];
+        if slot.is_some_and(|previous| previous != source) {
+            return Err("regexp_count pattern source is already bound".into());
+        }
+        *slot = Some(source);
+        Ok(())
+    }
+
+    pub fn regexp_count_pattern_source(
+        &self,
+        id: ExprId,
+    ) -> Option<novarocks_type_contract::RegexpCountPatternSource> {
+        self.regexp_count_sources.get(id.0).copied().flatten()
+    }
+
+    pub(crate) fn validate_regexp_count_pattern_source(
+        &self,
+        id: ExprId,
+        source: novarocks_type_contract::RegexpCountPatternSource,
+    ) -> Result<(), String> {
+        let Some(ExprNode::FunctionCall {
+            kind: function::FunctionKind::String("regexp_count"),
+            args,
+        }) = self.node(id)
+        else {
+            return Err("regexp_count pattern source belongs to a different call".into());
+        };
+        let [_, pattern] = args.as_slice() else {
+            return Err("regexp_count pattern source requires two arguments".into());
+        };
+        let exact_physical_utf8 = |ty: &novarocks_functions::FunctionValueType| {
+            ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && ty.data_type() == &DataType::Utf8
+        };
+        // A declared complete type cannot hide a checked constant's own domain.
+        // Both facts must independently satisfy this call-local source contract.
+        if self.data_type(*pattern) != Some(&DataType::Utf8)
+            || self
+                .value_type(*pattern)
+                .is_some_and(|ty| !exact_physical_utf8(ty))
+            || self.field_schema(*pattern).is_some_and(|schema| {
+                !matches!(schema.kind(), novarocks_type_contract::ValueKind::String)
+            })
+            || matches!(self.node(*pattern), Some(ExprNode::Constant(value)) if !exact_physical_utf8(value.value_type()))
+        {
+            return Err("regexp_count pattern source requires exact Physical Utf8".into());
+        }
+        if source.invalid_pattern_is_error()
+            && !matches!(
+                self.node(*pattern),
+                Some(ExprNode::Constant(_)) | Some(ExprNode::Literal(LiteralValue::Utf8(_)))
+            )
+        {
+            return Err("regexp_count native literal fact has a dynamic pattern definition".into());
+        }
+        Ok(())
     }
 
     pub fn node(&self, id: ExprId) -> Option<&ExprNode> {
@@ -1840,3 +1908,6 @@ mod runtime_scalar_memory_actual_sql_bitwise_tests;
 
 #[cfg(test)]
 mod signed_cast_nullability_sql_tests;
+
+#[cfg(test)]
+mod regexp_count_source_tests;

@@ -1559,3 +1559,155 @@ fn default_real_sql_utf8_to_nominal_largeint_keeps_original_i128_null_parse_poli
         assert_eq!(actual, expected, "{sql}");
     }
 }
+
+#[test]
+fn default_regexp_count_real_sql_disabled_folding_keeps_exact_emitted_source_through_strong_decode()
+{
+    use novarocks_physical_plan::ScanReadBudget;
+    use novarocks_sql::compiler::*;
+    use novarocks_type_contract::RegexpCountPatternSource as Source;
+    for (sql, expected_source, expected, fails) in [
+        (
+            "SELECT regexp_count('test string', '[0-9')",
+            Source::NativeV1Utf8LiteralWhenPresent,
+            None,
+            true,
+        ),
+        (
+            "SELECT regexp_count('aaa', 'a')",
+            Source::NativeV1Utf8LiteralWhenPresent,
+            Some(3),
+            false,
+        ),
+        (
+            "SELECT regexp_count(CAST(NULL AS VARCHAR), '[0-9')",
+            Source::NativeV1Utf8LiteralWhenPresent,
+            None,
+            false,
+        ),
+        (
+            "SELECT regexp_count('aaa', lower('[0-9'))",
+            Source::Dynamic,
+            None,
+            false,
+        ),
+    ] {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([88; 16]).unwrap(),
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: None,
+                current_database: "fixture".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    enable_materialized_view_rewrite: Some(false),
+                    enable_common_subexpr_reuse: Some(false),
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            catalog.snapshot(),
+            noop_constant_evaluator(),
+            policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: 64,
+                max_batch_bytes: 1 << 20,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+        .try_into_completion()
+        .unwrap();
+        let owner = SqlCompiler::start(request, &control)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .into_plan();
+        let calls=owner.plan().fragments().values().flat_map(|fragment| fragment.expressions().iter().filter_map(move |(_,expression)| matches!(&expression.kind,ExprKind::FunctionCall {function,..} if function.function_id.as_str()=="builtin.scalar/regexp_count/v1").then_some((fragment,expression)))).collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "{sql}");
+        let (fragment, call) = calls[0];
+        let ExprKind::FunctionCall { args, .. } = &call.kind else {
+            unreachable!()
+        };
+        let actual_pattern = fragment.expressions().get(args[1]).unwrap();
+        assert_eq!(
+            matches!(actual_pattern.kind, ExprKind::Constant(_)),
+            expected_source.invalid_pattern_is_error(),
+            "actual emitted definition, never equal-value inference: {sql}"
+        );
+        let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+            owner.plan(),
+            &catalog,
+            &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+            false,
+            compile_control(),
+        )
+        .unwrap();
+        let sources = encoded
+            .fragments
+            .iter()
+            .filter(|source| source.fragment_id == fragment.id().get())
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 1);
+        let source = sources[0];
+        let mut arena = ExprArena::default();
+        decode_node(
+            source,
+            source.root.as_ref().unwrap(),
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .unwrap();
+        let mut roots = Vec::new();
+        let mut index = 0;
+        while let Some(node) = arena.node(novarocks_execution::exec::expr::ExprId(index)) {
+            if matches!(
+                node,
+                novarocks_execution::exec::expr::ExprNode::FunctionCall {
+                    kind: novarocks_execution::exec::expr::function::FunctionKind::String(
+                        "regexp_count"
+                    ),
+                    ..
+                }
+            ) {
+                roots.push(novarocks_execution::exec::expr::ExprId(index));
+            }
+            index += 1;
+        }
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            arena.regexp_count_pattern_source(roots[0]),
+            Some(expected_source)
+        );
+        let output = arena.eval(roots[0], &empty_input());
+        if fails {
+            assert!(
+                output
+                    .unwrap_err()
+                    .starts_with("Invalid regex expression: [0-9."),
+                "{sql}"
+            );
+        } else {
+            let output = output.unwrap();
+            let output = output
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            assert_eq!(
+                (!output.is_null(0)).then(|| output.value(0)),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+}
