@@ -295,22 +295,35 @@ pub(super) fn conversion_intermediate_type_with_construction<E>(
     if recipe_family(source, target).is_ok() {
         return Ok(Some(target.clone()));
     }
-    let intermediate = match typed::same_shape_intermediate_with_construction(
-        source,
-        target,
-        typed::SameShapeConversion::JsonText,
-        creation,
-    ) {
-        Ok(value) => value,
-        Err(super::scalar_construction::OwnerFailure::Binding(
-            FunctionBindingError::NoMatchingOverload,
-        )) => typed::same_shape_intermediate_with_construction(
+    let intermediate = if source.logical_type() == ValueLogicalType::LargeInt
+        && source.data_type() == &DataType::FixedSizeBinary(16)
+        && target.logical_type() == ValueLogicalType::Physical
+        && target.data_type() == &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        && target.nullable()
+    {
+        // Original LARGEINT -> DATETIME is checked i128 -> i64, followed by
+        // the existing numeric calendar grammar. Construct the intermediate
+        // with this caller's actual owner; no same-carrier nominal erasure or
+        // new conversion family is authorized by this composition.
+        creation.value(DataType::Int64, true, ValueLogicalType::Physical)?
+    } else {
+        match typed::same_shape_intermediate_with_construction(
             source,
             target,
-            typed::SameShapeConversion::OpaqueBinary,
+            typed::SameShapeConversion::JsonText,
             creation,
-        )?,
-        Err(error) => return Err(error),
+        ) {
+            Ok(value) => value,
+            Err(super::scalar_construction::OwnerFailure::Binding(
+                FunctionBindingError::NoMatchingOverload,
+            )) => typed::same_shape_intermediate_with_construction(
+                source,
+                target,
+                typed::SameShapeConversion::OpaqueBinary,
+                creation,
+            )?,
+            Err(error) => return Err(error),
+        }
     };
     recipe_family(source, &intermediate)?;
     if intermediate.logical_type() != target.logical_type()
@@ -1194,3 +1207,7 @@ pub fn is_default_scalar_carrier_cast_overload(overload: &FunctionOverloadId) ->
             | NULL_LIFT
     )
 }
+
+#[cfg(test)]
+#[path = "value_conversion/largeint_datetime_tests.rs"]
+mod largeint_datetime_tests;
