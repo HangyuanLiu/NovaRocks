@@ -23,7 +23,7 @@ mod scalar_arrow_profile;
 
 fn main() {
     development::emit();
-    println!("cargo:rerun-if-env-changed=RUSTC");
+    // Cargo fingerprints the compiler; RUSTC is its build-script input, not a user override.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed=src/scalar_resources/profile.rs");
     assert!(

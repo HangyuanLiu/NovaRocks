@@ -44,11 +44,11 @@ pub fn emit(diagnostic_identity_env: &str) {
         .find(|candidate| candidate.is_file())
         .expect("source build helper must be present in the workspace");
     println!("cargo:rerun-if-changed={}", helper.display());
+    // Cargo already fingerprints its effective compiler. Watching its injected RUSTC
+    // as a caller environment variable causes false invalidation across invocations.
     for key in [
         diagnostic_identity_env,
         "RUSTFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "RUSTC",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
     ] {
