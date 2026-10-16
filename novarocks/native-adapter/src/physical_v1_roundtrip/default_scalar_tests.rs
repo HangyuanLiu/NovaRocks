@@ -851,10 +851,22 @@ fn default_array_literal_frozen_json_child_keeps_original_constructor() {
 }
 
 fn encoded_original_map_call() -> plan::PlanFragment {
+    encoded_original_map_call_with_sources(
+        ValueType::new(DataType::Int32, false),
+        ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json).unwrap(),
+        [
+            Arc::new(Int32Array::from(vec![7])),
+            Arc::new(StringArray::from(vec!["{\"a\":1}"])),
+        ],
+    )
+}
+
+fn encoded_original_map_call_with_sources(
+    key: ValueType,
+    json: ValueType,
+    arrays: [ArrayRef; 2],
+) -> plan::PlanFragment {
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let key = ValueType::new(DataType::Int32, false);
-    let json =
-        ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json).unwrap();
     let mut pools = Vec::new();
     let mut arguments = Vec::new();
     let references = [
@@ -866,10 +878,6 @@ fn encoded_original_map_call() -> plan::PlanFragment {
             pool: ConstantPoolId::new(41),
             ordinal: 0,
         },
-    ];
-    let arrays: [ArrayRef; 2] = [
-        Arc::new(Int32Array::from(vec![7])),
-        Arc::new(StringArray::from(vec!["{\"a\":1}"])),
     ];
     for (ty, array) in [&key, &json].into_iter().zip(arrays) {
         let pool = ConstantPool::try_new(
@@ -1173,4 +1181,251 @@ fn default_scalar_frozen_percentile_binary_target_reaches_original_keep_leaf() {
             .contains("default host does not support this frozen value-domain conversion"),
         "{error}"
     );
+}
+
+fn assert_real_sql_optimized_constant_keeps_original_none(sql: &str, expected: Option<&str>) {
+    use novarocks_physical_plan::ScanReadBudget;
+    use novarocks_sql::compiler::{
+        DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
+        SqlCompiler, SqlFinalPlanCompileRequest, SqlFunctionCatalog, SqlPhysicalEmissionMode,
+        SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+        build_builtin_engine_function_catalog, noop_constant_evaluator,
+    };
+
+    let control = SqlCompileControl::unbounded();
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let request = SqlFinalPlanCompileRequest::new(
+        PlanVersionId::try_new([83; 16]).unwrap(),
+        SqlStatementInput::sql(sql),
+        SqlCompileIntent::Query,
+        SqlSessionContext {
+            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            current_catalog: None,
+            current_database: "fixture".into(),
+            optimizer_settings: SessionOptimizerSettings {
+                // Keep real SQL Nested sources until the canonical request is captured.
+                // The existing lowering then unwraps them without changing that request.
+                disabled_rules: vec!["FoldConstant".into()],
+                enable_materialized_view_rewrite: Some(false),
+                enable_common_subexpr_reuse: Some(false),
+                ..SessionOptimizerSettings::default()
+            },
+        },
+        SqlPlanningEnvironment::Distributed,
+        catalog.snapshot(),
+        noop_constant_evaluator(),
+        policy(),
+        SqlPhysicalEmissionMode::OriginalNativeV1,
+        control.clone(),
+        PipelineDopDomain {
+            min: 1,
+            max: 8,
+            requires_power_of_two: true,
+        },
+        ScanReadBudget {
+            max_batch_rows: 64,
+            max_batch_bytes: 1 << 20,
+        },
+        DEFAULT_COMPLETION_LIMITS,
+    )
+    .try_into_completion()
+    .unwrap();
+    let owner = SqlCompiler::start(request, &control)
+        .expect("public SQL compilation")
+        .into_complete()
+        .expect("table-free SQL has no catalog observation need")
+        .into_plan();
+    let calls = owner
+        .plan()
+        .fragments()
+        .values()
+        .flat_map(|fragment| {
+            fragment
+                .expressions()
+                .iter()
+                .filter_map(move |(_, expression)| {
+                    matches!(&expression.kind, ExprKind::FunctionCall { function, .. }
+                if function.function_id.as_str().contains("/lower/"))
+                    .then_some((fragment, expression))
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the authored SQL must retain one LOWER call: {sql}"
+    );
+    let (fragment, call) = calls[0];
+    let ExprKind::FunctionCall { args, .. } = &call.kind else {
+        unreachable!()
+    };
+    assert_eq!(args.len(), 1);
+    let actual = fragment.expressions().get(args[0]).unwrap();
+    let ExprKind::Constant(reference) = &actual.kind else {
+        panic!(
+            "the SQL physical argument must already be a constant: {:?}",
+            actual.kind
+        );
+    };
+    let actual_value = owner
+        .plan()
+        .constants()
+        .entries()
+        .get(&reference.pool)
+        .unwrap()
+        .value(reference.ordinal)
+        .unwrap();
+    assert_eq!(actual_value.value_type(), &actual.ty);
+    let original = fragment
+        .call_requests()
+        .get(PhysicalCallDefinition::Expression(call.id))
+        .expect("original SQL request is frozen independently of physical optimization");
+    let [
+        StaticFunctionArgument::Value {
+            value_type,
+            constant,
+        },
+    ] = original.arguments.as_ref()
+    else {
+        panic!("one original value argument");
+    };
+    assert!(
+        constant.is_none(),
+        "Nested original source must not acquire an address: {sql}; request={original:?}"
+    );
+    assert_eq!(
+        value_type, &actual.ty,
+        "optimization preserves the full argument type"
+    );
+
+    let mut encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+        owner.plan(),
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        false,
+        compile_control(),
+    )
+    .expect("real public SQL plan encoding");
+    let matching = encoded
+        .fragments
+        .iter()
+        .filter(|source| source.fragment_id == fragment.id().get())
+        .count();
+    assert_eq!(
+        matching, 1,
+        "the authored call fragment has one exact wire identity"
+    );
+    let source = encoded.fragments.swap_remove(
+        encoded
+            .fragments
+            .iter()
+            .position(|source| source.fragment_id == fragment.id().get())
+            .unwrap(),
+    );
+    let mut arena = ExprArena::default();
+    let _decoded = decode_node(
+        &source,
+        source.root.as_ref().unwrap(),
+        &mut arena,
+        &NativePlanDecodeContext::default(),
+    )
+    .unwrap_or_else(|error| {
+        panic!("Strong decode must preserve original None and validate actual Constant: {error}")
+    });
+    let mut lower = Vec::new();
+    let mut index = 0;
+    while let Some(node) = arena.node(novarocks_execution::exec::expr::ExprId(index)) {
+        if matches!(
+            node,
+            novarocks_execution::exec::expr::ExprNode::FunctionCall {
+                kind: novarocks_execution::exec::expr::function::FunctionKind::String("lower"),
+                ..
+            }
+        ) {
+            lower.push(novarocks_execution::exec::expr::ExprId(index));
+        }
+        index += 1;
+    }
+    assert_eq!(
+        lower.len(),
+        1,
+        "original LOWER remains the actual execution owner"
+    );
+    let output = arena
+        .eval(lower[0], &empty_input())
+        .expect("original scalar evaluation");
+    let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(output.iter().collect::<Vec<_>>(), vec![expected]);
+}
+
+#[test]
+fn default_real_sql_nested_constant_preserves_original_none_through_strong_decode() {
+    assert_real_sql_optimized_constant_keeps_original_none(
+        "SELECT lower(('MiXeD'))",
+        Some("mixed"),
+    );
+}
+
+#[test]
+fn default_real_sql_nested_typed_null_preserves_original_none_through_strong_decode() {
+    assert_real_sql_optimized_constant_keeps_original_none(
+        "SELECT lower((CAST(NULL AS VARCHAR)))",
+        None,
+    );
+}
+
+#[test]
+fn default_map_original_some_rejects_equal_value_foreign_pool_and_ordinal() {
+    let ty = ValueType::new(DataType::Utf8, false);
+    // Both pools have the same exact type and two identical values. Their
+    // source identities and ordinals remain independent facts.
+    let source = encoded_original_map_call_with_sources(
+        ty.clone(),
+        ty,
+        [
+            Arc::new(StringArray::from(vec!["same", "same"])),
+            Arc::new(StringArray::from(vec!["same", "same"])),
+        ],
+    );
+    let mut arena = ExprArena::default();
+    with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&source),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .expect("the original exact two-pool source is valid");
+    for (pool, ordinal) in [(40, 0), (41, 1)] {
+        let mut changed = source.clone();
+        let Some(novarocks_proto_models::expr::expr::Kind::FunctionCall(call)) =
+            &mut call_expression_mut(&mut changed).kind
+        else {
+            panic!("real MAP source");
+        };
+        let Some(novarocks_proto_models::expr::expr::Kind::ConstantReference(reference)) =
+            &mut call.args[1].kind
+        else {
+            panic!("real original constant");
+        };
+        assert_eq!(reference.pool_id, Some(41));
+        assert_eq!(reference.row_ordinal, 0);
+        reference.pool_id = Some(pool);
+        reference.row_ordinal = ordinal;
+        let mut arena = ExprArena::default();
+        let failure = with_fragment_types(&changed, |types| {
+            crate::fragment_plan_node::decode_zero_input_expression(
+                call_expression(&changed),
+                novarocks_proto_codec::FieldPath::root("expr"),
+                &mut arena,
+                types,
+            )
+        })
+        .unwrap_err();
+        assert!(
+            failure.to_string().contains("constant address differs"),
+            "{failure}"
+        );
+    }
 }
