@@ -859,3 +859,37 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
     );
     assert!(owner.plan().fragments().values().any(|fragment| fragment.expressions().iter().any(|(_,expression)| matches!(&expression.kind,novarocks_physical_plan::ExprKind::FunctionCall {function,..} if function.function_id.as_str()=="builtin.scalar/regexp_count/v1"))), "failed literal evaluation must retain the actual call, never fold to NULL");
 }
+
+#[test]
+fn variant_typeof_preserves_the_staged_nominal_json_fold_decline_without_retagging() {
+    let json_type =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    for input in [
+        Some("{}"),
+        Some("[]"),
+        Some("null"),
+        Some("128"),
+        Some("2147483648"),
+        Some("not-json"),
+        None,
+    ] {
+        let argument = typed_arg(Arc::new(StringArray::from(vec![input])), json_type.clone());
+        let request = request(
+            FoldNodeKind::Function {
+                name: "variant_typeof".into(),
+            },
+            vec![argument],
+            DataType::Utf8,
+        );
+        // This adapter intentionally declines non-Physical domains. The real
+        // typed Native call must remain, rather than a fabricated folded NULL.
+        assert!(
+            constant_evaluator()
+                .eval_scalar(&request, &TestControl)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(request.args[0].value.value_type(), &json_type);
+    }
+}

@@ -67,6 +67,57 @@ fn output(binding: &ResolvedFunctionBinding) -> &FunctionValueType {
 fn json() -> FunctionValueType {
     logical(DataType::Utf8, ValueLogicalType::Json)
 }
+
+#[test]
+fn variant_typeof_keeps_exact_json_and_variant_domains_for_fresh_and_frozen_binding() {
+    for nullable in [false, true] {
+        for (carrier, domain) in [
+            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::LargeBinary, ValueLogicalType::Variant),
+        ] {
+            let ty = FunctionValueType::try_with_logical_type(carrier, nullable, domain).unwrap();
+            let arguments = [value(ty.clone())];
+            let binding = resolve("variant_typeof", FunctionKind::Scalar, &arguments);
+            assert_eq!(
+                binding.selected.argument_types.as_ref(),
+                &[FunctionArgumentType::Value(ty)]
+            );
+            assert_eq!(output(&binding), &physical(DataType::Utf8));
+        }
+    }
+}
+
+#[test]
+fn variant_typeof_rejects_plain_carriers_and_cannot_thaw_json_as_text() {
+    let catalog = builtin_engine_function_catalog();
+    let original = [value(json())];
+    let binding = resolve("variant_typeof", FunctionKind::Scalar, &original);
+    for carrier in [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::Null,
+        DataType::Int64,
+    ] {
+        let arguments = [value(physical(carrier))];
+        assert!(
+            catalog
+                .resolve_bound_user(
+                    "variant_typeof",
+                    FunctionKind::Scalar,
+                    request(&arguments),
+                    crate::binding_test_control()
+                )
+                .is_err()
+        );
+        assert!(
+            catalog
+                .validate_bound(&binding, request(&arguments), crate::binding_test_control())
+                .is_err()
+        );
+    }
+}
 fn json_item(nullable: bool) -> Arc<Field> {
     Arc::new(
         Field::new("item", DataType::Utf8, nullable).with_metadata(

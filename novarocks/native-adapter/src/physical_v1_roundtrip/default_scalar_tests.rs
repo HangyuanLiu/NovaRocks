@@ -2004,3 +2004,152 @@ fn default_real_sql_variant_get_parses_utf8_text_without_signing_variant_input()
         }
     }
 }
+
+#[test]
+fn default_real_sql_variant_typeof_keeps_declared_json_and_original_variant_profiles() {
+    use novarocks_physical_plan::ScanReadBudget;
+    use novarocks_sql::compiler::*;
+    for (sql, expected) in [
+        (r#"SELECT variant_typeof(parse_json('{}'))"#, Some("Object")),
+        (r#"SELECT variant_typeof(parse_json('[]'))"#, Some("Array")),
+        (r#"SELECT variant_typeof(parse_json('null'))"#, Some("Null")),
+        (r#"SELECT variant_typeof(parse_json('128'))"#, Some("Int16")),
+        (
+            r#"SELECT variant_typeof(parse_json('2147483648'))"#,
+            Some("Int64"),
+        ),
+        (
+            r#"SELECT variant_typeof(parse_json('true'))"#,
+            Some("Boolean(true)"),
+        ),
+        (
+            r#"SELECT variant_typeof(parse_json(CAST(NULL AS VARCHAR)))"#,
+            None,
+        ),
+        (r#"SELECT variant_typeof(CAST(NULL AS VARIANT))"#, None),
+        (
+            r#"SELECT variant_typeof(variant_get('{"a":129}', '$.a'))"#,
+            Some("Int16"),
+        ),
+    ] {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([98; 16]).unwrap(),
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: None,
+                current_database: "fixture".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    enable_materialized_view_rewrite: Some(false),
+                    enable_common_subexpr_reuse: Some(false),
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            catalog.snapshot(),
+            noop_constant_evaluator(),
+            policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: 64,
+                max_batch_bytes: 1 << 20,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+        .try_into_completion()
+        .unwrap();
+        let owner = SqlCompiler::start(request, &control)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .into_plan();
+        let calls = owner
+            .plan()
+            .fragments()
+            .values()
+            .flat_map(|fragment| {
+                fragment
+                    .expressions()
+                    .iter()
+                    .filter_map(move |(_, expression)| {
+                        matches!(&expression.kind, ExprKind::FunctionCall { function, .. }
+                    if function.function_id.as_str() == "builtin.scalar/variant_typeof/v1")
+                        .then_some((fragment, expression))
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "{sql}");
+        let (fragment, expression) = calls[0];
+        let ExprKind::FunctionCall { function, args } = &expression.kind else {
+            unreachable!()
+        };
+        let novarocks_type_contract::FunctionArgumentType::Value(argument_type) =
+            &function.argument_types[0]
+        else {
+            panic!("exact value argument")
+        };
+        assert!(matches!(
+            argument_type.logical_type(),
+            ValueLogicalType::Json | ValueLogicalType::Variant
+        ));
+        assert_eq!(
+            &fragment.expressions().get(args[0]).unwrap().ty,
+            argument_type
+        );
+        let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+            owner.plan(),
+            &catalog,
+            &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+            false,
+            compile_control(),
+        )
+        .unwrap();
+        let source = encoded
+            .fragments
+            .iter()
+            .find(|source| source.fragment_id == fragment.id().get())
+            .unwrap();
+        let mut arena = ExprArena::default();
+        decode_node(
+            source,
+            source.root.as_ref().unwrap(),
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .unwrap();
+        let mut roots = vec![];
+        let mut index = 0;
+        while let Some(node) = arena.node(novarocks_execution::exec::expr::ExprId(index)) {
+            if matches!(
+                node,
+                novarocks_execution::exec::expr::ExprNode::FunctionCall {
+                    kind: novarocks_execution::exec::expr::function::FunctionKind::Variant(
+                        "variant_typeof"
+                    ),
+                    ..
+                }
+            ) {
+                roots.push(novarocks_execution::exec::expr::ExprId(index));
+            }
+            index += 1;
+        }
+        assert_eq!(roots.len(), 1);
+        let result = arena.eval(roots[0], &empty_input()).unwrap();
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            (!result.is_null(0)).then(|| result.value(0)),
+            expected,
+            "{sql}"
+        );
+    }
+}

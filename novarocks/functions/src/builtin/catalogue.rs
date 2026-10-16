@@ -1486,7 +1486,6 @@ impl BuiltinScalarResolver {
                 | "builtin.scalar/json_exists/v1"
                 | "builtin.scalar/json_length/v1"
                 | "builtin.scalar/json_keys/v1"
-                | "builtin.scalar/variant_typeof/v1"
         ) {
             let Some(document) = argument_types.first() else {
                 return Err(FunctionBindingError::NoMatchingOverload);
@@ -1500,6 +1499,19 @@ impl BuiltinScalarResolver {
                     _ => false,
                 };
             if !admitted {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+        }
+
+        if self.function_id.as_str() == "builtin.scalar/variant_typeof/v1" {
+            let [document] = argument_types.as_slice() else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            if !matches!(
+                (document.logical_type(), document.data_type()),
+                (ValueLogicalType::Json, DataType::Utf8)
+                    | (ValueLogicalType::Variant, DataType::LargeBinary)
+            ) {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
         }

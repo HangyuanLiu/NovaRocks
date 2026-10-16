@@ -40,3 +40,27 @@ pub(super) fn downcast_variant_arg<'a>(
         .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| format!("{} expects LargeBinary for variant argument", fn_name))
 }
+
+pub(super) fn binary_value_at_any<'a>(
+    arr: &'a ArrayRef,
+    row: usize,
+    fn_name: &str,
+) -> Result<Option<&'a [u8]>, String> {
+    use arrow::array::{BinaryArray, BinaryViewArray};
+    if arr.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(Some(a.value(row)));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok(Some(a.value(row)));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok(Some(a.value(row)));
+    }
+    Err(format!(
+        "{fn_name}: expected binary metadata/value arrays, got {:?}",
+        arr.data_type()
+    ))
+}

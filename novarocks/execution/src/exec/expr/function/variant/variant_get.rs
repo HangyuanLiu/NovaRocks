@@ -19,6 +19,7 @@
 //! upstream parquet-variant-compute kernel so expression-layer results are
 //! row-identical with the scan-layer shredded fast path (IV3-6 decision B).
 
+use super::common::binary_value_at_any;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -86,26 +87,6 @@ fn kernel_path(path_str: &str) -> Result<parquet::variant::VariantPath<'static>,
     Ok(parquet::variant::VariantPath::from(elems))
 }
 
-fn binary_value_at_any(arr: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String> {
-    use arrow::array::{BinaryArray, BinaryViewArray};
-    if arr.is_null(row) {
-        return Ok(None);
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(Some(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(Some(a.value(row)));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BinaryViewArray>() {
-        return Ok(Some(a.value(row)));
-    }
-    Err(format!(
-        "variant_get: expected binary metadata/value arrays, got {:?}",
-        arr.data_type()
-    ))
-}
-
 /// Engine LargeBinary `[size|metadata|value]` rows -> upstream VariantArray.
 fn large_binary_to_variant_array(arr: &LargeBinaryArray) -> Result<VariantArray, String> {
     let mut metadata_builder = BinaryBuilder::new();
@@ -165,8 +146,8 @@ fn variant_array_to_large_binary(va: VariantArray) -> Result<ArrayRef, String> {
             continue;
         }
         let (m, v) = match (
-            binary_value_at_any(&metadata, row)?,
-            binary_value_at_any(&value, row)?,
+            binary_value_at_any(&metadata, row, "variant_get")?,
+            binary_value_at_any(&value, row, "variant_get")?,
         ) {
             (Some(m), Some(v)) => (m, v),
             _ => {
