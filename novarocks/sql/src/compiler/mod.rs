@@ -3768,3 +3768,6 @@ mod c16_p1_json_object_error_effect_tests;
 
 #[cfg(test)]
 mod range_envelope_behavior_tests;
+
+#[cfg(test)]
+mod map_subscript_value_type_tests;
