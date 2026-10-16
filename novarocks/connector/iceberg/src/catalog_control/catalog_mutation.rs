@@ -168,12 +168,6 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         &self,
         request: ConnectorCatalogMutationReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-        if let Err(error) = validate_context(&request.context) {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&error),
-                evidence: request.evidence,
-            });
-        }
         if request.evidence.descriptor() != self.descriptor()
             || request.evidence.incarnation() != self.incarnation()
             || request.evidence.schema_version() != ICEBERG_MUTATION_EVIDENCE_VERSION
@@ -3028,6 +3022,52 @@ fn hadoop_create_evidence(
     )
 }
 
+/// Observe an ordinary ALTER's exact table without producing attribution facts.
+/// Neither a matching schema nor a failed read decides the original publication.
+fn observe_only_alter_table_version(
+    provider: &IcebergMetadata,
+    target: &IcebergMutationEvidenceTarget,
+    descriptor: &crate::commit::publication_descriptor::PublicationDescriptor,
+    evidence: &ExternalMutationEvidence,
+    context: &ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    if !matches!(
+        evidence.operation_kind(),
+        "alter-schema" | "alter-partition-spec" | "alter-properties"
+    ) {
+        return Ok(());
+    }
+    let IcebergMutationEvidenceTarget::TableVersion {
+        namespace,
+        table,
+        table_uuid,
+        ..
+    } = target
+    else {
+        return Err(invalid(
+            "Ordinary ALTER observation requires its original table target",
+        ));
+    };
+    let ident = TableIdent::new(NamespaceIdent::new(namespace.clone()), table.clone());
+    let uuid = uuid::Uuid::parse_str(table_uuid)
+        .map_err(|_| invalid("Ordinary ALTER observation has an invalid frozen table UUID"))?;
+    if descriptor.targets != [ident.to_string()]
+        || descriptor.table_uuid != Some(uuid)
+        || descriptor.operation_id != evidence.operation_id().to_bytes()
+    {
+        return Err(invalid(
+            "Ordinary ALTER observation differs from its frozen target or UUID",
+        ));
+    }
+    let fresh = context.clone().after_external_effect();
+    // Success, absence, a foreign incarnation and read errors are observations
+    // only. Do not materialize a proof, install caches or perform finalization.
+    let _ = provider
+        .runtime()
+        .observe_table_classified_for_request(namespace, table, &fresh);
+    Ok(())
+}
+
 fn reconcile_evidence(
     provider: &IcebergMetadata,
     target: IcebergMutationEvidenceTarget,
@@ -3050,20 +3090,28 @@ fn reconcile_evidence(
     let Some((journal, entry)) =
         PublicationJournal::<ConnectorCatalogMutationReceipt>::from_evidence(&evidence)?
     else {
+        if let Err(error) = validate_context(context) {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(&error),
+                evidence: evidence.clone(),
+            });
+        }
         return ambiguous(
             "The original in-process publication journal is unavailable; retain Unknown".into(),
         );
     };
-    if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
-        journal.catalog_entry_outcome(entry)
+    let original = journal.catalog_entry_outcome(entry);
+    if !matches!(&original, ExternalMutationOutcome::CommitUnknown { .. })
+        || validate_context(context).is_err()
     {
-        return Ok(committed);
+        return Ok(original);
     }
     let descriptor = journal
         .entry_descriptor(entry)
         .ok_or_else(|| invalid("Reconciliation has no original publication entry"))?;
     if matches!(&descriptor.attribution, AttributionPlan::ObserveOnly) {
-        return ambiguous("The frozen request has no attributable positive probe".into());
+        observe_only_alter_table_version(provider, &target, &descriptor, &evidence, context)?;
+        return Ok(journal.catalog_entry_outcome(entry));
     }
     let fresh = context.clone().after_external_effect();
     let mut observed_document = None;
@@ -6487,6 +6535,442 @@ mod tests {
                 usize::from(present)
             );
             assert_eq!(provider.runtime().drop_cleanup().pending_len(), 0);
+        }
+    }
+
+    mod ordinary_alter_observation_tests {
+        use super::*;
+        use crate::commit::attempt::observation::PublicationJournal;
+        use crate::commit::publication_descriptor::AttributionPlan;
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use std::sync::Mutex;
+
+        const PATH: &str = "/v1/namespaces/managed/tables/mv";
+        const BEFORE: &str = "memory://warehouse/managed/mv/metadata/before.json";
+        const AFTER: &str = "memory://warehouse/managed/mv/metadata/after.json";
+
+        fn schema_change() -> ConnectorSchemaChange {
+            ConnectorSchemaChange::AddColumn {
+                parent: ConnectorColumnPath { segments: vec![] },
+                column: definition_column(ConnectorDataType::BigInt),
+                position: ConnectorColumnPosition::Default,
+            }
+        }
+
+        fn request(provider: &IcebergMetadata, kind: &str) -> ConnectorCatalogMutationRequest {
+            let table = ConnectorTableIdentity {
+                instance_id: provider.descriptor().instance_id.clone(),
+                namespace: "managed".into(),
+                table: "mv".into(),
+            };
+            let operation = match kind {
+                "schema" => ConnectorCatalogMutationOperation::AlterSchema {
+                    table,
+                    changes: vec![schema_change()],
+                },
+                "partition" => ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                    table,
+                    add: vec![ConnectorPartitionTransform::Bucket {
+                        column: "id".into(),
+                        num_buckets: 4,
+                    }],
+                    drop: vec![],
+                },
+                "properties" => ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes: vec![ConnectorPropertyChange::Set {
+                        key: "comment".into(),
+                        value: "ordinary ALTER observation".into(),
+                    }],
+                    authority: ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: None,
+                },
+                _ => unreachable!(),
+            };
+            ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation,
+                context: context(),
+            }
+        }
+
+        fn server(
+            base: &crate::iceberg::spec::TableMetadata,
+            observation: &'static str,
+            acknowledged: bool,
+        ) -> (
+            TestServer,
+            Arc<Mutex<Option<crate::iceberg::spec::TableMetadata>>>,
+        ) {
+            let before = base.clone();
+            let write_base = base.clone();
+            let current = Arc::new(Mutex::new(None));
+            let read = current.clone();
+            let write = current.clone();
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on_fn("GET", PATH, move |_, _| {
+                        let current = read.lock().unwrap();
+                        if let Some(after) = current.as_ref() {
+                            match observation {
+                                "absent" => return Reply::status(404),
+                                "failure" => return Reply::status(503),
+                                "old" => {}
+                                "new" | "foreign" => {
+                                    let mut metadata = serde_json::to_value(after).unwrap();
+                                    if observation == "foreign" {
+                                        metadata["table-uuid"] =
+                                            serde_json::json!(uuid::Uuid::from_u128(19));
+                                    }
+                                    return Reply::json(
+                                        200,
+                                        &serde_json::json!({
+                                            "metadata-location":AFTER,"metadata":metadata,
+                                        }),
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        Reply::json(
+                            200,
+                            &serde_json::json!({
+                                "metadata-location":BEFORE,"metadata":before,
+                            }),
+                        )
+                    })
+                    .on_fn("POST", PATH, move |wire, _| {
+                        let body: serde_json::Value = serde_json::from_slice(&wire.body).unwrap();
+                        let requirements: Vec<TableRequirement> =
+                            serde_json::from_value(body["requirements"].clone()).unwrap();
+                        assert_eq!(
+                            requirements
+                                .iter()
+                                .filter_map(|requirement| match requirement {
+                                    TableRequirement::UuidMatch { uuid } => Some(*uuid),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                            vec![write_base.uuid()],
+                        );
+                        let updates: Vec<TableUpdate> =
+                            serde_json::from_value(body["updates"].clone()).unwrap();
+                        let mut builder = write_base.clone().into_builder(None);
+                        for update in updates {
+                            builder = update.apply(builder).unwrap();
+                        }
+                        let after = builder.build().unwrap().metadata;
+                        let response = serde_json::json!({
+                            "metadata-location":AFTER,"metadata":after,
+                        });
+                        let mut current = write.lock().unwrap();
+                        assert!(
+                            current.is_none(),
+                            "the original publication is never replayed"
+                        );
+                        *current = Some(after);
+                        if acknowledged {
+                            Reply::json(200, &response)
+                        } else {
+                            Reply::status(503)
+                        }
+                    }),
+            );
+            (server, current)
+        }
+
+        fn unknown(
+            outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+        ) -> (ConnectorMutationFailure, ExternalMutationEvidence) {
+            let ExternalMutationOutcome::CommitUnknown { failure, evidence } = outcome else {
+                panic!("the unacknowledged publication must remain Unknown: {outcome:?}");
+            };
+            (failure, evidence)
+        }
+
+        fn assert_original_unknown(
+            outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+            expected: &(ConnectorMutationFailure, ExternalMutationEvidence),
+        ) {
+            let (failure, evidence) = unknown(outcome);
+            assert_eq!(failure.kind(), expected.0.kind());
+            assert_eq!(failure.message(), expected.0.message());
+            assert_eq!(evidence, expected.1);
+        }
+
+        #[test]
+        fn ordinary_alter_reads_fresh_without_attributing_old_new_absent_foreign_or_failed_views() {
+            for kind in ["schema", "partition", "properties"] {
+                for observed in ["old", "new", "absent", "foreign", "failure"] {
+                    let base = test_metadata(HashMap::new());
+                    let (server, applied) = server(&base, observed, false);
+                    let (_executor, provider) = variant_definition_provider(&server.url());
+                    let request = request(&provider, kind);
+                    let original_context = request.context.clone();
+                    let original = unknown(provider.execute(request).unwrap());
+                    {
+                        let applied = applied.lock().unwrap();
+                        let applied = applied.as_ref().expect("actual frozen updates applied");
+                        assert_eq!(applied.uuid(), base.uuid());
+                        match kind {
+                            "schema" => {
+                                assert_ne!(applied.current_schema_id(), base.current_schema_id())
+                            }
+                            "partition" => assert_ne!(
+                                applied.default_partition_spec_id(),
+                                base.default_partition_spec_id()
+                            ),
+                            "properties" => assert_eq!(
+                                applied.properties().get("comment").map(String::as_str),
+                                Some("ordinary ALTER observation")
+                            ),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let (journal, entry) =
+                        PublicationJournal::<ConnectorCatalogMutationReceipt>::from_evidence(
+                            &original.1,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let descriptor = journal.entry_descriptor(entry).unwrap();
+                    assert_eq!(descriptor.attribution, AttributionPlan::ObserveOnly);
+                    let reads = server.count("GET", PATH);
+                    // Reusing the original request scope must not reuse its old table cache.
+                    let outcome = provider
+                        .reconcile(ConnectorCatalogMutationReconcileRequest {
+                            evidence: original.1.clone(),
+                            context: original_context,
+                        })
+                        .unwrap();
+                    assert_original_unknown(outcome, &original);
+                    assert_eq!(server.count("GET", PATH), reads + 1, "{kind}/{observed}");
+                    assert_eq!(server.count("POST", PATH), 1, "{kind}/{observed}");
+                    assert_eq!(journal.entry_descriptor(entry).unwrap(), descriptor);
+                    assert_original_unknown(journal.catalog_entry_outcome(entry), &original);
+                }
+            }
+        }
+
+        #[test]
+        fn stopped_or_expired_ordinary_alter_keeps_original_unknown_without_another_get() {
+            for expired in [false, true] {
+                let base = test_metadata(HashMap::new());
+                let (server, _) = server(&base, "new", false);
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let original = unknown(provider.execute(request(&provider, "schema")).unwrap());
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                let context = ConnectorRequestContext::try_new(
+                    if expired {
+                        Instant::now() - Duration::from_secs(1)
+                    } else {
+                        Instant::now() + Duration::from_secs(30)
+                    },
+                    stop.view(),
+                    65536,
+                    131072,
+                )
+                .unwrap();
+                if !expired {
+                    stop.request_stop();
+                }
+                let reads = server.count("GET", PATH);
+                assert_original_unknown(
+                    provider
+                        .reconcile(ConnectorCatalogMutationReconcileRequest {
+                            evidence: original.1.clone(),
+                            context,
+                        })
+                        .unwrap(),
+                    &original,
+                );
+                assert_eq!(server.count("GET", PATH), reads);
+                assert_eq!(server.count("POST", PATH), 1);
+            }
+        }
+
+        #[test]
+        fn stopped_wire_only_alter_retains_context_rejection_without_observation() {
+            let base = test_metadata(HashMap::new());
+            let (server, _) = server(&base, "new", false);
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let original = unknown(provider.execute(request(&provider, "schema")).unwrap());
+            let wire = original.1.without_process_local_payload();
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            stop.request_stop();
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                131072,
+            )
+            .unwrap();
+            let reads = server.count("GET", PATH);
+            let (failure, retained) = unknown(
+                provider
+                    .reconcile(ConnectorCatalogMutationReconcileRequest {
+                        evidence: wire.clone(),
+                        context,
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::Cancelled);
+            assert_eq!(retained, wire);
+            assert!(retained.process_local_payload().is_none());
+            assert_eq!(server.count("GET", PATH), reads);
+            assert_eq!(server.count("POST", PATH), 1);
+        }
+
+        #[test]
+        fn ordinary_alter_checks_frozen_target_and_uuid_before_observation() {
+            let base = test_metadata(HashMap::new());
+            let (server, _) = server(&base, "new", false);
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let original = unknown(provider.execute(request(&provider, "schema")).unwrap());
+            let (journal, entry) =
+                PublicationJournal::<ConnectorCatalogMutationReceipt>::from_evidence(&original.1)
+                    .unwrap()
+                    .unwrap();
+            let descriptor = journal.entry_descriptor(entry).unwrap();
+            let reads = server.count("GET", PATH);
+            for target in [
+                IcebergMutationEvidenceTarget::TableVersion {
+                    namespace: "other".into(),
+                    table: "mv".into(),
+                    table_uuid: base.uuid().to_string(),
+                    before_metadata_location: Some(BEFORE.into()),
+                },
+                IcebergMutationEvidenceTarget::TableVersion {
+                    namespace: "managed".into(),
+                    table: "mv".into(),
+                    table_uuid: uuid::Uuid::from_u128(19).to_string(),
+                    before_metadata_location: Some(BEFORE.into()),
+                },
+            ] {
+                assert!(
+                    observe_only_alter_table_version(
+                        &provider,
+                        &target,
+                        &descriptor,
+                        &original.1,
+                        &context(),
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(server.count("GET", PATH), reads);
+            assert_eq!(server.count("POST", PATH), 1);
+            assert_original_unknown(journal.catalog_entry_outcome(entry), &original);
+        }
+
+        #[test]
+        fn decisive_ordinary_alter_journal_bypasses_observation_even_after_stop() {
+            use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
+            let base = test_metadata(HashMap::new());
+            let (server, _) = server(&base, "failure", true);
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let request = request(&provider, "schema");
+            let token = OperationToken::from_mutation(request.operation_id);
+            let frozen = crate::commit::staging::freeze_existing_change(
+                TableIdent::new(NamespaceIdent::new("managed".into()), "mv".into()),
+                "main",
+                &base,
+                BEFORE,
+                RequestShape::MetadataOnly,
+                AttemptToken::new(token, 0),
+                prepare_schema_updates(&base, &schema_change()).unwrap(),
+                &request.context,
+            )
+            .unwrap();
+            let external = evidence(
+                &provider,
+                request.operation_id,
+                request.operation.kind(),
+                IcebergMutationEvidenceTarget::TableVersion {
+                    namespace: "managed".into(),
+                    table: "mv".into(),
+                    table_uuid: base.uuid().to_string(),
+                    before_metadata_location: Some(BEFORE.into()),
+                },
+            )
+            .unwrap();
+            let journal = PublicationJournal::for_runtime(
+                token,
+                provider.runtime().resources().catalog_runtime(),
+            );
+            journal
+                .record(
+                    external,
+                    receipt(&provider, request.operation_id, request.operation.kind()).unwrap(),
+                    &frozen,
+                )
+                .unwrap();
+            let catalog = provider.runtime().novarocks_catalog().clone();
+            let publication = journal.clone();
+            let policy = catalog.evidence_policy();
+            let entry = provider
+                .runtime()
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    publication
+                        .publish_once(
+                            request.context,
+                            policy,
+                            move |descriptor, generation, original| async move {
+                                catalog
+                                    .prepare_frozen_publication(
+                                        frozen,
+                                        CatalogOperation::AlterSchema,
+                                        None,
+                                        descriptor,
+                                        generation,
+                                        original,
+                                    )
+                                    .await
+                            },
+                        )
+                        .await
+                })
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                journal.catalog_entry_outcome(entry),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            let evidence = journal.entry_evidence(entry).unwrap();
+            let reads = server.count("GET", PATH);
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            stop.request_stop();
+            let stopped = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                131072,
+            )
+            .unwrap();
+            assert!(matches!(
+                provider
+                    .reconcile(ConnectorCatalogMutationReconcileRequest {
+                        evidence,
+                        context: stopped
+                    })
+                    .unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert_eq!(server.count("GET", PATH), reads);
+            assert_eq!(server.count("POST", PATH), 1);
         }
     }
 

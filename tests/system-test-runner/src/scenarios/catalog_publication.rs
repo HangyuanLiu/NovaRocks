@@ -109,11 +109,22 @@ access_key_id = "${ENV:NOVA_PUBLICATION_ACCESS_KEY}"
 access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
 "#
         .to_owned();
+        // These races require two SQL actors to enter independently while one
+        // synchronous publication is held. One fixed query worker serializes
+        // them before either the catalog lock or the external CAS is tested.
+        let frontend_overlay = if matches!(
+            self.property,
+            Property::ExpiryConcurrency | Property::ManifestReprepare
+        ) {
+            format!("{credential}\n[runtime]\nquery_blocking_worker_threads = 2\n")
+        } else {
+            credential.clone()
+        };
         *slot = Some(fixture);
         Ok(ScenarioLaunchConfig {
             child_environment: environment,
             config_overlay: CrossProcessConfigOverlay {
-                fe: Some(credential.clone()),
+                fe: Some(frontend_overlay),
                 be: Some(credential.replace("object-store-metadata", "object-store-data")),
                 ..Default::default()
             },
@@ -587,14 +598,36 @@ fn maintenance_race(
     fixture: &PublicationFixture,
     property: Property,
 ) -> Result<()> {
-    let before = metadata(fixture)?;
-    let candidate = before["snapshots"]
-        .as_array()
-        .context("snapshot list missing")?
-        .first()
-        .context("snapshot graph empty")?["snapshot-id"]
+    let mut before = metadata(fixture)?;
+    let protected_before = before["current-snapshot-id"]
         .as_i64()
-        .context("snapshot ID missing")?;
+        .context("current snapshot missing before maintenance race")?;
+    if matches!(property, Property::ExpiryConcurrency) {
+        // Freeze a requirement for this existing ref before the Java hold.
+        // Moving it makes a handler retry fail that same requirement, so an
+        // HTTP conflict must reach the provider before it can reprepare.
+        set_ref(
+            fixture,
+            "orders",
+            &before,
+            "protected",
+            "tag",
+            Value::Null,
+            protected_before,
+        )?;
+        before = metadata(fixture)?;
+        ensure!(
+            before["refs"]["protected"]["snapshot-id"] == protected_before,
+            "protected ref was not established before maintenance preparation"
+        );
+    }
+    let candidate = oldest(&before)?;
+    if matches!(property, Property::ExpiryConcurrency) {
+        ensure!(
+            candidate != protected_before,
+            "ref movement must change the frozen target"
+        );
+    }
     let candidate_list = before["snapshots"]
         .as_array()
         .unwrap()
@@ -608,6 +641,11 @@ fn maintenance_race(
         fixture.rest().object_exists(&candidate_list)?,
         "candidate manifest list absent before expiry"
     );
+    let control = fixture.proxy()?;
+    let forwarded_before = control
+        .mutation_counts("ns", "orders")
+        .table_commit_forwarded;
+    let traffic_before = control.traffic_snapshot();
     let mut hold = fixture.service().arm("ns.orders")?;
     let user = context.mysql_user().to_owned();
     let port = context.mysql_port();
@@ -628,10 +666,25 @@ fn maintenance_race(
     let phase = (|| -> Result<()> {
         hold.wait_until_held(context.deadline())?;
         if matches!(property, Property::ExpiryConcurrency) {
-            reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build()?
-                .post(format!("{}/v1/namespaces/ns/tables/orders", fixture.rest().endpoints().rest_uri))
-                .json(&json!({"requirements":[{"type":"assert-table-uuid","uuid":before["table-uuid"]},{"type":"assert-ref-snapshot-id","ref":"protected","snapshot-id":null}],"updates":[{"action":"set-snapshot-ref","ref-name":"protected","type":"tag","snapshot-id":candidate}]}))
-                .send()?.error_for_status()?;
+            set_ref(
+                fixture,
+                "orders",
+                &before,
+                "protected",
+                "tag",
+                json!(protected_before),
+                candidate,
+            )?;
+            let competitor = metadata(fixture)?;
+            ensure!(
+                competitor["refs"]["protected"]["snapshot-id"] == candidate,
+                "external ref move was not visible before releasing maintenance"
+            );
+            save(
+                context,
+                "maintenance-competitor.json",
+                &json!({"before":before,"competitor":competitor,"previous_target":protected_before,"moved_target":candidate}),
+            )?;
         } else {
             // A distinct logical catalog is deliberately an external writer relative
             // to this catalog's local expiry/ref coordination domain.
@@ -666,11 +719,41 @@ fn maintenance_race(
         false,
         |_| Ok(()),
     )?;
+    let traffic_after = control.traffic_snapshot();
+    let forwarded = control
+        .mutation_counts("ns", "orders")
+        .table_commit_forwarded
+        - forwarded_before;
+    save(
+        context,
+        "maintenance-requests.json",
+        &json!({"before":traffic_before,"after":traffic_after,"forwarded":forwarded,"sql_result":format!("{outcome:?}"),"original":format!("{original:?}")}),
+    )?;
     ensure!(
         original == CommitOutcome::Conflict,
         "original maintenance request did not hit actual JDBC conflict"
     );
     outcome.context("maintenance did not successfully reprepare after definite conflict")?;
+    if matches!(property, Property::ExpiryConcurrency) {
+        ensure!(
+            traffic_after
+                .by_status
+                .get(&409)
+                .copied()
+                .unwrap_or_default()
+                == traffic_before
+                    .by_status
+                    .get(&409)
+                    .copied()
+                    .unwrap_or_default()
+                    + 1,
+            "existing ref move did not reach the provider as an actual REST 409"
+        );
+        ensure!(
+            forwarded == 2,
+            "existing ref conflict did not produce exactly two provider attempts"
+        );
+    }
     let after = metadata(fixture)?;
     let snapshots = after["snapshots"]
         .as_array()
@@ -682,7 +765,7 @@ fn maintenance_race(
         );
         ensure!(
             after["refs"]["protected"]["snapshot-id"] == candidate,
-            "expiry deleted concurrently added ref"
+            "expiry deleted the concurrently moved ref"
         );
         ensure!(
             snapshots

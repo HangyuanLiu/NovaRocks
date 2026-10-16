@@ -840,7 +840,7 @@ pub(crate) fn execute_drop_table_statement(
             novarocks_query_application::engine_error::EngineError::commit_unknown(
                 failure.to_string(),
             )
-            .to_string(),
+            .to_bracketed_user_message(),
         ),
         crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
             Err(error.to_string())

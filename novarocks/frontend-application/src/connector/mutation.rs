@@ -132,7 +132,7 @@ fn present_catalog_mutation_result(
                 .to_string(),
         ),
         ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_string())
+            Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
         }
         ResolvedCatalogMutation::ContractFailure { error, .. } => Err(error.to_string()),
     }
@@ -529,10 +529,9 @@ mod tests {
             evidence,
         })
         .unwrap_err();
-        assert_eq!(
-            unknown,
-            EngineError::commit_unknown(failure.to_string()).to_string()
-        );
+        assert_eq!(unknown, "[CommitUnknown] Unavailable: publication failed");
+        assert!(!uncommitted.contains("[CommitUnknown]"));
+        assert!(!committed.contains("[CommitUnknown]"));
         for dispatch in [
             MutationDispatchState::ConfirmedNotDispatched,
             MutationDispatchState::PossiblyDispatched,
