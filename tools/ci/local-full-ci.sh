@@ -524,6 +524,10 @@ run_cargo_gates() {
     tools/ci/check-connector-role-binding-boundary.py
   run_fail_fast_stage "connector role binding boundary mutations" "connector-role-binding-boundary-test.log" \
     tools/ci/tests/connector-role-binding-boundary-test.sh
+  run_fail_fast_stage "Iceberg provider dependency boundary" "iceberg-provider-dependency-boundary.log" \
+    python3 tools/ci/check-iceberg-provider-dependency-boundary.py --manifest-path Cargo.toml
+  run_fail_fast_stage "Iceberg provider dependency boundary mutations" "iceberg-provider-dependency-boundary-test.log" \
+    tools/ci/tests/iceberg-provider-dependency-boundary-test.sh
   run_fail_fast_stage "StateStore dependency boundary" "state-store-dependency-boundary.log" \
     python3 tools/ci/check-state-store-dependency-boundary.py --manifest-path Cargo.toml
   run_fail_fast_stage "StateStore dependency boundary mutations" "state-store-dependency-boundary-test.log" \
