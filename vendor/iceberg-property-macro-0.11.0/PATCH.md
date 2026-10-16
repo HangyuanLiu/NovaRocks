@@ -20,10 +20,13 @@ The initial source commit is unmodified except for this inventory.
 
 ## Dependency policy
 
-Retain upstream registry dependency versions and lints. The four Iceberg packages
-are patched together at version `0.11.0`; `iceberg-property-macro` is vendored
-without source patches. Do not vendor runtime/network/Arrow crates or add resource
-accounting hooks. Only the approved protocol/API patch inventory may diverge.
+Retain upstream registry dependency versions and lints. The root
+`[patch.crates-io]` selects `iceberg`, `iceberg-catalog-hms` and
+`iceberg-property-macro` at version `0.11.0`; the macro has no source patches.
+The unpatched REST SDK is a connector dev-only path dependency, outside the
+production normal/build dependency closures. Do not vendor runtime/network/Arrow
+crates or add resource accounting hooks. Only the approved protocol/API patch
+inventory may diverge.
 
 ## Validation
 
