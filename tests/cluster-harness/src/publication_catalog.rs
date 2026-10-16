@@ -1185,6 +1185,39 @@ fn forbidden_not_dispatched(message: impl Into<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// Consume the complete bounded request before the downstream fixture replies.
+    /// TCP may split either headers or body across arbitrary reads.
+    fn consume_downstream_request(socket: &mut std::net::TcpStream) {
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(socket);
+        let mut content_length = 0;
+        let mut header_bytes = 0;
+        loop {
+            let mut line = String::new();
+            let count = reader.read_line(&mut line).unwrap();
+            assert!(count > 0, "Downstream request ended before its headers");
+            header_bytes += count;
+            assert!(
+                header_bytes <= 16 * 1024,
+                "Fixture request headers exceed their bound"
+            );
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+        }
+        assert!(
+            content_length <= 16 * 1024,
+            "Fixture request body exceeds its bound"
+        );
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+    }
     use super::*;
 
     #[test]
@@ -1466,7 +1499,7 @@ mod tests {
 
     #[test]
     fn publication_stream_exits_after_client_deadline_and_fixture_join() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let downstream = std::thread::spawn(move || {
@@ -1474,8 +1507,7 @@ mod tests {
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).unwrap();
+            consume_downstream_request(&mut socket);
             let body = " ".repeat(128);
             write!(
                 socket,
@@ -1541,7 +1573,7 @@ mod tests {
 
     #[test]
     fn publication_fixture_shutdown_cancels_downstream_body_and_joins() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (headers_tx, headers_rx) = std::sync::mpsc::sync_channel(1);
@@ -1551,8 +1583,7 @@ mod tests {
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            let mut bytes = [0; 4096];
-            socket.read(&mut bytes).unwrap();
+            consume_downstream_request(&mut socket);
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{")
                 .unwrap();
