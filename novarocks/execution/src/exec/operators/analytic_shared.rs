@@ -30,6 +30,10 @@
 #[path = "analytic_input_stages.rs"]
 mod analytic_input_stages;
 
+#[cfg(test)]
+#[path = "analytic_frozen_parameter_tests.rs"]
+mod frozen_parameter_tests;
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1478,11 +1482,9 @@ fn compute_session_number(
     let delta_node = arena
         .node(func.args[1])
         .ok_or_else(|| "invalid ExprId".to_string())?;
-    let delta = match delta_node {
-        ExprNode::Literal(LiteralValue::Null) => {
-            return Ok(new_null_array(&DataType::Int64, total_rows));
-        }
-        _ => parse_int64_literal(arena, func.args[1])? as i64,
+    let delta = match nullable_int64_parameter(delta_node)? {
+        Some(delta) => delta,
+        None => return Ok(new_null_array(&DataType::Int64, total_rows)),
     };
 
     let value = args
@@ -3001,10 +3003,30 @@ fn rows_frame_bounds(
 
 fn parse_int64_literal(arena: &ExprArena, id: ExprId) -> Result<i64, String> {
     let node = arena.node(id).ok_or_else(|| "invalid ExprId".to_string())?;
+    nullable_int64_parameter(node)?
+        .ok_or_else(|| format!("expected integer literal, got {:?}", node))
+}
+
+fn nullable_int64_parameter(node: &ExprNode) -> Result<Option<i64>, String> {
     match node {
-        ExprNode::Literal(LiteralValue::Int64(v)) => Ok(*v),
-        ExprNode::Literal(LiteralValue::Int32(v)) => Ok(*v as i64),
-        other => Err(format!("expected integer literal, got {:?}", other)),
+        ExprNode::Literal(LiteralValue::Null) => Ok(None),
+        ExprNode::Literal(LiteralValue::Int64(value)) => Ok(Some(*value)),
+        ExprNode::Literal(LiteralValue::Int32(value)) => Ok(Some(i64::from(*value))),
+        ExprNode::Constant(value)
+            if value.value_type().logical_type()
+                == novarocks_type_contract::ValueLogicalType::Physical =>
+        {
+            // Keep the window parameter domain narrower than try_i64's signed carriers.
+            // Check the declared type before accepting a selected SQL NULL.
+            match value.value_type().data_type() {
+                DataType::Int32 | DataType::Int64 => value
+                    .try_i64()
+                    .map_err(|error| format!("invalid integer constant: {error}")),
+                DataType::Null => Ok(None),
+                _ => Err(format!("expected integer literal, got {:?}", node)),
+            }
+        }
+        _ => Err(format!("expected integer literal, got {:?}", node)),
     }
 }
 
