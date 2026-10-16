@@ -3765,3 +3765,6 @@ pub use crate::planner::distributed::build::state_source_fixture::ordered_array_
 
 #[cfg(test)]
 mod c16_p1_json_object_error_effect_tests;
+
+#[cfg(test)]
+mod range_envelope_behavior_tests;
