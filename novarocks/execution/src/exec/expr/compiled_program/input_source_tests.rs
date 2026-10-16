@@ -282,8 +282,8 @@ fn project_and_writer_entries_reach_original_checked_slot_without_capture() {
         let expected_array = Arc::as_ptr(chunk.record_batch().column(1)) as *const () as usize;
         let seen = Arc::new(Mutex::new(0));
         let observed = Arc::clone(&seen);
-        // Project already holds the input for its output storage lifetime.
-        // The Slot loan itself must add no owner on either entry path.
+        // Project retains one neutral output-storage holder before evaluation;
+        // Writer borrows its input only for the synchronous projection call.
         let expected_source_holders = if writer { 1 } else { 2 };
         let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
             let (array, source) = column.into_parts();
@@ -318,6 +318,19 @@ fn project_and_writer_entries_reach_original_checked_slot_without_capture() {
         };
         assert!(*seen.lock().unwrap() > 0);
         assert_eq!(output.len(), 3);
+        // The full Project emits RAND before its identity Slot; the writer
+        // fixture projects only that Slot.
+        let identity_column = if writer { 0 } else { 1 };
+        assert_eq!(
+            output.columns()[identity_column]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(42), None, Some(7)]
+        );
+        assert!(!output.source_authority().is_attached());
         assert_eq!(tracker.current(), if writer { 0 } else { bytes });
         drop(output);
         assert_eq!(tracker.current(), 0);
