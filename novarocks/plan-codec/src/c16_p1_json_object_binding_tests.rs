@@ -165,7 +165,10 @@ fn c16_p1_json_object_v1_wire_retains_accurate_logical_identity() {
         Ok(())
     );
     assert_eq!(function.result_type, *result);
-    assert_eq!(result.logical_type(), novarocks_type_contract::ValueLogicalType::Json);
+    assert_eq!(
+        result.logical_type(),
+        novarocks_type_contract::ValueLogicalType::Json
+    );
     assert!(!control.seen.lock().unwrap().is_empty());
     // The new wire preserves complete logical identity; an absent original
     // declaration still refuses before any catalogue/control reconstruction.

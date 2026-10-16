@@ -178,8 +178,7 @@ mod tests {
             crate::iceberg::Runtime::try_current().expect("test runtime"),
         )
         .await
-        .expect("REST generation")
-        .1;
+        .expect("REST generation");
         (endpoints.binding().await.expect("session"), server)
     }
 

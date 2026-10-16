@@ -49,6 +49,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 pub const PROVIDER_ID: &str = "iceberg";
 
 pub mod access_binding;
+mod activity;
 mod authority_source;
 pub(crate) mod catalog;
 pub mod catalog_cache;
@@ -120,7 +121,8 @@ pub mod iceberg {
     pub use ::iceberg::*;
 }
 
-pub mod iceberg_catalog_rest {
+#[cfg(test)]
+pub(crate) mod iceberg_catalog_rest {
     pub use ::iceberg_catalog_rest::*;
 }
 

@@ -24,6 +24,8 @@
 //! writes) keeps the complete success document; owner commits decode only the
 //! minimal view, chunk by chunk.
 
+pub(crate) mod prepared;
+
 use std::collections::HashMap;
 
 use reqwest::Method;
@@ -34,8 +36,7 @@ use uuid::Uuid;
 
 use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewSchema};
 use crate::iceberg::spec::Schema;
-use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent};
-use crate::iceberg_catalog_rest::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
+use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::rest_protocol::binding::SessionBinding;
 use crate::rest_protocol::endpoints::{RestEndpoints, VENDED_CREDENTIALS};
 use crate::rest_protocol::evidence::{
@@ -43,10 +44,11 @@ use crate::rest_protocol::evidence::{
     ResponseShape, RestEvidence, classify,
 };
 use crate::rest_protocol::http::{BodyReadError, RequestContext, ResponseBody, RestRequest};
-use crate::rest_protocol::json::{JsonScanner, ScanError, ViewSink, scan_complete};
+use crate::rest_protocol::json::{JsonScanner, ScanError, ViewSink};
 use crate::rest_protocol::minimal_view::{
     MutationView, NamespaceSink, TableResponseSink, ViewMutationSink,
 };
+use crate::rest_protocol::wire::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
 
 // Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
 // NovaRocks owns the view wire vocabulary: the upstream REST crate has no
@@ -181,18 +183,18 @@ pub(crate) struct MutationOutcome {
 impl RestEndpoints {
     /// Commit to an existing table, or publish a CTAS staged create
     /// (`assert-create`), as decided by `expect`.
+    #[cfg(test)]
     pub(crate) async fn commit_table(
         &self,
-        mut commit: TableCommit,
+        body: CommitTableRequest,
         expect: &AttributionExpectation,
         keep_document: bool,
     ) -> MutationOutcome {
-        let ident = commit.identifier().clone();
-        let body = CommitTableRequest {
-            identifier: Some(ident.clone()),
-            requirements: commit.take_requirements(),
-            updates: commit.take_updates(),
-        };
+        let ident = body
+            .identifier
+            .as_ref()
+            .expect("Protocol fixture must name an exact table")
+            .clone();
         self.mutate(
             Method::POST,
             |binding| binding.table_url(&ident),
@@ -205,6 +207,7 @@ impl RestEndpoints {
     }
 
     /// Create a table immediately (static access only).
+    #[cfg(test)]
     pub(crate) async fn create_table(
         &self,
         namespace: &NamespaceIdent,
@@ -223,6 +226,7 @@ impl RestEndpoints {
 
     /// Stage a create (`stage-create: true`), asking for vended credentials in
     /// both access modes, as today (L23).
+    #[cfg(test)]
     pub(crate) async fn stage_create(
         &self,
         namespace: &NamespaceIdent,
@@ -240,6 +244,7 @@ impl RestEndpoints {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_namespace(
         &self,
         namespace: &NamespaceIdent,
@@ -260,6 +265,7 @@ impl RestEndpoints {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn drop_namespace(&self, namespace: &NamespaceIdent) -> MutationOutcome {
         self.mutate::<()>(
             Method::DELETE,
@@ -273,6 +279,7 @@ impl RestEndpoints {
     }
 
     /// Drop a table. `purgeRequested` is never sent.
+    #[cfg(test)]
     pub(crate) async fn drop_table(&self, table: &TableIdent) -> MutationOutcome {
         self.mutate::<()>(
             Method::DELETE,
@@ -286,6 +293,7 @@ impl RestEndpoints {
     }
 
     /// Create a view from its validated first version.
+    #[cfg(test)]
     pub(crate) async fn create_view(
         &self,
         namespace: &NamespaceIdent,
@@ -304,6 +312,7 @@ impl RestEndpoints {
     }
 
     /// Replace a view's definition; `expect` carries the frozen view UUID.
+    #[cfg(test)]
     pub(crate) async fn replace_view(
         &self,
         replace: &ValidatedViewReplace,
@@ -321,6 +330,7 @@ impl RestEndpoints {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn drop_view(&self, view: &TableIdent) -> MutationOutcome {
         self.mutate::<()>(
             Method::DELETE,
@@ -364,7 +374,9 @@ impl RestEndpoints {
             .send_once(
                 request,
                 expect.endpoint().success_statuses(),
-                &RequestContext::default(),
+                // The legacy migration path retains a finite request phase.
+                // Prepared publication consumes the journal's evidence grant.
+                &RequestContext::for_read(),
             )
             .await;
         let (read, document) = match (expect.endpoint().response_shape(), body) {
@@ -387,48 +399,27 @@ fn not_written(cause: NotWrittenCause, expect: &AttributionExpectation) -> Mutat
     }
 }
 
-/// Read a success body into the endpoint's minimal view: chunk by chunk, or,
-/// when the caller keeps the document, completely and then scanned once.
+/// Scan and optionally retain a success body in the same bounded read phase.
+/// A retained document never starts a second synchronous attribution parse.
 async fn read_view(
     shape: ResponseShape,
     expect: &AttributionExpectation,
     body: ResponseBody,
     keep_document: bool,
 ) -> (BodyRead<MutationView>, Option<Vec<u8>>) {
-    if keep_document {
-        let bytes = match body.read_to_end().await {
-            Ok(bytes) => bytes,
-            Err(error) => return (BodyRead::Failed(read_failure(error)), None),
-        };
-        let view = match shape {
-            ResponseShape::Table => {
-                scan_complete(table_sink(expect), &bytes).map(MutationView::Table)
-            }
-            ResponseShape::Namespace => {
-                scan_complete(NamespaceSink::new(), &bytes).map(MutationView::Namespace)
-            }
-            ResponseShape::View => {
-                scan_complete(ViewMutationSink::new(), &bytes).map(MutationView::View)
-            }
-        };
-        return match view {
-            Ok(view) => (BodyRead::Complete(view), Some(bytes)),
-            Err(error) => (BodyRead::Failed(BodyReadFailure::Scan(error)), None),
-        };
-    }
     let view = match shape {
-        ResponseShape::Table => stream(body, table_sink(expect))
+        ResponseShape::Table => stream(body, table_sink(expect), keep_document)
             .await
-            .map(MutationView::Table),
-        ResponseShape::Namespace => stream(body, NamespaceSink::new())
+            .map(|(view, document)| (MutationView::Table(view), document)),
+        ResponseShape::Namespace => stream(body, NamespaceSink::new(), keep_document)
             .await
-            .map(MutationView::Namespace),
-        ResponseShape::View => stream(body, ViewMutationSink::new())
+            .map(|(view, document)| (MutationView::Namespace(view), document)),
+        ResponseShape::View => stream(body, ViewMutationSink::new(), keep_document)
             .await
-            .map(MutationView::View),
+            .map(|(view, document)| (MutationView::View(view), document)),
     };
     match view {
-        Ok(view) => (BodyRead::Complete(view), None),
+        Ok((view, document)) => (BodyRead::Complete(view), document),
         Err(failure) => (BodyRead::Failed(failure), None),
     }
 }
@@ -451,12 +442,20 @@ fn table_sink(expect: &AttributionExpectation) -> TableResponseSink {
 }
 
 /// Scan a body chunk by chunk; no raw byte outlives its chunk (L8).
-async fn stream<S: ViewSink>(mut body: ResponseBody, sink: S) -> Result<S::View, BodyReadFailure> {
+async fn stream<S: ViewSink>(
+    mut body: ResponseBody,
+    sink: S,
+    keep_document: bool,
+) -> Result<(S::View, Option<Vec<u8>>), BodyReadFailure> {
     let mut scanner = JsonScanner::new(sink);
+    let mut document = keep_document.then(Vec::new);
     while let Some(chunk) = body.next_chunk().await.map_err(read_failure)? {
         scanner.feed(&chunk).map_err(scan_failure)?;
+        if let Some(document) = &mut document {
+            document.extend_from_slice(&chunk);
+        }
     }
-    scanner.finish().map_err(scan_failure)
+    Ok((scanner.finish().map_err(scan_failure)?, document))
 }
 
 fn scan_failure(error: ScanError) -> BodyReadFailure {
@@ -487,10 +486,11 @@ mod tests {
     use crate::catalog::error::CatalogCommitEvidence;
     use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewDefinition};
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type, ViewMetadata};
-    use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent, TableRequirement};
+    use crate::iceberg::{NamespaceIdent, TableIdent, TableRequirement};
     use crate::rest_protocol::endpoints::RestEndpoints;
     use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot, RestEvidence};
     use crate::rest_protocol::test_server::{BodyPlan, Reply, Script, TestServer};
+    use crate::rest_protocol::wire::CommitTableRequest;
 
     const TABLE_UUID: &str = "1a2b3c4d-0000-4000-8000-000000000001";
     const VIEW_UUID: &str = "1a2b3c4d-0000-4000-8000-000000000002";
@@ -628,7 +628,6 @@ mod tests {
         )
         .await
         .expect("REST generation")
-        .1
     }
 
     fn uuid(text: &str) -> Uuid {
@@ -650,8 +649,8 @@ mod tests {
             .unwrap()
     }
 
-    fn create_request() -> crate::iceberg_catalog_rest::CreateTableRequest {
-        crate::iceberg_catalog_rest::CreateTableRequest {
+    fn create_request() -> crate::rest_protocol::wire::CreateTableRequest {
+        crate::rest_protocol::wire::CreateTableRequest {
             name: "t".to_string(),
             location: None,
             schema: schema(),
@@ -714,23 +713,23 @@ mod tests {
         let snapshot = || Some(ExpectedSnapshot::new(SNAPSHOT, Some("main".to_string())));
         match endpoint {
             Endpoint::TableCommit => {
-                let commit = TableCommit::builder()
-                    .ident(table())
-                    .requirements(vec![TableRequirement::UuidMatch {
+                let commit = CommitTableRequest {
+                    identifier: Some(table()),
+                    requirements: vec![TableRequirement::UuidMatch {
                         uuid: uuid(TABLE_UUID),
-                    }])
-                    .updates(vec![])
-                    .build();
+                    }],
+                    updates: vec![],
+                };
                 let expect =
                     AttributionExpectation::table_commit(uuid(TABLE_UUID), snapshot()).unwrap();
                 endpoints.commit_table(commit, &expect, false).await
             }
             Endpoint::CtasFinalCommit => {
-                let commit = TableCommit::builder()
-                    .ident(table())
-                    .requirements(vec![TableRequirement::NotExist])
-                    .updates(vec![])
-                    .build();
+                let commit = CommitTableRequest {
+                    identifier: Some(table()),
+                    requirements: vec![TableRequirement::NotExist],
+                    updates: vec![],
+                };
                 let expect = AttributionExpectation::ctas_final_commit(
                     uuid(TABLE_UUID),
                     snapshot(),
@@ -1015,8 +1014,7 @@ mod tests {
                 crate::iceberg::Runtime::try_current().unwrap(),
             )
             .await
-            .unwrap()
-            .1;
+            .unwrap();
             let outcome = dispatch(&endpoints, Endpoint::TableCommit).await;
             assert_eq!(observed(&outcome.evidence), expected, "{label}");
             assert_eq!(
@@ -1229,8 +1227,7 @@ mod scratch_probe {
             &expect,
         );
         println!("evidence: {evidence:?}");
-        let decoded =
-            serde_json::from_slice::<crate::iceberg_catalog_rest::LoadTableResult>(&bytes);
+        let decoded = serde_json::from_slice::<crate::rest_protocol::wire::LoadTableResult>(&bytes);
         println!("decode ok: {}", decoded.is_ok());
     }
 }

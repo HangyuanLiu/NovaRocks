@@ -116,6 +116,13 @@ impl IcebergMetadata {
         incarnation: ProviderBindingEpoch,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
+        runtime
+            .novarocks_catalog()
+            .bind_publication_generation(incarnation)
+            .expect("one materialized catalog client belongs to exactly one provider generation");
+        if let Some(activity) = runtime.resources().catalog_runtime().activity() {
+            activity.bind_epoch(incarnation);
+        }
         let binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,

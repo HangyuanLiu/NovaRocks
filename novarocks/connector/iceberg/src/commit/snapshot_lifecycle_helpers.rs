@@ -18,8 +18,10 @@
 //! Shared helpers for snapshot-lifecycle maintenance commands
 //! (EXPIRE SNAPSHOTS / REMOVE ORPHAN FILES / REWRITE MANIFESTS).
 
-#[path = "snapshot_lifecycle_helpers/expire_snapshots.rs"]
-pub mod expire_snapshots;
+#[path = "snapshot_lifecycle_helpers/reclamation.rs"]
+pub(crate) mod reclamation;
+#[path = "snapshot_lifecycle_helpers/retention.rs"]
+pub(crate) mod retention;
 #[path = "snapshot_lifecycle_helpers/rewrite_manifests.rs"]
 pub mod rewrite_manifests;
 
@@ -101,21 +103,13 @@ pub async fn enumerate_files_for_snapshots(
 /// and `referenced_data_file` set).
 pub fn puffin_half_reference_protection(
     candidates_to_delete: &mut FileSet,
-    dv_index: &HashMap<String, HashSet<String>>,
-    live_data_files: &FileSet,
+    _dv_index: &HashMap<String, HashSet<String>>,
+    _live_data_files: &FileSet,
 ) {
-    candidates_to_delete.retain(|path| {
-        if !is_puffin_path(path) {
-            return true;
-        }
-        let referenced = match dv_index.get(path) {
-            Some(set) => set,
-            // Unknown puffin (not in dv_index) → keep as candidate (allow delete).
-            None => return true,
-        };
-        // Keep candidate (delete) only if NO referenced data file is still live.
-        !referenced.iter().any(|d| live_data_files.contains(d))
-    });
+    // This legacy interface carries only an unproven partial index. A nonempty
+    // index cannot prove every blob in a physical Puffin is unreachable. The
+    // reclamation executor uses parsed complete footer facts instead.
+    candidates_to_delete.retain(|path| !is_puffin_path(path));
 }
 
 /// Returns true if the file path looks like a puffin file.
@@ -136,4 +130,33 @@ pub fn build_dv_index(pairs: &[(String, String)]) -> HashMap<String, HashSet<Str
             .insert(ref_data.clone());
     }
     idx
+}
+
+#[cfg(test)]
+mod puffin_protection_tests {
+    use super::*;
+    #[test]
+    fn unknown_or_incomplete_puffin_associations_never_authorize_deletion() {
+        let mut candidates = FileSet::from([
+            "unknown.puffin".into(),
+            "empty.puffin".into(),
+            "partial.puffin".into(),
+            "known.puffin".into(),
+            "plain.parquet".into(),
+        ]);
+        let index = HashMap::from([
+            ("empty.puffin".into(), HashSet::new()),
+            ("partial.puffin".into(), HashSet::from([String::new()])),
+            (
+                "known.puffin".into(),
+                HashSet::from(["live.parquet".into()]),
+            ),
+        ]);
+        puffin_half_reference_protection(
+            &mut candidates,
+            &index,
+            &FileSet::from(["live.parquet".into()]),
+        );
+        assert_eq!(candidates, FileSet::from(["plain.parquet".into()]));
+    }
 }

@@ -666,6 +666,12 @@ pub enum ConnectorStagedCreatePrepareOutcome {
         receipt: ConnectorStagedCreateReceipt,
         finalization: ExternalMutationFinalization,
     },
+    /// The stage was positively attributed, but no usable target can be
+    /// issued. This is distinct from publishing the final CTAS table.
+    AppliedButUnusable {
+        receipt: ConnectorStagedCreateReceipt,
+        finalization: ExternalMutationFinalization,
+    },
     Conflict {
         failure: ConnectorMutationFailure,
     },
@@ -1065,6 +1071,7 @@ pub struct ConnectorStagedCreateLease {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeaseOperationState {
     Preparing,
+    StageAppliedUnusable,
     Unpublished {
         handle_digest: [u8; 32],
         bound_write: Option<BoundWriteProof>,
@@ -1287,6 +1294,9 @@ impl ConnectorStagedCreateLease {
             return Err(error);
         }
         let state = match &outcome {
+            ConnectorStagedCreatePrepareOutcome::AppliedButUnusable { .. } => {
+                Some(LeaseOperationState::StageAppliedUnusable)
+            }
             ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } => {
                 Some(LeaseOperationState::Unpublished {
                     handle_digest: handle.digest(),
@@ -1583,11 +1593,11 @@ impl ConnectorStagedCreateLease {
             "staged-create-publish",
         )?;
         let (unresolved_handle_digest, unresolved_bound_write) = {
-            let operations = self
+            let mut operations = self
                 .operations
                 .lock()
                 .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
-            match operations.get(&operation_id) {
+            let prior = match operations.get(&operation_id) {
                 Some(LeaseOperationState::PublicationUnknown {
                     evidence_digest,
                     handle_digest,
@@ -1600,7 +1610,17 @@ impl ConnectorStagedCreateLease {
                         "staged-create publication adjudication requires the exact publish-unknown evidence",
                     ));
                 }
-            }
+            };
+            // Consume the sole observation permission under the same lock.
+            // A concurrent caller must fail before entering the provider.
+            operations.insert(
+                operation_id,
+                LeaseOperationState::Unknown {
+                    handle_digest: Some(prior.0),
+                    bound_write: Some(prior.1),
+                },
+            );
+            prior
         };
         let outcome = match self.capability.adjudicate_publication(request) {
             Ok(outcome) => outcome,
@@ -1677,6 +1697,9 @@ impl ConnectorStagedCreateLease {
             Some(LeaseOperationState::Preparing) => {
                 Err(invalid("staged table prepare is still in progress"))
             }
+            Some(LeaseOperationState::StageAppliedUnusable) => Err(invalid(
+                "staged create was applied but cannot issue a usable target; reuse is forbidden",
+            )),
             _ => Err(invalid(
                 "staged table handle was not issued by this retained lease",
             )),
@@ -1773,6 +1796,24 @@ impl ConnectorStagedCreateLease {
     ) -> Result<(), ConnectorError> {
         let operation_id = request.operation_id;
         match outcome {
+            ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+                receipt,
+                finalization,
+            } => {
+                self.validate_receipt(
+                    receipt,
+                    operation_id,
+                    ConnectorStagedCreateReceiptPhase::Prepared,
+                )?;
+                if receipt.effect() != ExternalMutationEffect::Applied
+                    || !matches!(finalization, ExternalMutationFinalization::Failed(_))
+                {
+                    return Err(invalid(
+                        "unusable staged create requires Applied evidence and failed finalization",
+                    ));
+                }
+                Ok(())
+            }
             ConnectorStagedCreatePrepareOutcome::Prepared {
                 handle, receipt, ..
             } => {
@@ -2171,6 +2212,7 @@ mod tests {
         unknown_prepare: bool,
         fail_prepare: bool,
         malformed_prepare: bool,
+        unusable_prepare: bool,
         noop_publish: bool,
         conflict_publish: bool,
         unknown_abort: bool,
@@ -2238,6 +2280,20 @@ mod tests {
                     ConnectorErrorKind::Unavailable,
                     "prepare dispatch failed",
                 ));
+            }
+            if self.unusable_prepare {
+                return Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+                    receipt: self.receipt(
+                        request.operation_id,
+                        ConnectorStagedCreateReceiptPhase::Prepared,
+                    ),
+                    finalization: ExternalMutationFinalization::Failed(
+                        ConnectorMutationFailure::new(
+                            super::super::ConnectorMutationFailureKind::Internal,
+                            "injected staged target materialization failure",
+                        ),
+                    ),
+                });
             }
             if self.unknown_prepare {
                 return Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
@@ -2361,6 +2417,17 @@ mod tests {
         inner: FakeCapability,
         poison_on_plan_write: Mutex<Option<SharedOperations>>,
         poison_on_abort: Mutex<Option<SharedOperations>>,
+        adjudication_override: Option<
+            Arc<
+                dyn Fn(
+                        ConnectorStagedCreatePublicationAdjudicationRequest,
+                    ) -> Result<
+                        ConnectorStagedCreatePublicationAdjudicationOutcome,
+                        ConnectorError,
+                    > + Send
+                    + Sync,
+            >,
+        >,
     }
 
     impl ConnectorStagedCreate for PoisoningCapability {
@@ -2424,7 +2491,10 @@ mod tests {
             &self,
             request: ConnectorStagedCreatePublicationAdjudicationRequest,
         ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
-            self.inner.adjudicate_publication(request)
+            match &self.adjudication_override {
+                Some(observe) => observe(request),
+                None => self.inner.adjudicate_publication(request),
+            }
         }
     }
 
@@ -2483,6 +2553,120 @@ mod tests {
     }
 
     #[test]
+    fn attributed_but_unusable_stage_is_terminal_without_mutation_authority() {
+        let (descriptor, incarnation) = owner();
+        let capability = Arc::new(FakeCapability {
+            descriptor: descriptor.clone(),
+            incarnation,
+            aborts: AtomicUsize::new(0),
+            prepares: AtomicUsize::new(0),
+            unknown_prepare: false,
+            fail_prepare: false,
+            malformed_prepare: false,
+            unusable_prepare: true,
+            noop_publish: false,
+            conflict_publish: false,
+            unknown_abort: false,
+            binds: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        });
+        let lease = ConnectorStagedCreateLease::new(
+            ConnectorProviderBindingKey {
+                instance_id: descriptor.instance_id.clone(),
+                incarnation,
+            },
+            capability.clone(),
+            || {},
+        )
+        .unwrap();
+        let operation_id = ConnectorMutationOperationId::new();
+        let request = prepare_request(lease.owner().clone(), operation_id);
+        let outcome = lease.prepare(request.clone()).unwrap();
+        let ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+            receipt,
+            finalization,
+        } = &outcome
+        else {
+            panic!("positive stage evidence must be retained without a handle")
+        };
+        assert_eq!(receipt.operation_id(), operation_id);
+        assert_eq!(receipt.effect(), ExternalMutationEffect::Applied);
+        assert!(matches!(
+            finalization,
+            ExternalMutationFinalization::Failed(_)
+        ));
+        assert!(matches!(
+            lease.operations.lock().unwrap().get(&operation_id),
+            Some(LeaseOperationState::StageAppliedUnusable)
+        ));
+        assert!(lease.prepare(request.clone()).is_err());
+        let handle = ConnectorStagedTableHandle::try_new(
+            lease.owner().clone(),
+            operation_id,
+            Bytes::from_static(b"forged"),
+        )
+        .unwrap();
+        assert!(
+            lease
+                .plan_write(ConnectorStagedWritePlanningRequest {
+                    handle: handle.clone(),
+                    context: context()
+                })
+                .is_err()
+        );
+        assert!(lease.bind_write(handle.clone(), write_proof(1)).is_err());
+        assert!(
+            lease
+                .publish(ConnectorStagedCreatePublishRequest {
+                    operation_id: ConnectorMutationOperationId::new(),
+                    handle: handle.clone(),
+                    write: write_proof(1),
+                    payload: ConnectorStagedCreatePublicationPayload::Ordinary,
+                    context: context(),
+                })
+                .is_err()
+        );
+        assert!(
+            lease
+                .abort(ConnectorStagedCreateAbortRequest {
+                    operation_id: ConnectorMutationOperationId::new(),
+                    handle,
+                    write: None,
+                    context: context(),
+                })
+                .is_err()
+        );
+        assert_eq!(capability.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(capability.publishes.load(Ordering::SeqCst), 0);
+        assert_eq!(capability.aborts.load(Ordering::SeqCst), 0);
+        assert_eq!(capability.binds.load(Ordering::SeqCst), 0);
+        for effect in [
+            ExternalMutationEffect::NoOp,
+            ExternalMutationEffect::Applied,
+        ] {
+            let malformed = ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+                receipt: ConnectorStagedCreateReceipt::try_new(
+                    lease.owner().clone(),
+                    operation_id,
+                    ConnectorStagedCreateReceiptPhase::Prepared,
+                    effect,
+                    Bytes::new(),
+                )
+                .unwrap(),
+                finalization: ExternalMutationFinalization::Complete,
+            };
+            assert!(
+                lease
+                    .validate_prepare_outcome(&request, &malformed)
+                    .is_err()
+            );
+        }
+        let mut foreign = request.clone();
+        foreign.operation_id = ConnectorMutationOperationId::new();
+        assert!(lease.validate_prepare_outcome(&foreign, &outcome).is_err());
+    }
+
+    #[test]
     fn exact_staged_writer_plan_can_recover_unknown_staging_without_catalog_dispatch() {
         let (descriptor, incarnation) = owner();
         let capability = Arc::new(FakeCapability {
@@ -2493,6 +2677,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2553,6 +2738,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2625,6 +2811,7 @@ mod tests {
             unknown_prepare: true,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2678,6 +2865,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2716,6 +2904,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2755,6 +2944,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: true,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2795,6 +2985,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: true,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2835,6 +3026,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -2896,6 +3088,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: true,
             conflict_publish: false,
             unknown_abort: false,
@@ -2958,6 +3151,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -3002,6 +3196,7 @@ mod tests {
                 unknown_prepare: false,
                 fail_prepare: false,
                 malformed_prepare: false,
+                unusable_prepare: false,
                 noop_publish: false,
                 conflict_publish: false,
                 unknown_abort: false,
@@ -3010,6 +3205,7 @@ mod tests {
             },
             poison_on_plan_write: Mutex::new(None),
             poison_on_abort: Mutex::new(None),
+            adjudication_override: None,
         });
         let lease = ConnectorStagedCreateLease::new(
             ConnectorProviderBindingKey {
@@ -3063,6 +3259,7 @@ mod tests {
                 unknown_prepare: false,
                 fail_prepare: false,
                 malformed_prepare: false,
+                unusable_prepare: false,
                 noop_publish: false,
                 conflict_publish: false,
                 unknown_abort: false,
@@ -3071,6 +3268,7 @@ mod tests {
             },
             poison_on_plan_write: Mutex::new(None),
             poison_on_abort: Mutex::new(None),
+            adjudication_override: None,
         });
         let lease = ConnectorStagedCreateLease::new(
             ConnectorProviderBindingKey {
@@ -3100,6 +3298,125 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publication_observation_consumes_permission_before_the_provider_call() {
+        let (descriptor, incarnation) = owner();
+        let inner = FakeCapability {
+            descriptor: descriptor.clone(),
+            incarnation,
+            aborts: AtomicUsize::new(0),
+            prepares: AtomicUsize::new(0),
+            unknown_prepare: false,
+            fail_prepare: false,
+            malformed_prepare: false,
+            unusable_prepare: false,
+            noop_publish: false,
+            conflict_publish: false,
+            unknown_abort: false,
+            binds: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        };
+        let target_operation_id = ConnectorMutationOperationId::new();
+        let dispatch_operation_id = ConnectorMutationOperationId::new();
+        let evidence = inner.evidence_for(dispatch_operation_id, "staged-create-publish");
+        let (entered_send, entered_receive) = std::sync::mpsc::channel();
+        let (exit_send, exit_receive) = std::sync::mpsc::channel();
+        let exit = Mutex::new(exit_receive);
+        let observations = Arc::new(AtomicUsize::new(0));
+        let count = observations.clone();
+        let receipt_owner = ConnectorProviderBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation,
+        };
+        let capability = Arc::new(PoisoningCapability {
+            inner,
+            poison_on_plan_write: Mutex::new(None),
+            poison_on_abort: Mutex::new(None),
+            adjudication_override: Some(Arc::new(move |request| {
+                count.fetch_add(1, Ordering::SeqCst);
+                entered_send.send(()).unwrap();
+                exit.lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Ok(
+                    ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
+                        receipt: ConnectorStagedCreateReceipt::try_new(
+                            receipt_owner.clone(),
+                            request.evidence.operation_id(),
+                            ConnectorStagedCreateReceiptPhase::Published,
+                            ExternalMutationEffect::Applied,
+                            Bytes::new(),
+                        )
+                        .unwrap(),
+                        finalization: ExternalMutationFinalization::Complete,
+                    },
+                )
+            })),
+        });
+        let lease = ConnectorStagedCreateLease::new(
+            ConnectorProviderBindingKey {
+                instance_id: descriptor.instance_id,
+                incarnation,
+            },
+            capability,
+            || {},
+        )
+        .unwrap();
+        lease.operations.lock().unwrap().insert(
+            target_operation_id,
+            LeaseOperationState::PublicationUnknown {
+                evidence_digest: evidence.digest(),
+                handle_digest: [7; 32],
+                bound_write: BoundWriteProof {
+                    receipt_digest: [8; 32],
+                    row_count: 9,
+                },
+            },
+        );
+        let observed = lease.clone();
+        let first_evidence = evidence.clone();
+        let first = std::thread::spawn(move || {
+            observed.adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
+                target_operation_id,
+                evidence: first_evidence,
+                context: context(),
+            })
+        });
+        entered_receive
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            lease
+                .adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
+                    target_operation_id,
+                    evidence: evidence.clone(),
+                    context: context(),
+                })
+                .is_err()
+        );
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        exit_send.send(()).unwrap();
+        assert!(matches!(
+            first.join().unwrap().unwrap(),
+            ConnectorStagedCreatePublicationAdjudicationOutcome::Published { .. }
+        ));
+        assert!(
+            lease
+                .adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
+                    target_operation_id,
+                    evidence,
+                    context: context(),
+                })
+                .is_err()
+        );
+        assert!(matches!(
+            lease.operations.lock().unwrap().get(&target_operation_id),
+            Some(LeaseOperationState::Published)
+        ));
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn publication_adjudication_consumes_exact_unknown_once() {
         let (descriptor, incarnation) = owner();
         let capability = Arc::new(FakeCapability {
@@ -3110,6 +3427,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: false,
             unknown_abort: false,
@@ -3193,6 +3511,7 @@ mod tests {
             unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
+            unusable_prepare: false,
             noop_publish: false,
             conflict_publish: true,
             unknown_abort: false,

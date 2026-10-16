@@ -24,33 +24,6 @@ use std::fmt;
 
 use crate::iceberg::{Error, ErrorKind};
 
-/// The private source marking the session probe's vetoed request (L28).
-#[derive(Debug)]
-struct ProbeVeto;
-
-impl fmt::Display for ProbeVeto {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("NovaRocks session probe request vetoed")
-    }
-}
-
-impl std::error::Error for ProbeVeto {}
-
-/// The error the auth owner returns for the session probe's request, so the
-/// request is never sent.
-pub(crate) fn probe_veto() -> Error {
-    Error::new(
-        ErrorKind::Unexpected,
-        "NovaRocks session probe request vetoed",
-    )
-    .with_source(ProbeVeto)
-}
-
-/// Whether `error` is the probe veto, recognized by its private source type.
-pub(crate) fn is_probe_veto(error: &Error) -> bool {
-    std::error::Error::source(error).is_some_and(|source| source.is::<ProbeVeto>())
-}
-
 /// Converts an upstream error into one that carries only its kind and the
 /// fixed text `operation` (for example "load table"): no message, context or
 /// source of the upstream error survives.
@@ -119,24 +92,6 @@ mod tests {
         assert_eq!(sanitized.message(), "REST catalog commit table failed");
         assert!(std::error::Error::source(&sanitized).is_none());
         assert_free_of_canaries(&sanitized);
-    }
-
-    #[test]
-    fn the_probe_veto_is_recognized_only_by_its_source_type() {
-        assert!(is_probe_veto(&probe_veto()));
-        let same_text = Error::new(
-            ErrorKind::Unexpected,
-            "NovaRocks session probe request vetoed",
-        );
-        assert!(!is_probe_veto(&same_text));
-        let other_source = Error::new(ErrorKind::Unexpected, "x").with_source(
-            std::io::Error::other("NovaRocks session probe request vetoed"),
-        );
-        assert!(!is_probe_veto(&other_source));
-        assert!(!is_probe_veto(&sanitize_upstream_error(
-            &probe_veto(),
-            "probe"
-        )));
     }
 
     #[test]

@@ -252,12 +252,14 @@ pub use predicate::{
     validate_static_predicates,
 };
 pub use provider::{
-    ProviderControlRoleFactory as ConnectorControlRoleBindingFactory,
-    ProviderExecutionRoleFactory as ConnectorExecutionRoleBindingFactory,
+    CatalogActivityEvents, CatalogActivityPhase, CatalogActivityReader, CatalogActivitySnapshot,
+    CatalogActivitySource, CatalogGenerationActivity, CatalogPhaseActivity, CatalogScopeIdentity,
+    ProviderCatalogControlFactory, ProviderControlRoleFactory, ProviderExecutionRoleFactory,
+    ProviderRoleDefinition, SealedProviderRoleRegistry,
 };
 pub use provider::{
-    ProviderControlRoleFactory, ProviderExecutionRoleFactory, ProviderRoleDefinition,
-    SealedProviderRoleRegistry,
+    ProviderControlRoleFactory as ConnectorControlRoleBindingFactory,
+    ProviderExecutionRoleFactory as ConnectorExecutionRoleBindingFactory,
 };
 pub use provider_binding::{ConnectorProviderBinding, ConnectorProviderBindingKey};
 pub use publication::{

@@ -54,6 +54,7 @@ impl From<OperationAuthority> for Authority {
 enum Shape {
     SnapshotProducing,
     MetadataOnly,
+    RefRetention,
     Create,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -117,6 +118,8 @@ pub(crate) struct FrozenPublicationFacts {
     table: String,
     target_ref: String,
     base: Base,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_facts: Option<super::model::FrozenBaseFacts>,
     published_snapshot_id: Option<i64>,
     objects: Vec<Object>,
     attempt_owned: Vec<u32>,
@@ -174,6 +177,7 @@ impl FrozenPublicationFacts {
         let expected_shape = match shape {
             RequestShape::SnapshotProducing => Shape::SnapshotProducing,
             RequestShape::MetadataOnly => Shape::MetadataOnly,
+            RequestShape::RefRetention => Shape::RefRetention,
             RequestShape::Create => Shape::Create,
         };
         if &self.namespace != identifier.namespace.as_ref()
@@ -262,12 +266,14 @@ impl FrozenPublicationFacts {
             shape: match request.shape() {
                 RequestShape::SnapshotProducing => Shape::SnapshotProducing,
                 RequestShape::MetadataOnly => Shape::MetadataOnly,
+                RequestShape::RefRetention => Shape::RefRetention,
                 RequestShape::Create => Shape::Create,
             },
             namespace: request.identifier().namespace.as_ref().to_vec(),
             table: request.identifier().name.clone(),
             target_ref: request.target_ref().into(),
             base,
+            base_facts: request.base_facts().cloned(),
             published_snapshot_id: request.ref_snapshot_after(request.target_ref()),
             attempt_owned: references(request.artifacts().attempt_owned())?,
             operation_references: references(request.artifacts().operation_references())?,
@@ -294,7 +300,7 @@ impl FrozenPublicationFacts {
                 Base::Existing {
                     metadata_location, ..
                 },
-                Shape::SnapshotProducing | Shape::MetadataOnly,
+                Shape::SnapshotProducing | Shape::MetadataOnly | Shape::RefRetention,
             ) if !metadata_location.is_empty() => {}
             (Base::Create { location, .. }, Shape::Create) if !location.is_empty() => {}
             _ => {
@@ -385,5 +391,106 @@ impl FrozenPublicationFacts {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_spi::connector::ConnectorMutationOperationId;
+
+    fn retention_facts() -> (
+        FrozenPublicationFacts,
+        OperationToken,
+        crate::iceberg::TableIdent,
+    ) {
+        let operation =
+            OperationToken::from_mutation(ConnectorMutationOperationId::from_bytes([4; 16]));
+        let attempt = super::super::model::AttemptToken::new(operation, 3);
+        let identifier = crate::iceberg::TableIdent::new(
+            crate::iceberg::NamespaceIdent::new("db".into()),
+            "t".into(),
+        );
+        (
+            FrozenPublicationFacts {
+                authority: operation.authority().into(),
+                operation_id: operation.to_bytes(),
+                attempt: attempt.into(),
+                shape: Shape::RefRetention,
+                namespace: vec!["db".into()],
+                table: "t".into(),
+                target_ref: "main".into(),
+                base: Base::Existing {
+                    uuid: uuid::Uuid::nil(),
+                    parent_snapshot_id: Some(17),
+                    metadata_location: "s3://warehouse/db/t/metadata/v3.json".into(),
+                },
+                base_facts: Some(super::super::model::FrozenBaseFacts {
+                    format_version: 3,
+                    last_sequence_number: 8,
+                    next_row_id: 120,
+                }),
+                published_snapshot_id: None,
+                objects: vec![],
+                attempt_owned: vec![],
+                operation_references: vec![],
+                session_references: vec![],
+            },
+            operation,
+            identifier,
+        )
+    }
+
+    #[test]
+    fn ref_retention_round_trip_preserves_original_baseline_and_authority() {
+        let (facts, operation, identifier) = retention_facts();
+        let bytes = serde_json::to_vec(&facts).unwrap();
+        let restored: FrozenPublicationFacts = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(facts, restored);
+        restored
+            .validate_existing_target(
+                operation,
+                &identifier,
+                uuid::Uuid::nil(),
+                "main",
+                RequestShape::RefRetention,
+            )
+            .unwrap();
+        restored.validate_no_session_data().unwrap();
+        assert!(
+            restored
+                .validate_existing_target(
+                    operation,
+                    &identifier,
+                    uuid::Uuid::nil(),
+                    "main",
+                    RequestShape::MetadataOnly
+                )
+                .is_err()
+        );
+        assert!(
+            restored
+                .validate(OperationToken::from_mutation(
+                    ConnectorMutationOperationId::from_bytes([5; 16])
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn old_recovery_facts_without_baseline_remain_readable_without_inventing_facts() {
+        let (facts, operation, _) = retention_facts();
+        let mut value = serde_json::to_value(facts).unwrap();
+        value["shape"] = serde_json::json!("metadata_only");
+        value.as_object_mut().unwrap().remove("base_facts");
+        let restored: FrozenPublicationFacts = serde_json::from_value(value).unwrap();
+        restored.validate(operation).unwrap();
+        assert!(restored.base_facts.is_none());
+        assert!(
+            serde_json::to_value(restored)
+                .unwrap()
+                .get("base_facts")
+                .is_none()
+        );
     }
 }

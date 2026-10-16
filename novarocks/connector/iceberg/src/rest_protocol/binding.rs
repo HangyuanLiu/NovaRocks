@@ -105,6 +105,7 @@ impl fmt::Debug for BoundHeader {
 pub(crate) struct SessionBinding {
     uri: String,
     prefix: Option<String>,
+    warehouse: Option<String>,
     /// Sorted by name.
     headers: Vec<BoundHeader>,
     /// Server-sent protocol headers left out of NovaRocks requests (L26);
@@ -116,6 +117,9 @@ pub(crate) struct SessionBinding {
     /// Whether the server advertised the table `HEAD` endpoint, learned from
     /// the session probe; `false` when no probe method was observed.
     table_head_advertised: bool,
+    namespace_head_advertised: bool,
+    endpoints: Option<Vec<String>>,
+    idempotency: super::configuration::IdempotencyCapability,
 }
 
 impl fmt::Debug for SessionBinding {
@@ -127,13 +131,13 @@ impl fmt::Debug for SessionBinding {
             .field("excluded_protocol_headers", &self.excluded_protocol_headers)
             .field("ignored_token_properties", &self.ignored_token_properties)
             .field("table_head_advertised", &self.table_head_advertised)
+            .field("idempotency", &self.idempotency)
             .finish_non_exhaustive()
     }
 }
 
 impl SessionBinding {
-    /// Validates the merged configuration upstream hands `catalog_session`
-    /// and captures the binding from it.
+    /// Validate the owner's merged configuration before publishing its binding.
     ///
     /// Server-sent `token`, `credential` or authentication-class headers fail
     /// establishment (L5); server-sent protocol headers are left out (L26).
@@ -156,7 +160,7 @@ impl SessionBinding {
             if is_authentication_header(name) {
                 return Err(BindingFailure::InvalidServerConfig);
             }
-            // Upstream validated every `header.*` before this callback.
+            // Validate merged headers before the session binding becomes visible.
             let name =
                 HeaderName::from_str(name).map_err(|_| BindingFailure::InvalidServerConfig)?;
             let value =
@@ -205,14 +209,65 @@ impl SessionBinding {
             .get(PROP_URI)
             .cloned()
             .ok_or(BindingFailure::InvalidServerConfig)?;
+        let parsed = reqwest::Url::parse(&uri).map_err(|_| BindingFailure::InvalidServerConfig)?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(BindingFailure::InvalidServerConfig);
+        }
         Ok(Self {
             uri,
             prefix: merged.get(PROP_PREFIX).cloned(),
+            warehouse: merged.get("warehouse").cloned(),
             headers,
             excluded_protocol_headers,
             ignored_token_properties,
             table_head_advertised: false,
+            namespace_head_advertised: false,
+            endpoints: None,
+            idempotency: Default::default(),
         })
+    }
+
+    pub(crate) fn set_capabilities(
+        &mut self,
+        endpoints: Option<Vec<String>>,
+        idempotency: super::configuration::IdempotencyCapability,
+    ) -> Result<(), BindingFailure> {
+        if let Some(endpoints) = &endpoints {
+            for endpoint in endpoints {
+                // Advertised paths are opaque capability templates, including
+                // relative or absolute OAuth examples. They never select a
+                // request destination; known routes are matched exactly below.
+                let (method, path) = endpoint
+                    .split_once(' ')
+                    .ok_or(BindingFailure::InvalidServerConfig)?;
+                if reqwest::Method::from_bytes(method.as_bytes()).is_err()
+                    || path.is_empty()
+                    || path.contains(' ')
+                {
+                    return Err(BindingFailure::InvalidServerConfig);
+                }
+            }
+        }
+        self.table_head_advertised = endpoints.as_ref().is_some_and(|endpoints| {
+            endpoints.iter().any(|endpoint| {
+                endpoint == "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+            })
+        });
+        self.namespace_head_advertised = endpoints.as_ref().is_some_and(|endpoints| {
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint == "HEAD /v1/{prefix}/namespaces/{namespace}")
+        });
+        self.endpoints = endpoints;
+        self.idempotency = idempotency;
+        Ok(())
+    }
+
+    pub(crate) fn idempotency_capability(&self) -> &super::configuration::IdempotencyCapability {
+        &self.idempotency
+    }
+    pub(crate) fn namespace_head_advertised(&self) -> bool {
+        self.namespace_head_advertised
     }
 
     pub(crate) fn uri(&self) -> &str {
@@ -221,6 +276,14 @@ impl SessionBinding {
 
     pub(crate) fn prefix(&self) -> Option<&str> {
         self.prefix.as_deref()
+    }
+
+    pub(crate) fn warehouse(&self) -> Option<&str> {
+        self.warehouse.as_deref()
+    }
+
+    pub(crate) fn advertised_endpoints(&self) -> Option<&[String]> {
+        self.endpoints.as_deref()
     }
 
     pub(crate) fn headers(&self) -> &[BoundHeader] {
@@ -237,10 +300,6 @@ impl SessionBinding {
 
     pub(crate) fn table_head_advertised(&self) -> bool {
         self.table_head_advertised
-    }
-
-    pub(crate) fn set_table_head_advertised(&mut self, advertised: bool) {
-        self.table_head_advertised = advertised;
     }
 
     /// Upstream's address algorithm (L30): a raw `/` join of `uri`, `v1`,
@@ -334,6 +393,8 @@ pub(crate) fn is_protocol_header(name: &str) -> bool {
             | "user-agent"
             | "x-client-version"
             | "x-iceberg-access-delegation"
+            | "if-none-match"
+            | "idempotency-key"
     )
 }
 
@@ -471,9 +532,15 @@ mod tests {
 
         // Upstream addresses the same resources NovaRocks composes (L30).
         let namespace = NamespaceIdent::from_strs(["a", "b"]).unwrap();
-        assert!(!fixture.upstream.namespace_exists(&namespace).await.unwrap());
+        assert!(
+            !fixture
+                .endpoints
+                .namespace_exists(&namespace)
+                .await
+                .unwrap()
+        );
         let table = TableIdent::new(namespace.clone(), "orders".to_string());
-        assert!(!fixture.upstream.table_exists(&table).await.unwrap());
+        assert!(!fixture.endpoints.table_exists(&table).await.unwrap());
         let namespace_path = Url::parse(&binding.namespace_url(&namespace))
             .unwrap()
             .path()
@@ -535,10 +602,14 @@ mod tests {
         let binding = SessionBinding {
             uri: "http://catalog:8181/api/".to_string(),
             prefix: Some("ws/main".to_string()),
+            warehouse: None,
             headers: Vec::new(),
             excluded_protocol_headers: Vec::new(),
             ignored_token_properties: Vec::new(),
             table_head_advertised: false,
+            namespace_head_advertised: false,
+            endpoints: None,
+            idempotency: Default::default(),
         };
         let namespace = NamespaceIdent::from_strs(["a", "b"]).unwrap();
         let view = TableIdent::new(namespace.clone(), "v".to_string());

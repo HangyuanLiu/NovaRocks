@@ -533,12 +533,12 @@ fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::commit::attempt::{self, OwnerPublisher, RetryPolicy, TransitionalPublisher};
+    use crate::commit::attempt::{self, RetryPolicy};
     use crate::commit::model::{
         AddedContent, Dependency, FileChanges, IcebergCleanupReport, IsolationLevel,
         OperationIntent, OperationIntentParts, OperationToken, PublicationOutcome, RequestShape,
@@ -592,15 +592,8 @@ mod tests {
         );
         let catalog: Arc<dyn Catalog> = concrete.clone();
         let owner =
-            crate::catalog::factory::NovaRocksCatalogFactory::adopt_recording_hadoop_for_test(
-                concrete,
-                catalog.clone(),
-            );
+            crate::catalog::factory::NovaRocksCatalogFactory::adopt_hadoop_for_test(concrete);
         let namespace = NamespaceIdent::new("db".to_string());
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .expect("create namespace");
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -609,17 +602,18 @@ mod tests {
             ))])
             .build()
             .expect("build schema");
-        catalog
-            .create_table(
-                &namespace,
-                TableCreation::builder()
-                    .name("t".to_string())
-                    .schema(schema)
-                    .format_version(format_version)
-                    .build(),
-            )
-            .await
-            .expect("create table");
+        crate::catalog::admission_test_support::create_static_fixture_table_with_owner(
+            Arc::clone(&owner),
+            binding.clone(),
+            novarocks_spi::connector::ProviderBindingEpoch::from_bytes([0x66; 16]),
+            crate::catalog::CatalogNamespaceName::new("db"),
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema)
+                .format_version(format_version)
+                .build(),
+        )
+        .await;
         LocalTableFixture {
             catalog,
             owner,
@@ -688,37 +682,63 @@ mod tests {
             token,
         })
         .unwrap();
-        let publisher = OwnerPublisher {
-            operation: token,
-            marker: None,
-            target: TransitionalPublisher {
-                catalog: fixture.owner.clone(),
+        let recovery_preflight: crate::commit::attempt::RecoveryPreflight =
+            Arc::new(|request, operation| {
+                let facts = crate::commit::recovery::FrozenPublicationFacts::from_request(
+                    request, operation,
+                )?;
+                facts.validate(operation.token())?;
+                let encoded = serde_json::to_vec(&facts).map_err(|error| {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::Unexpected,
+                        "Encode test publication recovery failed",
+                    )
+                    .with_source(error)
+                })?;
+                if encoded.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Test publication recovery exceeds evidence capacity",
+                    ));
+                }
+                Ok(())
+            });
+        let generation = novarocks_spi::connector::ProviderBindingEpoch::from_bytes([0x66; 16]);
+        fixture
+            .owner
+            .bind_publication_generation(generation)
+            .unwrap();
+        let evidence = novarocks_spi::connector::ExternalMutationEvidence::try_new(
+            2,
+            novarocks_spi::connector::ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                    "overwrite-fixture",
+                )
+                .unwrap(),
+            },
+            generation,
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "append_fixture",
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .unwrap();
+        let journal = crate::commit::attempt::observation::PublicationJournal::new(token);
+        let preflight_journal = journal.clone();
+        let publisher = journal.observe_prepared(Arc::new(
+            crate::commit::attempt::prepared::CatalogPublisher {
+                catalog_operation: crate::catalog::admission::CatalogOperation::Overwrite,
+                catalog: Arc::clone(&fixture.owner),
                 ident: fixture.table_ident.clone(),
                 target_ref: target_ref.to_string(),
-                evidence: crate::catalog::error::CatalogCommitEvidence::for_target("db.t")
-                    .with_target_uuid(table.metadata().uuid().to_string()),
-                recovery_preflight: Arc::new(|request, operation| {
-                    let facts = crate::commit::recovery::FrozenPublicationFacts::from_request(
-                        request, operation,
-                    )?;
-                    facts.validate(operation.token())?;
-                    let encoded = serde_json::to_vec(&facts).map_err(|error| {
-                        crate::iceberg::Error::new(
-                            crate::iceberg::ErrorKind::Unexpected,
-                            "Encode test publication recovery failed",
-                        )
-                        .with_source(error)
-                    })?;
-                    if encoded.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES {
-                        return Err(crate::iceberg::Error::new(
-                            crate::iceberg::ErrorKind::DataInvalid,
-                            "Test publication recovery exceeds evidence capacity",
-                        ));
-                    }
-                    Ok(())
+                operation: token,
+                recovery_preflight: Arc::new(move |request, operation| {
+                    recovery_preflight(request, operation)?;
+                    preflight_journal.record(evidence.clone(), (), request)
                 }),
             },
-        };
+        ));
         let report = attempt::run(
             &operation,
             &intent,
@@ -937,9 +957,19 @@ mod tests {
                 expected_table_uuid: Some(seeded.metadata().uuid()),
             },
         };
-        super::super::ref_action::execute_ref_action(fixture.catalog.as_ref(), &seeded, &plan)
-            .await
-            .expect("create dev branch");
+        let outcome = crate::catalog::admission_test_support::publish_ref_change(
+            Arc::clone(&fixture.owner),
+            &seeded,
+            plan.prepare(&seeded).unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted { .. }
+            ),
+            "{outcome:?}"
+        );
         let branched = fixture
             .catalog
             .load_table(&fixture.table_ident)
@@ -1010,6 +1040,15 @@ pub(crate) mod preparer_tests {
         }
 
         pub(crate) fn new_with_limits(limits: OperationLimits) -> Self {
+            Self::new_with_limits_and_activity(limits, None)
+        }
+        pub(crate) fn new_observed(activity: Arc<crate::activity::GenerationActivity>) -> Self {
+            Self::new_with_limits_and_activity(OperationLimits::default(), Some(activity))
+        }
+        fn new_with_limits_and_activity(
+            limits: OperationLimits,
+            activity: Option<Arc<crate::activity::GenerationActivity>>,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let location = format!("file://{}", directory.path().display());
             let runtime = tokio::runtime::Handle::current();
@@ -1019,6 +1058,15 @@ pub(crate) mod preparer_tests {
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
                 Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime.clone())),
             );
+            let catalog_runtime = match activity {
+                Some(activity) => {
+                    crate::resources::IcebergMetadataResources::new(binding.clone(), runtime)
+                        .with_activity(activity)
+                        .catalog_runtime()
+                        .clone()
+                }
+                None => crate::resources::IcebergCatalogRuntime::new(runtime),
+            };
             let stop = ConnectorStopOwner::new();
             let operation = IcebergCommitOperation::new(
                 OperationToken::from_write(ConnectorWriteOperationId::from_bytes([7; 16])),
@@ -1031,7 +1079,7 @@ pub(crate) mod preparer_tests {
                     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
                 )
                 .unwrap(),
-                crate::resources::IcebergCatalogRuntime::new(runtime),
+                catalog_runtime,
                 limits,
             )
             .unwrap();

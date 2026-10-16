@@ -24,19 +24,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
+#[cfg(test)]
+use super::ConditionalCreateFacts;
 use super::admission::{
     CatalogAdmission, CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogInitiation,
     CatalogOperation,
 };
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
-use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
-    CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateFacts, ConditionalCreateReceipt, ConditionalCreateRequest,
+    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
     ConditionalCreateVerdict, NovaRocksCatalog,
 };
+#[cfg(test)]
+use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 
 /// A Hadoop filesystem Iceberg catalog.
 ///
@@ -60,20 +61,17 @@ pub(super) struct NovaRocksHadoopCatalog {
 }
 
 impl NovaRocksHadoopCatalog {
+    pub(super) fn with_evidence_policy(
+        mut self,
+        policy: super::publication::CatalogEvidencePolicy,
+    ) -> Self {
+        self.delegate.evidence_policy = policy;
+        self
+    }
+
     pub(super) fn new(client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>) -> Self {
         Self {
             delegate: CatalogDelegate::new(client.clone()),
-            client,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn new_with_vendored_client_for_test(
-        client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>,
-        vendored_client: Arc<dyn crate::iceberg::Catalog>,
-    ) -> Self {
-        Self {
-            delegate: CatalogDelegate::new(vendored_client),
             client,
         }
     }
@@ -122,16 +120,272 @@ fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
+    fn freeze_create_publication(
+        &self,
+        request: super::catalog_request::CatalogCreatePublicationRequest,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::catalog_request::FrozenCatalogPublication,
+    > {
+        let target = CatalogTableName::new(
+            Arc::clone(&request.namespace.namespace),
+            request.creation.name.clone(),
+        );
+        self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            &target.into(),
+        )
+        .map_err(|reason| {
+            super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    reason.message(),
+                ),
+            )
+        })?;
+        let namespace = super::delegate::namespace_ident(&request.namespace)?;
+        let attempt = self
+            .client
+            .prepare_create_attempt(
+                &namespace,
+                request.creation,
+                uuid::Uuid::from_bytes(request.operation_id)
+                    .simple()
+                    .to_string(),
+            )
+            .map_err(|failure| {
+                super::publication_dispatch::PreparationFailure(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        match failure.kind {
+                            crate::hadoop_catalog::HadoopCreateFailureKind::Invalid => novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                            crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                            crate::hadoop_catalog::HadoopCreateFailureKind::Uncommitted
+                            | crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
+                        },
+                        failure.message,
+                    ),
+                )
+            })?;
+        Ok(
+            super::catalog_request::FrozenCatalogPublication::hadoop_create(
+                attempt,
+                request.operation_id,
+                request.no_op_if_exists,
+            )?,
+        )
+    }
+
+    async fn prepare_catalog_publication(
+        &self,
+        request: super::catalog_request::FrozenCatalogPublication,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+        _document: super::catalog_request::CatalogResponseDocument,
+        read_binding: crate::access_binding::IcebergReadBinding,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        preparation.check_active()?;
+        self.delegate.publication_generation.require(generation)?;
+        request.validate_descriptor(&descriptor)?;
+        self.admit_operation(&request.operation, &request.target)
+            .map_err(|error| {
+                super::publication_dispatch::PreparationFailure(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                        error.message(),
+                    ),
+                )
+            })?;
+        if request.operation
+            == CatalogOperation::CreateTable(super::CatalogCreateIntent::EmptyTable)
+        {
+            let (attempt, no_op_if_exists) = request.into_hadoop_create()?;
+            return Arc::clone(&self.client).prepare_conditional_create(
+                attempt,
+                no_op_if_exists,
+                &preparation,
+            );
+        }
+        if request.operation == CatalogOperation::DropTable {
+            request.table_drop_policy()?;
+            let CatalogAdmissionTarget::Table(table) = &request.target else {
+                return Err(crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "Table drop requires a table target",
+                )
+                .into());
+            };
+            preparation.check_active()?;
+            return Ok(
+                Arc::clone(&self.client).prepare_table_drop(super::delegate::table_ident(table)?)
+            );
+        }
+        if !matches!(
+            request.operation,
+            CatalogOperation::CreateNamespace | CatalogOperation::DropNamespace
+        ) {
+            return Err(super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    "Hadoop catalog request has no prepared mechanism for this operation",
+                ),
+            ));
+        }
+        if request.namespace_has_properties {
+            return Err(super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    "Hadoop namespace marker does not persist namespace properties",
+                ),
+            ));
+        }
+        let CatalogAdmissionTarget::Namespace(namespace) = &request.target else {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "Namespace publication requires a namespace target",
+            )
+            .into());
+        };
+        let ident = super::delegate::namespace_ident(namespace)?;
+        let exists = self
+            .delegate
+            .listing
+            .run_wait_for_exit(&preparation, async {
+                self.client
+                    .namespace_exists_for_read(
+                        &ident,
+                        read_binding.for_request(preparation.clone()),
+                    )
+                    .await
+                    .map_err(|error| map_bounded_read_error(&error))
+            })
+            .await?;
+        if request.namespace_no_op(exists)? {
+            return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+        }
+        preparation.check_active()?;
+        Ok(Arc::clone(&self.client).prepare_namespace_publication(
+            &ident,
+            request.operation == CatalogOperation::CreateNamespace,
+        ))
+    }
+
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.delegate.publication_generation.bind(generation)
+    }
+
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: super::admission::CatalogOperation,
+        staged_expectation: Option<super::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        novarocks_spi::connector::ConnectorOperationControl::check_active(&preparation)?;
+        self.delegate.publication_generation.require(generation)?;
+        descriptor.validate_frozen(&request)?;
+        self.admit_operation(
+            &operation,
+            &CatalogTableName::from_identifier(request.identifier()).into(),
+        )
+        .map_err(|error| {
+            super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    error.message(),
+                ),
+            )
+        })?;
+        if staged_expectation.is_some() {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Hadoop catalog has no staged publication protocol",
+            )
+            .into());
+        }
+        if !request.has_updates()
+            && matches!(
+                request.base(),
+                crate::commit::model::BaseIdentity::Existing { .. }
+            )
+        {
+            return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+        }
+        Arc::clone(&self.client)
+            .prepare_frozen_update(request, preparation)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn prepare_frozen_for_admission_test(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: CatalogOperation,
+        staged_expectation: Option<super::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        novarocks_spi::connector::ConnectorOperationControl::check_active(&preparation)?;
+        self.delegate.publication_generation.require(generation)?;
+        descriptor.validate_frozen(&request)?;
+        operation
+            .validate_target(&CatalogTableName::from_identifier(request.identifier()).into())
+            .map_err(|error| {
+                crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.message())
+            })?;
+        if staged_expectation.is_some()
+            || !matches!(
+                request.base(),
+                crate::commit::model::BaseIdentity::Existing { .. }
+            )
+        {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Hadoop test publication requires an existing frozen table",
+            )
+            .into());
+        }
+        if !request.has_updates() {
+            return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+        }
+        Arc::clone(&self.client)
+            .prepare_frozen_update(request, preparation)
+            .await
+    }
+
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        novarocks_spi::connector::ExternalMutationFinalization::Failed(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                "Positive attribution does not observe Hadoop publication cache finalization",
+            ),
+        )
+    }
+
+    fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
+        self.delegate.evidence_policy
+    }
+
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
         Arc::clone(&self.delegate.listing)
     }
 
     fn implementation_name(&self) -> &'static str {
         "hadoop"
-    }
-
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
-        Arc::clone(self.delegate.client())
     }
 
     fn admit_operation(
@@ -334,6 +588,26 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         )
     }
 
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.view_exists(view).await
+    }
+
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.load_view(view).await
+    }
+
     async fn view_exists(&self, _view: CatalogTableName) -> Result<bool, ConnectorError> {
         Err(super::views_unsupported("view_exists"))
     }
@@ -353,44 +627,10 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         Err(super::views_unsupported("load_view"))
     }
 
-    async fn create_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateNamespace,
-            &namespace.clone().into(),
-        ) {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.create_namespace(namespace).await
-    }
-
-    async fn drop_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::DropNamespace, &namespace.clone().into())
-        {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.drop_namespace(namespace).await
-    }
-
-    async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::DropTable, &table.clone().into())
-        {
-            return CatalogOutcome::Unsupported(reason);
-        }
-        self.delegate.drop_table(table).await
-    }
-
     async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,
-        metadata_location: Arc<str>,
+        _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
         if let Err(reason) = self.admit_operation(
             &CatalogOperation::AnchorWrittenMetadata,
@@ -398,61 +638,15 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         ) {
             return CatalogOutcome::Unsupported(reason);
         }
-        // The namespace has to exist before the table can be anchored under it.
-        // The previous helper created it with `let _ =`, so a namespace that
-        // failed to appear surfaced later as a confusing registration failure
-        // instead of the thing that actually went wrong.
-        let namespace = CatalogNamespaceName::new(Arc::clone(&table.namespace));
-        match self.delegate.namespace_exists(&namespace).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let created = self.delegate.create_namespace(namespace).await;
-                if !matches!(created, CatalogOutcome::KnownCommitted { .. }) {
-                    return match created {
-                        CatalogOutcome::KnownCommitted { .. } => unreachable!(),
-                        CatalogOutcome::Unsupported(reason) => CatalogOutcome::Unsupported(reason),
-                        CatalogOutcome::KnownUncommitted { failure } => {
-                            CatalogOutcome::KnownUncommitted { failure }
-                        }
-                        CatalogOutcome::CommitUnknown { failure, evidence } => {
-                            CatalogOutcome::CommitUnknown { failure, evidence }
-                        }
-                    };
-                }
-            }
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
-                    error.to_string(),
-                );
-            }
-        }
-        self.delegate.register_table(table, metadata_location).await
+        // Both the conditional create and retained update protocol publish
+        // their own metadata pointer. Admission must not register it again.
+        CatalogOutcome::committed(
+            table,
+            novarocks_spi::connector::ExternalMutationEffect::NoOp,
+        )
     }
 
-    /// Prepare the conditional metadata write that makes this table exist.
-    ///
-    /// Local only: it builds metadata and sends nothing, which is what lets the
-    /// caller freeze publication evidence before the attempt is dispatched.
-    async fn stage_create_table(
-        &self,
-        _namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::TableCreation,
-    ) -> super::StagedCreateStart {
-        super::StagedCreateStart::Unsupported(CatalogUnsupported::new(
-            "Hadoop Iceberg catalog has no staged-create protocol",
-        ))
-    }
-
-    async fn commit_staged_table(
-        &self,
-        _commit: crate::iceberg::TableCommit,
-        _expectation: super::StagedPublicationExpectation,
-    ) -> super::StagedCommitResult {
-        super::StagedCommitResult::Unsupported(CatalogUnsupported::new(
-            "Hadoop Iceberg catalog has no staged-create protocol",
-        ))
-    }
+    #[cfg(test)]
 
     async fn prepare_conditional_create(
         &self,
@@ -497,6 +691,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         }
     }
 
+    #[cfg(test)]
+
     async fn publish_conditional_create(
         &self,
         attempt: ConditionalCreateAttempt,
@@ -534,6 +730,40 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         }
     }
 
+    async fn adjudicate_conditional_create_for_read(
+        &self,
+        evidence: ConditionalCreateEvidence,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        let result = self
+            .client
+            .reconcile_create_attempt_for_read(
+                &evidence.namespace,
+                &evidence.table,
+                &evidence.expected_table_uuid,
+                &evidence.metadata_location,
+                &evidence.metadata_digest,
+                binding,
+            )
+            .await?;
+        Ok(match result {
+            crate::hadoop_catalog::HadoopCreateReconciliation::Committed {
+                finalization_failure,
+            } => ConditionalCreateVerdict::Committed {
+                finalization_failure: Some(Arc::from(finalization_failure.unwrap_or_else(|| {
+                    "Conditional-create attribution does not observe hint or cache finalization"
+                        .to_owned()
+                }))),
+            },
+            crate::hadoop_catalog::HadoopCreateReconciliation::Absent => {
+                ConditionalCreateVerdict::Absent
+            }
+            crate::hadoop_catalog::HadoopCreateReconciliation::Foreign => {
+                ConditionalCreateVerdict::Foreign
+            }
+        })
+    }
+
     async fn adjudicate_conditional_create(
         &self,
         evidence: ConditionalCreateEvidence,
@@ -568,104 +798,9 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             }
         })
     }
-
-    async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::Append, &request.target.clone().into())
-        {
-            return CatalogTransactionStart::Unsupported(reason);
-        }
-        super::start_update_table_transaction(self, request)
-    }
-
-    async fn new_create_table_transaction(
-        &self,
-        request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateTable(request.intent),
-            &request.target.clone().into(),
-        ) {
-            return CatalogTransactionStart::Unsupported(reason);
-        }
-        match request.intent {
-            CatalogCreateIntent::EmptyTable => {
-                // This catalog's create is a conditional metadata write, not a
-                // catalog call, so the transaction is built around that
-                // primitive rather than around `create_table`.
-                let target = request.target.clone();
-                let namespace = CatalogNamespaceName::new(Arc::clone(&target.namespace));
-                let prepared = self
-                    .prepare_conditional_create(super::ConditionalCreateRequest {
-                        namespace,
-                        creation: request.creation,
-                        operation_id: Arc::from(request.identity.hex()),
-                    })
-                    .await;
-                let Some((attempt, _effect, _witness)) = prepared.into_known_committed() else {
-                    // Preparation sends nothing, so a failure here is proven
-                    // uncommitted; report it without inventing a transaction.
-                    return CatalogTransactionStart::KnownUncommitted {
-                        failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                            "conditional create could not be prepared",
-                        ),
-                    };
-                };
-                let evidence = super::ConditionalCreateEvidence {
-                    namespace: Arc::clone(&target.namespace),
-                    table: Arc::clone(&target.name),
-                    expected_table_uuid: Arc::clone(&attempt.facts.table_uuid),
-                    metadata_location: Arc::clone(&attempt.facts.metadata_location),
-                    metadata_digest: Arc::clone(&attempt.facts.metadata_digest),
-                };
-                let commit_evidence =
-                    super::error::CatalogCommitEvidence::for_target(target.canonical())
-                        .with_target_uuid(Arc::clone(&attempt.facts.table_uuid))
-                        .with_metadata_location(Arc::clone(&attempt.facts.metadata_location));
-                // What admission observed, so the caller can freeze publication
-                // evidence before anything is dispatched.
-                let admission = super::transaction::AdmissionFacts {
-                    table_uuid: Some(Arc::clone(&attempt.facts.table_uuid)),
-                    metadata_location: Some(Arc::clone(&attempt.facts.metadata_location)),
-                    metadata_digest: Some(Arc::clone(&attempt.facts.metadata_digest)),
-                };
-                CatalogTransactionStart::Ready(Box::new(
-                    super::transaction::Transaction::new(
-                        request.identity,
-                        target,
-                        super::transaction::TransactionShape::Create(request.intent),
-                        commit_evidence,
-                        Arc::new(super::dispatch::ConditionalCreateDispatch::new(
-                            Arc::clone(&self.client),
-                            attempt
-                                .into_hadoop()
-                                .expect("this catalog prepared the attempt"),
-                            evidence,
-                        )),
-                    )
-                    .with_admission_facts(admission),
-                ))
-            }
-            CatalogCreateIntent::CreateTableAsSelect => match self.admit_operation(
-                &CatalogOperation::CreateTable(request.intent),
-                &request.target.clone().into(),
-            ) {
-                Ok(()) => super::start_create_table_transaction(&self.delegate, request),
-                Err(reason) => CatalogTransactionStart::Unsupported(reason),
-            },
-        }
-    }
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(CatalogUnsupported::new(
-            "Hadoop Iceberg catalog cannot replace a table atomically",
-        ))
-    }
 }
+
+#[cfg(test)]
 
 fn facts_from_hadoop(
     facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
@@ -679,6 +814,7 @@ fn facts_from_hadoop(
 }
 
 /// Preparing sends nothing, so its failures are all proven uncommitted.
+#[cfg(test)]
 fn map_prepare_failure<T>(
     failure: &crate::hadoop_catalog::HadoopCreateFailure,
 ) -> CatalogOutcome<T> {
@@ -699,6 +835,7 @@ fn map_prepare_failure<T>(
 
 // Used by `publish_conditional_create`, which only tests reach.
 #[allow(dead_code)]
+#[cfg(test)]
 fn map_publish_failure<T>(
     failure: &crate::hadoop_catalog::HadoopCreateFailure,
     facts: &ConditionalCreateFacts,
@@ -719,6 +856,8 @@ fn map_publish_failure<T>(
         ),
     }
 }
+
+#[cfg(test)]
 
 fn message(failure: &crate::hadoop_catalog::HadoopCreateFailure) -> String {
     match failure.facts.as_ref() {

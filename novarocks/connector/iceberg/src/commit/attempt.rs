@@ -18,6 +18,7 @@
 //! One immutable operation, fresh preparation per definite catalog conflict.
 
 pub(crate) mod observation;
+pub(crate) mod prepared;
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -34,7 +35,7 @@ use super::model::{
 };
 use super::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use super::staging::{PreparedChange, Preparer, StagingBase, StagingEngine};
-use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome, uncommitted_failure_kind};
+use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome, preparation_failure_kind};
 use crate::catalog::transaction::CommitProof;
 use crate::iceberg::spec::TableProperties;
 use crate::iceberg::{Error, ErrorKind, Result};
@@ -60,151 +61,6 @@ pub(crate) trait Publisher: Send + Sync {
 /// It shares staging and retry with owner publication without changing topology.
 pub(crate) type RecoveryPreflight =
     std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
-
-pub(crate) struct TransitionalPublisher {
-    pub catalog: std::sync::Arc<dyn crate::catalog::NovaRocksCatalog>,
-    pub ident: crate::iceberg::TableIdent,
-    pub target_ref: String,
-    pub evidence: CatalogCommitEvidence,
-    pub recovery_preflight: RecoveryPreflight,
-}
-
-#[async_trait]
-impl Publisher for TransitionalPublisher {
-    async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
-        attempt.check_active()?;
-        let loaded = self
-            .catalog
-            .load_commit_base(
-                crate::catalog::CatalogTableName::from_identifier(&self.ident),
-                attempt.file_io().clone(),
-            )
-            .await;
-        attempt.check_active()?;
-        let base = loaded?;
-        Ok(StagingBase::Existing {
-            metadata: base.metadata,
-            metadata_location: base.metadata_location,
-        })
-    }
-
-    fn preflight_recovery(
-        &self,
-        request: &FrozenRequest,
-        operation: &IcebergCommitOperation,
-    ) -> Result<()> {
-        (self.recovery_preflight)(request, operation)
-    }
-
-    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
-        if request.identifier() != &self.ident || request.target_ref() != self.target_ref {
-            return CatalogOutcome::uncommitted(
-                ConnectorMutationFailureKind::InvalidRequest,
-                "Frozen Iceberg request differs from its admitted target",
-            );
-        }
-        if !request.has_updates() {
-            return CatalogOutcome::committed(
-                CommitProof::no_op(),
-                novarocks_spi::connector::ExternalMutationEffect::NoOp,
-            );
-        }
-        // One dispatch through the owner's own mechanism: the REST owner's
-        // evidence-producing commit, or the shared single `update_table`
-        // (L12). The result is typed; nothing here infers from an error.
-        let dispatch = self.catalog.commit_dispatch(
-            self.ident.clone(),
-            std::sync::Arc::from(self.target_ref.as_str()),
-            None,
-        );
-        match dispatch.dispatch_once(Some(&request)).await {
-            crate::catalog::transaction::CommitDispatchResult::Applied(proof) => {
-                let effect = proof.effect;
-                CatalogOutcome::committed(proof, effect)
-            }
-            crate::catalog::transaction::CommitDispatchResult::Uncommitted { failure } => {
-                CatalogOutcome::KnownUncommitted { failure }
-            }
-            crate::catalog::transaction::CommitDispatchResult::Unknown { message } => {
-                CatalogOutcome::unknown(message, self.evidence.clone())
-            }
-        }
-    }
-}
-
-/// Eager writes retain the catalog-owner transaction frontier. The request is
-/// complete before admission and is borrowed only by the single dispatch.
-pub(crate) struct OwnerPublisher {
-    pub target: TransitionalPublisher,
-    pub operation: super::model::OperationToken,
-    pub marker: Option<(std::sync::Arc<str>, std::sync::Arc<str>)>,
-}
-
-#[async_trait]
-impl Publisher for OwnerPublisher {
-    async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
-        self.target.load_target(attempt).await
-    }
-
-    fn preflight_recovery(
-        &self,
-        request: &FrozenRequest,
-        operation: &IcebergCommitOperation,
-    ) -> Result<()> {
-        self.target.preflight_recovery(request, operation)
-    }
-
-    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
-        use super::model::BaseIdentity;
-        use crate::catalog::CatalogTransactionStart;
-        use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
-        if request.identifier() != &self.target.ident
-            || request.target_ref() != self.target.target_ref
-            || request.artifacts().attempt().operation() != self.operation
-        {
-            return CatalogOutcome::uncommitted(
-                ConnectorMutationFailureKind::InvalidRequest,
-                "Frozen owner request differs from its admitted operation or target",
-            );
-        }
-        let BaseIdentity::Existing { uuid, parent, .. } = request.base() else {
-            return CatalogOutcome::uncommitted(
-                ConnectorMutationFailureKind::InvalidRequest,
-                "Existing owner publication cannot dispatch a create request",
-            );
-        };
-        let admission = TransactionRequest {
-            identity: TransactionIdentity::new(
-                self.operation.authority().label(),
-                self.operation.to_bytes(),
-            ),
-            target: crate::catalog::CatalogTableName::from_identifier(request.identifier()),
-            target_ref: std::sync::Arc::from(request.target_ref()),
-            base_snapshot_id: *parent,
-            expected_table_uuid: Some(std::sync::Arc::from(uuid.to_string())),
-            marker: self.marker.clone(),
-        };
-        let mut frontier = match self.target.catalog.new_transaction(admission).await {
-            CatalogTransactionStart::Ready(frontier) => frontier,
-            CatalogTransactionStart::KnownUncommitted { failure } => {
-                return CatalogOutcome::KnownUncommitted { failure };
-            }
-            CatalogTransactionStart::CommitUnknown { failure, evidence } => {
-                return CatalogOutcome::CommitUnknown { failure, evidence };
-            }
-            CatalogTransactionStart::Unsupported(error) => {
-                return CatalogOutcome::Unsupported(error);
-            }
-        };
-        if let Err(error) = frontier.stage(request) {
-            return CatalogOutcome::uncommitted(
-                ConnectorMutationFailureKind::InvalidRequest,
-                error.message(),
-            );
-        }
-        frontier.commit().await
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetryPolicy {
@@ -265,7 +121,25 @@ impl RetryPolicy {
         })
     }
 
-    fn backoff(self, retry: u32) -> Duration {
+    pub(crate) const fn retries(self) -> u32 {
+        self.retries
+    }
+    pub(crate) const fn total_timeout(self) -> Duration {
+        self.total_timeout
+    }
+    pub(crate) fn backoff(self, retry: u32) -> Duration {
+        let ceiling = self.backoff_ceiling(retry);
+        // The property lower/upper bounds remain hard bounds. Jitter does not
+        // grant extra retry time or affect an already-dispatched request.
+        let millis = rand::Rng::gen_range(
+            &mut rand::thread_rng(),
+            self.min_wait.as_millis()..=ceiling.as_millis(),
+        );
+        Duration::from_millis(
+            u64::try_from(millis).expect("retry bounds originated as u64 milliseconds"),
+        )
+    }
+    fn backoff_ceiling(self, retry: u32) -> Duration {
         self.min_wait
             .saturating_mul(1u32.checked_shl(retry).unwrap_or(u32::MAX))
             .min(self.max_wait)
@@ -294,36 +168,51 @@ pub(crate) async fn run(
         .await;
     }
     let started = Instant::now();
+    let deadline = started
+        .checked_add(policy.total_timeout)
+        .map_or(operation.request_context().deadline(), |deadline| {
+            deadline.min(operation.request_context().deadline())
+        });
+    if let Err(error) = operation.bind_preparation_deadline(deadline) {
+        return rejected(operation, before_dispatch_failure(&error)).await;
+    }
     let mut attempt_number = 0;
     loop {
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        let attempt = match operation.begin_attempt() {
-            Ok(attempt) => attempt,
-            Err(error) => return rejected(operation, before_dispatch_failure(&error)).await,
-        };
-        let base = match publisher.load_target(&attempt).await {
-            Ok(base) => base,
-            Err(error) => return rejected(operation, before_dispatch_failure(&error)).await,
-        };
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        let prepared = prepare(&attempt, intent, base, prefix, preparers).await;
-        let (request, retained) = match prepared {
+        // This segment covers only preparation. Returning from the helper
+        // releases its observation guard before dispatch or rejected cleanup.
+        let prepared = operation
+            .runtime()
+            .observe_preparation_async(
+                async {
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    let attempt = operation
+                        .begin_attempt()
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    let base = publisher
+                        .load_target(&attempt)
+                        .await
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    let (request, retained) =
+                        prepare(&attempt, intent, base, prefix, preparers).await?;
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    publisher
+                        .preflight_recovery(&request, operation)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    Ok::<_, ConnectorMutationFailure>((attempt, request, retained))
+                },
+                |failure| failure.clone(),
+            )
+            .await;
+        let (attempt, request, retained) = match prepared {
             Ok(prepared) => prepared,
             Err(failure) => return rejected(operation, failure).await,
         };
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        if let Err(error) = publisher.preflight_recovery(&request, operation) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
         match publisher.dispatch_once(request).await {
             CatalogOutcome::KnownCommitted { receipt, .. } => {
                 return Report {
@@ -357,7 +246,13 @@ pub(crate) async fn run(
                 if wait >= left {
                     return rejected(operation, failure).await;
                 }
-                if let Err(error) = operation.pause(wait).await {
+                // Conflict cleanup is complete before this waiting segment;
+                // a stopped backoff remains a typed pre-dispatch failure.
+                if let Err(error) = operation
+                    .runtime()
+                    .observe_preparation_async(operation.pause(wait), before_dispatch_failure)
+                    .await
+                {
                     return rejected(operation, before_dispatch_failure(&error)).await;
                 }
                 attempt_number += 1;
@@ -479,6 +374,32 @@ async fn prepare(
                 .map(|s| s.snapshot_id()),
         );
         for snapshot in snapshots {
+            // Data live sets omit manifest objects. Freeze the exact physical
+            // roots of every AddSnapshot, including intermediate snapshots.
+            let snapshot_ref = engine.metadata().snapshot_by_id(snapshot).ok_or_else(|| {
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::InvalidRequest,
+                    "Staged publication snapshot is missing",
+                )
+            })?;
+            let list = crate::manifest::load_manifest_list(
+                snapshot_ref,
+                attempt.file_io(),
+                engine.metadata(),
+            )
+            .await
+            .map_err(|error| before_dispatch_failure(&error))?;
+            for path in std::iter::once(snapshot_ref.manifest_list()).chain(
+                list.entries()
+                    .iter()
+                    .map(|manifest| manifest.manifest_path.as_str()),
+            ) {
+                let object =
+                    ObjectIdentity::new(path).map_err(|error| before_dispatch_failure(&error))?;
+                if cross_attempt.contains(&object) {
+                    references.insert(object);
+                }
+            }
             let mut inputs = ValidationInputs::new(engine.metadata(), Some(snapshot), attempt);
             for identity in inputs
                 .live_set()
@@ -541,7 +462,7 @@ pub(crate) fn before_dispatch_failure(error: &Error) -> ConnectorMutationFailure
         }
         source = cause.source();
     }
-    ConnectorMutationFailure::new(uncommitted_failure_kind(error), error.to_string())
+    ConnectorMutationFailure::new(preparation_failure_kind(error), error.to_string())
 }
 
 #[cfg(test)]
@@ -925,7 +846,14 @@ mod tests {
             HashMap::from([("write.target-file-size-bytes".into(), "malformed".into())]);
         let defaults = RetryPolicy::from_properties(&properties).unwrap();
         assert_eq!(defaults.retries, 4);
-        assert_eq!(defaults.backoff(30), Duration::from_secs(60));
+        assert_eq!(defaults.backoff_ceiling(30), Duration::from_secs(60));
+        for retry in [0, 1, 4, 30] {
+            for _ in 0..32 {
+                let wait = defaults.backoff(retry);
+                assert!(wait >= defaults.min_wait);
+                assert!(wait <= defaults.backoff_ceiling(retry));
+            }
+        }
         for (key, value) in [
             ("commit.retry.num-retries", "-1"),
             ("commit.retry.min-wait-ms", "bad"),
@@ -1165,7 +1093,7 @@ mod tests {
         }
     }
 
-    struct CancelAfterPreparation<'a>(&'a Fixture);
+    struct CancelAfterPreparation<'a>(&'a Fixture, &'a crate::activity::CatalogActivity);
     #[async_trait]
     impl Preparer for CancelAfterPreparation<'_> {
         async fn prepare(
@@ -1174,6 +1102,10 @@ mod tests {
             intent: &OperationIntent,
         ) -> Result<PreparedChange> {
             let change = FastAppendPreparer.prepare(view, intent).await?;
+            use novarocks_spi::connector::{CatalogActivityPhase as P, CatalogActivityReader};
+            let snapshot = self.1.snapshot();
+            assert_eq!(snapshot.phases[P::PreDispatch as usize].inflight, 1);
+            assert_eq!(snapshot.phases[P::Evidence as usize].started, 0);
             self.0.cancel();
             Ok(change)
         }
@@ -1181,7 +1113,16 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_after_artifact_exit_prevents_dispatch_and_cleans_preparation() {
-        let fixture = Fixture::new();
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
+            ConnectorInstanceId, ConnectorProviderId,
+        };
+        let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::parse("preparer.actual").unwrap(),
+            uuid::Uuid::now_v7(),
+        ));
+        let fixture = Fixture::new_observed(root.generation());
         let metadata = fixture.metadata(FormatVersion::V3);
         let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
         let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
@@ -1189,7 +1130,7 @@ mod tests {
             &fixture.operation,
             &intent,
             &PreparedChange::default(),
-            &[&CancelAfterPreparation(&fixture)],
+            &[&CancelAfterPreparation(&fixture, &root)],
             &publisher,
             policy(),
         )
@@ -1204,6 +1145,10 @@ mod tests {
         );
         assert!(publisher.requests.lock().unwrap().is_empty());
         assert!(fixture.operation.artifacts().unwrap().is_empty());
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.phases[P::PreDispatch as usize].inflight, 0);
+        assert_eq!(snapshot.phases[P::PreDispatch as usize].exited, 1);
+        assert_eq!(snapshot.events.pre_dispatch_cancelled, 1);
     }
 
     #[tokio::test]
@@ -1351,5 +1296,262 @@ mod tests {
                 .keys()
                 .any(|identity| identity.object().path() == file)
         );
+    }
+    struct ReusedManifest(crate::iceberg::spec::ManifestFile);
+    #[async_trait]
+    impl Preparer for ReusedManifest {
+        async fn prepare(
+            &self,
+            view: &crate::commit::staging::StagedView<'_>,
+            intent: &OperationIntent,
+        ) -> Result<PreparedChange> {
+            crate::commit::overwrite::prepare_snapshot_change(
+                view,
+                intent,
+                10000 + view.metadata().next_sequence_number(),
+                crate::iceberg::spec::Operation::Replace,
+                vec![self.0.clone()],
+                HashMap::new(),
+                false,
+            )
+            .await
+        }
+    }
+    async fn operation_manifest_fixture(
+        fixture: &Fixture,
+    ) -> (
+        TableMetadata,
+        crate::iceberg::spec::ManifestFile,
+        ObjectIdentity,
+    ) {
+        use crate::commit::model::ArtifactKind;
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let added = AddedContent::new_logical_data(
+            data("file:///external-data.parquet", 3, Struct::empty()),
+            0,
+        )
+        .unwrap();
+        let intent = fixture.intent(&metadata, "main", vec![added]);
+        let (metadata, _) = fixture.stage(metadata, &intent, &FastAppendPreparer).await;
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let snapshot = metadata.snapshot_for_ref("main").unwrap();
+        let list = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &metadata)
+            .await
+            .unwrap();
+        let mut selected = list.entries()[0].clone();
+        let bytes = attempt
+            .file_io()
+            .new_input(&selected.manifest_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let mut objects = Vec::new();
+        for _ in 0..2 {
+            let object = attempt
+                .allocate(ArtifactClass::Operation, ArtifactKind::Manifest)
+                .unwrap();
+            let mut writer = attempt
+                .file_io()
+                .new_output(object.path())
+                .unwrap()
+                .writer()
+                .await
+                .unwrap();
+            writer.write(bytes.clone()).await.unwrap();
+            writer.close().await.unwrap();
+            objects.push(object);
+        }
+        selected.manifest_path = objects[0].path().to_string();
+        (metadata, selected, objects[1].clone())
+    }
+    #[tokio::test]
+    async fn operation_manifest_roots_survive_rejected_attempt_and_only_selected_roots_survive_success()
+     {
+        let fixture = Fixture::new();
+        let (metadata, selected, unused) = operation_manifest_fixture(&fixture).await;
+        let selected_object = ObjectIdentity::new(&selected.manifest_path).unwrap();
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let preparer = ReusedManifest(selected);
+        let first = fixture.operation.begin_attempt().unwrap();
+        let (request, _) = prepare(
+            &first,
+            &intent,
+            StagingBase::Existing {
+                metadata: metadata.clone(),
+                metadata_location: "file:///base.json".into(),
+            },
+            &PreparedChange::default(),
+            &[&preparer],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            request.artifacts().operation_references(),
+            [selected_object.clone()]
+        );
+        fixture
+            .operation
+            .cleanup(CleanupScope::ThisAttempt(first.attempt_token()))
+            .await;
+        assert!(
+            first
+                .file_io()
+                .exists(selected_object.path())
+                .await
+                .unwrap()
+        );
+        let next = fixture.operation.begin_attempt().unwrap();
+        let (request, retained) = prepare(
+            &next,
+            &intent,
+            StagingBase::Existing {
+                metadata,
+                metadata_location: "file:///base.json".into(),
+            },
+            &PreparedChange::default(),
+            &[&preparer],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            request.artifacts().operation_references(),
+            [selected_object.clone()]
+        );
+        assert!(!retained.contains(&unused));
+        fixture.operation.cleanup_after_commit(&retained).await;
+        assert!(next.file_io().exists(selected_object.path()).await.unwrap());
+        assert!(!next.file_io().exists(unused.path()).await.unwrap());
+    }
+    #[tokio::test]
+    async fn every_published_snapshot_retains_its_operation_manifest_after_final_head_removes_it() {
+        let fixture = Fixture::new();
+        let (metadata, selected, unused) = operation_manifest_fixture(&fixture).await;
+        let selected_object = ObjectIdentity::new(&selected.manifest_path).unwrap();
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let (request, retained) = prepare(
+            &attempt,
+            &intent,
+            StagingBase::Existing {
+                metadata,
+                metadata_location: "file:///base.json".into(),
+            },
+            &PreparedChange::default(),
+            &[&ReusedManifest(selected), &RemoveAfterAppend],
+        )
+        .await
+        .unwrap();
+        let snapshots = request
+            .updates()
+            .iter()
+            .filter_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 2);
+        assert_ne!(snapshots[0].snapshot_id(), snapshots[1].snapshot_id());
+        assert_eq!(
+            snapshots[1].parent_snapshot_id(),
+            Some(snapshots[0].snapshot_id())
+        );
+        assert!(request.updates().iter().rev().any(|update| matches!(
+            update,
+            TableUpdate::SetSnapshotRef { ref_name, reference }
+                if ref_name == "main" && reference.snapshot_id == snapshots[1].snapshot_id()
+        )));
+        // Decode the actual two lists rather than deriving the expected roots
+        // from the frozen artifact set under test.
+        let read_list = |snapshot: &crate::iceberg::spec::Snapshot| {
+            let input = attempt
+                .file_io()
+                .new_input(snapshot.manifest_list())
+                .unwrap();
+            async move {
+                crate::iceberg::spec::ManifestList::parse_with_version(
+                    &input.read().await.unwrap(),
+                    FormatVersion::V2,
+                )
+                .unwrap()
+            }
+        };
+        let earlier = read_list(snapshots[0]).await;
+        let final_head = read_list(snapshots[1]).await;
+        assert_eq!(earlier.entries().len(), 1);
+        assert_eq!(earlier.entries()[0].manifest_path, selected_object.path());
+        assert!(
+            final_head
+                .entries()
+                .iter()
+                .all(|manifest| manifest.manifest_path != selected_object.path())
+        );
+        assert_eq!(final_head.entries().len(), 1);
+        let deleted = crate::manifest::load_manifest(&final_head.entries()[0], attempt.file_io())
+            .await
+            .unwrap();
+        assert_eq!(deleted.entries().len(), 1);
+        assert!(
+            deleted
+                .entries()
+                .iter()
+                .all(|entry| { entry.status == crate::iceberg::spec::ManifestStatus::Deleted })
+        );
+        assert_eq!(
+            request.artifacts().operation_references(),
+            [selected_object.clone()]
+        );
+        assert!(!retained.contains(&unused));
+        fixture.operation.cleanup_after_commit(&retained).await;
+        assert!(
+            attempt
+                .file_io()
+                .exists(selected_object.path())
+                .await
+                .unwrap()
+        );
+        assert!(!attempt.file_io().exists(unused.path()).await.unwrap());
+        let preserved = read_list(snapshots[0]).await;
+        let manifest = crate::manifest::load_manifest(&preserved.entries()[0], attempt.file_io())
+            .await
+            .unwrap();
+        assert_eq!(manifest.entries().len(), 1);
+        assert_eq!(
+            manifest.entries()[0].data_file().file_path(),
+            "file:///external-data.parquet"
+        );
+        let final_preserved = read_list(snapshots[1]).await;
+        assert!(
+            final_preserved
+                .entries()
+                .iter()
+                .all(|manifest| manifest.manifest_path != selected_object.path())
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_reused_manifest_request_retains_all_possible_operation_outputs() {
+        let fixture = Fixture::new();
+        let (metadata, selected, unused) = operation_manifest_fixture(&fixture).await;
+        let selected_path = selected.manifest_path.clone();
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Unknown);
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&ReusedManifest(selected)],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(matches!(
+            report.publication,
+            PublicationOutcome::Unknown { .. }
+        ));
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        assert!(attempt.file_io().exists(&selected_path).await.unwrap());
+        assert!(attempt.file_io().exists(unused.path()).await.unwrap());
+        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
     }
 }

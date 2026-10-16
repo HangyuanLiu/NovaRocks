@@ -24,6 +24,7 @@ mod requirements;
 mod snapshot_id;
 mod view;
 
+pub(crate) use engine::freeze_existing_change;
 pub use engine::{PreparedChange, Preparer, StagingBase, StagingEngine};
 pub use initialization::staged_create_updates;
 pub use manifests::{

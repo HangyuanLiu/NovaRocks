@@ -18,34 +18,26 @@
 //! The per-role auth owner (L16): the only component that sets
 //! `Authorization` on a REST request of its role.
 //!
-//! The frontend owner is injected into upstream as its `AuthManager`: it
-//! provides the handshake session, validates the merged configuration and
-//! captures the session binding in `catalog_session` (5.3), and vetoes the
-//! session probe in `authenticate` (L28). The backend owner only authorizes
-//! its own requests. Both exchange the token from the persistent definition
-//! once per attempt and keep it; it is never refreshed.
+//! The frontend owner authenticates the one configuration handshake and all
+//! later requests of its generation. The backend owner authorizes only its
+//! routed credential requests and never establishes a catalog session. Token
+//! exchange is shared per attempt and successful tokens are never refreshed.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::FutureExt;
 use novarocks_fs::SecretValue;
+use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Method, Url};
 
 use super::attempt::{AttemptCell, AttemptFailure};
-use super::binding::{
-    SessionBinding, is_authentication_header, is_protocol_header, protocol_headers,
-};
-use super::boundary::probe_veto;
+use super::binding::{is_authentication_header, is_protocol_header, protocol_headers};
 use super::evidence::{BindingFailure, DispatchStage};
 use super::http::{RequestContext, RestHttpClient, RestRequest};
 use crate::access_binding::IcebergRestAuthMaterial;
-use crate::iceberg::{Error, ErrorKind, NamespaceIdent, Result as IcebergResult, TableIdent};
-use crate::iceberg_catalog_rest::{AuthManager, AuthSession, HttpClient, HttpRequest};
 
 const PROP_URI: &str = "uri";
 const PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";
@@ -230,7 +222,7 @@ async fn exchange_token(
     )
     .with_form_body(form);
     let (stage, body) = http
-        .send_once(Ok(request), &[200], &RequestContext::default())
+        .send_once(Ok(request), &[200], &RequestContext::for_read())
         .await;
     match (stage, body) {
         (DispatchStage::Status { .. }, Some(body)) => {
@@ -246,33 +238,6 @@ async fn exchange_token(
             Err(BindingFailure::TokenRejected)
         }
         _ => Err(BindingFailure::TokenUnavailable),
-    }
-}
-
-/// What establishment attempts captured from upstream's callbacks.
-#[derive(Default)]
-struct Establishment {
-    /// The binding `catalog_session` captured. Once captured it outlives the
-    /// attempt: upstream caches its session right after that callback, so a
-    /// later attempt can only re-observe it, never replace it.
-    bound: Option<SessionBinding>,
-    /// The step that failed in the current attempt.
-    failed: Option<BindingFailure>,
-    probe_namespace: Option<NamespaceIdent>,
-    /// The probe request's exact URL, known once the binding is.
-    probe_url: Option<Url>,
-    probe_method: Option<Method>,
-}
-
-impl Establishment {
-    fn arm_probe(&mut self) {
-        self.probe_url = match (&self.bound, &self.probe_namespace) {
-            (Some(binding), Some(namespace)) => {
-                Url::parse(&binding.table_url(&TableIdent::new(namespace.clone(), "t".to_string())))
-                    .ok()
-            }
-            _ => None,
-        };
     }
 }
 
@@ -298,7 +263,8 @@ pub(crate) struct RestAuthOwner {
     /// after the first success and never refreshed.
     token: AttemptCell<HeaderValue, AttemptFailure>,
     /// Frontend only: state of the current establishment attempt.
-    establishment: Option<Mutex<Establishment>>,
+    frontend: bool,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 }
 
 impl fmt::Debug for RestAuthOwner {
@@ -308,11 +274,7 @@ impl fmt::Debug for RestAuthOwner {
             Credential::Bearer(_) => "bearer",
             Credential::ClientCredentials { .. } => "oauth2",
         };
-        let role = if self.establishment.is_some() {
-            "frontend"
-        } else {
-            "backend"
-        };
+        let role = if self.frontend { "frontend" } else { "backend" };
         formatter
             .debug_struct("RestAuthOwner")
             .field("role", &role)
@@ -323,19 +285,26 @@ impl fmt::Debug for RestAuthOwner {
 }
 
 impl RestAuthOwner {
-    /// The frontend owner, plus the manager to inject into upstream with
-    /// `RestCatalogBuilder::with_auth_manager`. `http` must be the instance
-    /// handed to upstream with `with_client`.
+    /// The frontend role's sole authentication authority.
     pub(crate) fn frontend(
         identity: Option<IcebergRestAuthMaterial>,
         persistent: PersistentRestConfig,
         http: RestHttpClient,
-    ) -> Result<(Arc<Self>, RestAuthManager), String> {
-        let owner = Arc::new(Self::new(identity, persistent, http, true)?);
-        let manager = RestAuthManager {
-            owner: Arc::clone(&owner),
-        };
-        Ok((owner, manager))
+    ) -> Result<Arc<Self>, String> {
+        Self::frontend_observed(identity, persistent, http, None)
+    }
+    pub(crate) fn frontend_observed(
+        identity: Option<IcebergRestAuthMaterial>,
+        persistent: PersistentRestConfig,
+        http: RestHttpClient,
+        activity: Option<Arc<crate::activity::GenerationActivity>>,
+    ) -> Result<Arc<Self>, String> {
+        let mut owner = Self::new(identity, persistent, http, true)?;
+        owner.activity = activity;
+        Ok(Arc::new(owner))
+    }
+    pub(crate) fn activity(&self) -> Option<&Arc<crate::activity::GenerationActivity>> {
+        self.activity.as_ref()
     }
 
     /// The backend owner; it never builds an upstream client.
@@ -372,8 +341,13 @@ impl RestAuthOwner {
             persistent: Arc::new(persistent),
             http,
             token: AttemptCell::default(),
-            establishment: frontend.then(|| Mutex::new(Establishment::default())),
+            frontend,
+            activity: None,
         })
+    }
+
+    pub(crate) fn is_anonymous(&self) -> bool {
+        matches!(self.credential, Credential::Anonymous)
     }
 
     pub(crate) fn http(&self) -> &RestHttpClient {
@@ -402,7 +376,13 @@ impl RestAuthOwner {
                 let persistent = Arc::clone(&self.persistent);
                 let client_id = client_id.clone();
                 let client_secret = client_secret.clone();
+                let activity = self.activity.clone();
                 async move {
+                    let _initializer = activity.as_ref().map(|owner| {
+                        owner.enter(
+                            novarocks_spi::connector::CatalogActivityPhase::AuthorizationInitializer,
+                        )
+                    });
                     exchange_token(http, persistent, client_id, client_secret)
                         .await
                         .map_err(|step| AttemptFailure { attempt, step })
@@ -420,62 +400,6 @@ impl RestAuthOwner {
         }
         Ok(())
     }
-
-    /// Starts one establishment attempt: clears the failed step and probe
-    /// observation of an earlier attempt and arms a fresh probe. Returns the
-    /// probe namespace.
-    pub(crate) fn begin_establishment(&self) -> NamespaceIdent {
-        let namespace =
-            NamespaceIdent::new(format!("__novarocks_probe_{:016x}", rand::random::<u64>()));
-        let mut establishment = self.establishment();
-        establishment.failed = None;
-        establishment.probe_method = None;
-        establishment.probe_namespace = Some(namespace.clone());
-        establishment.arm_probe();
-        namespace
-    }
-
-    /// Ends the establishment attempt: the captured binding, else the failed
-    /// step of this attempt, plus the method of the vetoed probe request.
-    pub(crate) fn finish_establishment(
-        &self,
-    ) -> (
-        Option<Result<SessionBinding, BindingFailure>>,
-        Option<Method>,
-    ) {
-        let mut establishment = self.establishment();
-        let failed = establishment.failed.take();
-        let captured = match (&establishment.bound, failed) {
-            (Some(binding), _) => Some(Ok(binding.clone())),
-            (None, Some(step)) => Some(Err(step)),
-            (None, None) => None,
-        };
-        establishment.probe_namespace = None;
-        establishment.probe_url = None;
-        (captured, establishment.probe_method.take())
-    }
-
-    fn establishment(&self) -> std::sync::MutexGuard<'_, Establishment> {
-        self.establishment
-            .as_ref()
-            .expect("only the frontend auth owner establishes sessions")
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Records the method of the probe request and reports whether `url` is
-    /// the armed probe.
-    fn veto_probe(&self, method: &Method, url: &str) -> bool {
-        let mut establishment = self.establishment();
-        let is_probe = establishment
-            .probe_url
-            .as_ref()
-            .is_some_and(|probe| probe.as_str() == url);
-        if is_probe {
-            establishment.probe_method = Some(method.clone());
-        }
-        is_probe
-    }
 }
 
 fn bearer_value(token: &str) -> Option<HeaderValue> {
@@ -484,110 +408,12 @@ fn bearer_value(token: &str) -> Option<HeaderValue> {
     Some(value)
 }
 
-fn upstream_auth_error(text: &'static str) -> Error {
-    Error::new(ErrorKind::Unexpected, text)
-}
-
-/// The frontend auth owner as upstream's `AuthManager`.
-pub(crate) struct RestAuthManager {
-    owner: Arc<RestAuthOwner>,
-}
-
-impl fmt::Debug for RestAuthManager {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RestAuthManager")
-            .field("owner", &self.owner)
-            .finish()
-    }
-}
-
-#[async_trait]
-impl AuthManager for RestAuthManager {
-    async fn init_session(
-        &self,
-        _client: &HttpClient,
-        _props: &HashMap<String, String>,
-    ) -> IcebergResult<Box<dyn AuthSession>> {
-        if let Err(failure) = self.owner.authorization().await {
-            // The failed step belongs to the current establishment attempt.
-            self.owner.establishment().failed = Some(failure.step);
-            return Err(upstream_auth_error("REST catalog token acquisition failed"));
-        }
-        Ok(Box::new(RestAuthSession {
-            owner: Arc::clone(&self.owner),
-            vetoes_probe: false,
-        }))
-    }
-
-    async fn catalog_session(
-        &self,
-        _client: &HttpClient,
-        props: &HashMap<String, String>,
-    ) -> IcebergResult<Arc<dyn AuthSession>> {
-        let binding = SessionBinding::from_merged_properties(props, &self.owner.persistent);
-        let mut establishment = self.owner.establishment();
-        let binding = match binding {
-            Ok(binding) => binding,
-            Err(step) => {
-                establishment.failed = Some(step);
-                return Err(upstream_auth_error(
-                    "REST catalog configuration carries authentication material",
-                ));
-            }
-        };
-        let session: Arc<dyn AuthSession> = Arc::new(RestAuthSession {
-            owner: Arc::clone(&self.owner),
-            vetoes_probe: true,
-        });
-        // The last step before returning: upstream caches the session right
-        // after this callback succeeds and has no failing step left.
-        establishment.bound = Some(binding);
-        establishment.arm_probe();
-        Ok(session)
-    }
-}
-
-/// The session upstream authenticates its requests with.
-struct RestAuthSession {
-    owner: Arc<RestAuthOwner>,
-    /// The handshake session only authenticates `/v1/config`; the catalog
-    /// session also recognizes the probe.
-    vetoes_probe: bool,
-}
-
-impl fmt::Debug for RestAuthSession {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RestAuthSession")
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl AuthSession for RestAuthSession {
-    async fn authenticate(&self, request: &mut HttpRequest) -> IcebergResult<()> {
-        if self.vetoes_probe && self.owner.veto_probe(request.method(), request.url_str()) {
-            return Err(probe_veto());
-        }
-        let authorization = self
-            .owner
-            .authorization()
-            .await
-            .map_err(|_| upstream_auth_error("REST catalog token acquisition failed"))?;
-        if let Some(value) = authorization {
-            request.headers_mut().insert(AUTHORIZATION, value);
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::iceberg::{Catalog, CatalogBuilder};
+    use crate::iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use crate::rest_protocol::test_server::{
         Reply, Script, TestServer, bearer_identity, oauth2_identity,
     };
@@ -800,7 +626,7 @@ mod tests {
     fn debug_output_carries_no_principal_or_secret() {
         let definition = properties(&[("uri", "http://catalog"), ("header.x-tenant", "t-canary")]);
         let persistent = PersistentRestConfig::from_properties(&definition).unwrap();
-        let (owner, manager) = RestAuthOwner::frontend(
+        let owner = RestAuthOwner::frontend(
             Some(oauth2_identity("principal-canary", "secret-canary")),
             persistent.clone(),
             client(),
@@ -809,11 +635,7 @@ mod tests {
         let bearer =
             RestAuthOwner::backend(Some(bearer_identity("token-canary")), persistent, client())
                 .unwrap();
-        for debug in [
-            format!("{owner:?}"),
-            format!("{manager:?}"),
-            format!("{bearer:?}"),
-        ] {
+        for debug in [format!("{owner:?}"), format!("{bearer:?}")] {
             for canary in [
                 "principal-canary",
                 "secret-canary",

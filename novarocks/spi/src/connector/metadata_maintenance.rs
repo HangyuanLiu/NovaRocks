@@ -31,13 +31,13 @@ use super::{
     ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
-pub const CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION: u16 = 1;
+pub const CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION: u16 = 2;
 pub const MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES: usize = 16 * 1024;
 
-const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.request.v1\0";
-const PLAN_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.plan.v1\0";
-const RECEIPT_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.receipt.v1\0";
+const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.request.v2\0";
+const PLAN_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.plan.v2\0";
+const RECEIPT_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.receipt.v2\0";
 
 pub const REWRITE_METADATA_LAYOUT_KIND: &str = "rewrite-metadata-layout";
 pub const EXPIRE_TABLE_VERSIONS_KIND: &str = "expire-table-versions";
@@ -258,7 +258,7 @@ pub struct ConnectorMetadataMaintenancePlan {
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     request_digest: [u8; 32],
-    state_digest: [u8; 32],
+    intent_digest: [u8; 32],
     summary: ConnectorMetadataMaintenancePlanSummary,
     provider_payload: Bytes,
     plan_digest: [u8; 32],
@@ -266,7 +266,7 @@ pub struct ConnectorMetadataMaintenancePlan {
 impl ConnectorMetadataMaintenancePlan {
     pub fn try_new(
         request: &ConnectorMetadataMaintenancePlanningRequest,
-        state_digest: [u8; 32],
+        intent_digest: [u8; 32],
         summary: ConnectorMetadataMaintenancePlanSummary,
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
@@ -274,7 +274,7 @@ impl ConnectorMetadataMaintenancePlan {
         validate_payload(&provider_payload, "plan")?;
         let plan_digest = plan_digest(
             request.request_digest,
-            state_digest,
+            intent_digest,
             summary,
             &provider_payload,
         );
@@ -284,7 +284,7 @@ impl ConnectorMetadataMaintenancePlan {
             operation_id: request.operation_id,
             operation_kind: request.operation.kind().into(),
             request_digest: request.request_digest,
-            state_digest,
+            intent_digest,
             summary,
             provider_payload,
             plan_digest,
@@ -303,7 +303,7 @@ impl ConnectorMetadataMaintenancePlan {
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         request_digest: [u8; 32],
-        state_digest: [u8; 32],
+        intent_digest: [u8; 32],
         summary: ConnectorMetadataMaintenancePlanSummary,
         provider_payload: Bytes,
         plan_digest: [u8; 32],
@@ -317,7 +317,7 @@ impl ConnectorMetadataMaintenancePlan {
             operation_id,
             operation_kind,
             request_digest,
-            state_digest,
+            intent_digest,
             summary,
             provider_payload,
             plan_digest,
@@ -341,8 +341,8 @@ impl ConnectorMetadataMaintenancePlan {
     pub const fn request_digest(&self) -> [u8; 32] {
         self.request_digest
     }
-    pub const fn state_digest(&self) -> [u8; 32] {
-        self.state_digest
+    pub const fn intent_digest(&self) -> [u8; 32] {
+        self.intent_digest
     }
     pub const fn summary(&self) -> ConnectorMetadataMaintenancePlanSummary {
         self.summary
@@ -359,7 +359,7 @@ impl ConnectorMetadataMaintenancePlan {
         if self.schema_version != CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION
             || plan_digest(
                 self.request_digest,
-                self.state_digest,
+                self.intent_digest,
                 self.summary,
                 &self.provider_payload,
             ) != self.plan_digest
@@ -380,7 +380,7 @@ impl fmt::Debug for ConnectorMetadataMaintenancePlan {
             .field("operation_id", &self.operation_id)
             .field("operation_kind", &self.operation_kind)
             .field("request_digest", &self.request_digest)
-            .field("state_digest", &self.state_digest)
+            .field("intent_digest", &self.intent_digest)
             .field("summary", &self.summary)
             .field("provider_payload_len", &self.provider_payload.len())
             .field("plan_digest", &self.plan_digest)
@@ -421,7 +421,7 @@ pub struct ConnectorMetadataMaintenanceReceipt {
     operation_kind: Arc<str>,
     request_digest: [u8; 32],
     plan_digest: [u8; 32],
-    state_digest: [u8; 32],
+    intent_digest: [u8; 32],
     summary: ConnectorMetadataMaintenanceReceiptSummary,
     provider_payload: Bytes,
     provider_payload_digest: [u8; 32],
@@ -435,7 +435,7 @@ impl ConnectorMetadataMaintenanceReceipt {
         operation_kind: impl Into<Arc<str>>,
         request_digest: [u8; 32],
         plan_digest: [u8; 32],
-        state_digest: [u8; 32],
+        intent_digest: [u8; 32],
         summary: ConnectorMetadataMaintenanceReceiptSummary,
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
@@ -451,7 +451,7 @@ impl ConnectorMetadataMaintenanceReceipt {
             operation_kind,
             request_digest,
             plan_digest,
-            state_digest,
+            intent_digest,
             summary,
             provider_payload,
             provider_payload_digest,
@@ -478,8 +478,8 @@ impl ConnectorMetadataMaintenanceReceipt {
     pub const fn plan_digest(&self) -> [u8; 32] {
         self.plan_digest
     }
-    pub const fn state_digest(&self) -> [u8; 32] {
-        self.state_digest
+    pub const fn intent_digest(&self) -> [u8; 32] {
+        self.intent_digest
     }
     pub const fn summary(&self) -> ConnectorMetadataMaintenanceReceiptSummary {
         self.summary
@@ -736,7 +736,7 @@ impl ConnectorMetadataMaintenanceLease {
                     || receipt.operation_kind.as_ref() != plan.operation_kind.as_ref()
                     || receipt.request_digest != plan.request_digest
                     || receipt.plan_digest != plan.plan_digest
-                    || receipt.state_digest != plan.state_digest
+                    || receipt.intent_digest != plan.intent_digest
                 {
                     return Err(ConnectorError::new(
                         ConnectorErrorKind::InvalidRequest,
@@ -857,4 +857,183 @@ fn digest_with_domain(domain: &[u8], value: &[u8]) -> [u8; 32] {
     hash.update(domain);
     digest_bytes(&mut hash, value);
     hash.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::{
+        ConnectorListTablesRequest, ConnectorNamespaceRequest, ConnectorProviderId,
+        ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+        ExternalMutationEffect, ExternalMutationFinalization,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Native SPI boundary coverage: provider attempt facts remain opaque, but
+    // the lease must bind the fixed intent and all plan identities exactly.
+    struct Metadata(ConnectorInstanceId);
+    impl ConnectorMetadata for Metadata {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.0
+        }
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
+        }
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
+        }
+        fn list_tables(
+            &self,
+            _: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            unreachable!()
+        }
+        fn load_table(
+            &self,
+            _: ConnectorTableRequest,
+            _: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            unreachable!()
+        }
+    }
+    struct Provider {
+        descriptor: ConnectorInstanceDescriptor,
+        binding: ConnectorProviderBindingKey,
+        foreign: AtomicUsize,
+    }
+    impl ConnectorMetadataMaintenance for Provider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
+            &self.binding
+        }
+        fn plan_maintenance(
+            &self,
+            request: ConnectorMetadataMaintenancePlanningRequest,
+        ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
+            ConnectorMetadataMaintenancePlan::try_new(
+                &request,
+                [3; 32],
+                ConnectorMetadataMaintenancePlanSummary::default(),
+                Bytes::from_static(b"fixed intent"),
+            )
+        }
+        fn execute(
+            &self,
+            request: ConnectorMetadataMaintenanceExecuteRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
+        {
+            let mode = self.foreign.load(Ordering::SeqCst);
+            let plan = request.plan;
+            let receipt = ConnectorMetadataMaintenanceReceipt::try_new(
+                self.descriptor.clone(),
+                self.binding.incarnation,
+                plan.operation_id(),
+                plan.operation_kind(),
+                if mode == 1 {
+                    [9; 32]
+                } else {
+                    plan.request_digest()
+                },
+                if mode == 2 {
+                    [9; 32]
+                } else {
+                    plan.plan_digest()
+                },
+                if mode == 3 {
+                    [9; 32]
+                } else {
+                    plan.intent_digest()
+                },
+                ConnectorMetadataMaintenanceReceiptSummary::default(),
+                Bytes::from_static(b"attempt=2;base=new;request=new"),
+            )?;
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt,
+                finalization: ExternalMutationFinalization::Complete,
+            })
+        }
+    }
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            crate::connector::ConnectorStopOwner::new().view(),
+            64,
+            128,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn fixed_intent_accepts_new_attempt_receipt_and_rejects_foreign_identity() {
+        let instance = ConnectorInstanceId::parse("metadata-lease-test").unwrap();
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: instance.clone(),
+        };
+        let binding = ConnectorProviderBindingKey {
+            instance_id: instance.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
+        };
+        let provider = Arc::new(Provider {
+            descriptor: descriptor.clone(),
+            binding: binding.clone(),
+            foreign: AtomicUsize::new(0),
+        });
+        let lease = ConnectorMetadataMaintenanceLease::new(
+            descriptor,
+            ConnectorControlRuntimeId::from_bytes([1; 16]),
+            binding.incarnation,
+            Arc::new(Metadata(instance.clone())),
+            provider.clone(),
+            || {},
+        )
+        .unwrap();
+        let operation = ConnectorMetadataMaintenanceOperation::rewrite_metadata_layout(
+            ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap(),
+        )
+        .unwrap();
+        let plan = lease
+            .plan_operation(
+                ConnectorMutationOperationId::from_bytes([4; 16]),
+                operation,
+                context(),
+            )
+            .unwrap();
+        let original_digest = plan.plan_digest();
+        let outcome = lease
+            .execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
+                    .unwrap(),
+            )
+            .unwrap();
+        let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+            panic!("valid reprepare receipt rejected")
+        };
+        assert_eq!(
+            receipt.provider_payload().as_ref(),
+            b"attempt=2;base=new;request=new"
+        );
+        assert_eq!(receipt.intent_digest(), [3; 32]);
+        assert_eq!(receipt.plan_digest(), original_digest);
+        assert_eq!(plan.plan_digest(), original_digest);
+        for mode in 1..=3 {
+            provider.foreign.store(mode, Ordering::SeqCst);
+            assert!(
+                lease
+                    .execute(
+                        ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                            plan.clone(),
+                            context()
+                        )
+                        .unwrap()
+                    )
+                    .is_err()
+            );
+        }
+    }
 }

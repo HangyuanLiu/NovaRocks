@@ -27,14 +27,12 @@ use std::sync::Arc;
 use crate::access_binding::IcebergReadBinding;
 use crate::catalog_config::{IcebergCatalogConfiguration, IcebergCatalogKind};
 
-/// One concrete catalog client with both its generic control view and the
-/// typed REST surface needed for staged table publication. The REST view is an
-/// `Arc` clone of the same client allocation, never a second client or a
-/// runtime downcast.
+/// One generation's catalog facts. Hadoop and HMS retain their exact SDK read
+/// client; REST retains only the provider-owned endpoints and their session.
+/// Production has no generic REST SDK facade or second configuration owner.
 pub struct IcebergCatalogClient {
-    generic: Arc<dyn crate::iceberg::Catalog>,
+    generic: Option<Arc<dyn crate::iceberg::Catalog>>,
     hadoop: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
-    rest: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
     rest_endpoints: Option<Arc<crate::rest_protocol::endpoints::RestEndpoints>>,
     rest_access_delegation: RestAccessDelegationMode,
 }
@@ -48,12 +46,8 @@ pub(crate) enum RestAccessDelegationMode {
 }
 
 impl IcebergCatalogClient {
-    pub fn generic(&self) -> &Arc<dyn crate::iceberg::Catalog> {
-        &self.generic
-    }
-
-    pub fn rest(&self) -> Option<&Arc<crate::iceberg_catalog_rest::RestCatalog>> {
-        self.rest.as_ref()
+    pub fn generic(&self) -> Option<&Arc<dyn crate::iceberg::Catalog>> {
+        self.generic.as_ref()
     }
 
     pub fn hadoop(&self) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
@@ -97,7 +91,8 @@ pub fn build_hadoop_catalog(
 pub(crate) const REST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const REST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Read the fixed parameters used by catalog admission and the REST client.
+/// Read catalog listing admission, connection setup, and ordinary read-phase
+/// bounds. The third value is not a shared-client or publication read timeout.
 /// This projection grants no capacity and does not make them configurable.
 pub const fn frozen_sdk_listing_parameters() -> (usize, std::time::Duration, std::time::Duration) {
     (
@@ -107,18 +102,15 @@ pub const fn frozen_sdk_listing_parameters() -> (usize, std::time::Duration, std
     )
 }
 
-/// One REST generation: the upstream client and the NovaRocks endpoints that
-/// share its single session.
+/// One REST generation's provider-owned endpoints and single session.
 struct RestGeneration {
-    upstream: Arc<crate::iceberg_catalog_rest::RestCatalog>,
     endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
 }
 
 /// Build a REST catalog generation for the selected storage-authority mode.
 ///
-/// The generation's FE auth owner and HTTP client are injected into the
-/// upstream client, so upstream's `/v1/config` session and every NovaRocks
-/// request share one session binding and one connection pool.
+/// The generation's FE auth owner, HTTP client and endpoints share one
+/// configuration authority, immutable session binding and connection pool.
 ///
 /// A vended generation may authenticate to the REST control plane, but it has
 /// no storage capability until a table response contributes an attempt-scoped
@@ -130,8 +122,9 @@ async fn build_rest_catalog_with_access_delegation(
     binding: IcebergReadBinding,
     rest_access_delegation: RestAccessDelegationMode,
     runtime: crate::iceberg::Runtime,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 ) -> Result<RestGeneration, String> {
-    use crate::iceberg_catalog_rest::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
+    use crate::rest_protocol::wire::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
 
     if configuration.kind != IcebergCatalogKind::Rest {
         return Err(format!(
@@ -176,13 +169,13 @@ async fn build_rest_catalog_with_access_delegation(
         identity,
         storage_factory,
         runtime,
+        activity,
     )
     .await
 }
 
 /// Assemble one REST generation from its already-validated persistent
-/// properties: the FE auth owner and the HTTP client are injected into the
-/// upstream client, and the NovaRocks endpoints share its session.
+/// properties. The endpoints own establishment; no SDK client is constructed.
 // Design: ADR-0175 (docs/adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)
 async fn assemble_rest_generation(
     properties: HashMap<String, String>,
@@ -191,44 +184,23 @@ async fn assemble_rest_generation(
     identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
     storage_factory: Option<Arc<dyn crate::iceberg::io::StorageFactory>>,
     runtime: crate::iceberg::Runtime,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 ) -> Result<RestGeneration, String> {
-    use crate::iceberg::CatalogBuilder;
-    use crate::iceberg_catalog_rest::RestCatalogBuilder;
-
     let persistent =
         crate::rest_protocol::auth::PersistentRestConfig::from_properties(&properties)?;
     let http = crate::rest_protocol::http::RestHttpClient::new()?;
-    let reqwest_client = http.reqwest_client().clone();
-    let (owner, manager) =
-        crate::rest_protocol::auth::RestAuthOwner::frontend(identity, persistent, http)?;
-    let builder = RestCatalogBuilder::default()
-        .with_runtime(runtime.clone())
-        .with_client(reqwest_client)
-        .with_auth_manager(manager);
-    let builder = match &storage_factory {
-        Some(factory) => builder.with_storage_factory(Arc::clone(factory)),
-        None => builder,
-    };
-    let upstream = Arc::new(builder.load("rest".to_string(), properties).await.map_err(
-        |error| {
-            format!(
-                "build REST iceberg catalog: {}",
-                crate::rest_protocol::boundary::sanitize_upstream_error(&error, "construction")
-            )
-        },
-    )?);
+    let owner = crate::rest_protocol::auth::RestAuthOwner::frontend_observed(
+        identity, persistent, http, activity,
+    )?;
     let endpoints = Arc::new(crate::rest_protocol::endpoints::RestEndpoints::new(
-        Arc::clone(&upstream),
+        Arc::new(properties),
         owner,
         runtime,
         storage_factory,
         declared_routing_headers,
         vending_declared,
     ));
-    Ok(RestGeneration {
-        upstream,
-        endpoints,
-    })
+    Ok(RestGeneration { endpoints })
 }
 
 /// A vended REST generation built from raw properties, for tests that drive
@@ -238,13 +210,7 @@ pub(crate) async fn build_vended_rest_generation_for_test(
     properties: HashMap<String, String>,
     identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
     runtime: crate::iceberg::Runtime,
-) -> Result<
-    (
-        Arc<crate::iceberg_catalog_rest::RestCatalog>,
-        Arc<crate::rest_protocol::endpoints::RestEndpoints>,
-    ),
-    String,
-> {
+) -> Result<Arc<crate::rest_protocol::endpoints::RestEndpoints>, String> {
     let generation = assemble_rest_generation(
         properties,
         Default::default(),
@@ -252,9 +218,10 @@ pub(crate) async fn build_vended_rest_generation_for_test(
         identity,
         None,
         runtime,
+        None,
     )
     .await?;
-    Ok((generation.upstream, generation.endpoints))
+    Ok(generation.endpoints)
 }
 
 pub async fn build_hms_catalog(
@@ -323,6 +290,7 @@ pub async fn build_catalog_client(
         binding,
         RestAccessDelegationMode::Static,
         runtime,
+        None,
     )
     .await
 }
@@ -334,43 +302,41 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
     binding: IcebergReadBinding,
     rest_access_delegation: RestAccessDelegationMode,
     runtime: crate::iceberg::Runtime,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 ) -> Result<IcebergCatalogClient, String> {
+    crate::catalog::publication::CatalogEvidencePolicy::from_properties(&configuration.properties)?;
     match configuration.kind {
         IcebergCatalogKind::Hadoop => {
             let hadoop = Arc::new(build_hadoop_catalog(configuration, binding, runtime)?);
             let generic: Arc<dyn crate::iceberg::Catalog> = hadoop.clone();
             Ok(IcebergCatalogClient {
-                generic,
+                generic: Some(generic),
                 hadoop: Some(hadoop),
-                rest: None,
                 rest_endpoints: None,
                 rest_access_delegation: RestAccessDelegationMode::Static,
             })
         }
         IcebergCatalogKind::Rest => {
-            let RestGeneration {
-                upstream,
-                endpoints,
-            } = build_rest_catalog_with_access_delegation(
+            let RestGeneration { endpoints } = build_rest_catalog_with_access_delegation(
                 configuration,
                 binding,
                 rest_access_delegation,
                 runtime,
+                activity,
             )
             .await?;
-            let generic: Arc<dyn crate::iceberg::Catalog> = upstream.clone();
             Ok(IcebergCatalogClient {
-                generic,
+                generic: None,
                 hadoop: None,
-                rest: Some(upstream),
                 rest_endpoints: Some(endpoints),
                 rest_access_delegation,
             })
         }
         IcebergCatalogKind::Hive => Ok(IcebergCatalogClient {
-            generic: Arc::new(build_hms_catalog(configuration, binding, runtime).await?),
+            generic: Some(Arc::new(
+                build_hms_catalog(configuration, binding, runtime).await?,
+            )),
             hadoop: None,
-            rest: None,
             rest_endpoints: None,
             rest_access_delegation: RestAccessDelegationMode::Static,
         }),
@@ -421,8 +387,8 @@ mod tests {
         )
         .await
         .expect("provider catalog");
-        assert!(client.rest().is_none());
+        assert!(client.rest_endpoints().is_none());
         assert!(client.hadoop().is_some());
-        assert!(Arc::strong_count(client.generic()) >= 1);
+        assert!(Arc::strong_count(client.generic().expect("Hadoop read client")) >= 1);
     }
 }

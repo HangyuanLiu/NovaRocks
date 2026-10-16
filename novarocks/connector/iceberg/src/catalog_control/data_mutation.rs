@@ -174,6 +174,20 @@ impl PlannedIcebergMutation {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DataFinalizationFacts {
+    namespace: String,
+    table: String,
+    table_uuid: String,
+    // Outer None is TRUNCATE; inner None is ADD FILES without a name mapping.
+    name_mapping_digest: Option<Option<String>>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DataPublication {
+    receipt: ConnectorDataMutationReceipt,
+    finalization: DataFinalizationFacts,
+}
+
 #[derive(Clone)]
 struct CachedPlan {
     request_digest: [u8; 32],
@@ -222,6 +236,20 @@ impl MutationRecoveryTemplate {
             self.plan.summary(),
             durable_receipt_payload(snapshot_id)?,
         )
+    }
+
+    fn publication_receipt(&self, snapshot_id: i64) -> Result<DataPublication, ConnectorError> {
+        Ok(DataPublication {
+            receipt: self.receipt(snapshot_id)?,
+            finalization: DataFinalizationFacts {
+                namespace: self.payload.namespace.clone(),
+                table: self.payload.table.clone(),
+                table_uuid: self.payload.table_uuid.clone(),
+                name_mapping_digest: (self.plan.operation_kind()
+                    == novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND)
+                    .then(|| self.payload.name_mapping_digest_hex.clone()),
+            },
+        })
     }
 
     fn evidence(
@@ -345,6 +373,15 @@ trait IcebergDataMutationBackend: Send + Sync {
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError>;
 
+    fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy;
+    fn positive_attribution_finalization(&self) -> ExternalMutationFinalization;
+
+    fn finalize_reconciled(
+        &self,
+        facts: &DataFinalizationFacts,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), ConnectorError>;
+
     fn lookup_marker(
         &self,
         namespace: &str,
@@ -356,9 +393,11 @@ trait IcebergDataMutationBackend: Send + Sync {
     ) -> Result<MarkerLookup, ConnectorError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum MarkerLookup {
-    Matching { snapshot_id: i64 },
+    Matching {
+        observation: crate::commit::publication_descriptor::PositiveAttributionObservation,
+    },
     Conflicting,
     Missing,
 }
@@ -386,9 +425,9 @@ impl RegisteredIcebergDataMutationBackend {
             .control_state()
             .invalidate_table_cache(namespace, table);
         self.runtime
-            .load_table_for_request(namespace, table, request_context)
+            .load_table_classified_for_request(namespace, table, request_context)
             .map(|loaded| loaded.into_table())
-            .map_err(map_provider_error)
+            .map_err(|(kind, message)| ConnectorError::new(kind, message))
     }
 }
 
@@ -553,6 +592,23 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         self.execute_publication(planned, marker, recovery, context)
     }
 
+    fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
+        self.runtime.novarocks_catalog().evidence_policy()
+    }
+    fn positive_attribution_finalization(&self) -> ExternalMutationFinalization {
+        self.runtime
+            .novarocks_catalog()
+            .positive_attribution_finalization()
+    }
+
+    fn finalize_reconciled(
+        &self,
+        facts: &DataFinalizationFacts,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), ConnectorError> {
+        self.finalize_publication_facts(facts, context)
+    }
+
     fn lookup_marker(
         &self,
         namespace: &str,
@@ -587,7 +643,10 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     decode_canonical_json(raw.as_bytes(), "Iceberg data mutation marker")?;
                 if marker.operation_id_hex == operation_id_hex {
                     return Ok(if marker.identity_digest_hex == identity_digest_hex {
-                        MarkerLookup::Matching { snapshot_id }
+                        MarkerLookup::Matching { observation: crate::commit::publication_descriptor::PositiveAttributionObservation::SnapshotMarker {
+                            table_uuid: metadata.uuid(), snapshot_id,
+                            marker_key: MARKER_PROPERTY.to_owned(), marker_value: raw.clone(),
+                        } }
                     } else {
                         MarkerLookup::Conflicting
                     });
@@ -668,24 +727,6 @@ impl IcebergDataMutationAdapter {
         }
     }
 
-    fn receipt(
-        &self,
-        plan: &ConnectorDataMutationPlan,
-        snapshot_id: i64,
-    ) -> Result<ConnectorDataMutationReceipt, ConnectorError> {
-        ConnectorDataMutationReceipt::try_new(
-            self.descriptor.clone(),
-            self.key.incarnation,
-            plan.operation_id(),
-            plan.operation_kind(),
-            plan.request_digest(),
-            plan.plan_digest(),
-            plan.state_digest(),
-            plan.summary(),
-            durable_receipt_payload(snapshot_id)?,
-        )
-    }
-
     fn evidence(
         &self,
         plan: &ConnectorDataMutationPlan,
@@ -706,48 +747,6 @@ impl IcebergDataMutationAdapter {
         payload: &IcebergDataMutationPlanPayloadV2,
     ) -> Result<(), ConnectorError> {
         validate_durable_evidence(&self.evidence(plan, payload)?)
-    }
-
-    fn committed(
-        &self,
-        plan: &ConnectorDataMutationPlan,
-        snapshot_id: i64,
-        finalization: ExternalMutationFinalization,
-    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
-        Ok(ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            receipt: self.receipt(plan, snapshot_id)?,
-            finalization,
-        })
-    }
-
-    fn committed_from_reconcile(
-        &self,
-        request: &ConnectorDataMutationReconcileRequest,
-        evidence: &IcebergDataMutationEvidenceV2,
-        snapshot_id: i64,
-    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
-        let summary = ConnectorDataMutationPlanSummary::try_new(
-            evidence.file_count,
-            evidence.row_count,
-            evidence.total_bytes,
-        )?;
-        let receipt = ConnectorDataMutationReceipt::try_new(
-            self.descriptor.clone(),
-            self.key.incarnation,
-            request.operation_id,
-            request.operation_kind.clone(),
-            request.request_digest,
-            request.plan_digest,
-            request.state_digest,
-            summary,
-            durable_receipt_payload(snapshot_id)?,
-        )?;
-        Ok(ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            receipt,
-            finalization: ExternalMutationFinalization::Complete,
-        })
     }
 }
 
@@ -825,6 +824,15 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             .cloned()
         {
             if record.plan_digest == request.plan.plan_digest() {
+                if let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &record.outcome {
+                    if let Some((journal, entry)) =
+                        crate::commit::attempt::observation::PublicationJournal::<DataPublication>::from_evidence(evidence)?
+                    {
+                        return Ok(publication::project_external(
+                            journal.catalog_entry_outcome(entry),
+                        ));
+                    }
+                }
                 return Ok(record.outcome);
             }
             return Err(invalid(
@@ -852,11 +860,13 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             &marker.identity_digest_hex,
             &request.context,
         ) {
-            Ok(MarkerLookup::Matching { snapshot_id }) => self.committed(
-                &request.plan,
-                snapshot_id,
-                ExternalMutationFinalization::Complete,
-            )?,
+            Ok(MarkerLookup::Matching { .. }) => ExternalMutationOutcome::CommitUnknown {
+                failure: failure(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "An existing data mutation marker has no original local dispatch journal",
+                ),
+                evidence: self.evidence(&request.plan, cached.private.payload())?,
+            },
             Ok(MarkerLookup::Conflicting) => ExternalMutationOutcome::CommitUnknown {
                 failure: failure(
                     ConnectorMutationFailureKind::Conflict,
@@ -905,6 +915,23 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             "Iceberg data mutation evidence",
         )?;
         validate_evidence_request(&self.descriptor, &self.key, &request, &evidence)?;
+        let Some((journal, entry)) = crate::commit::attempt::observation::PublicationJournal::<
+            DataPublication,
+        >::from_evidence(&request.evidence)?
+        else {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "Read-only data mutation reconciliation has no original in-process journal owner",
+                ),
+                evidence: request.evidence,
+            });
+        };
+        if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
+            journal.catalog_entry_outcome(entry)
+        {
+            return Ok(publication::project_external(committed));
+        }
         match self.backend.lookup_marker(
             &evidence.namespace,
             &evidence.table,
@@ -913,8 +940,53 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             &evidence.identity_digest_hex,
             &request.context,
         )? {
-            MarkerLookup::Matching { snapshot_id } => {
-                self.committed_from_reconcile(&request, &evidence, snapshot_id)
+            MarkerLookup::Matching { observation } => {
+                let descriptor = journal
+                    .entry_descriptor(entry)
+                    .ok_or_else(|| corrupt("Data mutation journal entry is unavailable"))?;
+                if journal
+                    .append_positive_proof_with_finalization(
+                        descriptor.key,
+                        observation,
+                        self.backend.positive_attribution_finalization(),
+                    )
+                    .is_err()
+                {
+                    if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
+                        journal.catalog_entry_outcome(entry)
+                    {
+                        return Ok(publication::project_external(committed));
+                    }
+                    return Ok(ExternalMutationOutcome::CommitUnknown {
+                        failure: failure(
+                            ConnectorMutationFailureKind::Conflict,
+                            "Observed data mutation marker does not prove the exact original request",
+                        ),
+                        evidence: request.evidence,
+                    });
+                }
+                let mut result = journal.catalog_entry_outcome(entry);
+                if let ExternalMutationOutcome::KnownCommitted { receipt, .. } = &result {
+                    let finalized = journal
+                        .finalization_context(entry, self.backend.evidence_policy())
+                        .and_then(|grant| grant.for_io(&request.context))
+                        .and_then(|context| {
+                            let _finalizing = journal.finalization_activity(entry);
+                            self.backend
+                                .finalize_reconciled(&receipt.finalization, &context)
+                        });
+                    if let Err(error) = finalized {
+                        journal.record_entry_finalization(
+                            entry,
+                            ExternalMutationFinalization::Failed(failure(
+                                ConnectorMutationFailureKind::Internal,
+                                error.message(),
+                            )),
+                        );
+                    }
+                    result = journal.catalog_entry_outcome(entry);
+                }
+                Ok(publication::project_external(result))
             }
             MarkerLookup::Conflicting => Ok(ExternalMutationOutcome::CommitUnknown {
                 failure: failure(
@@ -1274,6 +1346,7 @@ mod tests {
         execute_count: AtomicUsize,
         context_calls: AtomicUsize,
         namespace: String,
+        observed_marker: Mutex<Option<(uuid::Uuid, String)>>,
     }
 
     impl FakeBackend {
@@ -1283,7 +1356,15 @@ mod tests {
                 execute_count: AtomicUsize::new(0),
                 context_calls: AtomicUsize::new(0),
                 namespace: "db".to_string(),
+                observed_marker: Mutex::new(None),
             }
+        }
+
+        fn matching(&self, snapshot_id: i64) -> MarkerLookup {
+            let (table_uuid, marker_value) = self.observed_marker.lock().unwrap().clone().unwrap();
+            MarkerLookup::Matching { observation: crate::commit::publication_descriptor::PositiveAttributionObservation::SnapshotMarker {
+                table_uuid, snapshot_id, marker_key: MARKER_PROPERTY.to_owned(), marker_value,
+            } }
         }
 
         fn with_namespace(namespace: impl Into<String>) -> Self {
@@ -1341,20 +1422,99 @@ mod tests {
 
         fn execute(
             &self,
-            _planned: &PlannedIcebergMutation,
-            _marker: &IcebergDataMutationMarkerV1,
+            planned: &PlannedIcebergMutation,
+            marker: &IcebergDataMutationMarkerV1,
             recovery: &MutationRecoveryTemplate,
-            _context: &ConnectorRequestContext,
+            context: &ConnectorRequestContext,
         ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
             self.execute_count.fetch_add(1, Ordering::SeqCst);
             self.context_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(
-                    ConnectorMutationFailureKind::Unavailable,
-                    "marker response unresolved",
-                ),
-                evidence: recovery.evidence(RecoveryPublication::MarkerOnly {})?,
-            })
+            use crate::commit::{
+                attempt::observation::{DispatchEvidence, ProtocolObservation, PublicationJournal},
+                model::OperationToken,
+                publication_descriptor::AttributionPlan,
+            };
+            let marker_value =
+                String::from_utf8(canonical_json(marker, "marker")?.to_vec()).unwrap();
+            let table_uuid = planned.source_metadata().uuid();
+            *self.observed_marker.lock().unwrap() = Some((table_uuid, marker_value.clone()));
+            let journal = PublicationJournal::new(OperationToken::from_mutation(
+                recovery.plan.operation_id(),
+            ));
+            let entry = journal
+                .prepare_catalog(
+                    recovery.evidence(RecoveryPublication::MarkerOnly {})?,
+                    recovery.publication_receipt(42)?,
+                    vec![format!(
+                        "{}.{}",
+                        planned.payload().namespace,
+                        planned.payload().table
+                    )],
+                    b"independent fake mutation dispatch".to_vec(),
+                    AttributionPlan::Snapshot {
+                        table_uuid,
+                        snapshot_id: 42,
+                        marker_key: MARKER_PROPERTY.to_owned(),
+                        marker_value,
+                    },
+                    context.clone(),
+                )
+                .map_err(|error| internal(error.to_string()))?;
+            // Exercise the real journal executor with one independent backend
+            // reply. This fixture has no catalog transport or second verdict.
+            struct UnresolvedDispatch;
+            #[async_trait::async_trait]
+            impl crate::catalog::publication_dispatch::PreparedCatalogDispatch for UnresolvedDispatch {
+                async fn dispatch_once(
+                    self: Box<Self>,
+                    _: crate::catalog::publication::EvidenceContext,
+                ) -> crate::catalog::publication_dispatch::DispatchCompletion {
+                    crate::catalog::publication_dispatch::DispatchCompletion::evidence(
+                        DispatchEvidence::Unknown {
+                            failure: failure(
+                                ConnectorMutationFailureKind::Unavailable,
+                                "marker response unresolved",
+                            ),
+                            observation: ProtocolObservation::default(),
+                        },
+                    )
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let issued =
+                runtime
+                    .block_on(journal.publish_once(
+                        context.clone(),
+                        crate::catalog::publication::CatalogEvidencePolicy::default(),
+                        |_, _, _| async {
+                            Ok(crate::catalog::publication_dispatch::PreparedPublication::Mutation {
+                            binding: None,
+                            dispatch: Box::new(UnresolvedDispatch),
+                        })
+                        },
+                    ))
+                    .map_err(|error| internal(error.to_string()))?;
+            assert_eq!(issued, entry);
+            Ok(publication::project_external(
+                journal.catalog_entry_outcome(entry),
+            ))
+        }
+
+        fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
+            crate::catalog::publication::CatalogEvidencePolicy::default()
+        }
+        fn positive_attribution_finalization(&self) -> ExternalMutationFinalization {
+            ExternalMutationFinalization::Complete
+        }
+        fn finalize_reconciled(
+            &self,
+            _facts: &DataFinalizationFacts,
+            _context: &ConnectorRequestContext,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
         }
 
         fn lookup_marker(
@@ -1367,7 +1527,7 @@ mod tests {
             _context: &ConnectorRequestContext,
         ) -> Result<MarkerLookup, ConnectorError> {
             self.context_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(*self.lookup.lock().expect("lookup"))
+            Ok(self.lookup.lock().expect("lookup").clone())
         }
     }
 
@@ -1444,30 +1604,49 @@ mod tests {
             )
             .expect("control runtime"),
         );
-        let catalog = runtime.novarocks_catalog().vendored_client();
-        executor.block_on(async move {
-            let namespace = NamespaceIdent::new("db".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("create namespace");
+        executor.block_on(async {
+            use crate::catalog::CatalogNamespaceName;
+            use crate::catalog::catalog_request::CatalogPublicationRequest;
+            use crate::catalog::error::CatalogOutcome;
+            let generation = ProviderBindingEpoch::from_bytes([8; 16]);
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &runtime,
+                generation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("db"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
             let schema = Schema::builder()
                 .with_fields(vec![
                     NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
                 ])
                 .build()
-                .expect("schema");
-            catalog
-                .create_table(
-                    &namespace,
-                    TableCreation::builder()
-                        .name("t".to_string())
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &runtime,
+                generation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("db"),
+                    creation: TableCreation::builder()
+                        .name("t".into())
                         .schema(schema)
                         .format_version(FormatVersion::V2)
                         .build(),
-                )
-                .await
-                .expect("create table");
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
         });
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
@@ -2018,7 +2197,7 @@ mod tests {
         ));
         assert_eq!(backend.execute_count.load(Ordering::SeqCst), 1);
 
-        *backend.lookup.lock().expect("lookup") = MarkerLookup::Matching { snapshot_id: 42 };
+        *backend.lookup.lock().expect("lookup") = backend.matching(42);
         let restarted =
             IcebergDataMutationAdapter::new_with_backend(key, backend).expect("restart adapter");
         let reconcile =
@@ -2061,7 +2240,7 @@ mod tests {
             panic!("expected unknown result");
         };
         original_cancellation.request_stop();
-        *backend.lookup.lock().expect("lookup") = MarkerLookup::Matching { snapshot_id: 42 };
+        *backend.lookup.lock().expect("lookup") = backend.matching(42);
         let restarted = IcebergDataMutationAdapter::new_with_backend(key, backend.clone())
             .expect("restart adapter");
         let recovery =
@@ -2117,9 +2296,50 @@ mod tests {
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
         ));
 
-        *backend.lookup.lock().expect("lookup") = MarkerLookup::Matching { snapshot_id: 43 };
+        *backend.lookup.lock().expect("lookup") = backend.matching(43);
         assert!(matches!(
-            restarted.reconcile(reconcile()).expect("matching marker"),
+            restarted
+                .reconcile(reconcile())
+                .expect("marker on another snapshot"),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        let wire_only =
+            ExternalMutationEvidence::try_from_wire_v1(&evidence.try_to_wire_v1().unwrap())
+                .unwrap();
+        assert!(matches!(
+            restarted
+                .reconcile(
+                    ConnectorDataMutationReconcileRequest::try_new(
+                        &plan,
+                        wire_only,
+                        test_context()
+                    )
+                    .unwrap()
+                )
+                .unwrap(),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        let mut foreign = backend.matching(42);
+        if let MarkerLookup::Matching {
+            observation:
+                crate::commit::publication_descriptor::PositiveAttributionObservation::SnapshotMarker {
+                    table_uuid,
+                    ..
+                },
+        } = &mut foreign
+        {
+            *table_uuid = uuid::Uuid::new_v4();
+        }
+        *backend.lookup.lock().unwrap() = foreign;
+        assert!(matches!(
+            restarted.reconcile(reconcile()).unwrap(),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        *backend.lookup.lock().expect("lookup") = backend.matching(42);
+        assert!(matches!(
+            restarted
+                .reconcile(reconcile())
+                .expect("exact original request marker"),
             ExternalMutationOutcome::KnownCommitted { .. }
         ));
         assert_eq!(backend.execute_count.load(Ordering::SeqCst), 1);

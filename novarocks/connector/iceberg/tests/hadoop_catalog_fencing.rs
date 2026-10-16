@@ -21,19 +21,31 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+use novarocks_connector_iceberg::access_binding::{
+    IcebergReadBinding, IcebergStaticCredentialResolver,
+};
 use novarocks_connector_iceberg::catalog_config::{
     IcebergCatalogConfiguration, parse_catalog_configuration_with_object_store_binding,
 };
 use novarocks_connector_iceberg::catalog_runtime::build_hadoop_catalog;
-use novarocks_connector_iceberg::iceberg::spec::{
-    FormatVersion, NestedField, PrimitiveType, Schema, TableMetadata, Type,
-};
-use novarocks_connector_iceberg::iceberg::{
-    Catalog, ErrorKind, NamespaceIdent, TableCreation, TableIdent,
-};
+use novarocks_connector_iceberg::connector_factory::IcebergConnectorFactory;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
 use novarocks_connector_iceberg::novarocks_fs::{
-    FsAccessResolver, ObjectStoreConfig, SecretValue, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FsAccessResolver, FsAccessResources, ObjectStoreConfig, ObjectStoreProviderPool,
+    ObjectStoreSecretMaterial, SecretValue, TokioFileIoRuntime, TokioFileTaskSpawner,
+};
+use novarocks_connector_iceberg::resources::IcebergMetadataResources;
+use novarocks_spi::connector::{
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+    CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCatalogMutationOperation,
+    ConnectorCatalogMutationRequest, ConnectorColumnDefinition, ConnectorControlCreation,
+    ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorDataType, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorNamespaceIdentity, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner, ConnectorTableIdentity,
+    CreatePolicy, CredentialConsumerRole, ExternalMutationEffect, ExternalMutationFinalization,
+    ExternalMutationOutcome, StaticCredentialReference,
 };
 use sha2::{Digest, Sha256};
 
@@ -75,6 +87,7 @@ struct ChildResult {
     outcome: String,
     uuid: String,
     location: String,
+    digest: String,
 }
 
 #[derive(Debug)]
@@ -131,54 +144,153 @@ fn hadoop_fencing_child_process_entry() {
 
     let config = catalog_configuration(&warehouse);
     let runtime = tokio::runtime::Runtime::new().expect("child runtime");
-    let catalog = build_hadoop_catalog(
-        &config,
-        catalog_binding(&config),
-        novarocks_connector_iceberg::iceberg::Runtime::new(&runtime),
-    )
-    .expect("build child Hadoop catalog");
-    let namespace_ident = NamespaceIdent::new(namespace.clone());
-    let table_ident = TableIdent::new(namespace_ident.clone(), table_name.clone());
+    // Each child constructs its own production control generation. The
+    // mutation capability freezes and publishes through that owner's journal.
+    let creation = child_control(&config, &runtime);
+    let binding = creation.binding();
+    let mutation = binding.mutation().expect("catalog mutation capability");
+    let target = ConnectorProviderBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    let namespace_result = mutation
+        .execute(ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: target.clone(),
+            operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                namespace: ConnectorNamespaceIdentity {
+                    instance_id: target.instance_id.clone(),
+                    namespace: namespace.clone().into(),
+                },
+                policy: CreatePolicy::NoOpIfExists,
+            },
+            context: request_context(),
+        })
+        .expect("execute namespace publication");
+    assert!(
+        matches!(
+            namespace_result,
+            ExternalMutationOutcome::KnownCommitted {
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ),
+        "namespace must exist before the table race: {namespace_result:?}"
+    );
 
     std::fs::write(barrier.join(format!("ready-{child_index}")), b"ready\n")
         .expect("publish child barrier readiness");
     wait_for_both_children(&barrier);
 
-    let outcome = runtime.block_on(async {
-        match catalog
-            .create_table(&namespace_ident, table_creation(&table_name))
-            .await
-        {
-            Ok(_) => "applied",
-            Err(error) if error.kind() == ErrorKind::TableAlreadyExists => match policy {
-                Policy::Strict => "conflict",
-                Policy::NoOp => "noop",
+    let result = mutation
+        .execute(ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: target.clone(),
+            operation: ConnectorCatalogMutationOperation::CreateTable {
+                table: ConnectorTableIdentity {
+                    instance_id: target.instance_id.clone(),
+                    namespace: namespace.clone().into(),
+                    table: table_name.clone().into(),
+                },
+                columns: vec![ConnectorColumnDefinition {
+                    name: "id".into(),
+                    data_type: ConnectorDataType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                }],
+                key: None,
+                partitioning: Vec::new(),
+                properties: vec![("format-version".into(), "2".into())],
+                policy: match policy {
+                    Policy::Strict => CreatePolicy::FailIfExists,
+                    Policy::NoOp => CreatePolicy::NoOpIfExists,
+                },
             },
-            Err(error) => panic!("child create returned an unexpected error: {error}"),
+            context: request_context(),
+        })
+        .expect("execute prepared create publication");
+    let (outcome, applied_version) = match result {
+        ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        } => {
+            assert_eq!(finalization, ExternalMutationFinalization::Complete);
+            assert_eq!(receipt.descriptor().instance_id, target.instance_id);
+            assert_eq!(receipt.incarnation(), target.incarnation);
+            match effect {
+                ExternalMutationEffect::Applied => (
+                    "applied",
+                    Some(
+                        serde_json::from_slice::<serde_json::Value>(
+                            receipt.provider_version().expect("applied create identity"),
+                        )
+                        .expect("decode applied create identity"),
+                    ),
+                ),
+                ExternalMutationEffect::NoOp => {
+                    assert_eq!(policy, Policy::NoOp);
+                    assert!(receipt.provider_version().is_none());
+                    ("noop", None)
+                }
+            }
         }
-    });
-    let loaded = runtime
-        .block_on(catalog.load_table(&table_ident))
-        .expect("load authoritative table after child create");
-    let location = loaded
-        .metadata_location()
-        .expect("Hadoop table has a metadata location");
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+            assert_eq!(policy, Policy::Strict);
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists);
+            assert_eq!(cleanup, ExternalMutationFinalization::Complete);
+            ("conflict", None)
+        }
+        other => panic!("child create returned an unexpected outcome: {other:?}"),
+    };
+    // Read the actual canonical object independently from the publication
+    // receipt, so a fabricated receipt cannot establish the storage oracle.
+    let location = format!(
+        "{}/{namespace}/{table_name}/metadata/v1.metadata.json",
+        config.warehouse_uri.trim_end_matches('/')
+    );
+    let read_binding = catalog_binding(&config);
+    let access =
+        novarocks_connector_iceberg::fs_io::resolve_access_for_location(&location, &read_binding)
+            .expect("resolve child v1 access");
+    let bytes = runtime
+        .block_on(
+            access
+                .operator()
+                .read(access.single_relative_path().expect("v1 path")),
+        )
+        .expect("read authoritative v1 after child create")
+        .to_bytes();
+    let metadata: TableMetadata = serde_json::from_slice(&bytes).expect("decode child v1");
+    let table_uuid = metadata.uuid().to_string();
+    let digest = hex_digest(&bytes);
+    if let Some(version) = applied_version {
+        assert_eq!(version["table_uuid"].as_str(), Some(table_uuid.as_str()));
+        assert_eq!(
+            version["metadata_location"].as_str(),
+            Some(location.as_str())
+        );
+        assert_eq!(version["metadata_digest"].as_str(), Some(digest.as_str()));
+    }
     println!(
-        "{RESULT_PREFIX}pid={} outcome={outcome} uuid={} location={location}",
+        "{RESULT_PREFIX}pid={} outcome={outcome} uuid={table_uuid} location={location} digest={digest}",
         std::process::id(),
-        loaded.metadata().uuid()
     );
 }
 
 fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
     let namespace = "fencing";
+    // Configuration parsing canonicalizes local paths to file:// URIs. Use
+    // that same identity for child inputs, receipts and the independent audit.
+    let config = catalog_configuration(warehouse);
+    let warehouse = config.warehouse_uri.as_str();
     let metadata_location = format!(
         "{}/{}/{}/metadata/v1.metadata.json",
         warehouse.trim_end_matches('/'),
         namespace,
         table_name
     );
-    let config = catalog_configuration(warehouse);
     let binding = catalog_binding(&config);
     let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
         &metadata_location,
@@ -242,10 +354,12 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
     );
     assert_eq!(results[0].uuid, results[1].uuid);
     assert_eq!(results[0].location, results[1].location);
+    assert_eq!(results[0].digest, results[1].digest);
 
     let audit = audit_prefix(&config, namespace, table_name);
     assert_eq!(audit.uuid, results[0].uuid);
     assert_eq!(audit.location, results[0].location);
+    assert_eq!(audit.digest, results[0].digest);
     assert!(
         audit.location.ends_with(&format!(
             "/{namespace}/{table_name}/metadata/v1.metadata.json"
@@ -363,6 +477,7 @@ fn parse_child_result(output: &Output) -> ChildResult {
         outcome: fields["outcome"].to_string(),
         uuid: fields["uuid"].to_string(),
         location: fields["location"].to_string(),
+        digest: fields["digest"].to_string(),
     }
 }
 
@@ -433,20 +548,116 @@ fn object_store_config(warehouse: &str) -> Option<ObjectStoreConfig> {
     })
 }
 
-fn table_creation(name: &str) -> TableCreation {
-    let schema = Schema::builder()
-        .with_fields(vec![Arc::new(NestedField::required(
-            1,
-            "id",
-            Type::Primitive(PrimitiveType::Long),
-        ))])
-        .build()
-        .expect("test schema");
-    TableCreation::builder()
-        .name(name.to_string())
-        .schema(schema)
-        .format_version(FormatVersion::V2)
-        .build()
+fn request_context() -> ConnectorRequestContext {
+    ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        ConnectorStopOwner::new().view(),
+        64 * 1024,
+        256 * 1024,
+    )
+    .expect("mutation request context")
+}
+
+struct ChildCredentials(Option<ObjectStoreSecretMaterial>);
+
+impl IcebergStaticCredentialResolver for ChildCredentials {
+    fn resolve_object_store_static(
+        &self,
+        _reference: &StaticCredentialReference,
+    ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "fencing child only owns frontend metadata credentials",
+        ))
+    }
+
+    fn resolve_object_store_metadata_static(
+        &self,
+        reference: &StaticCredentialReference,
+    ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+        assert_eq!(reference.name(), "fencing-metadata");
+        assert_eq!(reference.generation(), "1");
+        self.0.clone().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "local fencing child has no object-store credentials",
+            )
+        })
+    }
+}
+
+fn child_control(
+    config: &IcebergCatalogConfiguration,
+    runtime: &tokio::runtime::Runtime,
+) -> ConnectorControlCreation {
+    let mut properties = vec![
+        ("type".to_string(), "iceberg".to_string()),
+        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+        (
+            "iceberg.catalog.warehouse".to_string(),
+            config.warehouse_uri.clone(),
+        ),
+    ];
+    let mut credentials = Vec::new();
+    if let Some(object_store) = &config.object_store_config {
+        properties.push(("aws.s3.endpoint".to_string(), object_store.endpoint.clone()));
+        properties.push((
+            "aws.s3.enable_path_style_access".to_string(),
+            "true".to_string(),
+        ));
+        if let Some(region) = &object_store.region {
+            properties.push(("aws.s3.region".to_string(), region.clone()));
+        }
+        credentials.push(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(
+                    StaticCredentialReference::try_new("fencing-metadata", "1")
+                        .expect("metadata credential reference"),
+                ),
+            )
+            .expect("metadata credential binding"),
+        );
+    }
+    let instance_id = ConnectorInstanceId::parse("hadoop_fencing").expect("instance identity");
+    let provider_id = ConnectorProviderId::parse("iceberg").expect("provider identity");
+    let catalog_properties = CatalogProperties::new(
+        CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([1; 32])),
+        provider_id.clone(),
+        1,
+        properties
+            .iter()
+            .map(|(key, value)| CatalogProperty::new(key, value).expect("non-secret property"))
+            .collect(),
+        credentials,
+    )
+    .expect("typed catalog properties");
+    let resources = FsAccessResources::new(
+        Arc::new(ObjectStoreProviderPool::new(Default::default()).expect("child provider pool")),
+        FsAccessResolver::new(),
+        Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+    );
+    let planning_binding = IcebergReadBinding::with_static_metadata_credential_resolver(
+        resources,
+        Arc::new(ChildCredentials(
+            config
+                .object_store_config
+                .as_ref()
+                .map(ObjectStoreConfig::secret_material),
+        )),
+    );
+    let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
+        planning_binding,
+        runtime.handle().clone(),
+    ));
+    let request = ConnectorControlFactoryRequest::try_new(provider_id, instance_id, properties)
+        .and_then(|request| request.with_catalog_properties(catalog_properties))
+        .expect("child control factory request");
+    factory
+        .create_control(request)
+        .expect("build independent child control generation")
 }
 
 fn required_env(name: &str) -> String {

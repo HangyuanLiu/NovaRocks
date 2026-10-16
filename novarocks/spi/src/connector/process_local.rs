@@ -39,6 +39,19 @@ impl ConnectorProcessLocalPayload {
         }
     }
 
+    pub(crate) fn validate_owner(
+        &self,
+        expected: &ConnectorProviderBindingKey,
+    ) -> Result<(), ConnectorError> {
+        if &self.owner != expected {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "process-local payload belongs to another connector generation",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn value<T: Send + Sync + 'static>(
         &self,
         expected_instance_id: &str,

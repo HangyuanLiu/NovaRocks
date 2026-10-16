@@ -34,7 +34,7 @@ use crate::iceberg::spec::*;
 use crate::iceberg::{
     Error, ErrorKind, NamespaceIdent, Result, TableIdent, TableRequirement, TableUpdate,
 };
-use crate::iceberg_catalog_rest::{
+use crate::rest_protocol::wire::{
     CommitTableRequest, CommitTableResponse, CreateTableRequest, LoadTableResult,
 };
 use arrow::array::Int64Array;
@@ -1214,21 +1214,87 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
 
 use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewDefinition};
 use crate::catalog_runtime::RestAccessDelegationMode;
-use crate::iceberg::{Catalog as _, TableCommit};
-use crate::rest_protocol::adapter::{RestTransitionalAdapter, rest_evidence};
+
+use crate::catalog::NovaRocksCatalog;
+use crate::catalog::admission::CatalogOperation;
 use crate::rest_protocol::endpoints::RestEndpoints;
 use crate::rest_protocol::evidence::{
-    AttributionExpectation, ExpectedSnapshot, MutationEndpoint, RefRelation, RestEvidence,
-    RestReceipt, UnknownReason,
+    AttributionExpectation, ExpectedSnapshot, MutationEndpoint, RestEvidence, RestReceipt,
+    UnknownReason,
 };
 use crate::rest_protocol::mutation::MutationOutcome;
 use novarocks_spi::connector::ConnectorErrorKind;
 
 /// One NovaRocks REST generation built exactly as production builds a static
 /// catalog, plus the independent Java oracle for the same namespace.
+// A fixture-only finalizer runs after the real Java response. It preserves
+// the adapter's evidence and any original owner work; only the added work fails.
+struct JavaFinalizationProbeDispatch {
+    inner: Box<dyn crate::catalog::publication_dispatch::PreparedCatalogDispatch>,
+    journal: crate::commit::attempt::observation::PublicationJournal<()>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait]
+impl crate::catalog::publication_dispatch::PreparedCatalogDispatch
+    for JavaFinalizationProbeDispatch
+{
+    async fn dispatch_once(
+        self: Box<Self>,
+        context: crate::catalog::publication::EvidenceContext,
+    ) -> crate::catalog::publication_dispatch::DispatchCompletion {
+        let mut completion = self.inner.dispatch_once(context).await;
+        completion.finalization = Some(Box::new(JavaFinalizationProbe {
+            inner: completion.finalization,
+            journal: self.journal,
+            polls: self.polls,
+        }));
+        completion
+    }
+}
+struct JavaFinalizationProbe {
+    inner: Option<Box<dyn crate::catalog::publication_dispatch::FinalizationWork>>,
+    journal: crate::commit::attempt::observation::PublicationJournal<()>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait]
+impl crate::catalog::publication_dispatch::FinalizationWork for JavaFinalizationProbe {
+    async fn run(
+        self: Box<Self>,
+        context: crate::catalog::publication::EvidenceContext,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        assert!(
+            matches!(
+                self.journal
+                    .commit_outcome(self.journal.current_entry().unwrap()),
+                CatalogOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ),
+            "Actual Java Applied evidence must be recorded before the first finalization poll"
+        );
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(inner) = self.inner {
+            assert_eq!(
+                inner.run(context).await,
+                novarocks_spi::connector::ExternalMutationFinalization::Complete
+            );
+        }
+        novarocks_spi::connector::ExternalMutationFinalization::Failed(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Internal,
+                "Injected finalization failure after actual Java publication",
+            ),
+        )
+    }
+}
+
 struct NovaRocksRest {
     java: Java,
     endpoints: Arc<RestEndpoints>,
+    owner: Arc<dyn NovaRocksCatalog>,
+    descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
 }
 
 impl NovaRocksRest {
@@ -1270,7 +1336,110 @@ impl NovaRocksRest {
         );
         let endpoints = Arc::clone(client.rest_endpoints().expect("REST generation endpoints"));
         java.record("fixture", &json!({"publication": required("NOVA_ENV_REST_ENV_FILE"), "prefix": java.prefix, "namespace": java.namespace.as_ref()}));
-        Self { java, endpoints }
+        let owner =
+            crate::catalog::factory::NovaRocksCatalogFactory::adopt(&configuration, &client)
+                .unwrap();
+        Self {
+            java,
+            endpoints,
+            owner,
+            descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("iru13a")
+                    .unwrap(),
+            },
+            generation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes([13; 16]),
+        }
+    }
+
+    async fn publish(
+        &self,
+        label: &str,
+        request: FrozenRequest,
+        operation: CatalogOperation,
+        context: ConnectorRequestContext,
+        staged: Option<crate::catalog::StagedPublicationExpectation>,
+    ) -> CatalogOutcome<CommitProof> {
+        let outcome = crate::catalog::admission_test_support::publish_frozen(
+            Arc::clone(&self.owner),
+            self.descriptor.clone(),
+            self.generation,
+            request,
+            operation,
+            context,
+            staged,
+        )
+        .await;
+        self.java
+            .record(label, &json!({"journal-outcome":format!("{outcome:?}")}));
+        outcome
+    }
+
+    async fn publish_with_failed_finalization(
+        &self,
+        request: FrozenRequest,
+        context: ConnectorRequestContext,
+    ) -> CatalogOutcome<CommitProof> {
+        use crate::catalog::publication_dispatch::PreparedPublication;
+        let token = request.artifacts().attempt().operation();
+        let evidence = novarocks_spi::connector::ExternalMutationEvidence::try_new(
+            2,
+            self.descriptor.clone(),
+            self.generation,
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "java_finalization_probe",
+            Bytes::from_static(b"{}"),
+        )
+        .unwrap();
+        let journal = crate::commit::attempt::observation::PublicationJournal::new(token);
+        journal.record(evidence, (), &request).unwrap();
+        let owner = Arc::clone(&self.owner);
+        let policy = owner.evidence_policy();
+        let probe_journal = journal.clone();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_polls = Arc::clone(&polls);
+        let entry = journal
+            .publish_once(
+                context,
+                policy,
+                move |descriptor, generation, preparation| async move {
+                    let prepared = owner
+                        .prepare_frozen_for_admission_test(
+                            request,
+                            CatalogOperation::AlterProperties,
+                            None,
+                            descriptor,
+                            generation,
+                            preparation,
+                        )
+                        .await?;
+                    Ok(match prepared {
+                        PreparedPublication::Mutation { binding, dispatch } => {
+                            PreparedPublication::Mutation {
+                                binding,
+                                dispatch: Box::new(JavaFinalizationProbeDispatch {
+                                    inner: dispatch,
+                                    journal: probe_journal,
+                                    polls: probe_polls,
+                                }),
+                            }
+                        }
+                        PreparedPublication::NoOp => {
+                            panic!("Property change must dispatch a real mutation")
+                        }
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let outcome = journal.commit_outcome(entry);
+        self.java.record(
+            "failed-finalization",
+            &json!({"journal-outcome":format!("{outcome:?}")}),
+        );
+        outcome
     }
 
     fn namespace(&self) -> &NamespaceIdent {
@@ -1285,35 +1454,134 @@ impl NovaRocksRest {
         );
     }
 
+    /// Use the same frozen catalog owner and journal as production. Retain the
+    /// real response only after its evidence and finalization are recorded.
+    async fn publish_catalog(
+        &self,
+        label: &str,
+        request: crate::catalog::catalog_request::CatalogPublicationRequest,
+    ) -> (CatalogOutcome<CommitProof>, Option<Vec<u8>>) {
+        use crate::catalog::catalog_request::{
+            CatalogCreatePublicationRequest, CatalogPublicationRequest,
+        };
+        let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
+        let frozen = match request {
+            CatalogPublicationRequest::CreateTable {
+                namespace,
+                creation,
+                no_op_if_exists,
+            } => self
+                .owner
+                .freeze_create_publication(CatalogCreatePublicationRequest {
+                    operation_id: operation_id.to_bytes(),
+                    namespace,
+                    creation,
+                    no_op_if_exists,
+                })
+                .unwrap(),
+            request => request.freeze(operation_id.to_bytes()).unwrap(),
+        };
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let result = crate::catalog::admission_test_support::publish_catalog_with_document(
+            Arc::clone(&self.owner),
+            frozen,
+            operation_id,
+            self.generation,
+            context.clone(),
+            self.java.binding.for_request(context),
+        )
+        .await;
+        self.java
+            .record(label, &json!({"journal-outcome":format!("{:?}", result.0)}));
+        result
+    }
+
     async fn create_namespace(&self) {
-        let outcome = self
-            .endpoints
-            .create_namespace(self.namespace(), HashMap::new())
+        let (outcome, _) = self
+            .publish_catalog(
+                "create-namespace",
+                crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new(
+                        self.namespace().join("."),
+                    ),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
             .await;
-        self.record("create-namespace", &outcome);
-        applied(&outcome, MutationEndpoint::CreateNamespace);
+        committed_catalog(&outcome);
     }
 
     async fn drop_namespace(&self) {
-        let outcome = self.endpoints.drop_namespace(self.namespace()).await;
-        self.record("drop-namespace", &outcome);
-        applied(&outcome, MutationEndpoint::DropNamespace);
+        let (outcome, _) = self
+            .publish_catalog(
+                "drop-namespace",
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new(
+                        self.namespace().join("."),
+                    ),
+                    no_op_if_missing: false,
+                },
+            )
+            .await;
+        committed_catalog(&outcome);
     }
 
     /// Create a table immediately (static access) and return the applied
-    /// response document.
+    /// response document; Java independently checks the receipt's identity.
     async fn create_table(&self, label: &str, name: &str) -> LoadTableResult {
-        let outcome = self
-            .endpoints
-            .create_table(self.namespace(), create_request(name))
+        let request = create_request(name);
+        let (outcome, document) = self
+            .publish_catalog(
+                label,
+                crate::catalog::catalog_request::CatalogPublicationRequest::CreateTable {
+                    namespace: crate::catalog::CatalogNamespaceName::new(
+                        self.namespace().join("."),
+                    ),
+                    creation: crate::iceberg::TableCreation::builder()
+                        .name(request.name)
+                        .schema(request.schema)
+                        .partition_spec(request.partition_spec.unwrap())
+                        .sort_order(request.write_order.unwrap())
+                        .properties(request.properties)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
             .await;
-        self.record(label, &outcome);
-        let receipt = applied(&outcome, MutationEndpoint::CreateTable);
-        let created: LoadTableResult =
-            serde_json::from_slice(outcome.document.as_deref().expect("applied document")).unwrap();
-        assert_eq!(receipt.uuid, Some(created.metadata.uuid()));
+        let receipt = committed_catalog(&outcome);
+        assert!(
+            document.is_none(),
+            "Ordinary create retains minimal evidence only"
+        );
+        let (loaded, _) = self
+            .endpoints
+            .load_table(&self.java.ident(name), false)
+            .await
+            .unwrap();
+        // Static fixture metadata comes from the original Provider session;
+        // storage authority remains the original explicit fixture binding.
+        let created = LoadTableResult {
+            metadata_location: loaded.metadata_location().map(str::to_owned),
+            metadata: loaded.metadata().clone(),
+            config: HashMap::new(),
+            storage_credentials: None,
+        };
+        assert_eq!(
+            receipt.table_uuid.as_deref(),
+            Some(created.metadata.uuid().to_string().as_str())
+        );
         assert!(receipt.metadata_location.is_some());
-        assert_eq!(receipt.metadata_location, created.metadata_location);
+        assert_eq!(
+            receipt.metadata_location.as_deref(),
+            created.metadata_location.as_deref()
+        );
         assert_eq!(created.metadata.format_version(), FormatVersion::V3);
         let oracle = self.java.load(&self.java.ident(name)).await.unwrap();
         assert_eq!(oracle.metadata.uuid(), created.metadata.uuid());
@@ -1322,9 +1590,18 @@ impl NovaRocksRest {
     }
 
     async fn drop_table(&self, label: &str, name: &str) {
-        let outcome = self.endpoints.drop_table(&self.java.ident(name)).await;
-        self.record(label, &outcome);
-        applied(&outcome, MutationEndpoint::DropTable);
+        let (outcome, _) = self
+            .publish_catalog(
+                label,
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
+                    table: crate::catalog::CatalogTableName::new(self.namespace().join("."), name),
+                    no_op_if_missing: false,
+                    purge: false,
+                    capture: None,
+                },
+            )
+            .await;
+        committed_catalog(&outcome);
     }
 
     /// The raw status of an independent load.
@@ -1347,6 +1624,41 @@ fn applied(outcome: &MutationOutcome, endpoint: MutationEndpoint) -> RestReceipt
     }
 }
 
+fn committed_catalog(outcome: &CatalogOutcome<CommitProof>) -> CommitProof {
+    match outcome {
+        CatalogOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            receipt,
+        } => receipt.clone(),
+        other => panic!("Java must acknowledge the actual prepared owner: {other:?}"),
+    }
+}
+
+fn freeze_metadata_fixture(
+    java: &Java,
+    ident: TableIdent,
+    base: &LoadTableResult,
+    change: PreparedChange,
+) -> (FrozenRequest, ConnectorRequestContext) {
+    let operation = java.operation(&base.metadata);
+    let context = operation.request_context().clone();
+    let request = super::freeze_existing_change(
+        ident,
+        "main",
+        &base.metadata,
+        base.metadata_location
+            .as_deref()
+            .expect("authoritative Java metadata location"),
+        RequestShape::MetadataOnly,
+        AttemptToken::new(operation.token(), 0),
+        change,
+        &context,
+    )
+    .unwrap();
+    (request, context)
+}
+
 fn create_request(name: &str) -> CreateTableRequest {
     CreateTableRequest {
         name: name.to_owned(),
@@ -1360,16 +1672,6 @@ fn create_request(name: &str) -> CreateTableRequest {
             ("write.row-lineage".into(), "true".into()),
         ]),
     }
-}
-
-fn commit_of(request: &FrozenRequest, extra: Vec<TableUpdate>) -> TableCommit {
-    let mut updates = request.updates().to_vec();
-    updates.extend(extra);
-    TableCommit::builder()
-        .ident(request.identifier().clone())
-        .requirements(request.requirements().to_vec())
-        .updates(updates)
-        .build()
 }
 
 fn set_property(key: &str, value: &str) -> TableUpdate {
@@ -1386,11 +1688,43 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
     let endpoints = &rest.endpoints;
     let namespace = rest.namespace();
 
-    // Upstream reads and NovaRocks requests share one session binding.
-    let upstream = endpoints.upstream().await.unwrap();
-    assert!(!upstream.namespace_exists(namespace).await.unwrap());
+    // Provider reads and prepared publications share the original session binding.
+    let upstream = Arc::clone(&rest.owner);
+    assert!(
+        !upstream
+            .namespace_exists(crate::catalog::CatalogNamespaceName::new(
+                namespace.join(".")
+            ))
+            .await
+            .unwrap()
+    );
     rest.create_namespace().await;
-    assert!(upstream.namespace_exists(namespace).await.unwrap());
+    let (no_op, _) = rest
+        .publish_catalog(
+            "create-namespace-no-op",
+            crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                namespace: crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
+                properties: HashMap::new(),
+                no_op_if_exists: true,
+            },
+        )
+        .await;
+    assert!(matches!(
+        no_op,
+        CatalogOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            ..
+        }
+    ));
+    assert!(
+        upstream
+            .namespace_exists(crate::catalog::CatalogNamespaceName::new(
+                namespace.join(".")
+            ))
+            .await
+            .unwrap()
+    );
     let again = endpoints.create_namespace(namespace, HashMap::new()).await;
     rest.record("create-namespace-again", &again);
     assert_eq!(
@@ -1460,11 +1794,13 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
     listed.sort();
     assert_eq!(listed, names);
     let mut upstream_listed = upstream
-        .list_tables(namespace)
+        .list_tables(
+            crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
+            novarocks_spi::connector::ConnectorListingBound::V1,
+        )
         .await
         .unwrap()
         .into_iter()
-        .map(|ident| ident.name)
         .collect::<Vec<_>>();
     upstream_listed.sort();
     assert_eq!(upstream_listed, listed);
@@ -1483,11 +1819,13 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
         "drop without purgeRequested keeps the table files"
     );
     let mut remaining = upstream
-        .list_tables(namespace)
+        .list_tables(
+            crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
+            novarocks_spi::connector::ConnectorListingBound::V1,
+        )
         .await
         .unwrap()
         .into_iter()
-        .map(|ident| ident.name)
         .collect::<Vec<_>>();
     remaining.sort();
     assert_eq!(remaining, ["t1", "t2"]);
@@ -1499,9 +1837,25 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
         .await
         .unwrap();
     assert!(empty.identifiers.is_empty());
-    assert!(upstream.list_tables(namespace).await.unwrap().is_empty());
+    assert!(
+        upstream
+            .list_tables(
+                crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
+                novarocks_spi::connector::ConnectorListingBound::V1
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
     rest.drop_namespace().await;
-    assert!(!upstream.namespace_exists(namespace).await.unwrap());
+    assert!(
+        !upstream
+            .namespace_exists(crate::catalog::CatalogNamespaceName::new(
+                namespace.join(".")
+            ))
+            .await
+            .unwrap()
+    );
     // D13: a drop's 404 may follow a publication, so it is unknown.
     let missing = endpoints.drop_namespace(namespace).await;
     rest.record("drop-namespace-again", &missing);
@@ -1548,41 +1902,64 @@ async fn iru13a_java_rest_table_commit_shapes() {
             .contains(&TableRequirement::UuidMatch { uuid })
     );
     let snapshot = request.ref_snapshot_after("main").unwrap();
-    let expect = AttributionExpectation::table_commit(
-        uuid,
-        Some(ExpectedSnapshot::new(snapshot, Some("main".into()))),
-    )
-    .unwrap();
-    let outcome = endpoints
-        .commit_table(commit_of(&request, vec![]), &expect, false)
+    let outcome = rest
+        .publish(
+            "append",
+            request,
+            CatalogOperation::Append,
+            operation.request_context().clone(),
+            None,
+        )
         .await;
-    rest.record("append", &outcome);
-    let receipt = applied(&outcome, MutationEndpoint::TableCommit);
+    let receipt = committed_catalog(&outcome);
     assert_eq!(receipt.snapshot_id, Some(snapshot));
-    assert_eq!(receipt.uuid, Some(uuid));
-    assert_eq!(receipt.ref_relation, RefRelation::AtExpectedSnapshot);
+    assert_eq!(
+        receipt.table_uuid.as_deref(),
+        Some(uuid.to_string().as_str())
+    );
     let appended = java.load(&ident).await.unwrap();
     assert_eq!(
         semantic_facts(&appended.metadata),
         semantic_facts(&expected),
         "Java is the independent metadata oracle"
     );
-    assert_eq!(appended.metadata_location, receipt.metadata_location);
+    assert_eq!(
+        appended.metadata_location.as_deref(),
+        receipt.metadata_location.as_deref()
+    );
+    assert_eq!(
+        appended
+            .metadata
+            .snapshot_for_ref("main")
+            .map(|snapshot| snapshot.snapshot_id()),
+        Some(snapshot)
+    );
 
     // Metadata-only: attributed by the frozen UUID alone.
-    let commit = crate::commit::existing_commit::existing_table_commit(
+    let (request, context) = freeze_metadata_fixture(
+        java,
         ident.clone(),
-        &appended.metadata,
-        vec![],
-        vec![set_property("iru13a.metadata-only", "applied")],
-    )
-    .unwrap();
-    let expect = AttributionExpectation::table_commit(uuid, None).unwrap();
-    let outcome = endpoints.commit_table(commit, &expect, false).await;
-    rest.record("metadata-only", &outcome);
-    let receipt = applied(&outcome, MutationEndpoint::TableCommit);
+        &appended,
+        PreparedChange {
+            requirements: vec![],
+            updates: vec![set_property("iru13a.metadata-only", "applied")],
+        },
+    );
+    let outcome = rest
+        .publish(
+            "metadata-only",
+            request,
+            CatalogOperation::AlterProperties,
+            context,
+            None,
+        )
+        .await;
+    let receipt = committed_catalog(&outcome);
     assert_eq!(receipt.snapshot_id, None);
-    assert_eq!(receipt.uuid, Some(uuid));
+    assert_eq!(
+        receipt.table_uuid.as_deref(),
+        Some(uuid.to_string().as_str())
+    );
     let updated = java.load(&ident).await.unwrap();
     assert_eq!(
         updated
@@ -1593,19 +1970,24 @@ async fn iru13a_java_rest_table_commit_shapes() {
         Some("applied")
     );
     assert_eq!(updated.metadata.current_snapshot_id(), Some(snapshot));
-    assert_eq!(updated.metadata_location, receipt.metadata_location);
+    assert_eq!(
+        updated.metadata_location.as_deref(),
+        receipt.metadata_location.as_deref()
+    );
 
     // A failing requirement: produced before the append, when main was absent.
-    let commit = crate::commit::existing_commit::existing_table_commit(
-        ident.clone(),
-        &created.metadata,
-        vec![TableRequirement::RefSnapshotIdMatch {
-            r#ref: "main".into(),
-            snapshot_id: None,
-        }],
-        vec![set_property("iru13a.stale", "applied")],
-    )
-    .unwrap();
+    let commit = CommitTableRequest {
+        identifier: Some(ident.clone()),
+        requirements: vec![
+            TableRequirement::UuidMatch { uuid },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".into(),
+                snapshot_id: None,
+            },
+        ],
+        updates: vec![set_property("iru13a.stale", "applied")],
+    };
+    let expect = AttributionExpectation::table_commit(uuid, None).unwrap();
     let outcome = endpoints.commit_table(commit, &expect, false).await;
     rest.record("stale-requirement", &outcome);
     assert_eq!(
@@ -1618,6 +2000,156 @@ async fn iru13a_java_rest_table_commit_shapes() {
     let unchanged = java.load(&ident).await.unwrap();
     assert_eq!(unchanged.metadata_location, updated.metadata_location);
     assert!(!unchanged.metadata.properties().contains_key("iru13a.stale"));
+
+    // RefRetention is a distinct frozen shape: Java checks both the reference
+    // and its full policy, then its explicit CAS removal. No snapshot is added.
+    let retained_ref = SnapshotReference::new(
+        snapshot,
+        SnapshotRetention::branch(Some(2), Some(3_600_000), Some(7_200_000)),
+    );
+    let operation = java.operation(&unchanged.metadata);
+    let context = operation.request_context().clone();
+    let request = super::freeze_existing_change(
+        ident.clone(),
+        "main",
+        &unchanged.metadata,
+        unchanged.metadata_location.as_deref().unwrap(),
+        RequestShape::RefRetention,
+        AttemptToken::new(operation.token(), 0),
+        PreparedChange {
+            requirements: vec![],
+            updates: vec![TableUpdate::SetSnapshotRef {
+                ref_name: "retained".into(),
+                reference: retained_ref.clone(),
+            }],
+        },
+        &context,
+    )
+    .unwrap();
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::UuidMatch { uuid })
+    );
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::RefSnapshotIdMatch {
+                r#ref: "retained".into(),
+                snapshot_id: None,
+            })
+    );
+    let outcome = rest
+        .publish(
+            "ref-retention-set",
+            request,
+            CatalogOperation::CreateBranch,
+            context,
+            None,
+        )
+        .await;
+    let receipt = committed_catalog(&outcome);
+    let retained = java.load(&ident).await.unwrap();
+    assert_eq!(
+        retained.metadata.refs().get("retained"),
+        Some(&retained_ref)
+    );
+    assert_eq!(retained.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(
+        retained.metadata.snapshots().count(),
+        unchanged.metadata.snapshots().count()
+    );
+    assert_eq!(
+        receipt.table_uuid.as_deref(),
+        Some(uuid.to_string().as_str())
+    );
+    assert_eq!(
+        receipt.metadata_location.as_deref(),
+        retained.metadata_location.as_deref()
+    );
+    let operation = java.operation(&retained.metadata);
+    let context = operation.request_context().clone();
+    let request = super::freeze_existing_change(
+        ident.clone(),
+        "main",
+        &retained.metadata,
+        retained.metadata_location.as_deref().unwrap(),
+        RequestShape::RefRetention,
+        AttemptToken::new(operation.token(), 0),
+        PreparedChange {
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "retained".into(),
+                snapshot_id: Some(snapshot),
+            }],
+            updates: vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: "retained".into(),
+            }],
+        },
+        &context,
+    )
+    .unwrap();
+    let outcome = rest
+        .publish(
+            "ref-retention-remove",
+            request,
+            CatalogOperation::DropBranch,
+            context,
+            None,
+        )
+        .await;
+    let receipt = committed_catalog(&outcome);
+    let removed = java.load(&ident).await.unwrap();
+    assert!(!removed.metadata.refs().contains_key("retained"));
+    assert_eq!(removed.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(
+        semantic_facts(&removed.metadata),
+        semantic_facts(&unchanged.metadata)
+    );
+    assert_eq!(
+        receipt.metadata_location.as_deref(),
+        removed.metadata_location.as_deref()
+    );
+
+    let (request, context) = freeze_metadata_fixture(
+        java,
+        ident.clone(),
+        &removed,
+        PreparedChange {
+            requirements: vec![],
+            updates: vec![set_property("finalization-probe", "committed")],
+        },
+    );
+    let outcome = rest
+        .publish_with_failed_finalization(request, context)
+        .await;
+    let CatalogOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::Applied,
+        receipt,
+        finalization: novarocks_spi::connector::ExternalMutationFinalization::Failed(failure),
+    } = outcome
+    else {
+        panic!("Actual Java commit must remain Applied with separate failed finalization");
+    };
+    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+    assert_eq!(
+        failure.message(),
+        "Injected finalization failure after actual Java publication"
+    );
+    let finalized = java.load(&ident).await.unwrap();
+    assert_eq!(finalized.metadata.uuid(), uuid);
+    assert_eq!(finalized.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(
+        finalized
+            .metadata
+            .properties()
+            .get("finalization-probe")
+            .map(String::as_str),
+        Some("committed")
+    );
+    assert_eq!(
+        finalized.metadata_location.as_deref(),
+        receipt.metadata_location.as_deref()
+    );
 
     rest.drop_table("drop", "shapes").await;
     rest.drop_namespace().await;
@@ -1674,31 +2206,52 @@ async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
     )
     .unwrap();
     engine.stage(&FastAppendPreparer).await.unwrap();
-    let request = engine.freeze(&added_references(&create)).unwrap();
-    assert_eq!(request.requirements(), &[TableRequirement::NotExist]);
-    let snapshot = request.ref_snapshot_after("main").unwrap();
     let marker = (
         "novarocks.ctas.operation-id".to_string(),
         operation.token().path_component(),
     );
+    engine
+        .stage_change(PreparedChange {
+            requirements: vec![],
+            updates: vec![set_property(&marker.0, &marker.1)],
+        })
+        .unwrap();
+    let request = engine.freeze(&added_references(&create)).unwrap();
+    assert_eq!(request.requirements(), &[TableRequirement::NotExist]);
+    let snapshot = request.ref_snapshot_after("main").unwrap();
+
     let expect = AttributionExpectation::ctas_final_commit(
         staged_uuid,
         Some(ExpectedSnapshot::new(snapshot, Some("main".into()))),
         vec![marker.clone()],
     )
     .unwrap();
-    let outcome = endpoints
-        .commit_table(
-            commit_of(&request, vec![set_property(&marker.0, &marker.1)]),
-            &expect,
-            false,
+    // An explicit protocol-level duplicate is retained solely for the
+    // assert-create negative oracle; the production journal never replays it.
+    let duplicate = CommitTableRequest {
+        identifier: Some(request.identifier().clone()),
+        requirements: request.requirements().to_vec(),
+        updates: request.updates().to_vec(),
+    };
+    let outcome = rest
+        .publish(
+            "ctas-final-commit",
+            request,
+            CatalogOperation::CreateTable(crate::catalog::CatalogCreateIntent::CreateTableAsSelect),
+            operation.request_context().clone(),
+            Some(crate::catalog::StagedPublicationExpectation {
+                staged_table_uuid: staged_uuid,
+                snapshot_id: Some(snapshot),
+                properties: vec![marker.clone()],
+            }),
         )
         .await;
-    rest.record("ctas-final-commit", &outcome);
-    let receipt = applied(&outcome, MutationEndpoint::CtasFinalCommit);
+    let receipt = committed_catalog(&outcome);
     assert_eq!(receipt.snapshot_id, Some(snapshot));
-    assert_eq!(receipt.uuid, Some(staged_uuid));
-    assert_eq!(receipt.ref_relation, RefRelation::AtExpectedSnapshot);
+    assert_eq!(
+        receipt.table_uuid.as_deref(),
+        Some(staged_uuid.to_string().as_str())
+    );
     let published = java.load(&ident).await.unwrap();
     assert_eq!(published.metadata.uuid(), staged_uuid);
     assert_eq!(published.metadata.current_snapshot_id(), Some(snapshot));
@@ -1714,16 +2267,20 @@ async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
             .added_rows_count(),
         Some(2)
     );
-    assert_eq!(published.metadata_location, receipt.metadata_location);
+    assert_eq!(
+        published.metadata_location.as_deref(),
+        receipt.metadata_location.as_deref()
+    );
+    assert_eq!(
+        published
+            .metadata
+            .snapshot_for_ref("main")
+            .map(|s| s.snapshot_id()),
+        Some(snapshot)
+    );
 
     // The same final commit again: `assert-create` now fails on the server.
-    let outcome = endpoints
-        .commit_table(
-            commit_of(&request, vec![set_property(&marker.0, &marker.1)]),
-            &expect,
-            false,
-        )
-        .await;
+    let outcome = endpoints.commit_table(duplicate, &expect, false).await;
     rest.record("ctas-final-commit-again", &outcome);
     assert_eq!(
         outcome.evidence,
@@ -1901,7 +2458,7 @@ async fn iru13a_java_rest_view_create_replace_drop() {
 
 /// The partition evolution the `ALTER TABLE ... ADD PARTITION COLUMN` path
 /// builds from `base`: identity on `id`, guarded by the base default spec.
-fn partition_evolution(ident: &TableIdent, base: &TableMetadata) -> TableCommit {
+fn partition_evolution(base: &TableMetadata) -> PreparedChange {
     let base_spec_id = base.default_partition_spec_id();
     let spec = UnboundPartitionSpecBuilder::new()
         .add_partition_fields([UnboundPartitionField {
@@ -1929,15 +2486,12 @@ fn partition_evolution(ident: &TableIdent, base: &TableMetadata) -> TableCommit 
             .clone()
             .into_unbound();
     }
-    crate::commit::existing_commit::existing_table_commit(
-        ident.clone(),
-        base,
-        vec![TableRequirement::DefaultSpecIdMatch {
+    PreparedChange {
+        requirements: vec![TableRequirement::DefaultSpecIdMatch {
             default_spec_id: base_spec_id,
         }],
         updates,
-    )
-    .unwrap()
+    }
 }
 
 #[tokio::test]
@@ -1968,22 +2522,29 @@ async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
 
     // Produced from the dropped incarnation: every requirement but the frozen
     // UUID also holds on the recreated table.
-    let adapter = RestTransitionalAdapter::new(Arc::clone(&rest.endpoints));
-    let error = adapter
-        .update_table(partition_evolution(&ident, &old.metadata))
-        .await
-        .expect_err("a commit produced from the dropped table must not apply");
-    assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
-    assert_eq!(
-        rest_evidence(&error),
-        Some(&RestEvidence::Rejected {
-            status: 409,
-            kind: ConnectorMutationFailureKind::Conflict
-        })
+    let (request, context) = freeze_metadata_fixture(
+        java,
+        ident.clone(),
+        &old,
+        partition_evolution(&old.metadata),
     );
-    java.record(
-        "stale-partition-evolution",
-        &json!({"evidence": format!("{:?}", rest_evidence(&error))}),
+    let outcome = rest
+        .publish(
+            "stale-partition-evolution",
+            request,
+            CatalogOperation::AlterPartitionSpec,
+            context,
+            None,
+        )
+        .await;
+    let CatalogOutcome::KnownUncommitted { failure } = outcome else {
+        panic!("the stale incarnation must be rejected");
+    };
+    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
+    // Preserve the exact wire-status oracle separately from the typed verdict.
+    assert_eq!(
+        failure.message(),
+        "REST catalog rejected the request with HTTP 409"
     );
     let after = java.load(&ident).await.unwrap();
     assert_eq!(after.metadata_location, before.metadata_location);
@@ -1993,18 +2554,33 @@ async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
     );
 
     // Control: the same evolution produced from the recreated table applies.
-    let table = adapter
-        .update_table(partition_evolution(&ident, &before.metadata))
-        .await
-        .expect("a commit produced from the current table applies");
-    assert_eq!(table.metadata().uuid(), before.metadata.uuid());
+    let (request, context) = freeze_metadata_fixture(
+        java,
+        ident.clone(),
+        &before,
+        partition_evolution(&before.metadata),
+    );
+    let outcome = rest
+        .publish(
+            "current-partition-evolution",
+            request,
+            CatalogOperation::AlterPartitionSpec,
+            context,
+            None,
+        )
+        .await;
+    let proof = committed_catalog(&outcome);
+    assert_eq!(
+        proof.table_uuid.as_deref(),
+        Some(before.metadata.uuid().to_string().as_str())
+    );
     let evolved = java.load(&ident).await.unwrap();
     assert_ne!(
         evolved.metadata.default_partition_spec_id(),
         before.metadata.default_partition_spec_id()
     );
     java.record(
-        "current-partition-evolution",
+        "current-partition-evolution-result",
         &json!({"default-spec-id": evolved.metadata.default_partition_spec_id()}),
     );
 
@@ -2102,6 +2678,16 @@ async fn iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_versio
         )
         .unwrap();
         engine.stage(&FastAppendPreparer).await.unwrap();
+        let marker = (
+            "novarocks.ctas.operation-id".to_string(),
+            operation.token().path_component(),
+        );
+        engine
+            .stage_change(PreparedChange {
+                requirements: vec![],
+                updates: vec![set_property(&marker.0, &marker.1)],
+            })
+            .unwrap();
         let request = engine.freeze(&added_references(&create)).unwrap();
         let body = request.to_rest_json().unwrap();
         java.record(&format!("{name}-request"), &body);
@@ -2123,25 +2709,23 @@ async fn iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_versio
         );
 
         let snapshot = request.ref_snapshot_after("main").unwrap();
-        let marker = (
-            "novarocks.ctas.operation-id".to_string(),
-            operation.token().path_component(),
-        );
-        let expect = AttributionExpectation::ctas_final_commit(
-            staged.uuid(),
-            Some(ExpectedSnapshot::new(snapshot, Some("main".into()))),
-            vec![marker.clone()],
-        )
-        .unwrap();
-        let outcome = endpoints
-            .commit_table(
-                commit_of(&request, vec![set_property(&marker.0, &marker.1)]),
-                &expect,
-                false,
+
+        let outcome = rest
+            .publish(
+                &format!("{name}-final-commit"),
+                request,
+                CatalogOperation::CreateTable(
+                    crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+                ),
+                operation.request_context().clone(),
+                Some(crate::catalog::StagedPublicationExpectation {
+                    staged_table_uuid: staged.uuid(),
+                    snapshot_id: Some(snapshot),
+                    properties: vec![marker.clone()],
+                }),
             )
             .await;
-        rest.record(&format!("{name}-final-commit"), &outcome);
-        let receipt = applied(&outcome, MutationEndpoint::CtasFinalCommit);
+        let receipt = committed_catalog(&outcome);
         assert_eq!(receipt.snapshot_id, Some(snapshot));
 
         let published = java.load(&ident).await.unwrap().metadata;
@@ -2194,18 +2778,18 @@ impl NovaRocksRest {
         change: novarocks_spi::connector::ConnectorSchemaChange,
     ) -> TableMetadata {
         let ident = self.java.ident(name);
-        let base = self.java.load(&ident).await.unwrap().metadata;
-        let commit = crate::catalog_control::catalog_mutation::schema_change_commit(
-            ident.clone(),
-            &base,
+        let base = self.java.load(&ident).await.unwrap();
+        let change = crate::catalog_control::catalog_mutation::prepare_schema_updates(
+            &base.metadata,
             &change,
         )
-        .unwrap()
-        .expect("the change is not a no-op");
-        let expect = AttributionExpectation::table_commit(base.uuid(), None).unwrap();
-        let outcome = self.endpoints.commit_table(commit, &expect, false).await;
-        self.record(label, &outcome);
-        applied(&outcome, MutationEndpoint::TableCommit);
+        .unwrap();
+        assert!(!change.updates.is_empty(), "the change is not a no-op");
+        let (request, context) = freeze_metadata_fixture(&self.java, ident.clone(), &base, change);
+        let outcome = self
+            .publish(label, request, CatalogOperation::AlterSchema, context, None)
+            .await;
+        committed_catalog(&outcome);
         let altered = self.java.load(&ident).await.unwrap().metadata;
         self.java.record(
             &format!("{label}-result"),

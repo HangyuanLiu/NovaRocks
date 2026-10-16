@@ -519,6 +519,13 @@ impl ConnectorRequestContext {
         })
     }
 
+    /// A nested preparation budget may only shorten the admitted deadline.
+    /// All stop, authority, request-scope and execution capabilities are retained.
+    pub fn with_earlier_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = self.deadline.min(deadline);
+        self
+    }
+
     /// Preserve the host's operation origin through request projections.
     pub fn with_initiation(mut self, initiation: ConnectorRequestInitiation) -> Self {
         self.initiation = initiation;
@@ -753,6 +760,59 @@ mod tests {
     use novarocks_secret::SecretValue;
 
     use crate::connector::read_stack::ConnectorSourceOperations;
+
+    #[test]
+    fn shortening_preparation_keeps_original_scope_capabilities_and_stop() {
+        let stop = ConnectorStopOwner::new();
+        let original_deadline = Instant::now() + Duration::from_secs(30);
+        let original = ConnectorRequestContext::try_new(
+            original_deadline,
+            stop.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap()
+        .with_storage_resolver(Arc::new(RejectingResolver))
+        .with_vended_credential_lease_sink(Arc::new(RejectingSink))
+        .with_initiation(ConnectorRequestInitiation::JobAttempt);
+        let scope =
+            original.request_scope_extension_or_insert_with(|| String::from("original scope"));
+        let earlier = Instant::now() + Duration::from_secs(3);
+        let shortened = original
+            .clone()
+            .with_earlier_deadline(earlier)
+            .with_earlier_deadline(original_deadline + Duration::from_secs(30));
+        assert_eq!(shortened.deadline(), earlier);
+        assert!(Arc::ptr_eq(
+            &scope,
+            &shortened.request_scope_extension_or_insert_with(|| String::from("replaced"))
+        ));
+        assert!(Arc::ptr_eq(
+            original.storage_resolver().unwrap(),
+            shortened.storage_resolver().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            original.vended_credential_lease_sink().unwrap(),
+            shortened.vended_credential_lease_sink().unwrap()
+        ));
+        assert_eq!(
+            shortened.initiation(),
+            ConnectorRequestInitiation::JobAttempt
+        );
+        assert_eq!(
+            shortened.max_handle_payload_bytes(),
+            original.max_handle_payload_bytes()
+        );
+        assert_eq!(
+            shortened.max_total_payload_bytes(),
+            original.max_total_payload_bytes()
+        );
+        stop.request_stop();
+        assert_eq!(
+            shortened.check_active().unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
+    }
 
     #[test]
     fn request_initiation_defaults_to_statement_and_survives_projections() {

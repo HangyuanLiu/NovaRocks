@@ -75,11 +75,23 @@ PY
 : "${AWS_S3_SECRET_ACCESS_KEY:?pinned S3 secret required}"
 
 run_id=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
-export NR_IRU13A_INTEROP_NAMESPACE="iru13a_${run_id}"
-export NR_IRU13A_INTEROP_ARTIFACT_DIR="$NOVA_ENV_RUNTIME_DIR/iru13a-java-rest-$run_id"
-mkdir "$NR_IRU13A_INTEROP_ARTIFACT_DIR"
-artifact="$NR_IRU13A_INTEROP_ARTIFACT_DIR/runner.log"
-python3 - "$publication/manifest.json" "$NR_IRU13A_INTEROP_ARTIFACT_DIR/fixture.json" "$publication" <<'PY'
+interop_root="${NR_IRU13A_INTEROP_ARTIFACT_DIR:-$NOVA_ENV_RUNTIME_DIR/iru13a-java-rest-$run_id}"
+mkdir "$interop_root"
+export NR_JAVA_REST_INTEROP_RUN_ROOT="$interop_root"
+for family in IRU5 IRU13A IRU13B; do
+    namespace_key="NR_${family}_INTEROP_NAMESPACE"
+    artifact_key="NR_${family}_INTEROP_ARTIFACT_DIR"
+    # Provider catalog names are normalized; the independent Java oracle must
+    # address that same namespace rather than a differently cased identifier.
+    family_slug=$(printf '%s' "$family" | tr '[:upper:]' '[:lower:]')
+    printf -v "$namespace_key" '%s' "java_rest_${run_id}_${family_slug}"
+    printf -v "$artifact_key" '%s' "$interop_root/$family"
+    export "$namespace_key" "$artifact_key"
+    mkdir "${!artifact_key}"
+done
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target/normal}"
+export NOVAROCKS_BUILD_PROFILE=dev-opt
+python3 - "$publication/manifest.json" "$interop_root/fixture.json" "$publication" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -93,26 +105,82 @@ Path(sys.argv[2]).write_text(json.dumps(facts, indent=2) + '\n')
 PY
 
 cd "$repo_root"
-cargo test --locked --offline --profile dev-opt -p novarocks-connector-iceberg \
-    --lib iru13a_java_rest_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$artifact"
-
-# An unwired ignored module would otherwise produce a misleading zero-test success.
-python3 - "$artifact" <<'PY'
+# Cargo supplies the actual test executable; preserve build, listing and run
+# outputs separately, and reject missing, extra, ignored or zero-case success.
+python3 - "$interop_root" <<'PY_RUN'
 from pathlib import Path
-import re
-import sys
-text = Path(sys.argv[1]).read_text()
-expected = (
-    'iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads',
-    'iru13a_java_rest_table_commit_shapes',
-    'iru13a_java_rest_stage_create_and_ctas_final_commit',
-    'iru13a_java_rest_view_create_replace_drop',
-    'iru13a_java_rest_recreated_table_rejects_stale_partition_evolution',
-)
-for name in expected:
-    if not re.search(r'^test [^\n]*' + re.escape(name) + r' \.\.\. ok$', text, re.MULTILINE):
-        raise SystemExit(f'FAIL: expected ignored interop test did not pass: {name}')
-if not re.search(r'test result: ok\. 5 passed; 0 failed; 0 ignored;', text):
-    raise SystemExit('FAIL: expected exactly five enabled interop tests')
-PY
-printf 'IRU-13a Java REST interoperability artifacts: %s\n' "$NR_IRU13A_INTEROP_ARTIFACT_DIR"
+import datetime, hashlib, json, os, re, subprocess, sys
+root = Path(sys.argv[1]).resolve()
+expected = {
+    'commit::staging::interop_tests::iru5_java_rest_three_shapes_historic_spec_and_composition',
+    'commit::staging::interop_tests::iru5_java_rest_d12_inheritance_and_physical_rewrite',
+    'commit::staging::interop_tests::iru5_java_rest_two_canonical_clients_real_cas',
+    'commit::staging::interop_tests::iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas',
+    'commit::staging::interop_tests::iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads',
+    'commit::staging::interop_tests::iru13a_java_rest_table_commit_shapes',
+    'commit::staging::interop_tests::iru13a_java_rest_stage_create_and_ctas_final_commit',
+    'commit::staging::interop_tests::iru13a_java_rest_view_create_replace_drop',
+    'commit::staging::interop_tests::iru13a_java_rest_recreated_table_rejects_stale_partition_evolution',
+    'commit::staging::interop_tests::iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_version',
+    'commit::staging::interop_tests::iru13b_java_rest_schema_changes_keep_the_column_high_water_mark',
+    'commit::staging::interop_tests::iru13b_java_rest_view_replacements_always_add_the_selected_version',
+    'commit::staging::interop_tests::iru13b_java_rest_view_replacement_survives_version_id_reuse',
+    'commit::staging::interop_tests::iru13b_java_rest_view_replacement_keeps_dialects_unless_allowed',
+}
+pattern = 'commit::staging::interop_tests::'
+def run(name, command):
+    (root / f'{name}-command.json').write_text(json.dumps(command, indent=2) + '\n')
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with (root / f'{name}-stdout.log').open('wb') as stdout, (root / f'{name}-stderr.log').open('wb') as stderr:
+        result = subprocess.run(command, stdout=stdout, stderr=stderr)
+    (root / f'{name}-result.json').write_text(json.dumps({
+        'exit_code': result.returncode, 'started': started,
+        'ended': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }, indent=2) + '\n')
+    if result.returncode:
+        print((root / f'{name}-stdout.log').read_text(errors='replace')[-12000:])
+        print((root / f'{name}-stderr.log').read_text(errors='replace')[-12000:], file=sys.stderr)
+        raise SystemExit(result.returncode)
+    return (root / f'{name}-stdout.log').read_text(errors='replace')
+facts = {
+    'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+    'diff': subprocess.check_output(['git', 'diff', 'HEAD'], text=True),
+    'cargo': subprocess.check_output(['cargo', '--version'], text=True).strip(),
+    'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+    'profile': 'dev-opt', 'target_dir': os.environ['CARGO_TARGET_DIR'],
+    'lock_sha256': hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest(),
+}
+(root / 'source-build-facts.json').write_text(json.dumps(facts, indent=2) + '\n')
+output = run('build', [
+    'cargo', 'test', '--locked', '--offline', '--profile', 'dev-opt', '-j2',
+    '-p', 'novarocks-connector-iceberg', '--lib', '--no-run', '--message-format=json',
+])
+executables = set()
+for line in output.splitlines():
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    if (row.get('reason') == 'compiler-artifact' and row.get('executable')
+            and row.get('target', {}).get('name') == 'novarocks_connector_iceberg'
+            and row.get('profile', {}).get('test')):
+        executables.add(row['executable'])
+if len(executables) != 1:
+    raise SystemExit(f'FAIL: expected one Cargo-reported provider test executable, got {len(executables)}')
+binary = Path(executables.pop()).resolve(strict=True)
+(root / 'test-binary.json').write_text(json.dumps({
+    'path': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+}, indent=2) + '\n')
+listing = run('list', [str(binary), pattern, '--ignored', '--list'])
+listed = {line[:-6] for line in listing.splitlines() if line.endswith(': test')}
+if listed != expected:
+    raise SystemExit(f'FAIL: Java test inventory differs: missing={sorted(expected-listed)}, extra={sorted(listed-expected)}')
+output = run('tests', [str(binary), pattern, '--ignored', '--test-threads=1', '--nocapture'])
+passed = set(re.findall(r'^test (\S+) \.\.\. ok$', output, re.MULTILINE))
+if passed != expected:
+    raise SystemExit(f'FAIL: Java test results differ: missing={sorted(expected-passed)}, extra={sorted(passed-expected)}')
+if not re.search(rf'test result: ok\. {len(expected)} passed; 0 failed; 0 ignored;', output):
+    raise SystemExit('FAIL: expected all pinned Java tests to pass without skips')
+print(f'Java REST interoperability: {len(expected)} passed; 0 failed; 0 ignored')
+PY_RUN
+printf 'IRU-13a Java REST interoperability artifacts: %s\n' "$interop_root"

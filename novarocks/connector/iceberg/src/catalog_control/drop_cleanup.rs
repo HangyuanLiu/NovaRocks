@@ -52,6 +52,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::CatalogDropTableReceipt;
+#[cfg(test)]
 use crate::catalog::error::KnownCommitted;
 
 /// Upper bound on queued cleanups per control generation.
@@ -93,11 +94,26 @@ impl PostCommitCleanupRequest {
     /// That is a real outcome, not a defect: a table the catalog could not load
     /// before the drop has no attributable object set, and the correct response
     /// is to leak it for identity-aware collection rather than to guess.
+    pub(crate) fn from_journal_drop(
+        target: Arc<str>,
+        receipt: &CatalogDropTableReceipt,
+        committed: &crate::commit::attempt::observation::AppliedDropWitness,
+    ) -> Option<Self> {
+        if !committed.proves_capture(&target, receipt) {
+            return None;
+        }
+        Self::from_receipt(target, receipt)
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_committed_drop(
         target: Arc<str>,
         receipt: &CatalogDropTableReceipt,
         _committed: &KnownCommitted,
     ) -> Option<Self> {
+        Self::from_receipt(target, receipt)
+    }
+    fn from_receipt(target: Arc<str>, receipt: &CatalogDropTableReceipt) -> Option<Self> {
         let table_uuid = receipt.table_uuid.clone()?;
         let table_location = receipt.table_location.clone()?;
         // A non-positive timestamp is an unreadable age, and an unreadable age

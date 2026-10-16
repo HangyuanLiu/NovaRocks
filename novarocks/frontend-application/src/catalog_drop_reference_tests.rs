@@ -159,14 +159,15 @@ impl ConnectorExecutionDistribution for TestControl {
 
 /// Mints a distinct control generation per materialization, like a real
 /// provider role factory would: reusing an incarnation trips the retired-generation guard.
+#[derive(Clone)]
 struct ReadyFactory {
-    incarnations: AtomicU8,
+    incarnations: Arc<AtomicU8>,
 }
 
 impl ReadyFactory {
     fn new() -> Self {
         Self {
-            incarnations: AtomicU8::new(0),
+            incarnations: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -190,6 +191,23 @@ impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for ReadyFacto
         ))
     }
 
+    fn open_catalog(
+        &self,
+        identity: novarocks_spi::connector::CatalogScopeIdentity,
+    ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+        Arc::new(ReadyCatalogFactory {
+            factory: self.clone(),
+            identity,
+        })
+    }
+}
+
+struct ReadyCatalogFactory {
+    factory: ReadyFactory,
+    identity: novarocks_spi::connector::CatalogScopeIdentity,
+}
+
+impl novarocks_spi::connector::ProviderCatalogControlFactory for ReadyCatalogFactory {
     fn materialize(
         &self,
         properties: novarocks_spi::connector::NormalizedCatalogProperties,
@@ -203,7 +221,16 @@ impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for ReadyFacto
     > {
         use futures::FutureExt;
 
-        let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
+        assert_eq!(
+            properties.as_catalog_properties().provider_id(),
+            self.identity.provider_id(),
+        );
+        assert_eq!(
+            properties.handle().catalog_name(),
+            self.identity.instance_id(),
+        );
+
+        let incarnation = self.factory.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
         async move {
             let provider = Arc::new(TestControl {
                 instance_id: properties.handle().catalog_name().clone(),

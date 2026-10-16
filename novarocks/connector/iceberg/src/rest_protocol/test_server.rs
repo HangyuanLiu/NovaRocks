@@ -414,15 +414,22 @@ fn accept_loop(listener: TcpListener, state: Arc<ServerState>) {
     }
 }
 
+// The shutdown handle retained by TestServer must not keep a panicked
+// connection actor alive from the client's point of view.
+struct ConnectionShutdown(TcpStream);
+impl Drop for ConnectionShutdown {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
 fn serve_connection(stream: TcpStream, state: Arc<ServerState>) {
-    let Ok(mut writer) = stream.try_clone() else {
+    let Ok(writer) = stream.try_clone() else {
         return;
     };
+    let mut writer = ConnectionShutdown(writer);
     let mut reader = BufReader::new(stream);
-    serve_requests(&mut reader, &mut writer, &state);
-    // The server keeps a handle for shutdown, so dropping this thread's
-    // handles alone would leave the connection open.
-    let _ = writer.shutdown(Shutdown::Both);
+    serve_requests(&mut reader, &mut writer.0, &state);
 }
 
 fn serve_requests(reader: &mut BufReader<TcpStream>, writer: &mut TcpStream, state: &ServerState) {
@@ -651,13 +658,13 @@ pub(crate) async fn wait_until_requests(
     }
 }
 
-/// A frontend REST session composed as production composes it: the auth
-/// owner injected into the real upstream `RestCatalog`, sharing one HTTP
-/// client.
+/// A frontend REST session composed with the production auth owner, endpoints
+/// and shared establishment gate; no SDK session or probe is constructed.
 pub(crate) struct FrontendFixture {
     pub(crate) owner: Arc<super::auth::RestAuthOwner>,
-    pub(crate) gate: super::attempt::SessionGate,
-    pub(crate) upstream: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+    pub(crate) gate: Arc<super::attempt::SessionGate>,
+    pub(crate) endpoints: Arc<super::endpoints::RestEndpoints>,
+    properties: Arc<HashMap<String, String>>,
 }
 
 impl FrontendFixture {
@@ -668,34 +675,37 @@ impl FrontendFixture {
         identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
         http: super::http::RestHttpClient,
     ) -> Self {
-        use crate::iceberg::CatalogBuilder;
-
         let properties: HashMap<String, String> = properties
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         let persistent = super::auth::PersistentRestConfig::from_properties(&properties)
             .expect("valid persistent REST definition");
-        let (owner, manager) =
-            super::auth::RestAuthOwner::frontend(identity, persistent, http.clone())
-                .expect("valid identity");
-        let upstream = crate::iceberg_catalog_rest::RestCatalogBuilder::default()
-            .with_client(http.reqwest_client().clone())
-            .with_auth_manager(manager)
-            .load("rest", properties)
-            .await
-            .expect("load upstream REST catalog");
+        let owner = super::auth::RestAuthOwner::frontend(identity, persistent, http)
+            .expect("valid identity");
+        let properties = Arc::new(properties);
+        let gate = Arc::new(super::attempt::SessionGate::default());
+        let endpoints = Arc::new(super::endpoints::RestEndpoints::new_with_gate(
+            Arc::clone(&properties),
+            Arc::clone(&owner),
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
+            None,
+            Default::default(),
+            true,
+            Arc::clone(&gate),
+        ));
         Self {
             owner,
-            gate: super::attempt::SessionGate::default(),
-            upstream: Arc::new(upstream),
+            gate,
+            properties,
+            endpoints,
         }
     }
 
     pub(crate) async fn ensure_session(
         &self,
     ) -> Result<Arc<super::binding::SessionBinding>, super::attempt::AttemptFailure> {
-        super::attempt::ensure_session(&self.owner, &self.gate, &self.upstream).await
+        super::attempt::ensure_session(&self.owner, &self.gate, &self.properties).await
     }
 }
 
@@ -715,4 +725,28 @@ pub(crate) fn bearer_identity(token: &str) -> crate::access_binding::IcebergRest
     crate::access_binding::IcebergRestAuthMaterial::Bearer {
         token: novarocks_fs::SecretValue::new(token),
     }
+}
+
+#[test]
+fn panicked_connection_actor_closes_the_peer_before_server_shutdown() {
+    let server = TestServer::start(Script::new().on_fn("GET", "/panic", |_, _| {
+        panic!("Injected fixture handler panic");
+    }));
+    let mut peer = TcpStream::connect(server.url().trim_start_matches("http://")).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    peer.write_all(b"GET /panic HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut first = [0u8; 1];
+    match peer.read(&mut first) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) => {}
+        other => {
+            panic!("Panicked actor must close its peer without waiting for the server: {other:?}")
+        }
+    }
+    assert_eq!(server.count("GET", "/panic"), 1);
 }

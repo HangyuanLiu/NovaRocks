@@ -578,6 +578,85 @@ impl IsolatedIcebergRestFixture {
         self.minio_root_identity.clone()
     }
 
+    /// Independent object-existence oracle, restricted to this fixture's buckets.
+    /// It uses the fixture identity directly, outside provider caches and cleanup logic.
+    pub fn object_exists(&self, location: &str) -> Result<bool> {
+        let path = location
+            .strip_prefix("s3://")
+            .context("fixture object oracle requires s3 URI")?;
+        let (bucket, _) = path
+            .split_once('/')
+            .context("fixture object URI lacks key")?;
+        let owns_bucket = [
+            &self.endpoints.rest_warehouse,
+            &self.endpoints.rest_mv_warehouse,
+        ]
+        .iter()
+        .any(|warehouse| {
+            warehouse
+                .strip_prefix("s3://")
+                .is_some_and(|value| value.split('/').next() == Some(bucket))
+        });
+        ensure!(
+            owns_bucket,
+            "object oracle refuses a bucket outside its fixture"
+        );
+        let mut endpoint: reqwest::Url = self.endpoints.minio_endpoint.parse()?;
+        endpoint.set_path(&format!("/{path}"));
+        ensure!(
+            endpoint.path().starts_with(&format!("/{bucket}/")),
+            "fixture object URI escapes its owned bucket"
+        );
+        let host = endpoint
+            .host_str()
+            .context("fixture object endpoint lacks host")?;
+        let host = endpoint
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+        let timestamp = aws_amz_timestamp()?;
+        let date = &timestamp[..8];
+        let payload_hash = sha256_hex(b"");
+        let headers =
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{timestamp}\n");
+        let signed = "host;x-amz-content-sha256;x-amz-date";
+        let canonical = format!(
+            "HEAD\n{}\n\n{headers}\n{signed}\n{payload_hash}",
+            endpoint.path()
+        );
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}",
+            sha256_hex(canonical.as_bytes())
+        );
+        let key = aws_v4_signing_key(
+            &self.minio_root_identity.secret_access_key,
+            date,
+            "us-east-1",
+            "s3",
+        );
+        let signature = hex_encode(&hmac_sha256(&key, to_sign.as_bytes()));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}",
+            self.minio_root_identity.access_key_id
+        );
+        let status = fixture_http_client()?
+            .head(endpoint)
+            .header("host", host)
+            .header("x-amz-date", timestamp)
+            .header("x-amz-content-sha256", payload_hash)
+            .header("authorization", authorization)
+            .send()?
+            .status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        ensure!(
+            status.is_success(),
+            "fixture object oracle returned HTTP {status}"
+        );
+        Ok(true)
+    }
+
     /// Creates two distinct, valid MinIO STS identities. The fixture first
     /// provisions ordinary users and then signs AssumeRole requests as those
     /// users, yielding the access key, secret, and session token that MinIO
@@ -1421,6 +1500,26 @@ fn fixture_template_model_hash(repo_root: &Path) -> Result<String> {
 }
 
 fn build_publication_hook_image(repo_root: &Path) -> Result<String> {
+    // --pull=false alone still permits Docker to fetch a missing FROM image.
+    // Verify the local inputs before invoking the hook-only compilation.
+    let mut inspect = controlled_command("docker");
+    inspect.current_dir(repo_root).args([
+        "image",
+        "inspect",
+        "apache/iceberg-rest-fixture:1.10.1",
+        "apache/spark:3.5.5-java17",
+    ]);
+    let inputs = run_bounded_command(
+        inspect,
+        FIXTURE_DOCKER_TIMEOUT,
+        "inspect local publication hook base images",
+        &[],
+    )?;
+    ensure!(
+        inputs.status.success(),
+        "publication hook requires locally prepared base images: {}",
+        safe_diagnostics(&inputs, &[])
+    );
     let hook_root = repo_root.join("tests/fixtures/iceberg-rest-publication");
     let mut inputs = vec![hook_root.join("Dockerfile")];
     let source_root = hook_root.join("src/main/java/org/apache/iceberg/rest/fixture");
@@ -2887,5 +2986,55 @@ mod tests {
             .filter_map(|args| docker_ids(repo_root, args).ok())
             .flatten()
             .collect()
+    }
+
+    #[test]
+    fn publication_object_oracle_restricts_bucket_and_observes_exact_head_status() {
+        use std::io::{Read, Write};
+        let (_temp, mut fixture, _) = manifest_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        fixture.endpoints.minio_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        fixture.endpoints.rest_warehouse = "s3://owned/warehouse".into();
+        assert!(
+            fixture
+                .object_exists("s3://unowned/metadata/list.avro")
+                .is_err()
+        );
+        let server = thread::spawn(move || {
+            for (path, status) in [
+                ("present.avro", "200 OK"),
+                ("missing.avro", "404 Not Found"),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                assert!(request.starts_with(&format!("HEAD /owned/warehouse/{path} HTTP/1.1")));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: aws4-hmac-sha256 credential=test-key/")
+                );
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        assert!(
+            fixture
+                .object_exists("s3://owned/warehouse/present.avro")
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .object_exists("s3://owned/warehouse/missing.avro")
+                .unwrap()
+        );
+        server.join().unwrap();
     }
 }

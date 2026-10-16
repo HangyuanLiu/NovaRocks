@@ -24,12 +24,13 @@ use uuid::Uuid;
 
 use super::{AttemptArtifacts, OperationToken, invalid};
 use crate::iceberg::spec::TableMetadata;
-use crate::iceberg::{Result, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use crate::iceberg::{Result, TableIdent, TableRequirement, TableUpdate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestShape {
     SnapshotProducing,
     MetadataOnly,
+    RefRetention,
     Create,
 }
 
@@ -77,10 +78,29 @@ pub struct FrozenRequestParts {
     pub artifacts: AttemptArtifacts,
 }
 
+/// Recovery needs these original monotonic facts in addition to the wire.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenBaseFacts {
+    pub format_version: u8,
+    pub last_sequence_number: i64,
+    pub next_row_id: u64,
+}
+impl FrozenBaseFacts {
+    pub fn from_metadata(metadata: &TableMetadata) -> Self {
+        Self {
+            format_version: metadata.format_version() as u8,
+            last_sequence_number: metadata.last_sequence_number(),
+            next_row_id: metadata.next_row_id(),
+        }
+    }
+}
+
 /// Deliberately not Clone: one owner accepts the complete request and dispatches it once.
 #[derive(Debug)]
 pub struct FrozenRequest {
     parts: FrozenRequestParts,
+    base_facts: Option<FrozenBaseFacts>,
 }
 
 impl FrozenRequest {
@@ -97,7 +117,9 @@ impl FrozenRequest {
                     parent,
                     metadata_location,
                 },
-                RequestShape::SnapshotProducing | RequestShape::MetadataOnly,
+                RequestShape::SnapshotProducing
+                | RequestShape::MetadataOnly
+                | RequestShape::RefRetention,
             ) => {
                 if metadata_location.is_empty() {
                     return Err(invalid(
@@ -142,14 +164,30 @@ impl FrozenRequest {
                             "Snapshot-producing request must assert its exact target-ref parent",
                         ));
                     }
-                } else if parts
-                    .requirements
-                    .iter()
-                    .any(|r| matches!(r, TableRequirement::RefSnapshotIdMatch { .. }))
+                } else if parts.shape == RequestShape::MetadataOnly
+                    && parts
+                        .requirements
+                        .iter()
+                        .any(|r| matches!(r, TableRequirement::RefSnapshotIdMatch { .. }))
                 {
                     return Err(invalid(
                         "Metadata-only publication must not acquire a ref CAS",
                     ));
+                }
+                if parts.shape == RequestShape::RefRetention {
+                    for update in &parts.updates {
+                        validate_ref_retention_update(update)?;
+                        let ref_name = match update {
+                            TableUpdate::SetSnapshotRef { ref_name, .. }
+                            | TableUpdate::RemoveSnapshotRef { ref_name } => Some(ref_name),
+                            _ => None,
+                        };
+                        if let Some(name) = ref_name {
+                            if !parts.requirements.iter().any(|requirement| matches!(requirement, TableRequirement::RefSnapshotIdMatch { r#ref, .. } if r#ref == name)) {
+                                return Err(invalid("Ref-retention publication must assert each changed ref"));
+                            }
+                        }
+                    }
                 }
                 if parts.shape == RequestShape::MetadataOnly
                     && parts.updates.iter().any(|update| {
@@ -182,7 +220,29 @@ impl FrozenRequest {
                 ));
             }
         }
-        Ok(Self { parts })
+        let base_facts = match &parts.base {
+            BaseIdentity::Create { staged } => {
+                Some(FrozenBaseFacts::from_metadata(staged.initial_metadata()))
+            }
+            BaseIdentity::Existing { .. } => None,
+        };
+        Ok(Self { parts, base_facts })
+    }
+    pub fn with_base_facts(mut self, metadata: &TableMetadata) -> Result<Self> {
+        let uuid = match &self.parts.base {
+            BaseIdentity::Existing { uuid, .. } => *uuid,
+            BaseIdentity::Create { staged } => staged.initial_metadata().uuid(),
+        };
+        if metadata.uuid() != uuid {
+            return Err(invalid(
+                "Frozen recovery base belongs to another table incarnation",
+            ));
+        }
+        self.base_facts = Some(FrozenBaseFacts::from_metadata(metadata));
+        Ok(self)
+    }
+    pub fn base_facts(&self) -> Option<&FrozenBaseFacts> {
+        self.base_facts.as_ref()
     }
     pub const fn shape(&self) -> RequestShape {
         self.parts.shape
@@ -237,14 +297,30 @@ impl FrozenRequest {
         })
         .map(canonical_json)
     }
-    /// Only the catalog dispatch boundary calls this transitional SDK projection.
-    /// Rust restricted visibility cannot name the sibling catalog module.
-    pub(crate) fn into_table_commit(&self) -> TableCommit {
-        TableCommit::builder()
-            .ident(self.parts.target.clone())
-            .requirements(self.parts.requirements.clone())
-            .updates(self.parts.updates.clone())
-            .build()
+}
+
+/// Ref maintenance carries no data/schema mutation or arbitrary table property.
+pub(crate) fn validate_ref_retention_update(update: &TableUpdate) -> Result<()> {
+    match update {
+        TableUpdate::SetSnapshotRef { .. }
+        | TableUpdate::RemoveSnapshotRef { .. }
+        | TableUpdate::RemoveSnapshots { .. }
+        | TableUpdate::RemoveStatistics { .. }
+        | TableUpdate::RemovePartitionStatistics { .. } => Ok(()),
+        TableUpdate::SetProperties { updates }
+            if !updates.is_empty()
+                && updates.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "novarocks.connector.maintenance.v1" | "novarocks.connector.maintenance.v2"
+                    )
+                }) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(
+            "Ref-retention publication contains an unsupported update",
+        )),
     }
 }
 
@@ -325,11 +401,30 @@ mod tests {
         assert_eq!(request.ref_snapshot_after("main"), Some(21));
         assert_eq!(request.ref_snapshot_after("other"), Some(99));
         assert_eq!(request.ref_snapshot_after("MAIN"), None);
-        let expected_updates = request.updates().to_vec();
-        let expected_requirements = request.requirements().to_vec();
-        let mut commit = request.into_table_commit();
-        assert_eq!(commit.take_updates(), expected_updates);
-        assert_eq!(commit.take_requirements(), expected_requirements);
+        assert_eq!(
+            request.identifier(),
+            &TableIdent::from_strs(["db", "table"]).unwrap()
+        );
+        assert_eq!(
+            request.updates(),
+            &[
+                set_ref("main", 20),
+                set_ref("other", 99),
+                set_ref("main", 21)
+            ]
+        );
+        assert_eq!(
+            request.requirements(),
+            &[
+                TableRequirement::UuidMatch {
+                    uuid: Uuid::from_u128(1)
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".into(),
+                    snapshot_id: Some(10)
+                }
+            ]
+        );
     }
 
     #[test]
@@ -438,9 +533,49 @@ mod tests {
             serde_json::json!([{"type": "assert-create"}])
         );
         assert!(request.has_updates());
-        let expected_updates = request.updates().to_vec();
-        let mut commit = request.into_table_commit();
-        assert_eq!(commit.take_updates(), expected_updates);
-        assert_eq!(commit.take_requirements(), [TableRequirement::NotExist]);
+        assert_eq!(request.requirements(), [TableRequirement::NotExist]);
+        assert!(matches!(request.base(), BaseIdentity::Create { .. }));
+        assert_eq!(
+            request.to_rest_json().unwrap()["updates"],
+            serde_json::to_value(request.updates()).unwrap()
+        );
+    }
+    #[test]
+    fn ref_retention_freezes_exact_ref_updates_and_only_the_maintenance_marker() {
+        for marker in [
+            "novarocks.connector.maintenance.v1",
+            "novarocks.connector.maintenance.v2",
+        ] {
+            let mut input = parts(RequestShape::RefRetention);
+            input
+                .requirements
+                .push(TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".into(),
+                    snapshot_id: Some(10),
+                });
+            input.updates.push(set_ref("main", 11));
+            input.updates.push(TableUpdate::SetProperties {
+                updates: HashMap::from([(marker.to_owned(), "operation-1".into())]),
+            });
+            let request = FrozenRequest::new(input).unwrap();
+            assert_eq!(request.shape(), RequestShape::RefRetention);
+            assert_eq!(request.ref_snapshot_after("main"), Some(11));
+            let wire = request.to_rest_json().unwrap();
+            assert_eq!(wire["updates"][0]["action"], "set-snapshot-ref");
+            assert_eq!(wire["requirements"][1]["snapshot-id"], 10);
+        }
+        let mut arbitrary = parts(RequestShape::RefRetention);
+        arbitrary.updates.push(TableUpdate::SetProperties {
+            updates: HashMap::from([("owner".into(), "wrong".into())]),
+        });
+        assert!(FrozenRequest::new(arbitrary).is_err());
+        let mut unguarded = parts(RequestShape::RefRetention);
+        unguarded.updates.push(set_ref("tag", 11));
+        assert!(FrozenRequest::new(unguarded).is_err());
+        let mut schema = parts(RequestShape::RefRetention);
+        schema
+            .updates
+            .push(TableUpdate::SetCurrentSchema { schema_id: 0 });
+        assert!(FrozenRequest::new(schema).is_err());
     }
 }

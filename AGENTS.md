@@ -890,9 +890,9 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
-  单次派发 owner 在 `catalog/transaction.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
+  单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
-  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md) 后再改身份、字段继承或清理授权。
+  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md) 与 [ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 后再改身份、字段继承、派发生命周期或清理授权。
 - **Execution semantics/operator behavior**: inspect
   `novarocks/execution/src/exec/node/**` and
   `novarocks/execution/src/exec/operators/**`.

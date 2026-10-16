@@ -74,6 +74,8 @@ pub(crate) enum NotWrittenCause {
 /// Why a written request produced no status line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NoStatusCause {
+    /// The explicitly granted phase deadline elapsed before headers arrived.
+    DeadlineExceeded,
     /// The read timeout elapsed before a status line arrived.
     ReadTimeout,
     /// The connection closed before a status line arrived.
@@ -273,6 +275,12 @@ pub(crate) struct AttributionExpectation {
     properties: Vec<(String, String)>,
     /// What the table-response scan must retain; `Some` for table shapes.
     view_request: Option<TableViewRequest>,
+    retention: Option<RetentionExpectation>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetentionExpectation {
+    removed_snapshots: Vec<i64>,
+    refs: Vec<(String, Option<i64>)>,
 }
 
 impl AttributionExpectation {
@@ -302,6 +310,7 @@ impl AttributionExpectation {
             snapshot,
             properties,
             view_request,
+            retention: None,
         })
     }
 
@@ -314,6 +323,7 @@ impl AttributionExpectation {
             snapshot: None,
             properties: Vec::new(),
             view_request,
+            retention: None,
         }
     }
 
@@ -330,6 +340,43 @@ impl AttributionExpectation {
             snapshot,
             Vec::new(),
         )
+    }
+
+    pub(crate) fn ref_retention(
+        table_uuid: Uuid,
+        updates: &[crate::iceberg::TableUpdate],
+    ) -> Result<Self, ExpectationError> {
+        let mut snapshots = std::collections::BTreeSet::new();
+        let mut refs = std::collections::BTreeMap::new();
+        for update in updates {
+            match update {
+                crate::iceberg::TableUpdate::RemoveSnapshots { snapshot_ids } => {
+                    snapshots.extend(snapshot_ids.iter().copied())
+                }
+                crate::iceberg::TableUpdate::SetSnapshotRef {
+                    ref_name,
+                    reference,
+                } => {
+                    refs.insert(ref_name.clone(), Some(reference.snapshot_id));
+                }
+                crate::iceberg::TableUpdate::RemoveSnapshotRef { ref_name } => {
+                    refs.insert(ref_name.clone(), None);
+                }
+                _ => {}
+            }
+        }
+        let removed_snapshots = snapshots.into_iter().collect::<Vec<_>>();
+        let refs = refs.into_iter().collect::<Vec<_>>();
+        let mut expected = Self::table_commit(table_uuid, None)?;
+        expected.view_request = Some(TableViewRequest::default().with_retention(
+            removed_snapshots.clone(),
+            refs.iter().map(|(name, _)| name.clone()).collect(),
+        )?);
+        expected.retention = Some(RetentionExpectation {
+            removed_snapshots,
+            refs,
+        });
+        Ok(expected)
     }
 
     /// The CTAS final commit: the UUID the stage froze, the snapshot it adds
@@ -475,6 +522,7 @@ pub(crate) enum AnomalyCause {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UnattributableCause {
     SnapshotAbsent,
+    RetentionPostconditionMismatch,
     /// A NovaRocks-named property is absent or differs.
     PropertyMismatch {
         key: String,
@@ -518,6 +566,7 @@ pub(crate) struct RestReceipt {
     /// Diagnosis and IRU-6a only: in a refreshed response it may belong to a
     /// later version.
     pub(crate) metadata_location: Option<String>,
+    pub(crate) metadata_predecessor: crate::catalog::transaction::MetadataPredecessorObservation,
     pub(crate) ref_relation: RefRelation,
 }
 
@@ -528,6 +577,7 @@ impl RestReceipt {
             snapshot_id: None,
             uuid: None,
             metadata_location: None,
+            metadata_predecessor: Default::default(),
             ref_relation: RefRelation::NotTracked,
         }
     }
@@ -766,6 +816,16 @@ fn attribute_table(
     if view.snapshot.map(|check| check.snapshot_id) != request.snapshot()
         || view.target_ref.as_ref().map(|check| check.name.as_str()) != request.target_ref()
         || !scanned_keys.eq(request.property_keys().iter())
+        || !view
+            .retention_snapshots
+            .iter()
+            .map(|check| check.snapshot_id)
+            .eq(request.removed_snapshots().iter().copied())
+        || !view
+            .retention_refs
+            .iter()
+            .map(|(name, _, _)| name)
+            .eq(request.retention_refs().iter())
     {
         return Err(anomaly(AnomalyCause::ViewMismatch));
     }
@@ -793,6 +853,24 @@ fn attribute_table(
             relation,
         ));
     }
+    if let Some(retention) = &expect.retention {
+        if view
+            .retention_snapshots
+            .iter()
+            .any(|snapshot| snapshot.present)
+            || retention.refs.iter().zip(&view.retention_refs).any(
+                |((_, expected), (_, present, observed))| match expected {
+                    Some(snapshot) => !*present || observed != &Some(*snapshot),
+                    None => *present,
+                },
+            )
+        {
+            return Err(Failed::Unattributable(
+                UnattributableCause::RetentionPostconditionMismatch,
+                relation,
+            ));
+        }
+    }
     // Item 6: CTAS supplementary expectations.
     for ((key, expected), (_, observed)) in expect.properties.iter().zip(&view.properties) {
         let matches = matches!(
@@ -811,6 +889,7 @@ fn attribute_table(
         snapshot_id: expect.snapshot.as_ref().map(ExpectedSnapshot::snapshot_id),
         uuid: Some(uuid),
         metadata_location: view.metadata_location.non_empty().map(str::to_owned),
+        metadata_predecessor: view.metadata_predecessor.clone(),
         ref_relation: relation,
     })
 }
@@ -979,6 +1058,7 @@ impl RestEvidence {
     }
 
     /// Map a stage-create evidence to its saga branch (L19).
+    #[cfg(test)]
     pub(crate) fn into_stage_verdict(self) -> StageVerdict {
         match split(self) {
             Split::Applied(receipt) => StageVerdict::Staged { receipt },
@@ -991,6 +1071,7 @@ impl RestEvidence {
     }
 
     /// Map a CTAS final-commit evidence to its publication branch.
+    #[cfg(test)]
     pub(crate) fn into_ctas_commit_verdict(self) -> CtasCommitVerdict {
         match split(self) {
             Split::Applied(receipt) => CtasCommitVerdict::Committed { receipt },
@@ -1032,6 +1113,7 @@ fn split(evidence: RestEvidence) -> Split {
 /// attributable success is staged, everything else -- 400 and 404 included --
 /// is unknown.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum StageVerdict {
     Staged {
         receipt: RestReceipt,
@@ -1046,6 +1128,7 @@ pub(crate) enum StageVerdict {
 
 /// The publication branch of the CTAS final commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum CtasCommitVerdict {
     Committed {
         receipt: RestReceipt,
@@ -1891,5 +1974,96 @@ mod tests {
         );
         assert!(expectation(E::DropTable).table_view_request().is_none());
         assert!(expectation(E::StageCreate).table_view_request().is_some());
+    }
+    #[test]
+    fn ref_retention_success_checks_every_requested_postcondition() {
+        use crate::iceberg::TableUpdate;
+        use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+        let expect = AttributionExpectation::ref_retention(
+            uuid(TABLE_UUID),
+            &[
+                TableUpdate::RemoveSnapshots {
+                    snapshot_ids: vec![1, 2],
+                },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: "kept".into(),
+                    reference: SnapshotReference::new(
+                        3,
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: "tag".into(),
+                    reference: SnapshotReference::new(
+                        4,
+                        SnapshotRetention::Tag {
+                            max_ref_age_ms: None,
+                        },
+                    ),
+                },
+                TableUpdate::RemoveSnapshotRef {
+                    ref_name: "removed".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let response = serde_json::json!({"metadata-location":"s3://warehouse/t/metadata/v2.json","metadata":{"table-uuid":TABLE_UUID,"snapshots":[{"snapshot-id":3},{"snapshot-id":4},{"snapshot-id":999}],"refs":{"kept":{"snapshot-id":3},"tag":{"snapshot-id":4},"unrequested":{"snapshot-id":999}}}});
+        assert!(matches!(
+            classify(&status(200), read(&expect, &response.to_string()), &expect),
+            RestEvidence::Applied { .. }
+        ));
+        for changed in 0..5 {
+            let mut invalid = response.clone();
+            match changed {
+                0 => invalid["metadata"]["snapshots"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"snapshot-id":1})),
+                1 => invalid["metadata"]["snapshots"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"snapshot-id":2})),
+                2 => invalid["metadata"]["refs"]["kept"]["snapshot-id"] = 99.into(),
+                3 => {
+                    invalid["metadata"]["refs"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("tag");
+                }
+                4 => invalid["metadata"]["refs"]["removed"] = serde_json::json!({}),
+                _ => unreachable!(),
+            }
+            let evidence = classify(&status(200), read(&expect, &invalid.to_string()), &expect);
+            assert_eq!(
+                unknown_reason(&evidence),
+                &UnknownReason::Unattributable(UnattributableCause::RetentionPostconditionMismatch),
+                "case {changed}: {evidence:?}"
+            );
+        }
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"snapshot-id":null}),
+            serde_json::json!({"snapshot-id":"1"}),
+        ] {
+            let mut invalid = response.clone();
+            invalid["metadata"]["snapshots"]
+                .as_array_mut()
+                .unwrap()
+                .push(malformed);
+            assert!(
+                matches!(
+                    classify(&status(200), read(&expect, &invalid.to_string()), &expect),
+                    RestEvidence::Unknown { .. }
+                ),
+                "a malformed snapshot cannot prove requested IDs absent"
+            );
+        }
+        let duplicate_ref = format!(
+            r#"{{"metadata-location":"s3://w/m","metadata":{{"table-uuid":"{TABLE_UUID}","refs":{{"kept":{{"snapshot-id":3}},"kept":{{"snapshot-id":3}}}}}}}}"#
+        );
+        assert!(matches!(
+            classify(&status(200), read(&expect, &duplicate_ref), &expect),
+            RestEvidence::Unknown { .. }
+        ));
     }
 }

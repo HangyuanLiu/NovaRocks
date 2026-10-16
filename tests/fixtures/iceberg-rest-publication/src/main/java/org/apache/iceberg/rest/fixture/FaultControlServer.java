@@ -111,7 +111,7 @@ final class FaultControlServer {
           && activeHold.phase == HoldPhase.ARMED
           && activeHold.table.equals(table)) {
         hold = activeHold;
-        hold.phase = HoldPhase.HELD;
+        hold.phase = hold.stage.equals("before-persistent-commit") ? HoldPhase.HELD : HoldPhase.CLAIMED;
         hold.commitId = commitId;
         hold.thread = Thread.currentThread().getName();
         record(
@@ -122,14 +122,11 @@ final class FaultControlServer {
             baseIdentity,
             updatedIdentity,
             "TableOperations.commit entry");
-        record(
-            "hold-reached",
-            table,
-            hold.armId,
-            commitId,
-            baseIdentity,
-            updatedIdentity,
-            "no delegate commit has started");
+        if (hold.stage.equals("before-persistent-commit")) {
+          record(
+              "hold-reached", table, hold.armId, commitId, baseIdentity, updatedIdentity,
+              "no delegate commit has started");
+        }
       }
     }
 
@@ -143,7 +140,7 @@ final class FaultControlServer {
           baseIdentity,
           updatedIdentity,
           "TableOperations.commit entry");
-    } else {
+    } else if (hold.stage.equals("before-persistent-commit")) {
       try {
         if (!hold.released.await(maxHoldSeconds, TimeUnit.SECONDS)) {
           synchronized (LOCK) {
@@ -157,6 +154,8 @@ final class FaultControlServer {
               baseIdentity,
               updatedIdentity,
               "bounded hold expired");
+          record("commit-method-exited", table, armId, commitId, baseIdentity, updatedIdentity,
+              "pre-commit hold timed out without delegate dispatch");
           throw new IllegalStateException("UEA-7 publication hold timed out");
         }
       } catch (InterruptedException exception) {
@@ -172,6 +171,8 @@ final class FaultControlServer {
             baseIdentity,
             updatedIdentity,
             exception.toString());
+        record("commit-method-exited", table, armId, commitId, baseIdentity, updatedIdentity,
+            "pre-commit hold interrupted without delegate dispatch");
         throw new IllegalStateException("UEA-7 publication hold was interrupted", exception);
       }
     }
@@ -197,6 +198,26 @@ final class FaultControlServer {
         attempt.baseIdentity,
         attempt.updatedIdentity,
         "");
+    if (attempt.hold != null && attempt.hold.stage.equals("after-persistent-commit")) {
+      ActiveHold hold = attempt.hold;
+      synchronized (LOCK) { hold.phase = HoldPhase.HELD; }
+      record("persistent-commit-before-handler-reload", table, hold.armId, attempt.commitId,
+          attempt.baseIdentity, attempt.updatedIdentity, "delegate commit completed");
+      record("hold-reached", table, hold.armId, attempt.commitId,
+          attempt.baseIdentity, attempt.updatedIdentity, "handler has not reloaded metadata");
+      try {
+        if (!hold.released.await(maxHoldSeconds, TimeUnit.SECONDS)) {
+          finishHold(hold, HoldPhase.TIMED_OUT);
+          record("hold-timed-out", table, hold.armId, attempt.commitId,
+              attempt.baseIdentity, attempt.updatedIdentity, "post-commit hold expired");
+          throw new IllegalStateException("publication post-commit hold timed out");
+        }
+      } catch (InterruptedException exception) {
+        Thread.currentThread().interrupt();
+        finishHold(hold, HoldPhase.FAILED);
+        throw new IllegalStateException("publication post-commit hold interrupted", exception);
+      }
+    }
     finishHold(attempt.hold, HoldPhase.SUCCEEDED);
   }
 
@@ -212,6 +233,11 @@ final class FaultControlServer {
         attempt.updatedIdentity,
         failure.toString());
     finishHold(attempt.hold, conflict ? HoldPhase.CONFLICT : HoldPhase.FAILED);
+  }
+
+  static void commitMethodExited(String table, CommitAttempt attempt) {
+    record("commit-method-exited", table, attempt.armId, attempt.commitId,
+        attempt.baseIdentity, attempt.updatedIdentity, "TableOperations.commit actual exit");
   }
 
   static void refreshed(String table, TableMetadata metadata) {
@@ -288,13 +314,19 @@ final class FaultControlServer {
       return;
     }
 
+    String stage = parseQuery(exchange.getRequestURI().getRawQuery())
+        .getOrDefault("stage", "before-persistent-commit");
+    if (!stage.equals("before-persistent-commit") && !stage.equals("after-persistent-commit")) {
+      send(exchange, 400, errorJson("unsupported publication hold stage"));
+      return;
+    }
     ActiveHold hold;
     synchronized (LOCK) {
       if (activeHold != null && !activeHold.phase.isTerminal()) {
         send(exchange, 409, errorJson("a publication hold is already active"));
         return;
       }
-      hold = new ActiveHold("arm-" + ARM_SEQUENCE.getAndIncrement(), table);
+      hold = new ActiveHold("arm-" + ARM_SEQUENCE.getAndIncrement(), table, stage);
       activeHold = hold;
       record("hold-armed", table, hold.armId, "", "", "", "");
     }
@@ -346,6 +378,25 @@ final class FaultControlServer {
         return;
       }
       hold = activeHold;
+      if (hold.phase == HoldPhase.CLAIMED) {
+        hold.phase = HoldPhase.RELEASED;
+        hold.released.countDown();
+        record("hold-released", hold.table, hold.armId, hold.commitId, "", "", "early release");
+        send(exchange, 200, hold.toJson());
+        return;
+      }
+      if (hold.phase == HoldPhase.ARMED
+          && "true".equals(parseQuery(exchange.getRequestURI().getRawQuery()).get("cancel"))) {
+        hold.phase = HoldPhase.FAILED;
+        hold.released.countDown();
+        record("hold-disarmed", hold.table, hold.armId, "", "", "", "no request held");
+        send(exchange, 200, hold.toJson());
+        return;
+      }
+      if (hold.phase == HoldPhase.RELEASED || hold.phase.isTerminal()) {
+        send(exchange, 200, hold.toJson());
+        return;
+      }
       if (hold.phase != HoldPhase.HELD) {
         send(exchange, 409, errorJson("hold has not reached the persistent commit boundary"));
         return;
@@ -543,6 +594,7 @@ final class FaultControlServer {
 
   private enum HoldPhase {
     ARMED,
+    CLAIMED,
     HELD,
     RELEASED,
     SUCCEEDED,
@@ -562,14 +614,16 @@ final class FaultControlServer {
   private static final class ActiveHold {
     private final String armId;
     private final String table;
+    private final String stage;
     private final CountDownLatch released = new CountDownLatch(1);
     private HoldPhase phase = HoldPhase.ARMED;
     private String commitId = "";
     private String thread = "";
 
-    private ActiveHold(String armId, String table) {
+    private ActiveHold(String armId, String table, String stage) {
       this.armId = armId;
       this.table = table;
+      this.stage = stage;
     }
 
     private String toJson() {
@@ -577,6 +631,8 @@ final class FaultControlServer {
           + quoted(armId)
           + ",\"table\":"
           + quoted(table)
+          + ",\"stage\":"
+          + quoted(stage)
           + ",\"phase\":"
           + quoted(phase.wireName())
           + ",\"commit_id\":"

@@ -43,19 +43,13 @@ use crate::catalog::admission::{
     CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogOperation, connector_unsupported,
 };
 use crate::catalog::error::CatalogOutcome;
-use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
-use crate::catalog::{
-    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTransactionStart,
-};
-use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};
+use crate::catalog::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};
+use crate::commit::lower_ref_action;
 use crate::iceberg::spec::{
-    FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
-    SnapshotRetention, StructType, Summary, Transform, Type, UnboundPartitionField,
-    UnboundPartitionSpec, UnboundPartitionSpecBuilder,
+    FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, StructType, Summary,
+    Transform, Type, UnboundPartitionField, UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
-use crate::iceberg::{
-    NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
-};
+use crate::iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::reconcile_payload::{
@@ -100,9 +94,22 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         {
             return execute_application_document_update(self, &request, intent);
         }
-        // Every catalog creates through the create-table transaction. Which
-        // receipt shape comes back is decided by what the publication proof
-        // actually carries, not by asking which kind of catalog this is.
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::CreateNamespace { .. }
+                | ConnectorCatalogMutationOperation::DropNamespace { .. }
+        ) {
+            return execute_namespace_publication(self, &request);
+        }
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::CreateView { .. }
+                | ConnectorCatalogMutationOperation::DropView { .. }
+        ) {
+            return execute_view_publication(self, &request);
+        }
+        // The owner freezes its exact request once; the shared journal owns
+        // dispatch and the conclusion for every create mechanism.
         if let ConnectorCatalogMutationOperation::CreateTable {
             table,
             columns,
@@ -122,6 +129,12 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 properties,
                 *policy,
             );
+        }
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::DropTable { .. }
+        ) {
+            return execute_drop_table(self, &request);
         }
         if let ConnectorCatalogMutationOperation::AlterRef {
             table,
@@ -148,55 +161,13 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 guard,
             );
         }
-        if let ConnectorCatalogMutationOperation::AlterProperties {
-            table,
-            changes,
-            authority,
-            expected_committed_partitioning: Some(expected),
-        } = &request.operation
-        {
-            return execute_guarded_properties(
-                self, &request, table, changes, *authority, expected,
-            );
-        }
-
-        let operation_kind = request.operation.kind();
-        let evidence = match mutation_evidence(
-            self,
-            request.operation_id,
-            &request.operation,
-            &request.context,
-        ) {
-            Ok(value) => value,
-            Err(error) => return Ok(known_uncommitted(error)),
-        };
-        let result = execute_operation(self, &request.operation, &request.context);
-        match result {
-            Ok(effect) => Ok(ExternalMutationOutcome::KnownCommitted {
-                effect,
-                receipt: receipt(self, request.operation_id, operation_kind)?,
-                finalization: ExternalMutationFinalization::Complete,
-            }),
-            Err(error) if commit_may_be_unknown(error.kind()) => {
-                Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(&error),
-                    evidence,
-                })
-            }
-            Err(error) => Ok(known_uncommitted(error)),
-        }
+        execute_existing_publication(self, &request)
     }
 
     fn reconcile(
         &self,
         request: ConnectorCatalogMutationReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-        if let Err(error) = validate_context(&request.context) {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&error),
-                evidence: request.evidence,
-            });
-        }
         if request.evidence.descriptor() != self.descriptor()
             || request.evidence.incarnation() != self.incarnation()
             || request.evidence.schema_version() != ICEBERG_MUTATION_EVIDENCE_VERSION
@@ -378,223 +349,140 @@ fn validate_context(
 /// Nothing is lost by returning two states here: the caller reads dispatch
 /// certainty off the error's kind and turns an unknown into `CommitUnknown`,
 /// so `Unavailable` is the unknown rather than a flat failure.
-fn catalog_effect<T>(
-    outcome: crate::catalog::error::CatalogOutcome<T>,
-) -> Result<ExternalMutationEffect, ConnectorError> {
-    match outcome {
-        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => {
-            Ok(ExternalMutationEffect::Applied)
-        }
-        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
-            Err(map_mutation_failure(&failure))
-        }
-        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => {
-            Err(unavailable(failure.to_string()))
-        }
-        crate::catalog::error::CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            reason.message().to_string(),
-        )),
+
+fn publish_existing_frozen(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+    frozen: crate::commit::model::FrozenRequest,
+    external_evidence: ExternalMutationEvidence,
+    seed: ConnectorCatalogMutationReceipt,
+    operation: CatalogOperation,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
+        crate::commit::model::OperationToken::from_mutation(request.operation_id),
+        provider.runtime().resources().catalog_runtime(),
+    );
+    if let Err(error) = journal.record(external_evidence, seed, &frozen) {
+        return Ok(known_uncommitted(invalid(error.to_string())));
     }
+    let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+    let publication = journal.clone();
+    let preparation = request.context.clone();
+    let policy = catalog.evidence_policy();
+    let result = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move {
+            publication
+                .publish_once(
+                    preparation,
+                    policy,
+                    move |descriptor, generation, original| async move {
+                        catalog
+                            .prepare_frozen_publication(
+                                frozen, operation, None, descriptor, generation, original,
+                            )
+                            .await
+                    },
+                )
+                .await
+        });
+    Ok(match result {
+        Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
+        Ok(Err(error)) => {
+            journal.catalog_bridge_failure(format!("Table publication invocation failed: {error}"))
+        }
+        Err(error) => {
+            journal.catalog_bridge_failure(format!("Table publication bridge failed: {error}"))
+        }
+    })
 }
 
-fn execute_operation(
+fn execute_existing_publication(
     provider: &IcebergMetadata,
-    operation: &ConnectorCatalogMutationOperation,
-    context: &ConnectorRequestContext,
-) -> Result<ExternalMutationEffect, ConnectorError> {
-    match operation {
-        ConnectorCatalogMutationOperation::CreateTable { .. } => Err(ConnectorError::new(
-            ConnectorErrorKind::Internal,
-            "Iceberg CREATE TABLE is published through the create-table transaction, \
-             so it must not reach the effect-only mutation path",
-        )),
-        ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
-            ensure_owner(provider, &namespace.instance_id)?;
-            let exists = provider
-                .runtime()
-                .namespace_exists_for_request(&namespace.namespace, context)
-                .map_err(unavailable)?;
-            if exists {
-                return if *policy == CreatePolicy::NoOpIfExists {
-                    Ok(ExternalMutationEffect::NoOp)
-                } else {
-                    Err(already_exists("Iceberg namespace already exists"))
-                };
-            }
-            let namespace = crate::catalog::CatalogNamespaceName::new(
-                normalize_identifier(&namespace.namespace).map_err(invalid)?,
-            );
-            let owner = Arc::clone(provider.runtime().novarocks_catalog());
-            let outcome = provider
-                .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move { owner.create_namespace(namespace).await })
-                .map_err(unavailable)?;
-            catalog_effect(outcome)
-        }
-        ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
-            ensure_owner(provider, &namespace.instance_id)?;
-            let exists = provider
-                .runtime()
-                .namespace_exists_for_request(&namespace.namespace, context)
-                .map_err(unavailable)?;
-            if !exists {
-                return if *policy == DropPolicy::NoOpIfMissing {
-                    Ok(ExternalMutationEffect::NoOp)
-                } else {
-                    Err(not_found("Iceberg namespace does not exist"))
-                };
-            }
-            let namespace = crate::catalog::CatalogNamespaceName::new(
-                normalize_identifier(&namespace.namespace).map_err(invalid)?,
-            );
-            let owner = Arc::clone(provider.runtime().novarocks_catalog());
-            let outcome = provider
-                .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move { owner.drop_namespace(namespace).await })
-                .map_err(unavailable)?;
-            catalog_effect(outcome)
-        }
-        ConnectorCatalogMutationOperation::DropTable {
-            table,
-            policy,
-            data_disposition,
-        } => drop_table(provider, table, *policy, *data_disposition, context),
-        ConnectorCatalogMutationOperation::CreateView {
-            view,
-            columns,
-            definition,
-            comment,
-            properties,
-            policy,
-        } => {
-            ensure_owner(provider, &view.instance_id)?;
-            // The collision probe enumerates the namespace and observes the
-            // production listing bound: an over-bound namespace refuses the
-            // create instead of answering from a partial listing.
-            if provider
-                .runtime()
-                .list_tables_for_request(
-                    &view.namespace,
-                    context,
-                    novarocks_spi::connector::ConnectorListingBound::V1,
-                )
-                .map_err(|(kind, message)| ConnectorError::new(kind, message))?
-                .iter()
-                .any(|table| table.eq_ignore_ascii_case(&view.view))
-            {
-                return Err(already_exists(
-                    "a table with the requested Iceberg view name already exists",
-                ));
-            }
-            let exists =
-                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
-            match (*policy, exists) {
-                (CreateOrReplacePolicy::NoOpIfExists, true) => {
-                    return Ok(ExternalMutationEffect::NoOp);
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
+    use crate::commit::staging::PreparedChange;
+    let prepared = provider.runtime().resources().catalog_runtime().observe_preparation(|| {
+        let prepare = || -> crate::catalog::publication_dispatch::PreparationResult<_> {
+            let table = match &request.operation {
+                ConnectorCatalogMutationOperation::AlterSchema { table, .. }
+                | ConnectorCatalogMutationOperation::AlterPartitionSpec { table, .. }
+                | ConnectorCatalogMutationOperation::AlterProperties { table, .. }
+                | ConnectorCatalogMutationOperation::AlterRef { table, .. } => table,
+                _ => return Err(internal("Catalog mutation has no table publication lowerer").into()),
+            };
+            ensure_owner(provider, &table.instance_id)?;
+            let is_ref = matches!(&request.operation, ConnectorCatalogMutationOperation::AlterRef { .. });
+            let (guard, loaded) = if is_ref {
+                let (guard, loaded) = provider.runtime().coordinate_table_for_request(&table.namespace, &table.table, &request.context)?;
+                (Some(guard), loaded)
+            } else {
+                (None, provider.runtime().load_table_classified_for_request(&table.namespace, &table.table, &request.context)
+                    .map_err(|(kind, message)| ConnectorError::new(kind, message))?)
+            };
+            let metadata = loaded.table.metadata();
+            let change = match &request.operation {
+                ConnectorCatalogMutationOperation::AlterSchema { changes, .. } => prepare_schema_change(provider.runtime(), &loaded.table, changes, &request.context)?,
+                ConnectorCatalogMutationOperation::AlterPartitionSpec { add, drop, .. } => prepare_partition_change(metadata, add, drop)?,
+                ConnectorCatalogMutationOperation::AlterProperties { changes, authority, expected_committed_partitioning, .. } => {
+                    if changes.is_empty() { return Err(invalid("Iceberg property mutation is empty").into()); }
+                    let mut requirements = Vec::new();
+                    if let Some(expected) = expected_committed_partitioning {
+                        if committed_partitioning_from_metadata(metadata, metadata.default_partition_spec_id())? != *expected {
+                            return Err(crate::catalog::publication_dispatch::PreparationFailure(ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, "Iceberg default partitioning changed before guarded property mutation")));
+                        }
+                        requirements.push(TableRequirement::DefaultSpecIdMatch { default_spec_id: expected.spec_id() });
+                    }
+                    PreparedChange { updates: property_updates(metadata, changes, *authority)?, requirements }
                 }
-                (CreateOrReplacePolicy::FailIfExists, true) => {
-                    return Err(already_exists("Iceberg view already exists"));
+                ConnectorCatalogMutationOperation::AlterRef { action, .. } => {
+                    lower_ref_action(action.clone(), metadata, &table.namespace, &table.table, provider.descriptor().instance_id.as_str())?.prepare(&loaded.table).map_err(crate::catalog::publication_dispatch::PreparationFailure)?
                 }
-                _ => {}
-            }
-            let outcome = super::views::create_view(
-                provider.runtime(),
-                &view.namespace,
-                &view.view,
-                columns,
-                definition,
-                comment.as_deref(),
-                exists && *policy == CreateOrReplacePolicy::ReplaceIfExists,
-                &view_properties(properties)?,
-            )
-            .map_err(map_view_error)?;
-            catalog_effect(outcome)
+                _ => unreachable!(),
+            };
+            let token = OperationToken::from_mutation(request.operation_id);
+            let frozen = crate::commit::staging::freeze_existing_change(
+                loaded.table.identifier().clone(), "main", metadata,
+                loaded.table.metadata_location().ok_or_else(|| invalid("Table publication requires an authoritative metadata location"))?,
+                if is_ref { RequestShape::RefRetention } else { RequestShape::MetadataOnly },
+                AttemptToken::new(token, 0), change, &request.context,
+            ).map_err(|error| invalid(error.to_string()))?;
+            let external_evidence = evidence(provider, request.operation_id, request.operation.kind(), IcebergMutationEvidenceTarget::TableVersion {
+                namespace: table.namespace.to_string(), table: table.table.to_string(), table_uuid: metadata.uuid().to_string(),
+                before_metadata_location: loaded.table.metadata_location().map(str::to_owned),
+            })?;
+            let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+            Ok((guard, frozen, external_evidence, seed, table.clone()))
+        };
+        prepare()
+    }, |error: &crate::catalog::publication_dispatch::PreparationFailure| error.0.clone());
+    let (_guard, frozen, external_evidence, seed, table) = match prepared {
+        Ok(prepared) => prepared,
+        Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) => {
+            return Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
         }
-        ConnectorCatalogMutationOperation::DropView { view, policy } => {
-            ensure_owner(provider, &view.instance_id)?;
-            let exists =
-                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
-            if !exists {
-                return if *policy == DropPolicy::NoOpIfMissing {
-                    Ok(ExternalMutationEffect::NoOp)
-                } else {
-                    Err(not_found("Iceberg view does not exist"))
-                };
-            }
-            let outcome = super::views::drop_view(provider.runtime(), &view.namespace, &view.view)
-                .map_err(map_view_error)?;
-            catalog_effect(outcome)
-        }
-        ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
-            ensure_owner(provider, &table.instance_id)?;
-            alter_schema(provider.runtime(), table, changes, context)
-        }
-        ConnectorCatalogMutationOperation::AlterPartitionSpec { table, add, drop } => {
-            ensure_owner(provider, &table.instance_id)?;
-            alter_partition_spec(provider.runtime(), table, add, drop, context)?;
-            Ok(ExternalMutationEffect::Applied)
-        }
-        ConnectorCatalogMutationOperation::AlterProperties {
-            table,
-            changes,
-            authority,
-            expected_committed_partitioning: _,
-        } => {
-            ensure_owner(provider, &table.instance_id)?;
-            alter_properties(provider.runtime(), table, changes, *authority, context)?;
-            Ok(ExternalMutationEffect::Applied)
-        }
-        ConnectorCatalogMutationOperation::AlterRef { table, action } => {
-            ensure_owner(provider, &table.instance_id)?;
-            // Decide against the catalog, not against a copy of it. This
-            // action's outcome turns on which refs exist -- `if_not_exists`
-            // reports success and does nothing when it believes the ref is
-            // already there -- so a cached metadata that still carries a ref
-            // someone has since dropped makes the create a silent no-op, and
-            // the caller then stages against a ref that was never made.
-            provider
-                .runtime()
-                .control_state()
-                .invalidate_table_cache(&table.namespace, &table.table);
-            let loaded = provider
-                .runtime()
-                .load_table_for_request(&table.namespace, &table.table, context)
-                .map_err(unavailable)?;
-            let plan = lower_ref_action(
-                action.clone(),
-                loaded.table.metadata(),
-                &table.namespace,
-                &table.table,
-                provider.descriptor().instance_id.as_str(),
-            )?;
-            let catalog = provider.runtime().novarocks_catalog().vendored_client();
-            let outcome = provider
-                .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    execute_ref_action(catalog.as_ref(), &loaded.table, &plan).await
-                })
-                .map_err(unavailable)?
-                .map_err(unavailable)?;
-            provider
-                .runtime()
-                .control_state()
-                .invalidate_table_cache(&table.namespace, &table.table);
-            Ok(match outcome {
-                RefActionOutcome::Committed => ExternalMutationEffect::Applied,
-                RefActionOutcome::NoOp => ExternalMutationEffect::NoOp,
-            })
-        }
-        ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
-            Err(internal("special mutation bypassed its exact commit path"))
-        }
+    };
+    let outcome = publish_existing_frozen(
+        provider,
+        request,
+        frozen,
+        external_evidence,
+        seed,
+        catalog_admission_request(request).operation,
+    )?;
+    if matches!(&outcome, ExternalMutationOutcome::KnownCommitted { .. }) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
     }
+    Ok(outcome)
 }
 
 fn view_properties(
@@ -696,209 +584,138 @@ fn execute_create_table(
     properties: &[(Arc<str>, Arc<str>)],
     policy: CreatePolicy,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    // Property support is decided before namespace or table probes. New
-    // definitions have already passed the provider's pure admission.
-    table_properties(columns, key, properties)?;
-    // An existing target is settled here, before anything is dispatched.
-    // `CreatePolicy` is the caller's statement about what an existing table
-    // means -- `IF NOT EXISTS` makes it a no-op, a plain create makes it a
-    // conflict -- and the transaction constructor has no way to know which was
-    // asked for. Answering it first is also what keeps the answer exact: a
-    // catalog that reports an already-existing table as a dispatch failure
-    // would otherwise only be able to say the create did not happen, not why.
-    if provider
-        .runtime()
-        .table_exists_for_request(&table.namespace, &table.table, &request.context)
-        .map_err(unavailable)?
-    {
-        return match policy {
-            CreatePolicy::NoOpIfExists => Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::NoOp,
-                receipt: receipt(provider, request.operation_id, request.operation.kind())?,
-                finalization: ExternalMutationFinalization::Complete,
-            }),
-            // Stated directly rather than through a ConnectorError, which has
-            // no already-exists kind and would flatten this to InvalidRequest.
-            _ => Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::AlreadyExists,
-                    "Iceberg table already exists",
-                ),
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            }),
-        };
-    }
-    if !provider
-        .runtime()
-        .namespace_exists_for_request(&table.namespace, &request.context)
-        .map_err(unavailable)?
-    {
-        return Ok(known_uncommitted(not_found(
-            "Iceberg table namespace does not exist",
-        )));
-    }
-    let (_namespace, creation) =
-        match prepare_table_creation(table, columns, key, partitioning, properties) {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok(known_uncommitted(error)),
-        };
-    // Admission through the create-table constructor; publication through the
-    // transaction it hands back. Admission is local for this catalog -- it
-    // builds metadata and sends nothing -- which is what lets publication
-    // evidence be frozen before anything is dispatched.
-    let operation_id = hex_encode(&request.operation_id.to_bytes());
-    let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
-    let start_request = crate::catalog::transaction::CreateTableTransactionRequest {
-        identity: crate::catalog::transaction::TransactionIdentity::new(
-            "connector-mutation",
-            request.operation_id.to_bytes(),
+    use crate::catalog::catalog_request::CatalogCreatePublicationRequest;
+    use crate::catalog::publication_dispatch::{PreparationFailure, PreparationResult};
+    use crate::commit::attempt::observation::PublicationReceipts;
+    enum PreparedCreate {
+        NoOp(ConnectorCatalogMutationReceipt),
+        Mutation(
+            crate::catalog::catalog_request::FrozenCatalogPublication,
+            ExternalMutationEvidence,
+            PublicationReceipts<ConnectorCatalogMutationReceipt>,
         ),
-        target: crate::catalog::CatalogTableName::new(
-            table.namespace.as_ref(),
-            table.table.as_ref(),
-        ),
-        intent: crate::catalog::CatalogCreateIntent::EmptyTable,
-        creation,
-        warehouse: None,
-    };
-    let start = provider
+    }
+    let setup = provider
         .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move { owner.new_create_table_transaction(start_request).await })
-        .map_err(unavailable)?;
-    let mut transaction = match start {
-        crate::catalog::CatalogTransactionStart::Ready(transaction) => transaction,
-        crate::catalog::CatalogTransactionStart::Unsupported(reason) => {
-            return Ok(known_uncommitted(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                reason.message().to_string(),
-            )));
-        }
-        crate::catalog::CatalogTransactionStart::KnownUncommitted { failure } => {
-            return Ok(known_uncommitted(map_mutation_failure(&failure)));
-        }
-        crate::catalog::CatalogTransactionStart::CommitUnknown { failure, .. } => {
-            return Ok(known_uncommitted(ConnectorError::new(
-                ConnectorErrorKind::Unavailable,
-                failure.to_string(),
-            )));
-        }
-    };
-    // A catalog whose create publishes a metadata file can name it before the
-    // request goes out, which is what makes a later reconciliation exact. One
-    // that publishes through the catalog itself has no such name, and gets the
-    // ordinary mutation evidence instead.
-    let admission = transaction.admission_facts().clone();
-    let exact_admission = match (
-        admission.table_uuid.clone(),
-        admission.metadata_location.clone(),
-        admission.metadata_digest.clone(),
-    ) {
-        (Some(table_uuid), Some(metadata_location), Some(metadata_digest)) => {
-            Some(crate::catalog::ConditionalCreateFacts {
-                operation_id: std::sync::Arc::from(operation_id.as_str()),
-                table_uuid,
-                metadata_location,
-                metadata_digest,
-            })
-        }
-        _ => None,
-    };
-    let evidence = match &exact_admission {
-        Some(facts) => hadoop_create_evidence(provider, request, table, facts)?,
-        None => mutation_evidence(
-            provider,
-            request.operation_id,
-            &request.operation,
-            &request.context,
-        )?,
-    };
-    validate_context(&request.context)?;
-    let committed = provider
-        .runtime()
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { transaction.commit().await });
-    let outcome = match committed {
-        Ok(outcome) => outcome,
-        // The bridge wraps the conditional write, so it cannot prove the write
-        // never happened.
-        Err(error) => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&unavailable(error)),
-                evidence,
-            });
-        }
-    };
-    let proof = match outcome {
-        crate::catalog::error::CatalogOutcome::KnownCommitted { receipt, .. } => receipt,
-        crate::catalog::error::CatalogOutcome::Unsupported(reason) => {
-            return Ok(known_uncommitted(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                reason.message().to_string(),
-            )));
-        }
-        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
-            return Ok(known_uncommitted(map_mutation_failure(&failure)));
-        }
-        crate::catalog::error::CatalogOutcome::CommitUnknown {
-            failure: unknown_failure,
-            ..
-        } => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&ConnectorError::new(
-                    ConnectorErrorKind::Unavailable,
-                    unknown_failure.to_string(),
-                )),
-                evidence,
-            });
-        }
-    };
-    // The digest is read back after publication, so a proof that carries one
-    // lets the receipt name exactly what landed. A proof without one still
-    // reports the create; it just cannot be reconciled by metadata identity.
-    let exact_publication = proof.table_uuid.clone().zip(proof.metadata_digest.clone());
-    let build_receipt = |provider: &IcebergMetadata| -> Result<_, ConnectorError> {
-        match &exact_publication {
-            Some((table_uuid, metadata_digest)) => hadoop_create_receipt(
-                provider,
-                request.operation_id,
-                request.operation.kind(),
-                proof.metadata_location.as_deref(),
-                table_uuid,
-                metadata_digest,
-            ),
-            None => receipt(provider, request.operation_id, request.operation.kind()),
-        }
-    };
-    provider
-        .runtime()
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    match proof.effect {
-        ExternalMutationEffect::Applied => Ok(ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            receipt: build_receipt(provider)?,
-            // The transaction reports the commit itself, and a finalization
-            // failure after it never downgrades that.
+        .observe_preparation(
+            || -> PreparationResult<PreparedCreate> {
+                ensure_owner(provider, &table.instance_id)?;
+                table_properties(columns, key, properties)?;
+                request.context.check_active()?;
+                let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
+                let name = normalize_identifier(&table.table).map_err(invalid)?;
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let target = CatalogTableName::new(namespace.clone(), name.clone());
+                let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let exists = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.table_exists_for_read(target, binding).await })
+                    .map_err(unavailable)??;
+                request.context.check_active()?;
+                if exists {
+                    return if policy == CreatePolicy::NoOpIfExists {
+                        Ok(PreparedCreate::NoOp(seed))
+                    } else {
+                        Err(PreparationFailure(ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::AlreadyExists,
+                            "Iceberg table already exists",
+                        )))
+                    };
+                }
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let target = CatalogNamespaceName::new(namespace.clone());
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let exists = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.namespace_exists_for_read(target, binding).await })
+                    .map_err(unavailable)??;
+                request.context.check_active()?;
+                if !exists {
+                    return Err(not_found("Iceberg table namespace does not exist").into());
+                }
+                let (_, creation) =
+                    prepare_table_creation(table, columns, key, partitioning, properties)?;
+                let frozen = provider
+                    .runtime()
+                    .novarocks_catalog()
+                    .freeze_create_publication(CatalogCreatePublicationRequest {
+                        operation_id: request.operation_id.to_bytes(),
+                        namespace: CatalogNamespaceName::new(namespace.clone()),
+                        creation,
+                        no_op_if_exists: policy == CreatePolicy::NoOpIfExists,
+                    })?;
+                let (evidence, applied) = match frozen.conditional_create_facts() {
+                    Some(facts) => (
+                        hadoop_create_evidence(provider, request, table, &facts)?,
+                        hadoop_create_receipt(
+                            provider,
+                            request.operation_id,
+                            request.operation.kind(),
+                            Some(&facts.metadata_location),
+                            &facts.table_uuid,
+                            &facts.metadata_digest,
+                        )?,
+                    ),
+                    None => (
+                        evidence(
+                            provider,
+                            request.operation_id,
+                            request.operation.kind(),
+                            IcebergMutationEvidenceTarget::Table {
+                                namespace,
+                                table: name,
+                                should_exist: true,
+                                before_uuid: None,
+                            },
+                        )?,
+                        seed.clone(),
+                    ),
+                };
+                Ok(PreparedCreate::Mutation(
+                    frozen,
+                    evidence,
+                    PublicationReceipts::for_effects(applied, seed),
+                ))
+            },
+            |error| error.0.clone(),
+        );
+    match setup {
+        Err(PreparationFailure(failure)) => Ok(ExternalMutationOutcome::KnownUncommitted {
+            failure,
+            cleanup: ExternalMutationFinalization::Complete,
+        }),
+        Ok(PreparedCreate::NoOp(receipt)) => Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            receipt,
             finalization: ExternalMutationFinalization::Complete,
         }),
-        ExternalMutationEffect::NoOp if policy == CreatePolicy::NoOpIfExists => {
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::NoOp,
-                receipt: build_receipt(provider)?,
-                finalization: ExternalMutationFinalization::Complete,
-            })
+        Ok(PreparedCreate::Mutation(frozen, evidence, receipts)) => {
+            let outcome = execute_catalog_publication_with_receipts(
+                provider, request, frozen, evidence, receipts,
+            )?;
+            if matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }) {
+                provider
+                    .runtime()
+                    .control_state()
+                    .invalidate_table_cache(&table.namespace, &table.table);
+            }
+            Ok(outcome)
         }
-        ExternalMutationEffect::NoOp => Ok(ExternalMutationOutcome::KnownUncommitted {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::AlreadyExists,
-                "Iceberg table already exists",
-            ),
-            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-        }),
     }
 }
 
@@ -916,6 +733,159 @@ fn execute_create_table(
 /// a cleanup request needs. A drop whose response was lost enqueues nothing and
 /// deletes nothing — those objects leak, and identity-aware collection reclaims
 /// them later by re-proving they are dead.
+fn execute_drop_table(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogPublicationRequest;
+    use crate::catalog::publication_dispatch::{PreparationFailure, PreparationResult};
+    use crate::commit::attempt::observation::PublicationReceipts;
+    let ConnectorCatalogMutationOperation::DropTable {
+        table,
+        policy,
+        data_disposition,
+    } = &request.operation
+    else {
+        return Ok(known_uncommitted(internal(
+            "Table drop requires a drop operation",
+        )));
+    };
+    let seed = match receipt(provider, request.operation_id, request.operation.kind()) {
+        Ok(receipt) => receipt,
+        Err(error) => return Ok(known_uncommitted(error)),
+    };
+    let setup = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .observe_preparation(
+            || -> PreparationResult<_> {
+                ensure_owner(provider, &table.instance_id)?;
+                request.context.check_active()?;
+                let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
+                let name = normalize_identifier(&table.table).map_err(invalid)?;
+                let target = CatalogTableName::new(namespace.clone(), name.clone());
+                let canonical = target.canonical();
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let lookup = target.clone();
+                let exists = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.table_exists_for_read(lookup, binding).await })
+                    .map_err(unavailable)??;
+                request.context.check_active()?;
+                if !exists {
+                    if *policy == DropPolicy::NoOpIfMissing {
+                        return Ok(None);
+                    }
+                    return Err(not_found("Iceberg table does not exist").into());
+                }
+                // Cleanup identity is captured before deletion. A failed capture may
+                // leak objects, but cannot authorize collection of a replacement.
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let lookup = target.clone();
+                let loaded = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.load_table_for_read(lookup, binding).await })
+                    .map_err(unavailable)?;
+                request.context.check_active()?;
+                let captured = match loaded {
+                    Ok(loaded) => crate::catalog::CatalogDropTableReceipt {
+                        table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
+                        table_location: Some(Arc::from(loaded.metadata().location())),
+                        metadata_location: loaded.metadata_location().map(Arc::from),
+                        last_updated_ms: loaded.metadata().last_updated_ms(),
+                    },
+                    Err(_) => crate::catalog::CatalogDropTableReceipt {
+                        table_uuid: None,
+                        table_location: None,
+                        metadata_location: None,
+                        last_updated_ms: 0,
+                    },
+                };
+                let evidence = evidence(
+                    provider,
+                    request.operation_id,
+                    request.operation.kind(),
+                    IcebergMutationEvidenceTarget::Table {
+                        namespace,
+                        table: name,
+                        should_exist: false,
+                        before_uuid: captured.table_uuid.as_ref().map(ToString::to_string),
+                    },
+                )?;
+                let frozen = CatalogPublicationRequest::DropTable {
+                    table: target,
+                    no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
+                    purge: *data_disposition == ConnectorDropTableDataDisposition::Purge,
+                    capture: Some(captured.clone()),
+                }
+                .freeze(request.operation_id.to_bytes())?;
+                Ok(Some((frozen, evidence, seed.clone(), canonical, captured)))
+            },
+            |error| error.0.clone(),
+        );
+    let (frozen, evidence, seed, canonical, captured) = match setup {
+        Err(PreparationFailure(failure)) => {
+            return Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
+        }
+        Ok(None) => {
+            return Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: seed,
+                finalization: ExternalMutationFinalization::Complete,
+            });
+        }
+        Ok(Some(value)) => value,
+    };
+    let (outcome, witness) = execute_catalog_publication_recorded(
+        provider,
+        request,
+        frozen,
+        evidence,
+        PublicationReceipts::same(seed),
+    )?;
+    if matches!(
+        outcome,
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            ..
+        }
+    ) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
+        if *data_disposition == ConnectorDropTableDataDisposition::Purge {
+            if let Some(cleanup) = witness.as_ref().and_then(|witness| {
+                crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::from_journal_drop(
+                    canonical, &captured, witness,
+                )
+            }) {
+                provider.runtime().drop_cleanup().enqueue(cleanup);
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
 fn drop_table(
     provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
@@ -923,61 +893,26 @@ fn drop_table(
     data_disposition: ConnectorDropTableDataDisposition,
     context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    if !provider
-        .runtime()
-        .table_exists_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?
-    {
-        return if policy == DropPolicy::NoOpIfMissing {
-            Ok(ExternalMutationEffect::NoOp)
-        } else {
-            Err(not_found("Iceberg table does not exist"))
-        };
-    }
-    let runtime = provider.runtime();
-    let catalog = std::sync::Arc::clone(runtime.novarocks_catalog());
-    let name =
-        crate::catalog::CatalogTableName::new(table.namespace.as_ref(), table.table.as_ref());
-    let canonical = name.canonical();
-    let outcome = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.drop_table(name).await })
-        .map_err(unavailable)?;
-
-    // Cache invalidation is post-outcome finalization. It cannot change what
-    // the catalog did, so its result never downgrades a committed drop.
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-
-    use crate::catalog::error::CatalogOutcome;
-    match outcome {
-        CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            reason.message().to_string(),
-        )),
-        CatalogOutcome::KnownUncommitted { failure } => Err(map_mutation_failure(&failure)),
-        // Nothing is enqueued and nothing is deleted. The objects leak on
-        // purpose: the drop may have landed, and acting on that guess is how
-        // live data disappears.
-        CatalogOutcome::CommitUnknown { failure, .. } => Err(ConnectorError::new(
-            ConnectorErrorKind::Unavailable,
-            failure.to_string(),
-        )),
-        committed => {
-            let (receipt, effect, witness) = committed
-                .into_known_committed()
-                .expect("the remaining arm is the committed one");
-            if data_disposition == ConnectorDropTableDataDisposition::Purge
-                && let Some(request) =
-                    crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::
-                        from_committed_drop(canonical, &receipt, &witness)
-            {
-                runtime.drop_cleanup().enqueue(request);
-            }
-            Ok(effect)
+    let request = ConnectorCatalogMutationRequest {
+        operation_id: ConnectorMutationOperationId::new(),
+        target: novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: provider.descriptor().instance_id.clone(),
+            incarnation: provider.incarnation(),
+        },
+        operation: ConnectorCatalogMutationOperation::DropTable {
+            table: table.clone(),
+            policy,
+            data_disposition,
+        },
+        context: context.clone(),
+    };
+    match execute_drop_table(provider, &request)? {
+        ExternalMutationOutcome::KnownCommitted { effect, .. } => Ok(effect),
+        ExternalMutationOutcome::KnownUncommitted { failure, .. } => {
+            Err(map_mutation_failure(&failure))
+        }
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+            Err(unavailable(failure.to_string()))
         }
     }
 }
@@ -1144,22 +1079,16 @@ pub(crate) fn initial_partition_spec(
     Ok(Some(builder.build()))
 }
 
-fn alter_partition_spec(
-    runtime: &IcebergMetadataContext,
-    table: &ConnectorTableIdentity,
+fn prepare_partition_change(
+    metadata: &crate::iceberg::spec::TableMetadata,
     add: &[ConnectorPartitionTransform],
     drop: &[ConnectorPartitionTransform],
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
+) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
     if add.len() + drop.len() != 1 {
         return Err(invalid(
             "Iceberg partition mutation requires exactly one add or drop transform",
         ));
     }
-    let loaded = runtime
-        .load_table_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?;
-    let metadata = loaded.table.metadata();
     let base_spec_id = metadata.default_partition_spec_id();
     let schema = metadata.current_schema();
     let current = metadata.default_partition_spec();
@@ -1237,20 +1166,12 @@ fn alter_partition_spec(
             "evolved Iceberg partition spec has unexpected updates",
         ));
     }
-    let commit = crate::commit::existing_commit::existing_table_commit(
-        table_ident(table).map_err(invalid)?,
-        metadata,
-        vec![TableRequirement::DefaultSpecIdMatch {
+    Ok(crate::commit::staging::PreparedChange {
+        requirements: vec![TableRequirement::DefaultSpecIdMatch {
             default_spec_id: base_spec_id,
         }],
         updates,
-    )
-    .map_err(|error| internal(error.to_string()))?;
-    update_table(runtime, commit, "alter Iceberg partition spec")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(())
+    })
 }
 
 fn partition_source_id(
@@ -1437,38 +1358,6 @@ fn validate_partition_transform(
     Ok(())
 }
 
-fn alter_properties(
-    runtime: &IcebergMetadataContext,
-    table: &ConnectorTableIdentity,
-    changes: &[ConnectorPropertyChange],
-    authority: ConnectorPropertyAuthority,
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    if changes.is_empty() {
-        return Err(invalid("Iceberg property mutation is empty"));
-    }
-    let loaded = runtime
-        .load_table_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?;
-    let metadata = loaded.table.metadata();
-    let updates = property_updates(metadata, changes, authority)?;
-    if updates.is_empty() {
-        return Ok(());
-    }
-    let commit = crate::commit::existing_commit::existing_table_commit(
-        table_ident(table).map_err(invalid)?,
-        metadata,
-        Vec::new(),
-        updates,
-    )
-    .map_err(|error| internal(error.to_string()))?;
-    update_table(runtime, commit, "alter Iceberg table properties")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(())
-}
-
 fn property_updates(
     metadata: &crate::iceberg::spec::TableMetadata,
     changes: &[ConnectorPropertyChange],
@@ -1576,22 +1465,19 @@ fn is_engine_namespace(key: &str) -> bool {
 }
 
 // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
-fn alter_schema(
+fn prepare_schema_change(
     runtime: &IcebergMetadataContext,
-    table: &ConnectorTableIdentity,
+    loaded: &crate::iceberg::table::Table,
     changes: &[ConnectorSchemaChange],
     context: &ConnectorRequestContext,
-) -> Result<ExternalMutationEffect, ConnectorError> {
+) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
     let [change] = changes else {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "Iceberg schema mutation requires exactly one change",
         ));
     };
-    let loaded = runtime
-        .load_table_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?;
-    let metadata = loaded.table.metadata();
+    let metadata = loaded.metadata();
     // Reserved lineage columns are an engine contract rather than observed
     // schema fields, so reject them before any lookup can report them absent.
     reject_reserved_schema_change(change)?;
@@ -1604,7 +1490,7 @@ fn alter_schema(
         {
             return Err(invalid("Iceberg identifier columns cannot be dropped"));
         }
-        let physical = loaded.table.clone();
+        let physical = loaded.clone();
         let read_control = context.clone();
         let equality_delete_result = runtime.resources().catalog_runtime().block_on(async move {
             crate::manifest::current_equality_delete_column_names_with_control(
@@ -1635,16 +1521,7 @@ fn alter_schema(
     {
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
-    let Some(commit) =
-        schema_change_commit(table_ident(table).map_err(invalid)?, metadata, change)?
-    else {
-        return Ok(ExternalMutationEffect::NoOp);
-    };
-    update_table(runtime, commit, "alter Iceberg schema")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
+    prepare_schema_updates(metadata, change)
 }
 
 /// The commit of one validated schema change against `metadata`, or `None`
@@ -1652,14 +1529,13 @@ fn alter_schema(
 /// mark: the server keeps it at the larger of its prior value and the new
 /// schema's highest field ID, and the last-assigned-field-id requirement
 /// fences concurrent schema changes.
-pub(crate) fn schema_change_commit(
-    ident: TableIdent,
+pub(crate) fn prepare_schema_updates(
     metadata: &crate::iceberg::spec::TableMetadata,
     change: &ConnectorSchemaChange,
-) -> Result<Option<TableCommit>, ConnectorError> {
+) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
     let integer_domains = crate::scalar_integer_domain::metadata_declarations(metadata)?;
     if scalar_integer_modify_is_noop(metadata.current_schema(), &integer_domains, change)? {
-        return Ok(None);
+        return Ok(crate::commit::staging::PreparedChange::default());
     }
     let mut next_id = metadata
         .last_column_id()
@@ -1681,13 +1557,11 @@ pub(crate) fn schema_change_commit(
     if matches!(change, ConnectorSchemaChange::ModifyColumn { .. })
         && &new_schema == metadata.current_schema().as_ref()
     {
-        return Ok(None);
+        return Ok(crate::commit::staging::PreparedChange::default());
     }
     let updates = scalar_integer_schema_updates(metadata, change, new_schema, integer_domains)?;
-    let commit = crate::commit::existing_commit::existing_table_commit(
-        ident,
-        metadata,
-        vec![
+    Ok(crate::commit::staging::PreparedChange {
+        requirements: vec![
             TableRequirement::CurrentSchemaIdMatch {
                 current_schema_id: metadata.current_schema_id(),
             },
@@ -1696,9 +1570,7 @@ pub(crate) fn schema_change_commit(
             },
         ],
         updates,
-    )
-    .map_err(|error| internal(error.to_string()))?;
-    Ok(Some(commit))
+    })
 }
 
 fn scalar_integer_modify_is_noop(
@@ -2206,18 +2078,347 @@ fn table_ident(table: &ConnectorTableIdentity) -> Result<TableIdent, String> {
     .map_err(|error| format!("build Iceberg table identity: {error}"))
 }
 
-fn update_table(
-    runtime: &IcebergMetadataContext,
-    commit: TableCommit,
-    action: &str,
-) -> Result<crate::iceberg::table::Table, ConnectorError> {
-    let catalog = runtime.novarocks_catalog().vendored_client();
-    runtime
+fn execute_view_publication(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogPublicationRequest;
+    use crate::catalog::publication_dispatch::{PreparationFailure, PreparationResult};
+    enum PreparedView {
+        NoOp(ConnectorCatalogMutationReceipt),
+        Mutation {
+            request: crate::catalog::catalog_request::FrozenCatalogPublication,
+            evidence: ExternalMutationEvidence,
+            receipt: ConnectorCatalogMutationReceipt,
+        },
+    }
+    let preparation = provider
+        .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move { catalog.update_table(commit).await })
-        .map_err(unavailable)?
-        .map_err(|error| map_iceberg_message(action, error))
+        .observe_preparation(
+            || -> PreparationResult<_> {
+                let (view, create) = match &request.operation {
+                    ConnectorCatalogMutationOperation::CreateView { view, .. } => (view, true),
+                    ConnectorCatalogMutationOperation::DropView { view, .. } => (view, false),
+                    _ => return Err(internal("View publication requires a view mutation").into()),
+                };
+                ensure_owner(provider, &view.instance_id)?;
+                let namespace = normalize_identifier(&view.namespace).map_err(invalid)?;
+                let name = normalize_identifier(&view.view).map_err(invalid)?;
+                if create
+                    && provider
+                        .runtime()
+                        .list_tables_for_request(
+                            &namespace,
+                            &request.context,
+                            novarocks_spi::connector::ConnectorListingBound::V1,
+                        )
+                        .map_err(|(kind, message)| ConnectorError::new(kind, message))?
+                        .iter()
+                        .any(|table| table.eq_ignore_ascii_case(&name))
+                {
+                    return Err(PreparationFailure(ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::AlreadyExists,
+                        "a table with the requested Iceberg view name already exists",
+                    )));
+                }
+                let exists = super::views::view_exists(
+                    provider.runtime(),
+                    &namespace,
+                    &name,
+                    &request.context,
+                )?;
+                let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+                let publication = match &request.operation {
+                    ConnectorCatalogMutationOperation::CreateView {
+                        columns,
+                        definition,
+                        comment,
+                        properties,
+                        policy,
+                        ..
+                    } => {
+                        if exists {
+                            match policy {
+                                CreateOrReplacePolicy::NoOpIfExists => {
+                                    return Ok(PreparedView::NoOp(seed));
+                                }
+                                CreateOrReplacePolicy::FailIfExists => {
+                                    return Err(PreparationFailure(ConnectorMutationFailure::new(
+                                        ConnectorMutationFailureKind::AlreadyExists,
+                                        "Iceberg view already exists",
+                                    )));
+                                }
+                                CreateOrReplacePolicy::ReplaceIfExists => (),
+                            }
+                        }
+                        let (definition, properties) = super::views::prepare_definition(
+                            columns,
+                            definition,
+                            comment.as_deref(),
+                            &view_properties(properties)?,
+                        )
+                        .map_err(invalid)?;
+                        if exists {
+                            let current = super::views::load_view_metadata_for_request(
+                                provider.runtime(),
+                                &namespace,
+                                &name,
+                                &request.context,
+                            )?;
+                            let ident = TableIdent::new(
+                                NamespaceIdent::new(namespace.clone()),
+                                name.clone(),
+                            );
+                            let replacement =
+                                crate::catalog::view_request::ValidatedViewReplace::validate(
+                                    ident, &current, definition, properties,
+                                )
+                                .map_err(invalid)?;
+                            CatalogPublicationRequest::ReplaceView(replacement)
+                        } else {
+                            let creation = crate::catalog::view_request::ViewCreate::validate(
+                                name.clone(),
+                                definition,
+                                properties,
+                            )
+                            .map_err(invalid)?;
+                            CatalogPublicationRequest::CreateView {
+                                namespace: CatalogNamespaceName::new(namespace.clone()),
+                                creation,
+                            }
+                        }
+                    }
+                    ConnectorCatalogMutationOperation::DropView { policy, .. } => {
+                        if !exists {
+                            return if *policy == DropPolicy::NoOpIfMissing {
+                                Ok(PreparedView::NoOp(seed))
+                            } else {
+                                Err(not_found("Iceberg view does not exist").into())
+                            };
+                        }
+                        CatalogPublicationRequest::DropView(CatalogTableName::new(
+                            namespace.clone(),
+                            name.clone(),
+                        ))
+                    }
+                    _ => unreachable!(),
+                }
+                .freeze(request.operation_id.to_bytes())?;
+                let target = match publication.attribution() {
+                    crate::commit::publication_descriptor::AttributionPlan::ViewOperation {
+                        view_uuid: Some(uuid),
+                        operation_id,
+                    } => IcebergMutationEvidenceTarget::ViewOperation {
+                        namespace,
+                        view: name,
+                        view_uuid: uuid.to_string(),
+                        operation_marker: operation_id.clone(),
+                    },
+                    _ => IcebergMutationEvidenceTarget::View {
+                        namespace,
+                        view: name,
+                        should_exist: create,
+                    },
+                };
+                let evidence = evidence(
+                    provider,
+                    request.operation_id,
+                    request.operation.kind(),
+                    target,
+                )?;
+                Ok(PreparedView::Mutation {
+                    request: publication,
+                    evidence,
+                    receipt: seed,
+                })
+            },
+            |error| error.0.clone(),
+        );
+    match preparation {
+        Err(PreparationFailure(failure)) => Ok(ExternalMutationOutcome::KnownUncommitted {
+            failure,
+            cleanup: ExternalMutationFinalization::Complete,
+        }),
+        Ok(PreparedView::NoOp(receipt)) => Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        }),
+        Ok(PreparedView::Mutation {
+            request: publication,
+            evidence,
+            receipt: seed,
+        }) => execute_catalog_publication(provider, request, publication, evidence, seed),
+    }
+}
+
+fn execute_namespace_publication(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogPublicationRequest;
+    let namespace = match &request.operation {
+        ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
+        | ConnectorCatalogMutationOperation::DropNamespace { namespace, .. } => namespace,
+        _ => {
+            return Err(internal(
+                "Namespace publication requires a namespace mutation",
+            ));
+        }
+    };
+    if let Err(error) = ensure_owner(provider, &namespace.instance_id) {
+        return Ok(known_uncommitted(error));
+    }
+    // Local setup has proven no publication dispatch. Preserve that fact at
+    // the SPI boundary instead of returning an unqualified provider error.
+    let setup = (|| {
+        let frozen = match &request.operation {
+            ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new(
+                        normalize_identifier(&namespace.namespace).map_err(invalid)?,
+                    ),
+                    properties: HashMap::new(),
+                    no_op_if_exists: *policy == CreatePolicy::NoOpIfExists,
+                }
+            }
+            ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
+                CatalogPublicationRequest::DropNamespace {
+                    namespace: CatalogNamespaceName::new(
+                        normalize_identifier(&namespace.namespace).map_err(invalid)?,
+                    ),
+                    no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
+                }
+            }
+            _ => {
+                return Err(internal(
+                    "Namespace publication requires a namespace mutation",
+                ));
+            }
+        }
+        .freeze(request.operation_id.to_bytes())
+        .map_err(|error| invalid(error.to_string()))?;
+        let evidence = mutation_evidence(
+            provider,
+            request.operation_id,
+            &request.operation,
+            &request.context,
+        )?;
+        let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+        Ok::<_, ConnectorError>((frozen, evidence, seed))
+    })();
+    let (frozen, evidence, seed) = match setup {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(known_uncommitted(error)),
+    };
+    execute_catalog_publication(provider, request, frozen, evidence, seed)
+}
+
+fn execute_catalog_publication(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+    frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+    evidence: ExternalMutationEvidence,
+    seed: ConnectorCatalogMutationReceipt,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    execute_catalog_publication_with_receipts(
+        provider,
+        request,
+        frozen,
+        evidence,
+        crate::commit::attempt::observation::PublicationReceipts::same(seed),
+    )
+}
+
+fn execute_catalog_publication_with_receipts(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+    frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+    evidence: ExternalMutationEvidence,
+    receipts: crate::commit::attempt::observation::PublicationReceipts<
+        ConnectorCatalogMutationReceipt,
+    >,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    execute_catalog_publication_recorded(provider, request, frozen, evidence, receipts)
+        .map(|(outcome, _)| outcome)
+}
+
+fn execute_catalog_publication_recorded(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+    frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+    evidence: ExternalMutationEvidence,
+    receipts: crate::commit::attempt::observation::PublicationReceipts<
+        ConnectorCatalogMutationReceipt,
+    >,
+) -> Result<
+    (
+        ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+        Option<crate::commit::attempt::observation::AppliedDropWitness>,
+    ),
+    ConnectorError,
+> {
+    use crate::catalog::catalog_request::CatalogResponseDocument;
+    let drop_scope = frozen.drop_scope();
+    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
+        crate::commit::model::OperationToken::from_mutation(request.operation_id),
+        provider.runtime().resources().catalog_runtime(),
+    );
+    if let Err(error) = journal.prepare_catalog_with_receipts(
+        evidence,
+        receipts,
+        frozen.targets(),
+        frozen.request_bytes().to_vec(),
+        frozen.attribution().clone(),
+        request.context.clone(),
+    ) {
+        return Ok((known_uncommitted(invalid(error.to_string())), None));
+    }
+    let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+    let policy = catalog.evidence_policy();
+    let read_binding = provider.runtime().resources().planning_binding().clone();
+    let publication = journal.clone();
+    let preparation = request.context.clone();
+    let result = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move {
+            publication
+                .publish_once(
+                    preparation,
+                    policy,
+                    move |descriptor, generation, original| async move {
+                        catalog
+                            .prepare_catalog_publication(
+                                frozen,
+                                descriptor,
+                                generation,
+                                original,
+                                CatalogResponseDocument::default(),
+                                read_binding,
+                            )
+                            .await
+                    },
+                )
+                .await
+        });
+    let outcome = match result {
+        Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
+        Ok(Err(error)) => journal
+            .catalog_bridge_failure(format!("Catalog publication invocation failed: {error}")),
+        Err(error) => {
+            journal.catalog_bridge_failure(format!("Catalog publication bridge failed: {error}"))
+        }
+    };
+    let witness = journal.current_entry().and_then(|entry| {
+        drop_scope
+            .as_ref()
+            .and_then(|scope| journal.applied_drop_witness(entry, scope))
+    });
+    Ok((outcome, witness))
 }
 
 fn execute_application_document_update(
@@ -2228,13 +2429,25 @@ fn execute_application_document_update(
     let observation = intent.observation();
     let table = observation.target();
     ensure_owner(provider, &table.instance_id)?;
-    let loaded = match provider.runtime().load_table_for_request(
-        &table.namespace,
-        &table.table,
-        &request.context,
-    ) {
+    let loaded = match provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .observe_preparation(
+            || {
+                provider
+                    .runtime()
+                    .load_table_classified_for_request(
+                        &table.namespace,
+                        &table.table,
+                        &request.context,
+                    )
+                    .map_err(|(kind, message)| ConnectorError::new(kind, message))
+            },
+            failure,
+        ) {
         Ok(loaded) => loaded,
-        Err(error) => return Ok(known_uncommitted(unavailable(error))),
+        Err(error) => return Ok(known_uncommitted(error)),
     };
     if let Err(error) = crate::document_storage::observation::validate_expected_object(
         observation.object_id(),
@@ -2290,12 +2503,13 @@ fn execute_application_document_update(
     };
     let operation_marker =
         crate::document_storage::publication::operation_marker(request.operation_id);
+    let expected_manifest_digest = crate::document_storage::publication::manifest_digest(manifest);
     let target = IcebergMutationEvidenceTarget::ApplicationDocuments {
         namespace: table.namespace.to_string(),
         table: table.table.to_string(),
         table_uuid: loaded.table.metadata().uuid().to_string(),
         operation_marker: operation_marker.clone(),
-        manifest_digest: crate::document_storage::publication::manifest_digest(manifest),
+        manifest_digest: expected_manifest_digest,
         managed_kind: desired_marker.kind().to_string(),
         managed_owner: desired_marker.owner().to_string(),
         managed_incarnation: desired_marker.incarnation().to_string(),
@@ -2320,17 +2534,6 @@ fn execute_application_document_update(
             Ok(snapshot_id) => snapshot_id,
             Err(error) => return Ok(known_uncommitted(invalid(error))),
         };
-    let transaction_request = TransactionRequest {
-        identity: TransactionIdentity::new(
-            "application-document-update",
-            request.operation_id.to_bytes(),
-        ),
-        target: target_name,
-        target_ref: Arc::from("main"),
-        base_snapshot_id,
-        expected_table_uuid: Some(Arc::from(expected_uuid.to_string())),
-        marker: None,
-    };
     let commit = match application_document_update_commit(
         table,
         expected_uuid,
@@ -2342,82 +2545,110 @@ fn execute_application_document_update(
         Ok(commit) => commit,
         Err(error) => return Ok(known_uncommitted(error)),
     };
-    if let Err(error) = validate_context(&request.context) {
-        return Ok(known_uncommitted(error));
+    let commit = match commit.with_base_facts(loaded.table.metadata()) {
+        Ok(commit) => commit,
+        Err(error) => return Ok(known_uncommitted(invalid(error.to_string()))),
+    };
+    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
+        crate::commit::model::OperationToken::from_mutation(request.operation_id),
+        provider.runtime().resources().catalog_runtime(),
+    );
+    let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+    if let Err(error) = journal.record(external_evidence, seed, &commit) {
+        return Ok(known_uncommitted(invalid(error.to_string())));
     }
     let catalog = Arc::clone(provider.runtime().novarocks_catalog());
-    let outcome = provider
+    let policy = catalog.evidence_policy();
+    let publication = journal.clone();
+    let preparation = request.context.clone();
+    let dispatched = provider
         .runtime()
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            let mut frontier = match catalog.new_transaction(transaction_request).await {
-                CatalogTransactionStart::Ready(frontier) => frontier,
-                CatalogTransactionStart::KnownUncommitted { failure } => {
-                    return Ok(CatalogOutcome::KnownUncommitted { failure });
-                }
-                CatalogTransactionStart::CommitUnknown { failure, evidence } => {
-                    return Ok(CatalogOutcome::CommitUnknown { failure, evidence });
-                }
-                CatalogTransactionStart::Unsupported(error) => {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::Unsupported,
-                        error.to_string(),
-                    ));
-                }
-            };
-            frontier.stage(commit)?;
-            Ok(frontier.commit().await)
+            publication
+                .publish_once(
+                    preparation,
+                    policy,
+                    move |descriptor, generation, preparation| async move {
+                        catalog
+                            .prepare_frozen_publication(
+                                commit,
+                                CatalogOperation::UpdateDocuments,
+                                None,
+                                descriptor,
+                                generation,
+                                preparation,
+                            )
+                            .await
+                    },
+                )
+                .await
         });
-    let catalog_outcome = match outcome {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(error)) => return Ok(known_uncommitted(error)),
+    let outcome = match dispatched {
+        Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
+        Ok(Err(error)) => journal
+            .catalog_bridge_failure(format!("Document publication invocation failed: {error}")),
         Err(error) => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&unavailable(error)),
-                evidence: external_evidence,
-            });
+            journal.catalog_bridge_failure(format!("Document publication bridge failed: {error}"))
         }
     };
-    match catalog_outcome {
-        CatalogOutcome::KnownCommitted {
-            effect,
-            receipt: proof,
-            ..
-        } => {
+    let ExternalMutationOutcome::KnownCommitted {
+        effect,
+        receipt: seed,
+        finalization: owner_finalization,
+    } = outcome
+    else {
+        return Ok(outcome);
+    };
+    provider
+        .runtime()
+        .control_state()
+        .invalidate_table_cache(&table.namespace, &table.table);
+    let refreshed = journal.finalization_context(
+        journal.current_entry().expect("committed document update has a publication entry"), policy,
+    ).and_then(|grant| grant.for_io(&request.context))
+        .and_then(|context| {
+            let _finalizing = journal.current_entry().and_then(|entry| journal.finalization_activity(entry));
             provider
                 .runtime()
-                .control_state()
-                .invalidate_table_cache(&table.namespace, &table.table);
-            let refreshed = provider.runtime().load_table_for_request(
-                &table.namespace,
-                &table.table,
-                &request
-                    .context
-                    .clone()
-                    .without_vended_credential_lease_sink(),
-            );
-            let (committed_version, finalization) = match refreshed {
-                Ok(refreshed) => {
-                    match crate::document_storage::observation::committed_version(&refreshed.table)
-                    {
-                        Ok(version) => (Some(version), ExternalMutationFinalization::Complete),
-                        Err(error) => (
-                            None,
-                            ExternalMutationFinalization::Failed(failure(&internal(format!(
-                                "project committed Iceberg document version: {error}"
-                            )))),
-                        ),
-                    }
-                }
+                .load_table_for_request(&table.namespace, &table.table, &context)
+                .map_err(|error| {
+                    internal(format!("read committed Iceberg document update: {error}"))
+                })
+        })
+        .and_then(|refreshed| {
+            if refreshed.table.metadata().uuid() != expected_uuid
+                || !application_document_update_matches(refreshed.table.metadata(), &operation_marker,
+                    expected_manifest_digest, desired_marker.kind(), desired_marker.owner(), desired_marker.incarnation()) {
+                return Err(corrupt("Post-publication document metadata no longer belongs to this operation; retain its Applied proof without a refreshed version"));
+            }
+            Ok(refreshed)
+        });
+    let (committed_version, post_finalization) = match refreshed {
+        Ok(refreshed) => {
+            match crate::document_storage::observation::committed_version(&refreshed.table) {
+                Ok(version) => (Some(version), ExternalMutationFinalization::Complete),
                 Err(error) => (
                     None,
                     ExternalMutationFinalization::Failed(failure(&internal(format!(
-                        "read committed Iceberg document update: {error}"
+                        "project committed Iceberg document version: {error}"
                     )))),
                 ),
-            };
-            let (receipt, finalization) = application_document_committed_receipt(
+            }
+        }
+        Err(error) => (None, ExternalMutationFinalization::Failed(failure(&error))),
+    };
+    let entry = journal
+        .current_entry()
+        .expect("committed document publication has an entry");
+    let proof = match journal.commit_outcome(entry) {
+        CatalogOutcome::KnownCommitted { receipt, .. } => receipt,
+        _ => unreachable!("a committed journal proof cannot be downgraded"),
+    };
+    let (receipt, post_finalization) =
+        if committed_version.is_some() || proof.metadata_location.is_some() {
+            application_document_committed_receipt(
                 provider,
                 request.operation_id,
                 request.operation.kind(),
@@ -2426,30 +2657,39 @@ fn execute_application_document_update(
                     .as_deref()
                     .map(|value| Bytes::copy_from_slice(value.as_bytes())),
                 committed_version,
-                finalization,
-            );
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect,
-                receipt,
-                finalization,
-            })
-        }
-        CatalogOutcome::KnownUncommitted { failure } => {
-            Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure,
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            })
-        }
-        CatalogOutcome::CommitUnknown { failure, .. } => {
-            Ok(ExternalMutationOutcome::CommitUnknown {
-                failure,
-                evidence: external_evidence,
-            })
-        }
-        CatalogOutcome::Unsupported(error) => Ok(known_uncommitted(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            error.to_string(),
-        ))),
+                post_finalization,
+            )
+        } else {
+            (seed, post_finalization)
+        };
+    journal.record_entry_finalization(entry, post_finalization.clone());
+    let finalization = merge_publication_finalization(owner_finalization, post_finalization);
+    Ok(ExternalMutationOutcome::KnownCommitted {
+        effect,
+        receipt,
+        finalization,
+    })
+}
+
+fn merge_publication_finalization(
+    first: ExternalMutationFinalization,
+    second: ExternalMutationFinalization,
+) -> ExternalMutationFinalization {
+    match (first, second) {
+        (
+            ExternalMutationFinalization::Failed(first),
+            ExternalMutationFinalization::Failed(second),
+        ) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            first.kind(),
+            format!(
+                "{}; additional finalization failure: {}",
+                first.message(),
+                second.message()
+            ),
+        )),
+        (failed @ ExternalMutationFinalization::Failed(_), _)
+        | (_, failed @ ExternalMutationFinalization::Failed(_)) => failed,
+        _ => ExternalMutationFinalization::Complete,
     }
 }
 
@@ -2488,114 +2728,7 @@ fn application_document_update_commit(
     .map_err(|e| invalid(e.to_string()))
 }
 
-fn execute_guarded_properties(
-    provider: &IcebergMetadata,
-    request: &ConnectorCatalogMutationRequest,
-    table: &ConnectorTableIdentity,
-    changes: &[ConnectorPropertyChange],
-    authority: ConnectorPropertyAuthority,
-    expected: &ConnectorCommittedPartitioning,
-) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    if changes.is_empty() {
-        return Ok(known_uncommitted(invalid(
-            "Iceberg property mutation is empty",
-        )));
-    }
-    let loaded = match provider.runtime().load_table_for_request(
-        &table.namespace,
-        &table.table,
-        &request.context,
-    ) {
-        Ok(loaded) => loaded,
-        Err(error) => return Ok(known_uncommitted(unavailable(error))),
-    };
-    let metadata = loaded.table.metadata();
-    let current =
-        committed_partitioning_from_metadata(metadata, metadata.default_partition_spec_id())?;
-    if &current != expected {
-        return Ok(known_conflict(
-            "Iceberg default partitioning changed before guarded property mutation",
-        ));
-    }
-    let updates = match property_updates(metadata, changes, authority) {
-        Ok(updates) => updates,
-        Err(error) => return Ok(known_uncommitted(error)),
-    };
-    if updates.is_empty() {
-        return Ok(ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::NoOp,
-            receipt: receipt_with_version(
-                provider,
-                request.operation_id,
-                request.operation.kind(),
-                loaded.table.metadata_location(),
-            )?,
-            finalization: ExternalMutationFinalization::Complete,
-        });
-    }
-    let evidence = mutation_evidence(
-        provider,
-        request.operation_id,
-        &request.operation,
-        &request.context,
-    )?;
-    validate_context(&request.context)?;
-    let commit = crate::commit::existing_commit::existing_table_commit(
-        table_ident(table).map_err(invalid)?,
-        metadata,
-        vec![TableRequirement::DefaultSpecIdMatch {
-            default_spec_id: expected.spec_id(),
-        }],
-        updates,
-    )
-    .map_err(|error| internal(error.to_string()))?;
-    let catalog = provider.runtime().novarocks_catalog().vendored_client();
-    let committed = provider
-        .runtime()
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.update_table(commit).await });
-    let committed = match committed {
-        Ok(Ok(table)) => table,
-        Ok(Err(error)) if guarded_property_commit_conflict(error.kind()) => {
-            return Ok(known_conflict(format!(
-                "Iceberg guarded property mutation lost its partitioning CAS: {error}"
-            )));
-        }
-        Ok(Err(error)) => {
-            let error = map_iceberg_message("alter Iceberg table properties", error);
-            if commit_may_be_unknown(error.kind()) {
-                return Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(&error),
-                    evidence,
-                });
-            }
-            return Ok(known_uncommitted(error));
-        }
-        Err(error) => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&unavailable(error)),
-                evidence,
-            });
-        }
-    };
-    provider
-        .runtime()
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationOutcome::KnownCommitted {
-        effect: ExternalMutationEffect::Applied,
-        receipt: receipt_with_version(
-            provider,
-            request.operation_id,
-            request.operation.kind(),
-            committed.metadata_location(),
-        )?,
-        finalization: ExternalMutationFinalization::Complete,
-    })
-}
-
+#[cfg(test)]
 fn guarded_property_commit_conflict(kind: crate::iceberg::ErrorKind) -> bool {
     matches!(
         kind,
@@ -2616,134 +2749,121 @@ fn execute_guarded_publication(
     expected_table_uuid: &str,
     guard: &novarocks_spi::connector::ConnectorRefreshPublicationGuard,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    let Some(source_snapshot_id) = committed_version.snapshot_id() else {
-        return Ok(known_uncommitted(invalid(
-            "guarded Iceberg publication requires a committed snapshot ID",
-        )));
-    };
-    if source_branch.eq_ignore_ascii_case("main") || !target_branch.eq_ignore_ascii_case("main") {
-        return Ok(known_uncommitted(invalid(
-            "guarded Iceberg publication must publish a staging branch to main",
-        )));
-    }
-    ensure_mv_publication_staging_ref(source_branch, guard.publication_id())?;
-    let loaded = provider
-        .runtime()
-        .load_table_for_request(&table.namespace, &table.table, &request.context)
-        .map_err(unavailable)?;
-    let marker = crate::commit::MvPublicationSnapshotMarker {
-        publication_id: guard.publication_id(),
-    };
-    let metadata = loaded.table.metadata();
-    let expected_table_uuid = uuid::Uuid::parse_str(expected_table_uuid).map_err(|error| {
-        invalid(format!(
-            "guarded Iceberg publication has an invalid expected target table UUID: {error}"
-        ))
-    })?;
-    if metadata.uuid() != expected_table_uuid {
-        return Ok(known_uncommitted(invalid(
-            "guarded Iceberg publication target table incarnation changed",
-        )));
-    }
-    if metadata.current_snapshot_id() != expected_target_snapshot_id {
-        return Ok(known_uncommitted(invalid(
-            "guarded Iceberg publication target snapshot changed",
-        )));
-    }
-    let Some(source_ref) = metadata.refs().get(source_branch) else {
-        return Ok(known_uncommitted(not_found(
-            "guarded Iceberg publication staging branch does not exist",
-        )));
-    };
-    if !source_ref.is_branch() || source_ref.snapshot_id != source_snapshot_id {
-        return Ok(known_uncommitted(invalid(
-            "guarded Iceberg publication staging branch does not match the committed version",
-        )));
-    }
-    let Some(source_snapshot) = metadata.snapshot_by_id(source_snapshot_id) else {
-        return Ok(known_uncommitted(not_found(
-            "guarded Iceberg publication staging snapshot does not exist",
-        )));
-    };
-    if !crate::commit::snapshot_matches_publication_marker(source_snapshot, &marker) {
-        return Ok(known_uncommitted(invalid(
-            "guarded Iceberg publication staging snapshot marker does not match",
-        )));
-    }
-    let evidence = evidence(
-        provider,
-        request.operation_id,
-        request.operation.kind(),
-        IcebergMutationEvidenceTarget::GuardedFastForward {
-            namespace: table.namespace.to_string(),
-            table: table.table.to_string(),
-            table_uuid: loaded.table.metadata().uuid().to_string(),
-            before_metadata_location: loaded.table.metadata_location().map(ToString::to_string),
-            source_branch: source_branch.to_string(),
-            target_branch: target_branch.to_string(),
-            source_snapshot_id,
-            expected_target_snapshot_id,
-            guard_digest: guard.digest(),
-        },
-    )?;
-    let plan = crate::commit::MvRefreshPublishPlan {
-        namespace: table.namespace.to_string(),
-        table: table.table.to_string(),
-        target_table_uuid: expected_table_uuid,
-        staging_branch: source_branch.to_string(),
-        expected_main_snapshot_id: expected_target_snapshot_id,
-        staging_snapshot_id: source_snapshot_id,
-        marker,
-    };
-    validate_context(&request.context)?;
-    let catalog = provider.runtime().novarocks_catalog().vendored_client();
-    let scoped_table = loaded.table.clone();
-    let result = provider
+    use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
+    let prepared = provider
         .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move {
-            crate::commit::publish_staging_branch_to_main(catalog.as_ref(), &scoped_table, &plan)
-                .await
-        });
-    match result {
-        Ok(Ok(outcome)) => {
-            provider
-                .runtime()
-                .control_state()
-                .invalidate_table_cache(&table.namespace, &table.table);
-            let current = provider
-                .runtime()
-                .load_table_for_request(&table.namespace, &table.table, &request.context)
-                .map_err(unavailable)?;
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: guarded_publication_receipt(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    current.table.metadata_location(),
-                    outcome.published_snapshot_id,
-                )?,
-                finalization: ExternalMutationFinalization::Complete,
-            })
+        .observe_preparation(
+            || {
+                let prepare = || -> crate::catalog::publication_dispatch::PreparationResult<_> {
+                    ensure_owner(provider, &table.instance_id)?;
+                    let source_snapshot_id = committed_version.snapshot_id().ok_or_else(|| {
+                        invalid("Guarded Iceberg publication requires a committed snapshot ID")
+                    })?;
+                    if source_branch.eq_ignore_ascii_case("main")
+                        || !target_branch.eq_ignore_ascii_case("main")
+                    {
+                        return Err(invalid(
+                            "Guarded Iceberg publication must publish a staging branch to main",
+                        )
+                        .into());
+                    }
+                    ensure_mv_publication_staging_ref(source_branch, guard.publication_id())?;
+                    let (coordination, loaded) = provider.runtime().coordinate_table_for_request(
+                        &table.namespace,
+                        &table.table,
+                        &request.context,
+                    )?;
+                    let expected_uuid =
+                        uuid::Uuid::parse_str(expected_table_uuid).map_err(|error| {
+                            invalid(format!("Invalid guarded publication table UUID: {error}"))
+                        })?;
+                    let plan = crate::commit::MvRefreshPublishPlan {
+                        namespace: table.namespace.to_string(),
+                        table: table.table.to_string(),
+                        target_table_uuid: expected_uuid,
+                        staging_branch: source_branch.to_owned(),
+                        expected_main_snapshot_id: expected_target_snapshot_id,
+                        staging_snapshot_id: source_snapshot_id,
+                        marker: crate::commit::MvPublicationSnapshotMarker {
+                            publication_id: guard.publication_id(),
+                        },
+                    };
+                    let change = plan
+                        .prepare(&loaded.table)
+                        .map_err(crate::catalog::publication_dispatch::PreparationFailure)?;
+                    let frozen = crate::commit::staging::freeze_existing_change(
+                        loaded.table.identifier().clone(),
+                        target_branch,
+                        loaded.table.metadata(),
+                        loaded.table.metadata_location().ok_or_else(|| {
+                            invalid(
+                                "Guarded publication requires an authoritative metadata location",
+                            )
+                        })?,
+                        RequestShape::RefRetention,
+                        AttemptToken::new(OperationToken::from_mutation(request.operation_id), 0),
+                        change,
+                        &request.context,
+                    )
+                    .map_err(|error| invalid(error.to_string()))?;
+                    let external_evidence = evidence(
+                        provider,
+                        request.operation_id,
+                        request.operation.kind(),
+                        IcebergMutationEvidenceTarget::GuardedFastForward {
+                            namespace: table.namespace.to_string(),
+                            table: table.table.to_string(),
+                            table_uuid: expected_uuid.to_string(),
+                            before_metadata_location: loaded
+                                .table
+                                .metadata_location()
+                                .map(str::to_owned),
+                            source_branch: source_branch.to_owned(),
+                            target_branch: target_branch.to_owned(),
+                            source_snapshot_id,
+                            expected_target_snapshot_id,
+                            guard_digest: guard.digest(),
+                        },
+                    )?;
+                    let seed = guarded_publication_receipt(
+                        provider,
+                        request.operation_id,
+                        request.operation.kind(),
+                        None,
+                        source_snapshot_id,
+                    )?;
+                    Ok((coordination, frozen, external_evidence, seed))
+                };
+                prepare()
+            },
+            |error: &crate::catalog::publication_dispatch::PreparationFailure| error.0.clone(),
+        );
+    let (_coordination, frozen, external_evidence, seed) = match prepared {
+        Ok(prepared) => prepared,
+        Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) => {
+            return Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
         }
-        Ok(Err(error)) => {
-            let error = unavailable(error);
-            Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&error),
-                evidence,
-            })
-        }
-        Err(error) => {
-            let error = unavailable(error);
-            Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&error),
-                evidence,
-            })
-        }
+    };
+    let outcome = publish_existing_frozen(
+        provider,
+        request,
+        frozen,
+        external_evidence,
+        seed,
+        CatalogOperation::FastForwardBranch,
+    )?;
+    if matches!(&outcome, ExternalMutationOutcome::KnownCommitted { .. }) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
     }
+    Ok(outcome)
 }
 
 fn ensure_mv_publication_staging_ref(
@@ -2902,14 +3022,63 @@ fn hadoop_create_evidence(
     )
 }
 
+/// Observe an ordinary ALTER's exact table without producing attribution facts.
+/// Neither a matching schema nor a failed read decides the original publication.
+fn observe_only_alter_table_version(
+    provider: &IcebergMetadata,
+    target: &IcebergMutationEvidenceTarget,
+    descriptor: &crate::commit::publication_descriptor::PublicationDescriptor,
+    evidence: &ExternalMutationEvidence,
+    context: &ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    if !matches!(
+        evidence.operation_kind(),
+        "alter-schema" | "alter-partition-spec" | "alter-properties"
+    ) {
+        return Ok(());
+    }
+    let IcebergMutationEvidenceTarget::TableVersion {
+        namespace,
+        table,
+        table_uuid,
+        ..
+    } = target
+    else {
+        return Err(invalid(
+            "Ordinary ALTER observation requires its original table target",
+        ));
+    };
+    let ident = TableIdent::new(NamespaceIdent::new(namespace.clone()), table.clone());
+    let uuid = uuid::Uuid::parse_str(table_uuid)
+        .map_err(|_| invalid("Ordinary ALTER observation has an invalid frozen table UUID"))?;
+    if descriptor.targets != [ident.to_string()]
+        || descriptor.table_uuid != Some(uuid)
+        || descriptor.operation_id != evidence.operation_id().to_bytes()
+    {
+        return Err(invalid(
+            "Ordinary ALTER observation differs from its frozen target or UUID",
+        ));
+    }
+    let fresh = context.clone().after_external_effect();
+    // Success, absence, a foreign incarnation and read errors are observations
+    // only. Do not materialize a proof, install caches or perform finalization.
+    let _ = provider
+        .runtime()
+        .observe_table_classified_for_request(namespace, table, &fresh);
+    Ok(())
+}
+
 fn reconcile_evidence(
     provider: &IcebergMetadata,
     target: IcebergMutationEvidenceTarget,
     evidence: ExternalMutationEvidence,
     context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    let uncommitted = |message: &str| Ok(known_uncommitted(invalid(message)));
-    let ambiguous = |message: &str| {
+    use crate::commit::attempt::observation::PublicationJournal;
+    use crate::commit::publication_descriptor::{
+        AttributionPlan, PositiveAttributionObservation as Observation,
+    };
+    let ambiguous = |message: String| {
         Ok(ExternalMutationOutcome::CommitUnknown {
             failure: ConnectorMutationFailure::new(
                 ConnectorMutationFailureKind::Unavailable,
@@ -2918,234 +3087,255 @@ fn reconcile_evidence(
             evidence: evidence.clone(),
         })
     };
-    match target {
-        IcebergMutationEvidenceTarget::Namespace {
-            namespace,
-            should_exist,
-        } => {
-            let exists = provider
-                .runtime()
-                .namespace_exists_for_request(&namespace, context)
-                .map_err(unavailable)?;
-            if exists == should_exist {
-                ambiguous("Iceberg namespace postcondition matches but cannot be attributed")
-            } else {
-                uncommitted("Iceberg namespace mutation postcondition is absent")
-            }
+    let Some((journal, entry)) =
+        PublicationJournal::<ConnectorCatalogMutationReceipt>::from_evidence(&evidence)?
+    else {
+        if let Err(error) = validate_context(context) {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(&error),
+                evidence: evidence.clone(),
+            });
         }
-        IcebergMutationEvidenceTarget::Table {
-            namespace,
-            table,
-            should_exist,
-            before_uuid,
-        } => {
-            let identity = ConnectorTableIdentity {
-                instance_id: provider.descriptor().instance_id.clone(),
-                namespace: namespace.into(),
-                table: table.into(),
-            };
-            let current = load_optional_table(provider.runtime(), &identity, context)?;
-            match (should_exist, before_uuid, current) {
-                (true, None, Some(_)) | (false, _, None) => {
-                    ambiguous("Iceberg table postcondition matches but cannot be attributed")
-                }
-                (true, Some(before), Some(current))
-                    if current.table.metadata().uuid().to_string() == before =>
-                {
-                    uncommitted("Iceberg table existed before create and is unchanged")
-                }
-                (false, Some(before), Some(current))
-                    if current.table.metadata().uuid().to_string() == before =>
-                {
-                    uncommitted("Iceberg table still exists after drop attempt")
-                }
-                (true, _, None) | (false, None, Some(_)) => {
-                    uncommitted("Iceberg table mutation postcondition is absent")
-                }
-                _ => ambiguous("Iceberg table incarnation changed during reconciliation"),
-            }
-        }
-        IcebergMutationEvidenceTarget::HadoopCreate {
-            namespace,
-            table,
-            expected_uuid,
-            metadata_location,
-            metadata_digest,
-            operation_id,
-        } => {
-            if operation_id != hex_encode(&evidence.operation_id().to_bytes()) {
-                return Err(invalid(
-                    "Hadoop create evidence operation identity does not match its envelope",
-                ));
-            }
-            // Read-only adjudication through the catalog owner. Absence stays
-            // ambiguous rather than becoming proof, and nothing here writes.
-            let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
-            let adjudication = crate::catalog::ConditionalCreateEvidence {
-                namespace: std::sync::Arc::from(namespace.as_str()),
-                table: std::sync::Arc::from(table.as_str()),
-                expected_table_uuid: std::sync::Arc::from(expected_uuid.as_str()),
-                metadata_location: std::sync::Arc::from(metadata_location.as_str()),
-                metadata_digest: std::sync::Arc::from(metadata_digest.as_str()),
-            };
-            let result = provider
-                .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move { owner.adjudicate_conditional_create(adjudication).await });
-            match result {
-                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Committed {
-                    finalization_failure,
-                })) => Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt: hadoop_create_receipt(
-                        provider,
-                        evidence.operation_id(),
-                        evidence.operation_kind(),
-                        Some(&metadata_location),
-                        &expected_uuid,
-                        &metadata_digest,
-                    )?,
-                    finalization: hadoop_finalization(finalization_failure.map(|f| f.to_string())),
-                }),
-                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Absent)) => {
-                    uncommitted("Hadoop create fence is absent")
-                }
-                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Foreign)) => {
-                    ambiguous("Hadoop create fence belongs to another table incarnation")
-                }
-                Ok(Err(error)) => {
-                    ambiguous(&format!("read authoritative Hadoop create fence: {error}"))
-                }
-                Err(message) => ambiguous(&format!(
-                    "read authoritative Hadoop create fence: {message}"
-                )),
-            }
-        }
-        IcebergMutationEvidenceTarget::View {
-            namespace,
-            view,
-            should_exist,
-        } => {
-            let exists = super::views::view_exists(provider.runtime(), &namespace, &view)?;
-            if exists == should_exist {
-                ambiguous("Iceberg view postcondition matches but cannot be attributed")
-            } else {
-                uncommitted("Iceberg view mutation postcondition is absent")
-            }
-        }
-        IcebergMutationEvidenceTarget::TableVersion {
-            namespace,
-            table,
-            table_uuid,
-            before_metadata_location,
-        } => {
-            let identity = ConnectorTableIdentity {
-                instance_id: provider.descriptor().instance_id.clone(),
-                namespace: namespace.into(),
-                table: table.into(),
-            };
-            let Some(current) = load_optional_table(provider.runtime(), &identity, context)? else {
-                return ambiguous("Iceberg table disappeared during mutation reconciliation");
-            };
-            if current.table.metadata().uuid().to_string() != table_uuid {
-                return ambiguous("Iceberg table incarnation changed during reconciliation");
-            }
-            if current.table.metadata_location().map(ToString::to_string)
-                == before_metadata_location
-            {
-                uncommitted("Iceberg table metadata did not advance")
-            } else {
-                ambiguous("Iceberg table metadata advanced but commit attribution is ambiguous")
-            }
-        }
-        IcebergMutationEvidenceTarget::ApplicationDocuments {
-            namespace,
-            table,
-            table_uuid,
-            operation_marker,
-            manifest_digest,
-            managed_kind,
-            managed_owner,
-            managed_incarnation,
-        } => {
-            let identity = ConnectorTableIdentity {
-                instance_id: provider.descriptor().instance_id.clone(),
-                namespace: namespace.into(),
-                table: table.into(),
-            };
-            let Some(current) = load_optional_table(provider.runtime(), &identity, context)? else {
-                return ambiguous("Iceberg document target disappeared during reconciliation");
-            };
-            let metadata = current.table.metadata();
-            if metadata.uuid().to_string() != table_uuid {
-                return ambiguous(
-                    "Iceberg document target incarnation changed during reconciliation",
-                );
-            }
-            if application_document_update_matches(
-                metadata,
-                &operation_marker,
-                manifest_digest,
-                &managed_kind,
-                &managed_owner,
-                &managed_incarnation,
-            ) {
-                let (committed_version, finalization) =
-                    match crate::document_storage::observation::committed_version(&current.table) {
-                        Ok(version) => (Some(version), ExternalMutationFinalization::Complete),
-                        Err(error) => (
-                            None,
-                            ExternalMutationFinalization::Failed(failure(&internal(format!(
-                                "project reconciled Iceberg document version: {error}"
-                            )))),
-                        ),
-                    };
-                let (receipt, finalization) = application_document_committed_receipt(
-                    provider,
-                    evidence.operation_id(),
-                    evidence.operation_kind(),
-                    current
-                        .table
-                        .metadata_location()
-                        .map(|location| Bytes::copy_from_slice(location.as_bytes())),
-                    committed_version,
-                    finalization,
-                );
-                Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt,
-                    finalization,
-                })
-            } else {
-                ambiguous(
-                    "Iceberg document update exact postcondition is not attributable to this operation",
-                )
-            }
-        }
-        IcebergMutationEvidenceTarget::MvMetadataOnlyStage { .. } => Err(unsupported(
-            "metadata-only MV publication is crash-only and cannot be reconciled after CommitUnknown",
-        )),
-        IcebergMutationEvidenceTarget::Ref {
-            namespace,
-            table,
-            table_uuid,
-            ref_name,
-            expected_snapshot_id,
-        } => reconcile_ref(
-            provider,
-            &evidence,
-            &namespace,
-            &table,
-            &table_uuid,
-            &ref_name,
-            expected_snapshot_id,
-            context,
-        ),
-        IcebergMutationEvidenceTarget::GuardedFastForward { .. } => Err(unsupported(
-            "MV staging publication is crash-only and cannot be reconciled after CommitUnknown",
-        )),
+        return ambiguous(
+            "The original in-process publication journal is unavailable; retain Unknown".into(),
+        );
+    };
+    let original = journal.catalog_entry_outcome(entry);
+    if !matches!(&original, ExternalMutationOutcome::CommitUnknown { .. })
+        || validate_context(context).is_err()
+    {
+        return Ok(original);
     }
+    let descriptor = journal
+        .entry_descriptor(entry)
+        .ok_or_else(|| invalid("Reconciliation has no original publication entry"))?;
+    if matches!(&descriptor.attribution, AttributionPlan::ObserveOnly) {
+        observe_only_alter_table_version(provider, &target, &descriptor, &evidence, context)?;
+        return Ok(journal.catalog_entry_outcome(entry));
+    }
+    let fresh = context.clone().after_external_effect();
+    let mut observed_document = None;
+    let mut observed_finalization_failure = None;
+    let mut probe = || -> Result<Option<Observation>, ConnectorError> {
+        match (&target, &descriptor.attribution) {
+            (
+                IcebergMutationEvidenceTarget::HadoopCreate {
+                    namespace,
+                    table,
+                    expected_uuid,
+                    metadata_location,
+                    metadata_digest,
+                    operation_id,
+                },
+                AttributionPlan::ExactMetadata { .. },
+            ) => {
+                if operation_id != &hex_encode(&evidence.operation_id().to_bytes()) {
+                    return Err(invalid(
+                        "Hadoop create operation identity does not match its evidence",
+                    ));
+                }
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let adjudication = crate::catalog::ConditionalCreateEvidence {
+                    namespace: Arc::from(namespace.as_str()),
+                    table: Arc::from(table.as_str()),
+                    expected_table_uuid: Arc::from(expected_uuid.as_str()),
+                    metadata_location: Arc::from(metadata_location.as_str()),
+                    metadata_digest: Arc::from(metadata_digest.as_str()),
+                };
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(context.clone());
+                // Conditional-create adjudication is purely observational, including hints.
+                let result = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move {
+                        owner
+                            .adjudicate_conditional_create_for_read(adjudication, binding)
+                            .await
+                    })
+                    .map_err(unavailable)?
+                    .map_err(|error| unavailable(error.to_string()))?;
+                match result {
+                    crate::catalog::ConditionalCreateVerdict::Committed {
+                        finalization_failure,
+                    } => {
+                        observed_finalization_failure = finalization_failure;
+                        Ok(Some(Observation::ExactMetadata {
+                            table_uuid: uuid::Uuid::parse_str(expected_uuid)
+                                .map_err(|error| invalid(error.to_string()))?,
+                            location: metadata_location.clone(),
+                            digest: metadata_digest.clone(),
+                        }))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            (
+                IcebergMutationEvidenceTarget::ApplicationDocuments {
+                    namespace,
+                    table,
+                    table_uuid,
+                    operation_marker,
+                    manifest_digest,
+                    managed_kind,
+                    managed_owner,
+                    managed_incarnation,
+                },
+                AttributionPlan::Property { key, .. },
+            ) => {
+                let current = provider
+                    .runtime()
+                    .observe_table_classified_for_request(namespace, table, &fresh)
+                    .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+                if current.table.metadata().uuid().to_string() != *table_uuid
+                    || !application_document_update_matches(
+                        current.table.metadata(),
+                        operation_marker,
+                        *manifest_digest,
+                        managed_kind,
+                        managed_owner,
+                        managed_incarnation,
+                    )
+                {
+                    return Ok(None);
+                }
+                let Some(value) = current.table.metadata().properties().get(key).cloned() else {
+                    return Ok(None);
+                };
+                let observation = Observation::PropertyMarker {
+                    table_uuid: current.table.metadata().uuid(),
+                    key: key.clone(),
+                    value,
+                };
+                observed_document = Some(current.table);
+                Ok(Some(observation))
+            }
+            (
+                IcebergMutationEvidenceTarget::ViewOperation {
+                    namespace,
+                    view,
+                    view_uuid,
+                    operation_marker,
+                },
+                AttributionPlan::ViewOperation { .. },
+            ) => {
+                let current = super::views::load_view_metadata_for_request(
+                    provider.runtime(),
+                    namespace,
+                    view,
+                    &fresh,
+                )?;
+                let current =
+                    serde_json::to_value(current).map_err(|error| internal(error.to_string()))?;
+                if current.get("view-uuid").and_then(serde_json::Value::as_str)
+                    != Some(view_uuid.as_str())
+                {
+                    return Ok(None);
+                }
+                let matched = current
+                    .get("versions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|versions| {
+                        versions.iter().any(|version| {
+                            version
+                                .get("summary")
+                                .and_then(|summary| summary.get("novarocks.operation-id"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some(operation_marker.as_str())
+                        })
+                    });
+                if !matched {
+                    return Ok(None);
+                }
+                Ok(Some(Observation::ViewOperation {
+                    view_uuid: Some(
+                        uuid::Uuid::parse_str(view_uuid)
+                            .map_err(|error| invalid(error.to_string()))?,
+                    ),
+                    operation_id: operation_marker.clone(),
+                }))
+            }
+            _ => Ok(None),
+        }
+    };
+    let observation = match probe() {
+        Ok(Some(observation)) => observation,
+        Ok(None) => {
+            return ambiguous("The exact frozen positive proof is not yet observable".into());
+        }
+        Err(error) => {
+            return ambiguous(format!(
+                "Read-only positive reconciliation remains unresolved: {error}"
+            ));
+        }
+    };
+    let attribution_finalization = match observed_finalization_failure {
+        Some(message) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            message,
+        )),
+        None => provider
+            .runtime()
+            .novarocks_catalog()
+            .positive_attribution_finalization(),
+    };
+    if let Err(error) = journal.append_positive_proof_with_finalization(
+        descriptor.key,
+        observation,
+        attribution_finalization,
+    ) {
+        if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
+            journal.catalog_entry_outcome(entry)
+        {
+            return Ok(committed);
+        }
+        return ambiguous(format!(
+            "Positive observation does not prove this publication: {error}"
+        ));
+    }
+    let outcome = journal.catalog_entry_outcome(entry);
+    if let Some(table) = observed_document {
+        let ExternalMutationOutcome::KnownCommitted {
+            effect,
+            finalization,
+            ..
+        } = outcome
+        else {
+            return Ok(outcome);
+        };
+        let (version, projection) =
+            match crate::document_storage::observation::committed_version(&table) {
+                Ok(version) => (Some(version), finalization),
+                Err(error) => (
+                    None,
+                    merge_publication_finalization(
+                        finalization,
+                        ExternalMutationFinalization::Failed(failure(&error)),
+                    ),
+                ),
+            };
+        let (receipt, finalization) = application_document_committed_receipt(
+            provider,
+            evidence.operation_id(),
+            evidence.operation_kind(),
+            table
+                .metadata_location()
+                .map(|location| Bytes::copy_from_slice(location.as_bytes())),
+            version,
+            projection,
+        );
+        journal.record_entry_finalization(entry, finalization.clone());
+        return Ok(ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        });
+    }
+    Ok(outcome)
 }
 
 fn application_document_update_matches(
@@ -3188,59 +3378,6 @@ fn metadata_only_base_uuid(
         ));
     }
     Ok(value.to_string())
-}
-
-fn reconcile_ref(
-    provider: &IcebergMetadata,
-    evidence: &ExternalMutationEvidence,
-    namespace: &str,
-    table: &str,
-    table_uuid: &str,
-    ref_name: &str,
-    expected_snapshot_id: Option<i64>,
-    context: &ConnectorRequestContext,
-) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    let identity = ConnectorTableIdentity {
-        instance_id: provider.descriptor().instance_id.clone(),
-        namespace: namespace.into(),
-        table: table.into(),
-    };
-    let Some(current) = load_optional_table(provider.runtime(), &identity, context)? else {
-        return Ok(known_uncommitted(not_found(
-            "Iceberg table does not exist during ref reconciliation",
-        )));
-    };
-    if current.table.metadata().uuid().to_string() != table_uuid {
-        return Ok(ExternalMutationOutcome::CommitUnknown {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Conflict,
-                "Iceberg table incarnation changed during ref reconciliation",
-            ),
-            evidence: evidence.clone(),
-        });
-    }
-    let actual = current
-        .table
-        .metadata()
-        .refs()
-        .get(ref_name)
-        .map(|reference| reference.snapshot_id);
-    if actual == expected_snapshot_id {
-        Ok(ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            receipt: receipt_with_version(
-                provider,
-                evidence.operation_id(),
-                evidence.operation_kind(),
-                current.table.metadata_location(),
-            )?,
-            finalization: ExternalMutationFinalization::Complete,
-        })
-    } else {
-        Ok(known_uncommitted(invalid(
-            "Iceberg ref does not match the mutation postcondition",
-        )))
-    }
 }
 
 fn load_optional_table(
@@ -3454,13 +3591,6 @@ fn failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
     }
 }
 
-fn commit_may_be_unknown(kind: ConnectorErrorKind) -> bool {
-    matches!(
-        kind,
-        ConnectorErrorKind::Unavailable | ConnectorErrorKind::Internal
-    )
-}
-
 fn map_iceberg(error: crate::iceberg::Error) -> ConnectorError {
     use crate::iceberg::ErrorKind;
     let kind = match error.kind() {
@@ -3484,6 +3614,7 @@ fn map_iceberg_message(action: &str, error: crate::iceberg::Error) -> ConnectorE
     ConnectorError::new(mapped.kind(), format!("{action}: {mapped}"))
 }
 
+#[cfg(test)]
 fn map_view_error(error: String) -> ConnectorError {
     if error.starts_with("unknown view:") {
         not_found(error)
@@ -3542,10 +3673,10 @@ mod tests {
         ConnectorDocumentStorageBinding, ConnectorDocumentStorageBudget,
         ConnectorDocumentStorageLimits, ConnectorDocumentStorageManagement, ConnectorInstanceId,
         ConnectorManagedObjectMarker, ConnectorMetadata, ConnectorPrepareDocumentsRequest,
-        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
-        ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest,
-        ConnectorTableObjectId, ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector,
-        ConnectorTableResolution,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRefKind,
+        ConnectorRequestContext, ConnectorTableObjectBindingFailure,
+        ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+        ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -3600,6 +3731,164 @@ mod tests {
         ) -> Result<Bytes, ConnectorError> {
             ConnectorDocumentStorageManagement::prepare_documents(self.storage.as_ref(), request)
         }
+    }
+
+    struct LostPositiveResponse(
+        Box<dyn crate::catalog::publication_dispatch::PreparedCatalogDispatch>,
+    );
+    #[async_trait::async_trait]
+    impl crate::catalog::publication_dispatch::PreparedCatalogDispatch for LostPositiveResponse {
+        async fn dispatch_once(
+            self: Box<Self>,
+            context: crate::catalog::publication::EvidenceContext,
+        ) -> crate::catalog::publication_dispatch::DispatchCompletion {
+            let completed = self.0.dispatch_once(context).await;
+            assert!(
+                matches!(
+                    completed.evidence,
+                    crate::commit::attempt::observation::DispatchEvidence::Applied { .. }
+                ),
+                "the real catalog must apply before response loss"
+            );
+            crate::catalog::publication_dispatch::DispatchCompletion::evidence(
+                crate::commit::attempt::observation::DispatchEvidence::Unknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "injected loss after the real catalog applied",
+                    ),
+                    observation: Default::default(),
+                },
+            )
+        }
+    }
+    fn lose_positive_response(
+        prepared: crate::catalog::publication_dispatch::PreparedPublication,
+    ) -> crate::catalog::publication_dispatch::PreparedPublication {
+        use crate::catalog::publication_dispatch::PreparedPublication;
+        match prepared {
+            PreparedPublication::Mutation { binding, dispatch } => PreparedPublication::Mutation {
+                binding,
+                dispatch: Box::new(LostPositiveResponse(dispatch)),
+            },
+            PreparedPublication::NoOp => panic!("response-loss oracle requires a real mutation"),
+        }
+    }
+
+    fn lose_catalog_response(
+        provider: &IcebergMetadata,
+        request: &ConnectorCatalogMutationRequest,
+        frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+        external_evidence: ExternalMutationEvidence,
+        seed: ConnectorCatalogMutationReceipt,
+    ) -> ExternalMutationEvidence {
+        let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
+            crate::commit::model::OperationToken::from_mutation(request.operation_id),
+            provider.runtime().resources().catalog_runtime(),
+        );
+        journal
+            .prepare_catalog(
+                external_evidence,
+                seed,
+                frozen.targets(),
+                frozen.request_bytes().to_vec(),
+                frozen.attribution().clone(),
+                request.context.clone(),
+            )
+            .unwrap();
+        let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+        let binding = provider.runtime().resources().planning_binding().clone();
+        let policy = catalog.evidence_policy();
+        let publication = journal.clone();
+        let context = request.context.clone();
+        let entry = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                publication
+                    .publish_once(
+                        context,
+                        policy,
+                        move |descriptor, generation, original| async move {
+                            catalog
+                                .prepare_catalog_publication(
+                                    frozen,
+                                    descriptor,
+                                    generation,
+                                    original,
+                                    Default::default(),
+                                    binding,
+                                )
+                                .await
+                                .map(lose_positive_response)
+                        },
+                    )
+                    .await
+            })
+            .unwrap()
+            .unwrap();
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+            journal.catalog_entry_outcome(entry)
+        else {
+            panic!("lost response must be recorded Unknown");
+        };
+        evidence
+    }
+
+    fn lose_table_response(
+        provider: &IcebergMetadata,
+        request: &ConnectorCatalogMutationRequest,
+        frozen: crate::commit::model::FrozenRequest,
+        external_evidence: ExternalMutationEvidence,
+    ) -> ExternalMutationEvidence {
+        let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
+            crate::commit::model::OperationToken::from_mutation(request.operation_id),
+            provider.runtime().resources().catalog_runtime(),
+        );
+        journal
+            .record(
+                external_evidence,
+                receipt(provider, request.operation_id, request.operation.kind()).unwrap(),
+                &frozen,
+            )
+            .unwrap();
+        let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+        let policy = catalog.evidence_policy();
+        let publication = journal.clone();
+        let context = request.context.clone();
+        let entry = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                publication
+                    .publish_once(
+                        context,
+                        policy,
+                        move |descriptor, generation, original| async move {
+                            catalog
+                                .prepare_frozen_publication(
+                                    frozen,
+                                    CatalogOperation::UpdateDocuments,
+                                    None,
+                                    descriptor,
+                                    generation,
+                                    original,
+                                )
+                                .await
+                                .map(lose_positive_response)
+                        },
+                    )
+                    .await
+            })
+            .unwrap()
+            .unwrap();
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+            journal.catalog_entry_outcome(entry)
+        else {
+            panic!("lost response must be recorded Unknown");
+        };
+        evidence
     }
 
     fn context() -> ConnectorRequestContext {
@@ -4009,6 +4298,1166 @@ mod tests {
         assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), before);
     }
 
+    fn namespace_request(
+        provider: &IcebergMetadata,
+        create: bool,
+        conditional: bool,
+    ) -> ConnectorCatalogMutationRequest {
+        let namespace = novarocks_spi::connector::ConnectorNamespaceIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "db".into(),
+        };
+        ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: if create {
+                ConnectorCatalogMutationOperation::CreateNamespace {
+                    namespace,
+                    policy: if conditional {
+                        CreatePolicy::NoOpIfExists
+                    } else {
+                        CreatePolicy::FailIfExists
+                    },
+                }
+            } else {
+                ConnectorCatalogMutationOperation::DropNamespace {
+                    namespace,
+                    policy: if conditional {
+                        DropPolicy::NoOpIfMissing
+                    } else {
+                        DropPolicy::FailIfMissing
+                    },
+                }
+            },
+            context: context(),
+        }
+    }
+
+    #[test]
+    fn namespace_hadoop_journal_preserves_applied_no_op_and_typed_refusals() {
+        let (_executor, warehouse, provider) = provider();
+        let marker = warehouse.path().join("db/.novarocks_namespace");
+        for (create, conditional, expected) in [
+            (true, false, "applied"),
+            (true, true, "noop"),
+            (true, false, "exists"),
+            (false, false, "applied"),
+            (false, true, "noop"),
+            (false, false, "missing"),
+        ] {
+            let before = marker.exists();
+            let outcome = provider
+                .execute(namespace_request(&provider, create, conditional))
+                .unwrap();
+            match (expected, outcome) {
+                (
+                    "applied",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    },
+                ) => assert_eq!(marker.exists(), create),
+                (
+                    "noop",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    },
+                ) => assert_eq!(marker.exists(), before),
+                ("exists", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists)
+                }
+                ("missing", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::NotFound)
+                }
+                (_, other) => panic!("Unexpected {expected} namespace outcome: {other:?}"),
+            }
+        }
+        let mut request = namespace_request(&provider, true, false);
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        stop.request_stop();
+        request.context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(10),
+            stop.view(),
+            65536,
+            262144,
+        )
+        .unwrap();
+        assert!(
+            matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::Cancelled)
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn namespace_hadoop_properties_are_refused_before_filesystem_discovery() {
+        use crate::catalog::catalog_request::{CatalogPublicationRequest, CatalogResponseDocument};
+        let (_executor, warehouse, provider) = provider();
+        let frozen = CatalogPublicationRequest::CreateNamespace {
+            namespace: CatalogNamespaceName::new("db"),
+            properties: HashMap::from([("owner".into(), "user".into())]),
+            no_op_if_exists: false,
+        }
+        .freeze([8; 16])
+        .unwrap();
+        let descriptor = crate::commit::publication_descriptor::PublicationDescriptor::catalog(
+            [8; 16],
+            frozen.targets(),
+            frozen.request_bytes().to_vec(),
+            frozen.attribution().clone(),
+        )
+        .unwrap();
+        let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+        let generation = provider.incarnation();
+        let read_binding = provider.runtime().resources().planning_binding().clone();
+        let result = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                catalog
+                    .prepare_catalog_publication(
+                        frozen,
+                        descriptor,
+                        generation,
+                        context(),
+                        CatalogResponseDocument::default(),
+                        read_binding,
+                    )
+                    .await
+            })
+            .unwrap();
+        assert!(
+            matches!(result, Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) if failure.kind() == ConnectorMutationFailureKind::Unsupported)
+        );
+        assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn namespace_rest_journal_preserves_protocol_evidence_and_never_retries() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for create in [true, false] {
+            for (code, expected) in [
+                (200, "applied"),
+                (204, "applied"),
+                (409, "rejected"),
+                (401, "rejected"),
+                (403, "rejected"),
+                (419, "rejected"),
+                (404, "unknown"),
+                (503, "unknown"),
+            ] {
+                if (create && code == 204) || (!create && code == 200) {
+                    continue;
+                }
+                let method = if create { "POST" } else { "DELETE" };
+                let path = if create {
+                    "/v1/namespaces"
+                } else {
+                    "/v1/namespaces/db"
+                };
+                let reply = if create && code == 200 {
+                    Reply::json(
+                        code,
+                        &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                    )
+                } else {
+                    Reply::status(code)
+                };
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db",
+                            if create {
+                                Reply::status(404)
+                            } else {
+                                Reply::json(
+                                    200,
+                                    &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                                )
+                            },
+                        )
+                        .on(method, path, reply),
+                );
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let outcome = provider
+                    .execute(namespace_request(&provider, create, false))
+                    .unwrap();
+                match (expected, outcome) {
+                    (
+                        "applied",
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        },
+                    ) => (),
+                    ("rejected", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                        assert_eq!(
+                            failure.kind(),
+                            match code {
+                                409 if create => ConnectorMutationFailureKind::AlreadyExists,
+                                409 => ConnectorMutationFailureKind::Conflict,
+                                401 | 419 => ConnectorMutationFailureKind::Unauthenticated,
+                                403 => ConnectorMutationFailureKind::PermissionDenied,
+                                _ => unreachable!(),
+                            }
+                        );
+                    }
+                    ("unknown", ExternalMutationOutcome::CommitUnknown { evidence, .. }) => {
+                        let outcome = provider
+                            .reconcile(ConnectorCatalogMutationReconcileRequest {
+                                evidence,
+                                context: context(),
+                            })
+                            .unwrap();
+                        assert!(matches!(
+                            outcome,
+                            ExternalMutationOutcome::CommitUnknown { .. }
+                        ));
+                        assert_eq!(
+                            server.requests_to("GET", "/v1/namespaces/db").len(),
+                            1,
+                            "ObserveOnly performs no state-based adjudication"
+                        );
+                    }
+                    (_, other) => panic!("Unexpected {method} {code} outcome: {other:?}"),
+                }
+                assert_eq!(server.requests_to(method, path).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_rest_preparation_stop_prevents_send_but_dispatch_stop_keeps_evidence() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for during_probe in [true, false] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db",
+                        Reply::status(404).with_delay(if during_probe {
+                            Duration::from_millis(250)
+                        } else {
+                            Duration::ZERO
+                        }),
+                    )
+                    .on(
+                        "POST",
+                        "/v1/namespaces",
+                        Reply::json(
+                            200,
+                            &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                        )
+                        .with_delay(Duration::from_millis(250)),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = namespace_request(&provider, true, false);
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            request.context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                262144,
+            )
+            .unwrap();
+            let outcome = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| provider.execute(request));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (method, path) = if during_probe {
+                    ("GET", "/v1/namespaces/db")
+                } else {
+                    ("POST", "/v1/namespaces")
+                };
+                while server.requests_to(method, path).is_empty() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Namespace request did not reach the controlled phase"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                stop.request_stop();
+                worker.join().unwrap().unwrap()
+            });
+            if during_probe {
+                assert!(
+                    matches!(outcome, ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::Cancelled)
+                );
+                assert!(server.requests_to("POST", "/v1/namespaces").is_empty());
+            } else {
+                assert!(matches!(
+                    outcome,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    }
+                ));
+                assert_eq!(server.requests_to("POST", "/v1/namespaces").len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_local_setup_refusal_keeps_zero_dispatch_evidence() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        for create in [true, false] {
+            for (name, expected) in [
+                (
+                    "bad/name".to_string(),
+                    ConnectorMutationFailureKind::InvalidRequest,
+                ),
+                (
+                    "n".repeat(65537),
+                    ConnectorMutationFailureKind::ResourceExhausted,
+                ),
+            ] {
+                let mut request = namespace_request(&provider, create, false);
+                let (ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
+                | ConnectorCatalogMutationOperation::DropNamespace { namespace, .. }) =
+                    &mut request.operation
+                else {
+                    unreachable!()
+                };
+                namespace.namespace = name.into();
+                assert!(
+                    matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == expected)
+                );
+            }
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn namespace_target_instance_mismatch_is_refused_before_session_io() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        for create in [true, false] {
+            let mut request = namespace_request(&provider, create, false);
+            let (ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
+            | ConnectorCatalogMutationOperation::DropNamespace { namespace, .. }) =
+                &mut request.operation
+            else {
+                unreachable!()
+            };
+            namespace.instance_id =
+                novarocks_spi::connector::ConnectorInstanceId::parse("foreign").unwrap();
+            assert!(
+                matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::InvalidRequest)
+            );
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn namespace_rest_owner_rejects_cross_endpoint_descriptor_before_session_io() {
+        use crate::catalog::catalog_request::{CatalogPublicationRequest, CatalogResponseDocument};
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        let table = CatalogTableName::new("db", "t");
+        let original = CatalogPublicationRequest::DropTable {
+            table: table.clone(),
+            no_op_if_missing: false,
+            purge: false,
+            capture: None,
+        }
+        .freeze([9; 16])
+        .unwrap();
+        let descriptor = crate::commit::publication_descriptor::PublicationDescriptor::catalog(
+            [9; 16],
+            original.targets(),
+            original.request_bytes().to_vec(),
+            original.attribution().clone(),
+        )
+        .unwrap();
+        let other = CatalogPublicationRequest::DropView(table)
+            .freeze([9; 16])
+            .unwrap();
+        let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+        let generation = provider.incarnation();
+        let read_binding = provider.runtime().resources().planning_binding().clone();
+        let result = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                catalog
+                    .prepare_catalog_publication(
+                        other,
+                        descriptor,
+                        generation,
+                        context(),
+                        CatalogResponseDocument::default(),
+                        read_binding,
+                    )
+                    .await
+            })
+            .unwrap();
+        assert!(
+            matches!(result, Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) if failure.kind() == ConnectorMutationFailureKind::InvalidRequest)
+        );
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn namespace_rest_conditional_no_op_and_preparation_failure_send_no_mutation() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for (create, exists, conditional, code, expected) in [
+            (true, true, true, 200, "noop"),
+            (true, true, false, 200, "exists"),
+            (false, false, true, 404, "noop"),
+            (false, false, false, 404, "missing"),
+            (true, false, false, 503, "unavailable"),
+        ] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db",
+                        if exists {
+                            Reply::json(
+                                200,
+                                &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                            )
+                        } else {
+                            Reply::status(code)
+                        },
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            match (
+                expected,
+                provider
+                    .execute(namespace_request(&provider, create, conditional))
+                    .unwrap(),
+            ) {
+                (
+                    "noop",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    },
+                ) => (),
+                (kind, ExternalMutationOutcome::KnownUncommitted { failure, .. }) => assert_eq!(
+                    failure.kind(),
+                    match kind {
+                        "exists" => ConnectorMutationFailureKind::AlreadyExists,
+                        "missing" => ConnectorMutationFailureKind::NotFound,
+                        _ => ConnectorMutationFailureKind::Unavailable,
+                    }
+                ),
+                (_, other) => panic!("Unexpected namespace preparation outcome: {other:?}"),
+            }
+            assert!(server.requests().iter().all(|r| r.method == "GET"));
+        }
+    }
+
+    fn view_request(provider: &IcebergMetadata, mode: &str) -> ConnectorCatalogMutationRequest {
+        let view = novarocks_spi::connector::ConnectorViewIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "db".into(),
+            view: "v".into(),
+        };
+        ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: if mode == "drop" {
+                ConnectorCatalogMutationOperation::DropView {
+                    view,
+                    policy: DropPolicy::FailIfMissing,
+                }
+            } else {
+                ConnectorCatalogMutationOperation::CreateView { view,
+                columns: vec![ConnectorColumnDefinition { name: "a".into(), data_type: ConnectorDataType::Int, nullable: true, aggregation: None, default: None }],
+                definition: novarocks_spi::connector::ConnectorViewDefinition {
+                    dialect: novarocks_spi::connector::ConnectorViewDialect::StarRocks,
+                    raw_sql: "select 1 as a".into(), default_catalog: Some("source".into()), default_namespace: "source_db".into(),
+                    source_format: Some(novarocks_spi::connector::ConnectorViewSourceFormat::EffectiveUserSourceV1),
+                }, comment: None, properties: vec![],
+                policy: if mode == "replace" { CreateOrReplacePolicy::ReplaceIfExists } else { CreateOrReplacePolicy::FailIfExists },
+            }
+            },
+            context: context(),
+        }
+    }
+
+    fn complete_view_response() -> serde_json::Value {
+        serde_json::json!({"metadata-location":"s3://warehouse/db/v/metadata/1.json", "metadata": {
+            "view-uuid":"00000000-0000-0000-0000-000000000001", "format-version":1,
+            "location":"s3://warehouse/db/v", "current-version-id":1,
+            "versions":[{"version-id":1, "schema-id":0, "timestamp-ms":1600000000000_i64,
+                "summary":{}, "representations":[{"type":"sql", "sql":"select 1 as a", "dialect":"starrocks"}], "default-namespace":["db"]}],
+            "version-log":[{"version-id":1, "timestamp-ms":1600000000000_i64}],
+            "schemas":[{"type":"struct", "schema-id":0, "fields":[{"id":1, "name":"a", "required":false, "type":"int"}]}], "properties":{}
+        }})
+    }
+
+    #[test]
+    fn view_unknown_reconciliation_appends_only_the_exact_operation_proof() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for mode in ["exact", "foreign-uuid", "foreign-operation"] {
+            let current = Arc::new(std::sync::Mutex::new(complete_view_response()));
+            let read_current = current.clone();
+            let write_current = current.clone();
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on("HEAD", "/v1/namespaces/db/views/v", Reply::status(200))
+                    .on_fn("GET", "/v1/namespaces/db/views/v", move |_, _| {
+                        Reply::json(200, &read_current.lock().unwrap())
+                    })
+                    .on_fn("POST", "/v1/namespaces/db/views/v", move |request, _| {
+                        let sent: serde_json::Value =
+                            serde_json::from_slice(&request.body).unwrap();
+                        let mut updates = sent["updates"].clone();
+                        if mode == "foreign-operation" {
+                            let version = updates
+                                .as_array_mut()
+                                .unwrap()
+                                .iter_mut()
+                                .find(|update| update["action"] == "add-view-version")
+                                .expect("replacement carries its new view version");
+                            version["view-version"]["summary"]["novarocks.operation-id"] =
+                                serde_json::json!(uuid::Uuid::now_v7().to_string());
+                        }
+                        let updates: Vec<crate::iceberg::ViewUpdate> =
+                            serde_json::from_value(updates).expect("actual view updates");
+                        let mut current = write_current.lock().unwrap();
+                        let metadata: crate::iceberg::spec::ViewMetadata =
+                            serde_json::from_value(current["metadata"].clone()).unwrap();
+                        let mut builder = metadata.into_builder();
+                        // Apply the actual frozen updates in order. Existing
+                        // schema IDs and LAST_ADDED are resolved by the format
+                        // builder, including replacements without AddSchema.
+                        for update in updates {
+                            builder = match update {
+                                crate::iceberg::ViewUpdate::AddSchema { schema, .. } => {
+                                    builder.add_schema(schema)
+                                }
+                                crate::iceberg::ViewUpdate::AddViewVersion { view_version } => {
+                                    builder.add_version(view_version).unwrap()
+                                }
+                                crate::iceberg::ViewUpdate::SetCurrentViewVersion {
+                                    view_version_id,
+                                } => builder.set_current_version_id(view_version_id).unwrap(),
+                                crate::iceberg::ViewUpdate::SetProperties { updates } => {
+                                    builder.set_properties(updates).unwrap()
+                                }
+                                other => panic!("Unexpected replacement update: {other:?}"),
+                            };
+                        }
+                        if mode == "foreign-uuid" {
+                            builder = builder.assign_uuid(uuid::Uuid::now_v7());
+                        }
+                        let metadata = builder.build().unwrap().metadata;
+                        current["metadata-location"] = serde_json::json!(format!(
+                            "{}/metadata/{}.json",
+                            metadata.location(),
+                            uuid::Uuid::now_v7()
+                        ));
+                        current["metadata"] = serde_json::to_value(metadata).unwrap();
+                        Reply::status(503)
+                    }),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let request = view_request(&provider, "replace");
+            let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+                provider.execute(request).unwrap()
+            else {
+                panic!("lost view response stays Unknown");
+            };
+            let (journal, entry) = crate::commit::attempt::observation::PublicationJournal::<
+                ConnectorCatalogMutationReceipt,
+            >::from_evidence(&evidence)
+            .unwrap()
+            .unwrap();
+            let key = journal.entry_descriptor(entry).unwrap().key;
+            let wire_only =
+                ExternalMutationEvidence::try_from_wire_v1(&evidence.try_to_wire_v1().unwrap())
+                    .unwrap();
+            let reads = server.count("GET", "/v1/namespaces/db/views/v");
+            assert!(matches!(
+                provider
+                    .reconcile(ConnectorCatalogMutationReconcileRequest {
+                        evidence: wire_only,
+                        context: context()
+                    })
+                    .unwrap(),
+                ExternalMutationOutcome::CommitUnknown { .. }
+            ));
+            assert_eq!(
+                server.count("GET", "/v1/namespaces/db/views/v"),
+                reads,
+                "wire-only facts cannot synthesize the original entry"
+            );
+            let result = provider
+                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                    evidence: evidence.clone(),
+                    context: context(),
+                })
+                .unwrap();
+            if mode == "exact" {
+                assert!(
+                    matches!(
+                        result,
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        }
+                    ),
+                    "{result:?}"
+                );
+                assert!(matches!(
+                    journal.catalog_entry_outcome(entry),
+                    ExternalMutationOutcome::KnownCommitted { .. }
+                ));
+                assert!(matches!(
+                    provider
+                        .reconcile(ConnectorCatalogMutationReconcileRequest {
+                            evidence,
+                            context: context()
+                        })
+                        .unwrap(),
+                    ExternalMutationOutcome::KnownCommitted { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    ExternalMutationOutcome::CommitUnknown { .. }
+                ));
+                assert!(matches!(
+                    journal.catalog_entry_outcome(entry),
+                    ExternalMutationOutcome::CommitUnknown { .. }
+                ));
+            }
+            assert_eq!(journal.entry_descriptor(entry).unwrap().key, key);
+            assert_eq!(server.count("POST", "/v1/namespaces/db/views/v"), 1);
+        }
+    }
+
+    #[test]
+    fn view_journal_keeps_exact_evidence_once_without_full_response_materialization() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for mode in ["create", "replace", "drop"] {
+            for code in [200, 204, 409, 401, 403, 419, 404, 503] {
+                if (mode == "drop" && code == 200) || (mode != "drop" && code == 204) {
+                    continue;
+                }
+                let method = if mode == "drop" { "DELETE" } else { "POST" };
+                let path = if mode == "create" {
+                    "/v1/namespaces/db/views"
+                } else {
+                    "/v1/namespaces/db/views/v"
+                };
+                // Valid minimal attribution, deliberately invalid full ViewMetadata.
+                let success = serde_json::json!({"metadata-location":"s3://warehouse/db/v/metadata/2.json",
+                    "metadata":{"view-uuid":"00000000-0000-0000-0000-000000000001"}});
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/tables",
+                            Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                        )
+                        .on(
+                            "HEAD",
+                            "/v1/namespaces/db/views/v",
+                            Reply::status(if mode == "create" { 404 } else { 200 }),
+                        )
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/views/v",
+                            Reply::json(200, &complete_view_response()),
+                        )
+                        .on(
+                            method,
+                            path,
+                            if code == 200 {
+                                Reply::json(200, &success)
+                            } else {
+                                Reply::status(code)
+                            },
+                        ),
+                );
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                match (
+                    code,
+                    provider.execute(view_request(&provider, mode)).unwrap(),
+                ) {
+                    (
+                        200 | 204,
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        },
+                    ) => (),
+                    (
+                        409 | 401 | 403 | 419,
+                        ExternalMutationOutcome::KnownUncommitted { failure, .. },
+                    ) => assert_eq!(
+                        failure.kind(),
+                        match code {
+                            409 if mode == "create" => ConnectorMutationFailureKind::AlreadyExists,
+                            409 => ConnectorMutationFailureKind::Conflict,
+                            401 | 419 => ConnectorMutationFailureKind::Unauthenticated,
+                            403 => ConnectorMutationFailureKind::PermissionDenied,
+                            _ => unreachable!(),
+                        }
+                    ),
+                    (404 | 503, ExternalMutationOutcome::CommitUnknown { evidence, .. }) => {
+                        if mode == "replace" {
+                            let decoded =
+                                decode_mutation_evidence(evidence.provider_payload()).unwrap();
+                            let IcebergMutationEvidenceTarget::ViewOperation {
+                                view_uuid,
+                                operation_marker,
+                                ..
+                            } = decoded.target
+                            else {
+                                panic!("Replacement lost its exact operation proof facts")
+                            };
+                            assert_eq!(view_uuid, "00000000-0000-0000-0000-000000000001");
+                            let sent: serde_json::Value =
+                                serde_json::from_slice(&server.requests_to("POST", path)[0].body)
+                                    .unwrap();
+                            let version = sent["updates"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|u| u["action"] == "add-view-version")
+                                .unwrap();
+                            assert_eq!(
+                                version["view-version"]["summary"]["novarocks.operation-id"],
+                                operation_marker
+                            );
+                            assert_eq!(
+                                uuid::Uuid::parse_str(&operation_marker)
+                                    .unwrap()
+                                    .get_version_num(),
+                                7
+                            );
+                        }
+                        let before = server.requests().len();
+                        assert!(matches!(
+                            provider
+                                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                                    evidence: evidence.clone(),
+                                    context: context()
+                                })
+                                .unwrap(),
+                            ExternalMutationOutcome::CommitUnknown { evidence: retained, .. }
+                                if retained == evidence
+                        ));
+                        let after = server.requests();
+                        let probes = &after[before..];
+                        assert_eq!(probes.len(), usize::from(mode == "replace"));
+                        assert!(
+                            probes.iter().all(|request| request.method == "GET"
+                                && request.path() == "/v1/namespaces/db/views/v"),
+                            "Only the frozen replacement's exact positive probe may run"
+                        );
+                        assert_eq!(
+                            server.requests_to(method, path).len(),
+                            1,
+                            "Read-only reconciliation must not replay the mutation"
+                        );
+                    }
+                    (_, other) => panic!("Unexpected {mode} {code}: {other:?}"),
+                }
+                assert_eq!(server.requests_to(method, path).len(), 1);
+                if mode == "create" {
+                    let sent: serde_json::Value =
+                        serde_json::from_slice(&server.requests_to("POST", path)[0].body).unwrap();
+                    assert!(
+                        sent["view-version"]["summary"]
+                            .get("novarocks.operation-id")
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn view_preflight_keeps_no_ops_typed_refusals_and_table_collision() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for case in [
+            "create-noop",
+            "exists",
+            "drop-noop",
+            "missing",
+            "table-collision",
+        ] {
+            let is_drop = case == "drop-noop" || case == "missing";
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(
+                            200,
+                            &if case == "table-collision" {
+                                serde_json::json!({"identifiers":[{"namespace":["db"],"name":"v"}]})
+                            } else {
+                                serde_json::json!({"identifiers":[]})
+                            },
+                        ),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(if is_drop { 404 } else { 200 }),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = view_request(&provider, if is_drop { "drop" } else { "create" });
+            match &mut request.operation {
+                ConnectorCatalogMutationOperation::CreateView { policy, .. }
+                    if case == "create-noop" =>
+                {
+                    *policy = CreateOrReplacePolicy::NoOpIfExists
+                }
+                ConnectorCatalogMutationOperation::DropView { policy, .. }
+                    if case == "drop-noop" =>
+                {
+                    *policy = DropPolicy::NoOpIfMissing
+                }
+                _ => (),
+            }
+            match (case, provider.execute(request).unwrap()) {
+                (
+                    "create-noop" | "drop-noop",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    },
+                ) => (),
+                (
+                    "exists" | "table-collision",
+                    ExternalMutationOutcome::KnownUncommitted { failure, .. },
+                ) => assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists),
+                ("missing", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::NotFound)
+                }
+                (_, other) => panic!("Unexpected {case} preflight: {other:?}"),
+            }
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|r| r.method == "GET" || r.method == "HEAD")
+            );
+            if case == "table-collision" {
+                assert!(
+                    server
+                        .requests_to("HEAD", "/v1/namespaces/db/views/v")
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn view_reads_and_mutation_preflight_observe_the_original_stop_during_io() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for action in ["exists", "load", "create"] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(404).with_delay(Duration::from_millis(250)),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &complete_view_response())
+                            .with_delay(Duration::from_millis(250)),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                262144,
+            )
+            .unwrap();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let mut request = view_request(&provider, "create");
+                    request.context = context;
+                    if action == "create" {
+                        assert!(matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::Cancelled));
+                    } else {
+                        let ConnectorCatalogMutationOperation::CreateView { view, .. } = request.operation else { unreachable!() };
+                        let request = novarocks_spi::connector::ConnectorViewRequest { view, context: request.context };
+                        let error = if action == "exists" {
+                            novarocks_spi::connector::ConnectorViewMetadata::view_exists(&provider, request).unwrap_err()
+                        } else {
+                            novarocks_spi::connector::ConnectorViewMetadata::load_view(&provider, request).unwrap_err()
+                        };
+                        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+                    }
+                });
+                let method = if action == "load" { "GET" } else { "HEAD" };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while server
+                    .requests_to(method, "/v1/namespaces/db/views/v")
+                    .is_empty()
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "View read did not reach controlled I/O"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                stop.request_stop();
+                worker.join().unwrap();
+            });
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|r| r.method == "GET" || r.method == "HEAD")
+            );
+        }
+    }
+
+    #[test]
+    fn view_identity_and_local_name_refusals_precede_session_io() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        for mode in ["create", "replace", "drop"] {
+            for invalid in ["nested-instance", "generation", "name"] {
+                let mut request = view_request(&provider, mode);
+                if invalid == "generation" {
+                    request.target.incarnation = ProviderBindingEpoch::from_bytes([99; 16]);
+                }
+                let (ConnectorCatalogMutationOperation::CreateView { view, .. }
+                | ConnectorCatalogMutationOperation::DropView { view, .. }) =
+                    &mut request.operation
+                else {
+                    unreachable!()
+                };
+                if invalid == "nested-instance" {
+                    view.instance_id =
+                        novarocks_spi::connector::ConnectorInstanceId::parse("foreign").unwrap();
+                }
+                if invalid == "name" {
+                    view.view = "bad/name".into();
+                }
+                assert!(
+                    matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::InvalidRequest)
+                );
+            }
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn view_each_preparation_read_stops_or_expires_without_mutation() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for phase in ["listing", "head", "replacement"] {
+            for cancel in [true, false] {
+                let delayed = if cancel {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(2)
+                };
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/tables",
+                            Reply::json(200, &serde_json::json!({"identifiers":[]})).with_delay(
+                                if phase == "listing" {
+                                    delayed
+                                } else {
+                                    Duration::ZERO
+                                },
+                            ),
+                        )
+                        .on(
+                            "HEAD",
+                            "/v1/namespaces/db/views/v",
+                            Reply::status(if phase == "replacement" { 200 } else { 404 })
+                                .with_delay(if phase == "head" {
+                                    delayed
+                                } else {
+                                    Duration::ZERO
+                                }),
+                        )
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/views/v",
+                            Reply::json(200, &complete_view_response()).with_delay(
+                                if phase == "replacement" {
+                                    delayed
+                                } else {
+                                    Duration::ZERO
+                                },
+                            ),
+                        ),
+                );
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let mut request = view_request(
+                    &provider,
+                    if phase == "replacement" {
+                        "replace"
+                    } else {
+                        "create"
+                    },
+                );
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                request.context = ConnectorRequestContext::try_new(
+                    Instant::now()
+                        + if cancel {
+                            Duration::from_secs(30)
+                        } else {
+                            Duration::from_secs(1)
+                        },
+                    stop.view(),
+                    65536,
+                    262144,
+                )
+                .unwrap();
+                let (method, path) = match phase {
+                    "listing" => ("GET", "/v1/namespaces/db/tables"),
+                    "head" => ("HEAD", "/v1/namespaces/db/views/v"),
+                    _ => ("GET", "/v1/namespaces/db/views/v"),
+                };
+                let outcome = std::thread::scope(|scope| {
+                    let worker = scope.spawn(|| provider.execute(request));
+                    if cancel {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while server.requests_to(method, path).is_empty() {
+                            assert!(
+                                Instant::now() < deadline,
+                                "View preparation did not reach the controlled phase"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        stop.request_stop();
+                    }
+                    worker.join().unwrap().unwrap()
+                });
+                assert!(
+                    matches!(outcome, ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == if cancel { ConnectorMutationFailureKind::Cancelled } else { ConnectorMutationFailureKind::DeadlineExceeded })
+                );
+                assert_eq!(
+                    server.requests_to(method, path).len(),
+                    1,
+                    "Original deadline must cover the actual {phase} wait"
+                );
+                assert!(
+                    server
+                        .requests()
+                        .iter()
+                        .all(|r| r.method == "GET" || r.method == "HEAD")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn view_actual_publication_entry_refuses_dialect_loss_and_invalid_history_before_mutation() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for case in ["dialect", "history-create", "history-replace"] {
+            let mut current = complete_view_response();
+            if case == "dialect" {
+                current["metadata"]["versions"][0]["representations"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(
+                        serde_json::json!({"type":"sql", "sql":"select 1 as a", "dialect":"spark"}),
+                    );
+            }
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(if case == "history-create" { 404 } else { 200 }),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &current),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = view_request(
+                &provider,
+                if case == "history-create" {
+                    "create"
+                } else {
+                    "replace"
+                },
+            );
+            if case != "dialect" {
+                let ConnectorCatalogMutationOperation::CreateView { properties, .. } =
+                    &mut request.operation
+                else {
+                    unreachable!()
+                };
+                properties.push(("version.history.num-entries".into(), "0".into()));
+            }
+            let outcome = provider.execute(request).unwrap();
+            let ExternalMutationOutcome::KnownUncommitted { failure, .. } = outcome else {
+                panic!("View local validation did not prove zero dispatch")
+            };
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::InvalidRequest);
+            assert!(failure.to_string().contains(if case == "dialect" {
+                "drop SQL dialects"
+            } else {
+                "version.history.num-entries"
+            }));
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|r| r.method == "GET" || r.method == "HEAD")
+            );
+        }
+    }
+
     fn document_storage_lease(
         provider: &IcebergMetadata,
     ) -> novarocks_spi::connector::ConnectorDocumentStorageLease {
@@ -4023,7 +5472,15 @@ mod tests {
             descriptor.clone(),
             incarnation,
             Some(storage.clone()),
-            Some(Arc::new(HadoopDocumentTestCapability { storage })),
+            Some(
+                if provider.runtime().control_state().configuration().kind
+                    == crate::catalog_config::IcebergCatalogKind::Rest
+                {
+                    storage as Arc<dyn ConnectorDocumentStorageManagement>
+                } else {
+                    Arc::new(HadoopDocumentTestCapability { storage })
+                },
+            ),
         )
         .expect("document storage binding");
         let capability = Arc::new(provider.clone());
@@ -4163,14 +5620,14 @@ mod tests {
             .runtime()
             .load_table(&table.namespace, &table.table)
             .expect("load managed table fixture");
-        let runtime = Arc::clone(provider.runtime());
+        let fixture_provider = provider.clone();
         provider
             .runtime()
             .resources()
             .catalog_runtime()
             .block_on(async move {
                 crate::commit::run::append_snapshot_for_test(
-                    runtime,
+                    fixture_provider,
                     loaded.table,
                     Vec::new(),
                     "main".to_string(),
@@ -4333,15 +5790,7 @@ mod tests {
     }
 
     fn guarded_table(provider: &IcebergMetadata) -> ConnectorTableIdentity {
-        let namespace = NamespaceIdent::new("guarded".to_string());
-        let catalog = provider.runtime().novarocks_catalog().vendored_client();
-        provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
-            .expect("namespace runtime")
-            .expect("create namespace");
+        create_namespace(provider, "guarded");
         let table = ConnectorTableIdentity {
             instance_id: provider.descriptor().instance_id.clone(),
             namespace: "guarded".into(),
@@ -4393,15 +5842,30 @@ mod tests {
     }
 
     fn create_namespace(provider: &IcebergMetadata, name: &str) {
-        let namespace = NamespaceIdent::new(name.to_string());
-        let catalog = provider.runtime().novarocks_catalog().vendored_client();
-        provider
+        let runtime = provider.runtime().clone();
+        let epoch = provider.incarnation();
+        let namespace = crate::catalog::CatalogNamespaceName::new(name);
+        let outcome = provider
             .runtime()
             .resources()
             .catalog_runtime()
-            .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
-            .expect("namespace runtime")
-            .expect("create namespace");
+            .block_on(async move {
+                crate::catalog::admission_test_support::publish_catalog_fixture(
+                    &runtime,
+                    epoch,
+                    crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                        namespace,
+                        properties: HashMap::new(),
+                        no_op_if_exists: false,
+                    },
+                )
+                .await
+            })
+            .expect("namespace runtime");
+        assert!(
+            matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+            "{outcome:?}"
+        );
     }
 
     /// Create a table for a fixture through the production create path.
@@ -4508,7 +5972,7 @@ mod tests {
             ),
         ]);
 
-        let mut commit = application_document_update_commit(
+        let commit = application_document_update_commit(
             &table,
             table_uuid,
             properties.clone(),
@@ -4697,18 +6161,39 @@ mod tests {
         let (_executor, _warehouse, provider) = document_provider();
         let table = managed_table(&provider);
         let update = application_document_update_fixture(&provider, &table);
-        let exact = application_document_evidence(
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let ConnectorCatalogMutationOperation::UpdateApplicationDocuments { intent } =
+            &update.request.operation
+        else {
+            unreachable!()
+        };
+        let properties = crate::document_storage::publication::update_properties(
+            intent,
+            update.request.operation_id,
+            loaded.table.metadata(),
+        )
+        .unwrap();
+        let frozen = application_document_update_commit(
+            &table,
+            loaded.table.metadata().uuid(),
+            properties,
+            update.request.operation_id,
+            loaded.table.metadata().current_snapshot_id(),
+            loaded.table.metadata_location().unwrap(),
+        )
+        .unwrap()
+        .with_base_facts(loaded.table.metadata())
+        .unwrap();
+        let external_evidence = application_document_evidence(
             &provider,
             &update,
             update.operation_marker.clone(),
             update.manifest_digest,
         );
-        assert!(matches!(
-            provider
-                .execute(update.request.clone())
-                .expect("execute update"),
-            ExternalMutationOutcome::KnownCommitted { .. }
-        ));
+        let exact = lose_table_response(&provider, &update.request, frozen, external_evidence);
 
         let reconciled = provider
             .reconcile(ConnectorCatalogMutationReconcileRequest {
@@ -4716,14 +6201,20 @@ mod tests {
                 context: context(),
             })
             .expect("reconcile exact application-document update");
-        assert!(matches!(
-            reconciled,
-            ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                finalization: ExternalMutationFinalization::Complete,
-                ..
-            }
-        ));
+        // The wrapper discarded the real owner's unrun cache finalizer.
+        // Exact document attribution proves Applied without proving that work.
+        assert!(
+            matches!(
+                reconciled,
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    finalization: ExternalMutationFinalization::Failed(ref failure),
+                    ..
+                } if failure.kind() == ConnectorMutationFailureKind::Unavailable
+                    && failure.message().contains("Hadoop publication cache finalization")
+            ),
+            "lost owner finalization must not be invented: {reconciled:?}"
+        );
 
         let mismatches = [
             application_document_evidence(
@@ -4846,14 +6337,786 @@ mod tests {
                 CreatePolicy::NoOpIfExists,
             ))
             .expect("no-op existing create");
-        assert!(matches!(
-            no_op,
+        match no_op {
             ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::NoOp,
+                receipt,
                 finalization: ExternalMutationFinalization::Complete,
-                ..
+            } => {
+                assert!(receipt.provider_version().is_none());
+                assert!(receipt.committed_version().is_none());
             }
+            other => panic!("existing NoOp must carry no attempted identity: {other:?}"),
+        }
+    }
+
+    fn drop_request(
+        provider: &IcebergMetadata,
+        policy: DropPolicy,
+        purge: bool,
+    ) -> ConnectorCatalogMutationRequest {
+        let mut request = create_request(
+            provider,
+            ConnectorMutationOperationId::new(),
+            CreatePolicy::FailIfExists,
+        );
+        let ConnectorCatalogMutationOperation::CreateTable { table, .. } = &request.operation
+        else {
+            unreachable!()
+        };
+        request.operation = ConnectorCatalogMutationOperation::DropTable {
+            table: table.clone(),
+            policy,
+            data_disposition: if purge {
+                ConnectorDropTableDataDisposition::Purge
+            } else {
+                ConnectorDropTableDataDisposition::Retain
+            },
+        };
+        request
+    }
+
+    #[test]
+    fn drop_journal_only_hands_captured_identity_to_purge_after_applied() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for purge in [false, true] {
+            for code in [200, 204, 409, 401, 403, 419, 404, 408, 429, 503] {
+                let metadata = test_metadata(HashMap::new());
+                let uuid = metadata.uuid().to_string();
+                let server = TestServer::start(Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on("GET", "/v1/namespaces/atomic/tables/events", Reply::json(200, &serde_json::json!({"metadata-location":"memory://warehouse/managed/mv/metadata/old.json", "metadata":metadata})))
+                .on("DELETE", "/v1/namespaces/atomic/tables/events", Reply::status(code)));
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let outcome = provider
+                    .execute(drop_request(&provider, DropPolicy::FailIfMissing, purge))
+                    .unwrap();
+                match (code, outcome) {
+                    (
+                        200 | 204,
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        },
+                    ) => (),
+                    (
+                        409 | 401 | 403 | 419,
+                        ExternalMutationOutcome::KnownUncommitted { failure, .. },
+                    ) => assert_eq!(
+                        failure.kind(),
+                        match code {
+                            409 => ConnectorMutationFailureKind::Conflict,
+                            401 | 419 => ConnectorMutationFailureKind::Unauthenticated,
+                            _ => ConnectorMutationFailureKind::PermissionDenied,
+                        }
+                    ),
+                    (_, ExternalMutationOutcome::CommitUnknown { evidence, .. }) => {
+                        assert!(matches!(
+                            provider
+                                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                                    evidence,
+                                    context: context()
+                                })
+                                .unwrap(),
+                            ExternalMutationOutcome::CommitUnknown { .. }
+                        ))
+                    }
+                    (_, other) => panic!("unexpected drop {code}: {other:?}"),
+                }
+                assert_eq!(
+                    server
+                        .requests_to("DELETE", "/v1/namespaces/atomic/tables/events")
+                        .len(),
+                    1
+                );
+                let captured = provider.runtime().drop_cleanup().take_eligible(i64::MAX);
+                assert_eq!(
+                    captured.len(),
+                    usize::from(purge && matches!(code, 200 | 204))
+                );
+                if let Some(captured) = captured.first() {
+                    assert_eq!(captured.table_uuid.as_ref(), uuid);
+                    assert_eq!(
+                        captured.table_location.as_ref(),
+                        "memory://warehouse/managed/mv"
+                    );
+                    assert_eq!(
+                        captured.metadata_location.as_deref(),
+                        Some("memory://warehouse/managed/mv/metadata/old.json")
+                    );
+                    assert!(captured.created_at_ms > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drop_capture_read_uses_original_control_before_delete_or_cleanup() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for cancel in [false, true] {
+            let path = "/v1/namespaces/atomic/tables/events";
+            let server = TestServer::start(Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on_sequence("GET", path, vec![Reply::json(200, &serde_json::json!({})),
+                    Reply::json(200, &serde_json::json!({"metadata-location":"memory://metadata/old.json", "metadata":test_metadata(HashMap::new())})).with_delay(Duration::from_secs(2))])
+                .on("DELETE", path, Reply::status(204)));
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            let mut request = drop_request(&provider, DropPolicy::FailIfMissing, true);
+            request.context = ConnectorRequestContext::try_new(
+                Instant::now()
+                    + if cancel {
+                        Duration::from_secs(10)
+                    } else {
+                        Duration::from_millis(100)
+                    },
+                stop.view(),
+                65536,
+                131072,
+            )
+            .unwrap();
+            let started = Instant::now();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| provider.execute(request).unwrap());
+                if cancel {
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while server.requests_to("GET", path).len() < 2 {
+                        assert!(Instant::now() < until, "capture GET did not start");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    stop.request_stop();
+                }
+                assert!(
+                    matches!(worker.join().unwrap(),ExternalMutationOutcome::KnownUncommitted{failure,..} if failure.kind()== if cancel {ConnectorMutationFailureKind::Cancelled} else {ConnectorMutationFailureKind::DeadlineExceeded})
+                );
+            });
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "capture ignored request control"
+            );
+            assert!(server.requests_to("DELETE", path).is_empty());
+            assert_eq!(provider.runtime().drop_cleanup().pending_len(), 0);
+        }
+    }
+
+    #[test]
+    fn drop_no_op_and_missing_capture_cannot_authorize_cleanup() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for present in [false, true] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/atomic/tables/events",
+                        if present {
+                            Reply::json(200, &serde_json::json!({"not":"table metadata"}))
+                        } else {
+                            Reply::status(404)
+                        },
+                    )
+                    .on(
+                        "DELETE",
+                        "/v1/namespaces/atomic/tables/events",
+                        Reply::status(204),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let outcome = provider
+                .execute(drop_request(&provider, DropPolicy::NoOpIfMissing, true))
+                .unwrap();
+            assert!(
+                matches!(outcome,ExternalMutationOutcome::KnownCommitted { effect,.. } if effect == if present { ExternalMutationEffect::Applied } else { ExternalMutationEffect::NoOp })
+            );
+            assert_eq!(
+                server
+                    .requests_to("DELETE", "/v1/namespaces/atomic/tables/events")
+                    .len(),
+                usize::from(present)
+            );
+            assert_eq!(provider.runtime().drop_cleanup().pending_len(), 0);
+        }
+    }
+
+    mod ordinary_alter_observation_tests {
+        use super::*;
+        use crate::commit::attempt::observation::PublicationJournal;
+        use crate::commit::publication_descriptor::AttributionPlan;
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use std::sync::Mutex;
+
+        const PATH: &str = "/v1/namespaces/managed/tables/mv";
+        const BEFORE: &str = "memory://warehouse/managed/mv/metadata/before.json";
+        const AFTER: &str = "memory://warehouse/managed/mv/metadata/after.json";
+
+        fn schema_change() -> ConnectorSchemaChange {
+            ConnectorSchemaChange::AddColumn {
+                parent: ConnectorColumnPath { segments: vec![] },
+                column: definition_column(ConnectorDataType::BigInt),
+                position: ConnectorColumnPosition::Default,
+            }
+        }
+
+        fn request(provider: &IcebergMetadata, kind: &str) -> ConnectorCatalogMutationRequest {
+            let table = ConnectorTableIdentity {
+                instance_id: provider.descriptor().instance_id.clone(),
+                namespace: "managed".into(),
+                table: "mv".into(),
+            };
+            let operation = match kind {
+                "schema" => ConnectorCatalogMutationOperation::AlterSchema {
+                    table,
+                    changes: vec![schema_change()],
+                },
+                "partition" => ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                    table,
+                    add: vec![ConnectorPartitionTransform::Bucket {
+                        column: "id".into(),
+                        num_buckets: 4,
+                    }],
+                    drop: vec![],
+                },
+                "properties" => ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes: vec![ConnectorPropertyChange::Set {
+                        key: "comment".into(),
+                        value: "ordinary ALTER observation".into(),
+                    }],
+                    authority: ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: None,
+                },
+                _ => unreachable!(),
+            };
+            ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation,
+                context: context(),
+            }
+        }
+
+        fn server(
+            base: &crate::iceberg::spec::TableMetadata,
+            observation: &'static str,
+            acknowledged: bool,
+        ) -> (
+            TestServer,
+            Arc<Mutex<Option<crate::iceberg::spec::TableMetadata>>>,
+        ) {
+            let before = base.clone();
+            let write_base = base.clone();
+            let current = Arc::new(Mutex::new(None));
+            let read = current.clone();
+            let write = current.clone();
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on_fn("GET", PATH, move |_, _| {
+                        let current = read.lock().unwrap();
+                        if let Some(after) = current.as_ref() {
+                            match observation {
+                                "absent" => return Reply::status(404),
+                                "failure" => return Reply::status(503),
+                                "old" => {}
+                                "new" | "foreign" => {
+                                    let mut metadata = serde_json::to_value(after).unwrap();
+                                    if observation == "foreign" {
+                                        metadata["table-uuid"] =
+                                            serde_json::json!(uuid::Uuid::from_u128(19));
+                                    }
+                                    return Reply::json(
+                                        200,
+                                        &serde_json::json!({
+                                            "metadata-location":AFTER,"metadata":metadata,
+                                        }),
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        Reply::json(
+                            200,
+                            &serde_json::json!({
+                                "metadata-location":BEFORE,"metadata":before,
+                            }),
+                        )
+                    })
+                    .on_fn("POST", PATH, move |wire, _| {
+                        let body: serde_json::Value = serde_json::from_slice(&wire.body).unwrap();
+                        let requirements: Vec<TableRequirement> =
+                            serde_json::from_value(body["requirements"].clone()).unwrap();
+                        assert_eq!(
+                            requirements
+                                .iter()
+                                .filter_map(|requirement| match requirement {
+                                    TableRequirement::UuidMatch { uuid } => Some(*uuid),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                            vec![write_base.uuid()],
+                        );
+                        let updates: Vec<TableUpdate> =
+                            serde_json::from_value(body["updates"].clone()).unwrap();
+                        let mut builder = write_base.clone().into_builder(None);
+                        for update in updates {
+                            builder = update.apply(builder).unwrap();
+                        }
+                        let after = builder.build().unwrap().metadata;
+                        let response = serde_json::json!({
+                            "metadata-location":AFTER,"metadata":after,
+                        });
+                        let mut current = write.lock().unwrap();
+                        assert!(
+                            current.is_none(),
+                            "the original publication is never replayed"
+                        );
+                        *current = Some(after);
+                        if acknowledged {
+                            Reply::json(200, &response)
+                        } else {
+                            Reply::status(503)
+                        }
+                    }),
+            );
+            (server, current)
+        }
+
+        fn unknown(
+            outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+        ) -> (ConnectorMutationFailure, ExternalMutationEvidence) {
+            let ExternalMutationOutcome::CommitUnknown { failure, evidence } = outcome else {
+                panic!("the unacknowledged publication must remain Unknown: {outcome:?}");
+            };
+            (failure, evidence)
+        }
+
+        fn assert_original_unknown(
+            outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+            expected: &(ConnectorMutationFailure, ExternalMutationEvidence),
+        ) {
+            let (failure, evidence) = unknown(outcome);
+            assert_eq!(failure.kind(), expected.0.kind());
+            assert_eq!(failure.message(), expected.0.message());
+            assert_eq!(evidence, expected.1);
+        }
+
+        #[test]
+        fn ordinary_alter_reads_fresh_without_attributing_old_new_absent_foreign_or_failed_views() {
+            for kind in ["schema", "partition", "properties"] {
+                for observed in ["old", "new", "absent", "foreign", "failure"] {
+                    let base = test_metadata(HashMap::new());
+                    let (server, applied) = server(&base, observed, false);
+                    let (_executor, provider) = variant_definition_provider(&server.url());
+                    let request = request(&provider, kind);
+                    let original_context = request.context.clone();
+                    let original = unknown(provider.execute(request).unwrap());
+                    {
+                        let applied = applied.lock().unwrap();
+                        let applied = applied.as_ref().expect("actual frozen updates applied");
+                        assert_eq!(applied.uuid(), base.uuid());
+                        match kind {
+                            "schema" => {
+                                assert_ne!(applied.current_schema_id(), base.current_schema_id())
+                            }
+                            "partition" => assert_ne!(
+                                applied.default_partition_spec_id(),
+                                base.default_partition_spec_id()
+                            ),
+                            "properties" => assert_eq!(
+                                applied.properties().get("comment").map(String::as_str),
+                                Some("ordinary ALTER observation")
+                            ),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let (journal, entry) =
+                        PublicationJournal::<ConnectorCatalogMutationReceipt>::from_evidence(
+                            &original.1,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let descriptor = journal.entry_descriptor(entry).unwrap();
+                    assert_eq!(descriptor.attribution, AttributionPlan::ObserveOnly);
+                    let reads = server.count("GET", PATH);
+                    // Reusing the original request scope must not reuse its old table cache.
+                    let outcome = provider
+                        .reconcile(ConnectorCatalogMutationReconcileRequest {
+                            evidence: original.1.clone(),
+                            context: original_context,
+                        })
+                        .unwrap();
+                    assert_original_unknown(outcome, &original);
+                    assert_eq!(server.count("GET", PATH), reads + 1, "{kind}/{observed}");
+                    assert_eq!(server.count("POST", PATH), 1, "{kind}/{observed}");
+                    assert_eq!(journal.entry_descriptor(entry).unwrap(), descriptor);
+                    assert_original_unknown(journal.catalog_entry_outcome(entry), &original);
+                }
+            }
+        }
+
+        #[test]
+        fn stopped_or_expired_ordinary_alter_keeps_original_unknown_without_another_get() {
+            for expired in [false, true] {
+                let base = test_metadata(HashMap::new());
+                let (server, _) = server(&base, "new", false);
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let original = unknown(provider.execute(request(&provider, "schema")).unwrap());
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                let context = ConnectorRequestContext::try_new(
+                    if expired {
+                        Instant::now() - Duration::from_secs(1)
+                    } else {
+                        Instant::now() + Duration::from_secs(30)
+                    },
+                    stop.view(),
+                    65536,
+                    131072,
+                )
+                .unwrap();
+                if !expired {
+                    stop.request_stop();
+                }
+                let reads = server.count("GET", PATH);
+                assert_original_unknown(
+                    provider
+                        .reconcile(ConnectorCatalogMutationReconcileRequest {
+                            evidence: original.1.clone(),
+                            context,
+                        })
+                        .unwrap(),
+                    &original,
+                );
+                assert_eq!(server.count("GET", PATH), reads);
+                assert_eq!(server.count("POST", PATH), 1);
+            }
+        }
+
+        #[test]
+        fn stopped_wire_only_alter_retains_context_rejection_without_observation() {
+            let base = test_metadata(HashMap::new());
+            let (server, _) = server(&base, "new", false);
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let original = unknown(provider.execute(request(&provider, "schema")).unwrap());
+            let wire = original.1.without_process_local_payload();
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            stop.request_stop();
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                131072,
+            )
+            .unwrap();
+            let reads = server.count("GET", PATH);
+            let (failure, retained) = unknown(
+                provider
+                    .reconcile(ConnectorCatalogMutationReconcileRequest {
+                        evidence: wire.clone(),
+                        context,
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::Cancelled);
+            assert_eq!(retained, wire);
+            assert!(retained.process_local_payload().is_none());
+            assert_eq!(server.count("GET", PATH), reads);
+            assert_eq!(server.count("POST", PATH), 1);
+        }
+
+        #[test]
+        fn ordinary_alter_checks_frozen_target_and_uuid_before_observation() {
+            let base = test_metadata(HashMap::new());
+            let (server, _) = server(&base, "new", false);
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let original = unknown(provider.execute(request(&provider, "schema")).unwrap());
+            let (journal, entry) =
+                PublicationJournal::<ConnectorCatalogMutationReceipt>::from_evidence(&original.1)
+                    .unwrap()
+                    .unwrap();
+            let descriptor = journal.entry_descriptor(entry).unwrap();
+            let reads = server.count("GET", PATH);
+            for target in [
+                IcebergMutationEvidenceTarget::TableVersion {
+                    namespace: "other".into(),
+                    table: "mv".into(),
+                    table_uuid: base.uuid().to_string(),
+                    before_metadata_location: Some(BEFORE.into()),
+                },
+                IcebergMutationEvidenceTarget::TableVersion {
+                    namespace: "managed".into(),
+                    table: "mv".into(),
+                    table_uuid: uuid::Uuid::from_u128(19).to_string(),
+                    before_metadata_location: Some(BEFORE.into()),
+                },
+            ] {
+                assert!(
+                    observe_only_alter_table_version(
+                        &provider,
+                        &target,
+                        &descriptor,
+                        &original.1,
+                        &context(),
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(server.count("GET", PATH), reads);
+            assert_eq!(server.count("POST", PATH), 1);
+            assert_original_unknown(journal.catalog_entry_outcome(entry), &original);
+        }
+
+        #[test]
+        fn decisive_ordinary_alter_journal_bypasses_observation_even_after_stop() {
+            use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
+            let base = test_metadata(HashMap::new());
+            let (server, _) = server(&base, "failure", true);
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let request = request(&provider, "schema");
+            let token = OperationToken::from_mutation(request.operation_id);
+            let frozen = crate::commit::staging::freeze_existing_change(
+                TableIdent::new(NamespaceIdent::new("managed".into()), "mv".into()),
+                "main",
+                &base,
+                BEFORE,
+                RequestShape::MetadataOnly,
+                AttemptToken::new(token, 0),
+                prepare_schema_updates(&base, &schema_change()).unwrap(),
+                &request.context,
+            )
+            .unwrap();
+            let external = evidence(
+                &provider,
+                request.operation_id,
+                request.operation.kind(),
+                IcebergMutationEvidenceTarget::TableVersion {
+                    namespace: "managed".into(),
+                    table: "mv".into(),
+                    table_uuid: base.uuid().to_string(),
+                    before_metadata_location: Some(BEFORE.into()),
+                },
+            )
+            .unwrap();
+            let journal = PublicationJournal::for_runtime(
+                token,
+                provider.runtime().resources().catalog_runtime(),
+            );
+            journal
+                .record(
+                    external,
+                    receipt(&provider, request.operation_id, request.operation.kind()).unwrap(),
+                    &frozen,
+                )
+                .unwrap();
+            let catalog = provider.runtime().novarocks_catalog().clone();
+            let publication = journal.clone();
+            let policy = catalog.evidence_policy();
+            let entry = provider
+                .runtime()
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    publication
+                        .publish_once(
+                            request.context,
+                            policy,
+                            move |descriptor, generation, original| async move {
+                                catalog
+                                    .prepare_frozen_publication(
+                                        frozen,
+                                        CatalogOperation::AlterSchema,
+                                        None,
+                                        descriptor,
+                                        generation,
+                                        original,
+                                    )
+                                    .await
+                            },
+                        )
+                        .await
+                })
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                journal.catalog_entry_outcome(entry),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            let evidence = journal.entry_evidence(entry).unwrap();
+            let reads = server.count("GET", PATH);
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            stop.request_stop();
+            let stopped = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                131072,
+            )
+            .unwrap();
+            assert!(matches!(
+                provider
+                    .reconcile(ConnectorCatalogMutationReconcileRequest {
+                        evidence,
+                        context: stopped
+                    })
+                    .unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert_eq!(server.count("GET", PATH), reads);
+            assert_eq!(server.count("POST", PATH), 1);
+        }
+    }
+
+    #[test]
+    fn ordinary_rest_create_unknown_stays_unknown_when_reconciled_against_absence() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(
+                    "GET",
+                    "/v1/namespaces/atomic/tables/events",
+                    Reply::status(404),
+                )
+                .on(
+                    "GET",
+                    "/v1/namespaces/atomic",
+                    Reply::json(
+                        200,
+                        &serde_json::json!({"namespace":["atomic"],"properties":{}}),
+                    ),
+                )
+                .on("POST", "/v1/namespaces/atomic/tables", Reply::status(503)),
+        );
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        let request = create_request(
+            &provider,
+            ConnectorMutationOperationId::new(),
+            CreatePolicy::FailIfExists,
+        );
+        let evidence = match provider.execute(request).unwrap() {
+            ExternalMutationOutcome::CommitUnknown { evidence, .. } => evidence,
+            other => panic!("ambiguous POST must remain Unknown: {other:?}"),
+        };
+        assert!(matches!(
+            provider
+                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                    evidence,
+                    context: context()
+                })
+                .unwrap(),
+            ExternalMutationOutcome::CommitUnknown { .. }
         ));
+        assert_eq!(
+            server
+                .requests_to("POST", "/v1/namespaces/atomic/tables")
+                .len(),
+            1
+        );
+        assert_eq!(
+            server
+                .requests_to("GET", "/v1/namespaces/atomic/tables/events")
+                .len(),
+            1,
+            "ObserveOnly cannot adjudicate from table presence or absence"
+        );
+    }
+
+    #[test]
+    fn ordinary_create_preparation_reads_keep_original_stop_and_deadline() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for namespace in [false, true] {
+            for cancel in [false, true] {
+                let table_path = "/v1/namespaces/atomic/tables/events";
+                let namespace_path = "/v1/namespaces/atomic";
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on(
+                            "GET",
+                            table_path,
+                            Reply::status(404).with_delay(if namespace {
+                                Duration::ZERO
+                            } else {
+                                Duration::from_secs(2)
+                            }),
+                        )
+                        .on(
+                            "GET",
+                            namespace_path,
+                            Reply::json(
+                                200,
+                                &serde_json::json!({"namespace":["atomic"],"properties":{}}),
+                            )
+                            .with_delay(if namespace {
+                                Duration::from_secs(2)
+                            } else {
+                                Duration::ZERO
+                            }),
+                        ),
+                );
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                let mut request = create_request(
+                    &provider,
+                    ConnectorMutationOperationId::new(),
+                    CreatePolicy::FailIfExists,
+                );
+                request.context = ConnectorRequestContext::try_new(
+                    Instant::now()
+                        + if cancel {
+                            Duration::from_secs(10)
+                        } else {
+                            Duration::from_millis(100)
+                        },
+                    stop.view(),
+                    65536,
+                    131072,
+                )
+                .unwrap();
+                let started = Instant::now();
+                std::thread::scope(|scope| {
+                    let worker = scope.spawn(|| provider.execute(request).unwrap());
+                    if cancel {
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while server
+                            .requests_to(
+                                "GET",
+                                if namespace {
+                                    namespace_path
+                                } else {
+                                    table_path
+                                },
+                            )
+                            .is_empty()
+                        {
+                            assert!(Instant::now() < until, "create probe did not start");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        stop.request_stop();
+                    }
+                    assert!(
+                        matches!(worker.join().unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == if cancel { ConnectorMutationFailureKind::Cancelled } else { ConnectorMutationFailureKind::DeadlineExceeded })
+                    );
+                });
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "preparation ignored its original control while waiting for HTTP"
+                );
+                assert!(
+                    server
+                        .requests_to("POST", "/v1/namespaces/atomic/tables")
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[test]
@@ -4876,35 +7139,52 @@ mod tests {
         let (namespace, creation) =
             prepare_table_creation(table, columns, key.as_ref(), partitioning, properties)
                 .expect("prepare table creation");
-        // Through the catalog owner, like production: no concrete client here.
-        let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
-        let prepare = crate::catalog::ConditionalCreateRequest {
-            namespace: crate::catalog::CatalogNamespaceName::new(namespace.to_url_string()),
-            creation,
-            operation_id: std::sync::Arc::from(hex_encode(&operation_id.to_bytes()).as_str()),
+        let frozen = provider
+            .runtime()
+            .novarocks_catalog()
+            .freeze_create_publication(
+                crate::catalog::catalog_request::CatalogCreatePublicationRequest {
+                    operation_id: operation_id.to_bytes(),
+                    namespace: CatalogNamespaceName::new(namespace.to_url_string()),
+                    creation,
+                    no_op_if_exists: false,
+                },
+            )
+            .unwrap();
+        let facts = frozen.conditional_create_facts().unwrap();
+        let external_evidence = hadoop_create_evidence(&provider, &request, table, &facts).unwrap();
+        let seed = hadoop_create_receipt(
+            &provider,
+            operation_id,
+            request.operation.kind(),
+            Some(&facts.metadata_location),
+            &facts.table_uuid,
+            &facts.metadata_digest,
+        )
+        .unwrap();
+        let evidence = lose_catalog_response(&provider, &request, frozen, external_evidence, seed);
+        let metadata_path = std::path::Path::new(
+            facts
+                .metadata_location
+                .strip_prefix("file://")
+                .unwrap_or(&facts.metadata_location),
+        );
+        let metadata_directory = metadata_path.parent().unwrap();
+        let hint_path = metadata_directory.join("version-hint.text");
+        assert!(
+            !hint_path.exists(),
+            "the discarded finalizer did not write a hint"
+        );
+        let metadata_before = std::fs::read(metadata_path).unwrap();
+        let publication_objects = || {
+            let mut paths = std::fs::read_dir(metadata_directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
         };
-        let prepared = provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.prepare_conditional_create(prepare).await })
-            .expect("catalog runtime");
-        let (attempt, _effect, _witness) = prepared
-            .into_known_committed()
-            .expect("prepare is local and cannot fail here");
-        let evidence = hadoop_create_evidence(&provider, &request, table, &attempt.facts)
-            .expect("create evidence");
-        let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
-        let published = provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.publish_conditional_create(attempt).await })
-            .expect("catalog runtime");
-        assert!(matches!(
-            published,
-            crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
-        ));
+        let objects_before = publication_objects();
 
         let reconciled = provider
             .reconcile(ConnectorCatalogMutationReconcileRequest {
@@ -4916,9 +7196,263 @@ mod tests {
             reconciled,
             ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
+                finalization: ExternalMutationFinalization::Failed(failure),
+                ..
+            } if failure.message().contains("hint or cache finalization")
+        ));
+        assert!(
+            !hint_path.exists(),
+            "read-only attribution must not repair the hint"
+        );
+        assert_eq!(std::fs::read(metadata_path).unwrap(), metadata_before);
+        assert_eq!(
+            publication_objects(),
+            objects_before,
+            "reconciliation must not publish another object"
+        );
+    }
+
+    #[test]
+    fn ref_unknown_cannot_be_reconciled_from_absence_or_a_coincidentally_matching_ref() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for present_after in [false, true] {
+            let metadata = test_metadata(HashMap::new());
+            let snapshot = Snapshot::builder()
+                .with_snapshot_id(7)
+                .with_sequence_number(1)
+                .with_timestamp_ms(metadata.last_updated_ms())
+                .with_manifest_list("memory://manifest-list.avro".to_owned())
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_schema_id(metadata.current_schema_id())
+                .build();
+            let builder = TableUpdate::AddSnapshot { snapshot }
+                .apply(metadata.into_builder(None))
+                .unwrap();
+            let metadata = TableUpdate::SetSnapshotRef {
+                ref_name: "main".into(),
+                reference: crate::ref_snapshot::moved_reference(None, 7, true),
+            }
+            .apply(builder)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            let before = serde_json::json!({"metadata-location":"memory://metadata/before.json","metadata":metadata});
+            let current = Arc::new(std::sync::Mutex::new(Some(before)));
+            let read = current.clone();
+            let write = current.clone();
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on_fn(
+                        "GET",
+                        "/v1/namespaces/managed/tables/mv",
+                        move |_, _| match &*read.lock().unwrap() {
+                            Some(metadata) => Reply::json(200, metadata),
+                            None => Reply::status(404),
+                        },
+                    )
+                    .on_fn("POST", "/v1/namespaces/managed/tables/mv", move |_, _| {
+                        let mut state = write.lock().unwrap();
+                        if present_after {
+                            state.as_mut().unwrap()["metadata"]["refs"]["release"] =
+                                serde_json::json!({"snapshot-id":7,"type":"branch"});
+                        } else {
+                            *state = None;
+                        }
+                        Reply::status(503)
+                    }),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let request = ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterRef {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        namespace: "managed".into(),
+                        table: "mv".into(),
+                    },
+                    action: ConnectorRefAction::Create {
+                        kind: ConnectorRefKind::Branch,
+                        name: "release".into(),
+                        snapshot_id: Some(7),
+                        policy: CreateOrReplacePolicy::FailIfExists,
+                        expected_table_uuid: None,
+                    },
+                },
+                context: context(),
+            };
+            let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+                provider.execute(request).unwrap()
+            else {
+                panic!("lost ref response remains Unknown");
+            };
+            let reads = server.count("GET", "/v1/namespaces/managed/tables/mv");
+            assert!(matches!(
+                provider
+                    .reconcile(ConnectorCatalogMutationReconcileRequest {
+                        evidence,
+                        context: context()
+                    })
+                    .unwrap(),
+                ExternalMutationOutcome::CommitUnknown { .. }
+            ));
+            assert_eq!(
+                server.count("GET", "/v1/namespaces/managed/tables/mv"),
+                reads,
+                "ObserveOnly cannot invent an attribution probe"
+            );
+            assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
+        }
+    }
+
+    #[test]
+    fn typed_existing_metadata_publications_apply_schema_partition_properties_and_noop() {
+        let (_executor, _warehouse, provider) = provider();
+        create_namespace(&provider, "typed");
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "typed".into(),
+            table: "events".into(),
+        };
+        create_table_fixture(
+            &provider,
+            &table,
+            &[ConnectorColumnDefinition {
+                name: "id".into(),
+                data_type: ConnectorDataType::BigInt,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+            CreatePolicy::FailIfExists,
+        )
+        .unwrap();
+        let initial = provider
+            .runtime()
+            .observe_table_for_request("typed", "events", &context())
+            .unwrap();
+        let original_uuid = initial.table.metadata().uuid();
+        let operations = [
+            ConnectorCatalogMutationOperation::AlterSchema {
+                table: table.clone(),
+                changes: vec![ConnectorSchemaChange::RenameColumn {
+                    path: ConnectorColumnPath {
+                        segments: vec!["id".into()],
+                    },
+                    to: "renamed".into(),
+                }],
+            },
+            ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                table: table.clone(),
+                add: vec![ConnectorPartitionTransform::Identity {
+                    column: "renamed".into(),
+                }],
+                drop: vec![],
+            },
+            ConnectorCatalogMutationOperation::AlterProperties {
+                table: table.clone(),
+                changes: vec![ConnectorPropertyChange::Set {
+                    key: "owner".into(),
+                    value: "analytics".into(),
+                }],
+                authority: ConnectorPropertyAuthority::UserStatement,
+                expected_committed_partitioning: None,
+            },
+        ];
+        for operation in operations {
+            let outcome = provider
+                .execute(ConnectorCatalogMutationRequest {
+                    operation_id: ConnectorMutationOperationId::new(),
+                    target: ConnectorProviderBindingKey {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        incarnation: provider.incarnation(),
+                    },
+                    operation,
+                    context: context(),
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+        }
+        let current = provider
+            .runtime()
+            .observe_table_for_request("typed", "events", &context())
+            .unwrap();
+        assert_eq!(current.table.metadata().uuid(), original_uuid);
+        assert!(
+            current
+                .table
+                .metadata()
+                .current_schema()
+                .field_by_name("renamed")
+                .is_some()
+        );
+        assert_eq!(
+            current
+                .table
+                .metadata()
+                .default_partition_spec()
+                .fields()
+                .len(),
+            1
+        );
+        assert_eq!(current.table.metadata().properties()["owner"], "analytics");
+        let location = current.table.metadata_location().map(str::to_owned);
+        let outcome = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes: vec![ConnectorPropertyChange::Unset {
+                        key: "missing".into(),
+                        if_exists: true,
+                    }],
+                    authority: ConnectorPropertyAuthority::UserStatement,
+                    expected_committed_partitioning: None,
+                },
+                context: context(),
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
                 ..
             }
         ));
+        assert_eq!(
+            provider
+                .runtime()
+                .observe_table_for_request("typed", "events", &context())
+                .unwrap()
+                .table
+                .metadata_location()
+                .map(str::to_owned),
+            location
+        );
     }
 
     #[test]
@@ -5207,13 +7741,32 @@ mod tests {
             },
         };
 
-        let error = alter_schema(provider.runtime(), &table, &[change], &context())
-            .expect_err("reserved field must not be resolved from table metadata");
+        let outcome = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterSchema {
+                    table,
+                    changes: vec![change],
+                },
+                context: context(),
+            })
+            .expect("execute reserved-field refusal");
+        let ExternalMutationOutcome::KnownUncommitted {
+            failure: error,
+            cleanup: ExternalMutationFinalization::Complete,
+        } = outcome
+        else {
+            panic!("reserved-field request must be refused before dispatch: {outcome:?}");
+        };
 
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(error.kind(), ConnectorMutationFailureKind::Unsupported);
         assert_eq!(
             error.message(),
-            "Iceberg schema evolution cannot modify reserved column `_row_id`"
+            "Unsupported: Iceberg schema evolution cannot modify reserved column `_row_id`"
         );
     }
 
@@ -5307,21 +7860,36 @@ mod tests {
     }
 
     #[test]
-    fn response_loss_classification_is_narrow() {
-        assert!(commit_may_be_unknown(ConnectorErrorKind::Unavailable));
-        assert!(commit_may_be_unknown(ConnectorErrorKind::Internal));
-        for kind in [
-            ConnectorErrorKind::InvalidRequest,
-            ConnectorErrorKind::NotFound,
-            ConnectorErrorKind::PermissionDenied,
-            ConnectorErrorKind::Unsupported,
-            ConnectorErrorKind::Cancelled,
-            ConnectorErrorKind::DeadlineExceeded,
-            ConnectorErrorKind::ResourceExhausted,
-            ConnectorErrorKind::CorruptData,
+    fn response_loss_after_dispatch_keeps_publication_unknown() {
+        use crate::rest_protocol::evidence::*;
+        for cause in [
+            NoStatusCause::Closed,
+            NoStatusCause::DeadlineExceeded,
+            NoStatusCause::ReadTimeout,
+            NoStatusCause::Other,
         ] {
-            assert!(!commit_may_be_unknown(kind), "{kind:?}");
+            let evidence = classify(
+                &DispatchStage::WrittenNoStatus(cause),
+                BodyRead::NotRead,
+                &AttributionExpectation::drop_table(),
+            );
+            let outcome = evidence.into_catalog_outcome(
+                crate::catalog::error::CatalogCommitEvidence::for_target("db.t"),
+            );
+            assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+            assert!(outcome.closes_mutation_authority());
+            assert!(!outcome.permits_cleanup());
         }
+        let evidence = classify(
+            &DispatchStage::NotWritten(NotWrittenCause::Connect),
+            BodyRead::NotRead,
+            &AttributionExpectation::drop_table(),
+        );
+        let outcome = evidence.into_catalog_outcome(
+            crate::catalog::error::CatalogCommitEvidence::for_target("db.t"),
+        );
+        assert!(matches!(outcome, CatalogOutcome::KnownUncommitted { .. }));
+        assert!(outcome.permits_cleanup());
     }
 
     #[test]
@@ -5402,14 +7970,280 @@ mod tests {
             let operation_id = ConnectorMutationOperationId::new();
             let evidence =
                 evidence(&provider, operation_id, "mv-publication", target).expect("MV evidence");
-            let error = provider
+            let outcome = provider
                 .reconcile(ConnectorCatalogMutationReconcileRequest {
                     evidence,
                     context: context(),
                 })
-                .expect_err("MV reconcile is crash-only");
-            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                .expect("wire-only reconciliation stays unresolved");
+            assert!(matches!(
+                outcome,
+                ExternalMutationOutcome::CommitUnknown { .. }
+            ));
         }
+    }
+
+    #[test]
+    fn activity_preflight_reads_before_a_journal_keep_waits_and_typed_stops_visible() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
+        };
+        for kind in ["create", "drop", "view"] {
+            for timed_out in [false, true] {
+                let path = if kind == "view" {
+                    "/v1/namespaces/db/tables"
+                } else {
+                    "/v1/namespaces/atomic/tables/events"
+                };
+                let wire = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+                let get_wire = wire.clone();
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on_fn("GET", path, move |_, _| {
+                            entered_tx.send(()).unwrap();
+                            let (lock, ready) = &*get_wire;
+                            drop(
+                                ready
+                                    .wait_timeout_while(
+                                        lock.lock().unwrap(),
+                                        Duration::from_secs(20),
+                                        |released| !*released,
+                                    )
+                                    .unwrap(),
+                            );
+                            Reply::status(404)
+                        }),
+                );
+                let _server_release = ReleaseProducerRead(wire.clone());
+                let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    ConnectorInstanceId::parse("ice").unwrap(),
+                    uuid::Uuid::now_v7(),
+                ));
+                let (_executor, provider) =
+                    variant_definition_provider_observed(&server.url(), Some(root.generation()));
+                let mut request = match kind {
+                    "create" => create_request(
+                        &provider,
+                        ConnectorMutationOperationId::new(),
+                        CreatePolicy::FailIfExists,
+                    ),
+                    "drop" => drop_request(&provider, DropPolicy::FailIfMissing, false),
+                    _ => view_request(&provider, "create"),
+                };
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                request.context = ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(if timed_out { 2 } else { 20 }),
+                    stop.view(),
+                    64 * 1024,
+                    256 * 1024,
+                )
+                .unwrap();
+                std::thread::scope(|threads| {
+                    let release = ReleaseProducerRead(wire.clone());
+                    let worker = threads.spawn(|| provider.execute(request));
+                    entered_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("original-control preflight reached actual GET");
+                    let snapshot = root.snapshot();
+                    assert_eq!(
+                        snapshot.phases[P::PreDispatch as usize].inflight,
+                        1,
+                        "{kind}"
+                    );
+                    assert_eq!(snapshot.phases[P::Bridge as usize].inflight, 1);
+                    assert_eq!(snapshot.phases[P::Dispatch as usize].started, 0);
+                    if !timed_out {
+                        stop.request_stop();
+                    }
+                    let outcome = worker.join().unwrap().unwrap();
+                    let ExternalMutationOutcome::KnownUncommitted { failure, .. } = outcome else {
+                        panic!("preflight cannot publish")
+                    };
+                    assert_eq!(
+                        failure.kind(),
+                        if timed_out {
+                            ConnectorMutationFailureKind::DeadlineExceeded
+                        } else {
+                            ConnectorMutationFailureKind::Cancelled
+                        }
+                    );
+                    let snapshot = root.snapshot();
+                    assert_eq!(snapshot.phases[P::PreDispatch as usize].inflight, 0);
+                    assert_eq!(snapshot.phases[P::PreDispatch as usize].elapsed_count, 1);
+                    assert_eq!(snapshot.phases[P::Bridge as usize].inflight, 0);
+                    assert_eq!(snapshot.phases[P::Dispatch as usize].started, 0);
+                    assert_eq!(
+                        snapshot.events.pre_dispatch_cancelled,
+                        u64::from(!timed_out)
+                    );
+                    assert_eq!(snapshot.events.pre_dispatch_timed_out, u64::from(timed_out));
+                    assert!(
+                        server
+                            .requests()
+                            .iter()
+                            .all(|request| request.method == "GET" || request.method == "HEAD")
+                    );
+                    drop(release);
+                });
+                drop(provider);
+                server.shut_down();
+            }
+        }
+    }
+
+    struct ReleaseProducerRead(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseProducerRead {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.0;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    #[test]
+    fn activity_producer_document_reload_is_finalization_after_applied_evidence() {
+        use crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY;
+        use crate::document_storage::observation::{
+            MANAGED_INCARNATION_PROPERTY, MANAGED_KIND_PROPERTY, MANAGED_OWNER_PROPERTY,
+        };
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
+        };
+        struct ReplyState {
+            before: serde_json::Value,
+            after: Option<serde_json::Value>,
+            desired: HashMap<String, String>,
+            committed: bool,
+        }
+        let marker = managed_marker();
+        let before = test_metadata(HashMap::from([
+            (MANAGED_KIND_PROPERTY.into(), marker.kind().into()),
+            (MANAGED_OWNER_PROPERTY.into(), marker.owner().into()),
+            (
+                MANAGED_INCARNATION_PROPERTY.into(),
+                marker.incarnation().into(),
+            ),
+            (
+                DOCUMENT_MANIFEST_PROPERTY.into(),
+                initial_mv_document_manifest(),
+            ),
+        ]));
+        let state = Arc::new(std::sync::Mutex::new(ReplyState {
+            before: serde_json::json!({
+            "metadata-location":"memory://warehouse/managed/mv/metadata/before.json", "metadata": before }),
+            after: None,
+            desired: HashMap::new(),
+            committed: false,
+        }));
+        let wire = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let get_wire = wire.clone();
+        let get_state = state.clone();
+        let post_state = state.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let server = TestServer::start(Script::new()
+            .on("GET", "/v1/config", Reply::config(&[], &[], None))
+            .on_fn("GET", "/v1/namespaces/managed/tables/mv", move |_,_| {
+                let (committed, reply) = { let state = get_state.lock().unwrap();
+                    (state.committed, if state.committed { state.after.clone().unwrap() } else { state.before.clone() }) };
+                if committed {
+                    entered_tx.send(()).unwrap();
+                    let (lock, ready) = &*get_wire;
+                    drop(ready.wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(20), |released| !*released).unwrap());
+                }
+                Reply::json(200, &reply)
+            })
+            .on_fn("POST", "/v1/namespaces/managed/tables/mv", move |request,_| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let mut state = post_state.lock().unwrap();
+                assert!(!state.committed, "one actual mutation only");
+                assert_eq!(body["updates"], serde_json::json!([{"action":"set-properties", "updates":state.desired}]));
+                state.committed = true;
+                Reply::json(200, state.after.as_ref().unwrap())
+            }));
+        let _server_release = ReleaseProducerRead(wire.clone());
+        let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::parse("ice").unwrap(),
+            uuid::Uuid::now_v7(),
+        ));
+        let (_executor, provider) =
+            variant_definition_provider_observed(&server.url(), Some(root.generation()));
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "managed".into(),
+            table: "mv".into(),
+        };
+        let update = application_document_update_fixture(&provider, &table);
+        let operation_id = update.request.operation_id;
+        let ConnectorCatalogMutationOperation::UpdateApplicationDocuments { intent } =
+            &update.request.operation
+        else {
+            unreachable!()
+        };
+        let desired =
+            crate::document_storage::publication::update_properties(intent, operation_id, &before)
+                .unwrap();
+        let mut after = serde_json::to_value(&before).unwrap();
+        for (key, value) in &desired {
+            after["properties"][key] = serde_json::Value::String(value.clone());
+        }
+        {
+            let mut state = state.lock().unwrap();
+            state.desired = desired;
+            state.after = Some(
+                serde_json::json!({"metadata-location":"memory://warehouse/managed/mv/metadata/after.json", "metadata":after}),
+            );
+        }
+        std::thread::scope(|threads| {
+            // Released before scope's implicit join even if an assertion panics.
+            let release = ReleaseProducerRead(wire.clone());
+            let worker = threads.spawn(|| provider.execute(update.request));
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("real post-publication reload entered");
+            let snapshot = root.snapshot();
+            for phase in [P::Evidence, P::Dispatch, P::PreDispatch] {
+                assert_eq!(snapshot.phases[phase as usize].inflight, 0);
+            }
+            assert_eq!(snapshot.phases[P::Finalization as usize].inflight, 1);
+            assert_eq!(snapshot.phases[P::Bridge as usize].inflight, 1);
+            assert!(!worker.is_finished());
+            assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
+            drop(release);
+            let outcome = worker.join().unwrap().unwrap();
+            let ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt,
+                finalization,
+            } = outcome
+            else {
+                panic!("producer must retain Applied")
+            };
+            assert_eq!(effect, ExternalMutationEffect::Applied);
+            assert_eq!(finalization, ExternalMutationFinalization::Complete);
+            assert_eq!(receipt.operation_id(), operation_id);
+        });
+        let snapshot = root.snapshot();
+        for phase in [
+            P::Evidence,
+            P::Dispatch,
+            P::PreDispatch,
+            P::Finalization,
+            P::Bridge,
+        ] {
+            let row = &snapshot.phases[phase as usize];
+            assert_eq!(row.inflight, 0);
+            assert_eq!(row.started, row.exited);
+            assert_eq!(row.elapsed_count, row.exited);
+        }
+        assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
+        drop(provider);
+        server.shut_down();
+        assert!(root.snapshot().generations.is_empty());
     }
 
     #[test]
@@ -5865,46 +8699,58 @@ mod tests {
             original.table.metadata().last_column_id()
         );
 
-        alter_partition_spec(
-            provider.runtime(),
-            &table,
-            &[ConnectorPartitionTransform::Bucket {
-                column: "id".into(),
-                num_buckets: 4,
-            }],
-            &[],
-            &stale,
-        )
-        .expect_err("partition evolution must not land on the replacement");
-        alter_schema(
-            provider.runtime(),
-            &table,
-            &[ConnectorSchemaChange::AddColumn {
-                parent: ConnectorColumnPath { segments: vec![] },
-                column: ConnectorColumnDefinition {
-                    name: "extra".into(),
-                    data_type: ConnectorDataType::Int,
-                    nullable: true,
-                    aggregation: None,
-                    default: None,
-                },
-                position: ConnectorColumnPosition::Default,
-            }],
-            &stale,
-        )
-        .expect_err("schema evolution must not land on the replacement");
         let properties = vec![ConnectorPropertyChange::Set {
             key: "novarocks.mv.partition".into(),
             value: "stale".into(),
         }];
-        alter_properties(
-            provider.runtime(),
-            &table,
-            &properties,
-            ConnectorPropertyAuthority::EngineOwned,
-            &stale,
-        )
-        .expect_err("property mutation must not land on the replacement");
+        let operations = [
+            ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                table: table.clone(),
+                add: vec![ConnectorPartitionTransform::Bucket {
+                    column: "id".into(),
+                    num_buckets: 4,
+                }],
+                drop: vec![],
+            },
+            ConnectorCatalogMutationOperation::AlterSchema {
+                table: table.clone(),
+                changes: vec![ConnectorSchemaChange::AddColumn {
+                    parent: ConnectorColumnPath { segments: vec![] },
+                    column: ConnectorColumnDefinition {
+                        name: "extra".into(),
+                        data_type: ConnectorDataType::Int,
+                        nullable: true,
+                        aggregation: None,
+                        default: None,
+                    },
+                    position: ConnectorColumnPosition::Default,
+                }],
+            },
+            ConnectorCatalogMutationOperation::AlterProperties {
+                table: table.clone(),
+                changes: properties.clone(),
+                authority: ConnectorPropertyAuthority::EngineOwned,
+                expected_committed_partitioning: None,
+            },
+        ];
+        for operation in operations {
+            let outcome = provider
+                .execute(ConnectorCatalogMutationRequest {
+                    operation_id: ConnectorMutationOperationId::new(),
+                    target: ConnectorProviderBindingKey {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        incarnation: provider.incarnation(),
+                    },
+                    operation,
+                    context: stale.clone(),
+                })
+                .expect("dispatch stale request through its provider");
+            assert!(
+                matches!(outcome,ExternalMutationOutcome::KnownUncommitted{ref failure,..}
+                if failure.kind()==ConnectorMutationFailureKind::Conflict),
+                "{outcome:?}"
+            );
+        }
         let expected = committed_partitioning_from_metadata(
             original.table.metadata(),
             original.table.metadata().default_partition_spec_id(),
@@ -5926,9 +8772,10 @@ mod tests {
                 context: stale.clone(),
             })
             .expect("execute guarded property mutation");
-        assert!(!matches!(
+        assert!(matches!(
             guarded,
-            ExternalMutationOutcome::KnownCommitted { .. }
+            ExternalMutationOutcome::KnownUncommitted { failure, .. }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
         ));
 
         let after = provider
@@ -5939,36 +8786,40 @@ mod tests {
     }
 
     #[test]
-    fn a_rest_failure_reaches_the_direct_path_classifier_as_unknown_unless_409() {
-        use crate::rest_protocol::adapter::RestEvidenceCarrier;
-        use crate::rest_protocol::evidence::{
-            AttributionExpectation, BodyRead, DispatchStage, classify,
-        };
-        let adapter_error = |kind, status| {
+    fn rest_404_stays_unknown_and_409_is_a_typed_conflict() {
+        use crate::rest_protocol::evidence::*;
+        for status in [404, 409] {
             let evidence = classify(
                 &DispatchStage::Status {
                     code: status,
-                    header_names: Vec::new(),
+                    header_names: vec![],
                 },
                 BodyRead::NotRead,
                 &AttributionExpectation::drop_table(),
             );
-            crate::iceberg::Error::new(kind, "adapter failure")
-                .with_source(RestEvidenceCarrier::new(evidence))
-        };
-        // The adapter never raises TableNotFound for a 404 (L13), so the
-        // direct path's own classifier reports an unknown outcome.
-        let not_found = map_iceberg(adapter_error(crate::iceberg::ErrorKind::Unexpected, 404));
-        assert!(commit_may_be_unknown(not_found.kind()));
-        let conflict = map_iceberg(adapter_error(
-            crate::iceberg::ErrorKind::CatalogCommitConflicts,
-            409,
-        ));
-        assert!(!commit_may_be_unknown(conflict.kind()));
+            let outcome = evidence.into_catalog_outcome(
+                crate::catalog::error::CatalogCommitEvidence::for_target("db.t"),
+            );
+            if status == 404 {
+                assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+                assert!(!outcome.permits_cleanup());
+            } else {
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownUncommitted { ref failure } if failure.kind() == ConnectorMutationFailureKind::Conflict)
+                );
+                assert!(outcome.permits_cleanup());
+            }
+        }
     }
     /// The REST spy detects catalog requests; the existing refusing FileIO
     /// owner makes either synchronous or spawned object access fail the test.
     fn variant_definition_provider(endpoint: &str) -> (tokio::runtime::Runtime, IcebergMetadata) {
+        variant_definition_provider_observed(endpoint, None)
+    }
+    fn variant_definition_provider_observed(
+        endpoint: &str,
+        activity: Option<Arc<crate::activity::GenerationActivity>>,
+    ) -> (tokio::runtime::Runtime, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let configuration = crate::catalog_config::parse_catalog_configuration(
             "ice",
@@ -5985,9 +8836,14 @@ mod tests {
             Arc::new(RefuseFileIo),
             Arc::new(RefuseFileIo),
         );
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
+        let resources = match activity {
+            Some(activity) => resources.with_activity(activity),
+            None => resources,
+        };
         let runtime = IcebergMetadataContext::try_new(
             IcebergCatalogControlState::new(configuration),
-            IcebergMetadataResources::new(binding, executor.handle().clone()),
+            resources,
         )
         .expect("lazy REST generation");
         let provider = IcebergMetadata::new(
@@ -6332,10 +9188,10 @@ mod tests {
                 .expect("existing Variant does not make metadata read-only");
             apply_schema_change(&fields, &change, &mut 3)
                 .expect("existing schema-change semantics remain legal");
-            let commit = schema_change_commit(ident(), &metadata, &change)
+            let commit = prepare_schema_updates(&metadata, &change)
                 .expect("existing schema change reaches its commit owner");
             assert_eq!(
-                commit.is_none(),
+                commit.updates.is_empty(),
                 matches!(change, ConnectorSchemaChange::ModifyColumn { .. }),
                 "the unchanged MODIFY must not publish an identical schema"
             );
@@ -6347,29 +9203,24 @@ mod tests {
             data_type,
         };
         assert!(
-            schema_change_commit(ident(), &metadata, &ordinary_modify(ConnectorDataType::Int))
+            prepare_schema_updates(&metadata, &ordinary_modify(ConnectorDataType::Int))
                 .unwrap()
-                .is_none(),
+                .updates
+                .is_empty(),
             "ordinary same-type MODIFY is also a no-op"
         );
         assert!(
-            schema_change_commit(
-                ident(),
-                &metadata,
-                &ordinary_modify(ConnectorDataType::BigInt)
-            )
-            .unwrap()
-            .is_some(),
+            !prepare_schema_updates(&metadata, &ordinary_modify(ConnectorDataType::BigInt))
+                .unwrap()
+                .updates
+                .is_empty(),
             "a real widening must still publish a schema"
         );
         assert_eq!(
-            schema_change_commit(
-                ident(),
-                &metadata,
-                &ordinary_modify(ConnectorDataType::Variant)
-            )
-            .unwrap_err()
-            .kind(),
+            prepare_schema_updates(&metadata, &ordinary_modify(ConnectorDataType::Variant))
+                .err()
+                .expect("MODIFY introducing Variant is refused")
+                .kind(),
             ConnectorErrorKind::Unsupported,
             "MODIFY cannot introduce Variant"
         );

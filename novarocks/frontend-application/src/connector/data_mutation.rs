@@ -223,7 +223,10 @@ pub struct DataMutationSession {
 
 enum DataMutationSessionPhase {
     Planned,
-    AwaitingAdjudication(ExternalMutationEvidence),
+    AwaitingAdjudication {
+        evidence: ExternalMutationEvidence,
+        failure: ConnectorMutationFailure,
+    },
     Terminal,
 }
 
@@ -337,8 +340,11 @@ impl DataMutationSession {
             }
         };
         self.phase = match &outcome {
-            ExternalMutationOutcome::CommitUnknown { evidence, .. } => {
-                DataMutationSessionPhase::AwaitingAdjudication(evidence.clone())
+            ExternalMutationOutcome::CommitUnknown { evidence, failure } => {
+                DataMutationSessionPhase::AwaitingAdjudication {
+                    evidence: evidence.clone(),
+                    failure: failure.clone(),
+                }
             }
             _ => DataMutationSessionPhase::Terminal,
         };
@@ -353,7 +359,11 @@ impl DataMutationSession {
         evidence: ExternalMutationEvidence,
         cache_finalizer: &dyn DataMutationCacheFinalizer,
     ) -> ResolvedDataMutation {
-        let DataMutationSessionPhase::AwaitingAdjudication(expected) = &self.phase else {
+        let DataMutationSessionPhase::AwaitingAdjudication {
+            evidence: expected,
+            failure: original_failure,
+        } = &self.phase
+        else {
             return contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -371,24 +381,41 @@ impl DataMutationSession {
                 DataMutationDispatchState::ConfirmedNotDispatched,
             );
         }
+        // Wire carriers validate identity, while the same-statement session
+        // retains the original provider owner and its exact journal entry.
+        let original_failure = original_failure.clone();
+        let original_evidence = expected.clone();
         let reconcile = match ConnectorDataMutationReconcileRequest::try_new(
             &self.plan,
-            evidence,
+            expected.clone(),
             self.context.clone(),
         ) {
             Ok(request) => request,
-            Err(error) => {
-                return contract_failure(error, DataMutationDispatchState::ConfirmedNotDispatched);
+            Err(_error) => {
+                self.phase = DataMutationSessionPhase::Terminal;
+                return ResolvedDataMutation::CommitUnknown {
+                    failure: original_failure,
+                    evidence: original_evidence,
+                };
             }
         };
         let outcome = match self.lease.reconcile(reconcile) {
             Ok(outcome) => outcome,
-            Err(error) => {
+            Err(_error) => {
                 self.phase = DataMutationSessionPhase::Terminal;
-                return contract_failure(error, DataMutationDispatchState::PossiblyDispatched);
+                return ResolvedDataMutation::CommitUnknown {
+                    failure: original_failure,
+                    evidence: original_evidence,
+                };
             }
         };
         self.phase = DataMutationSessionPhase::Terminal;
+        if matches!(outcome, ExternalMutationOutcome::KnownUncommitted { .. }) {
+            return ResolvedDataMutation::CommitUnknown {
+                failure: original_failure,
+                evidence: original_evidence,
+            };
+        }
         resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
     }
 }
@@ -511,6 +538,8 @@ mod tests {
         PlanningFailure,
         Uncommitted,
         UnknownThenCommitted,
+        UnknownThenNegative,
+        UnknownThenReadError,
         UnknownStaysUnknown,
         ExecuteContractFailure,
     }
@@ -575,6 +604,13 @@ mod tests {
                 Bytes::from_static(b"evidence"),
             )
             .expect("evidence")
+            .with_process_local_payload(
+                novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                    self.key.clone(),
+                    Arc::new(String::from("original provider owner")),
+                ),
+            )
+            .expect("exact local owner")
         }
     }
 
@@ -692,7 +728,10 @@ mod tests {
             }
             if matches!(
                 self.mode,
-                Mode::UnknownThenCommitted | Mode::UnknownStaysUnknown
+                Mode::UnknownThenCommitted
+                    | Mode::UnknownThenNegative
+                    | Mode::UnknownThenReadError
+                    | Mode::UnknownStaysUnknown
             ) {
                 return Ok(ExternalMutationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
@@ -724,6 +763,31 @@ mod tests {
             request: ConnectorDataMutationReconcileRequest,
         ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
             self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                request
+                    .evidence
+                    .process_local_payload()
+                    .unwrap()
+                    .value::<String>(self.descriptor.instance_id.as_str())
+                    .unwrap()
+                    .as_str(),
+                "original provider owner"
+            );
+            if matches!(self.mode, Mode::UnknownThenReadError) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "read-only probe failed",
+                ));
+            }
+            if matches!(self.mode, Mode::UnknownThenNegative) {
+                return Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::NotFound,
+                        "marker absent",
+                    ),
+                    cleanup: ExternalMutationFinalization::Complete,
+                });
+            }
             if matches!(self.mode, Mode::UnknownStaysUnknown) {
                 return Ok(ExternalMutationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
@@ -970,8 +1034,12 @@ mod tests {
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
 
+        let decoded =
+            ExternalMutationEvidence::try_from_wire_v1(&evidence.try_to_wire_v1().unwrap())
+                .unwrap();
+        assert!(decoded.process_local_payload().is_none());
         assert!(matches!(
-            session.adjudicate_once(evidence, &finalizer),
+            session.adjudicate_once(decoded, &finalizer),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
@@ -986,6 +1054,44 @@ mod tests {
             }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn negative_reconciliation_preserves_the_original_unknown_and_its_owner() {
+        for mode in [Mode::UnknownThenNegative, Mode::UnknownThenReadError] {
+            let provider = FakeProvider::new(mode);
+            let finalizer = Finalizer {
+                events: provider.events.clone(),
+                fail: false,
+            };
+            let mut session = DataMutationSession::plan(
+                &Resolver::new(provider.clone()),
+                &provider.descriptor.instance_id,
+                ConnectorMutationOperationId::new(),
+                table(&provider.descriptor.instance_id),
+                truncate_intent(),
+                context(),
+            )
+            .unwrap();
+            let ResolvedDataMutation::CommitUnknown { evidence, failure } =
+                session.execute_once(&finalizer)
+            else {
+                panic!("unknown");
+            };
+            let ResolvedDataMutation::CommitUnknown {
+                evidence: after,
+                failure: original,
+            } = session.adjudicate_once(evidence.clone(), &finalizer)
+            else {
+                panic!("negative observation cannot clear Unknown");
+            };
+            assert_eq!(after, evidence);
+            assert!(after.process_local_payload().is_some());
+            assert_eq!(original, failure);
+            assert!(provider.events.lock().unwrap().is_empty());
+            assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

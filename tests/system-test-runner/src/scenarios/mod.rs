@@ -1,6 +1,7 @@
 use crate::scenario::Scenario;
 
 mod backend_membership;
+mod catalog_publication;
 mod catalog_state;
 mod connector;
 mod distributed_writer;
@@ -83,6 +84,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(distributed_writer::scenarios());
     scenarios.extend(frontend_lifecycle::scenarios());
     scenarios.extend(catalog_state::scenarios());
+    scenarios.extend(catalog_publication::scenarios());
     scenarios.extend(mv_recovery::scenarios());
     scenarios.extend(mv_uea7::scenarios());
     scenarios.push(Box::new(mv_uea7_handover::MvOwnerHandover::default()));

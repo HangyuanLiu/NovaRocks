@@ -515,9 +515,9 @@ mod tests {
     /// provider role factory: reusing an incarnation would trip the retired-generation guard
     /// on a same-name recreate. It also counts materializations, so a test can
     /// tell "reconciled again" apart from "materialized again".
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct ReadyFactory {
-        incarnations: AtomicU8,
+        incarnations: Arc<AtomicU8>,
         materializations: Arc<AtomicUsize>,
     }
 
@@ -679,6 +679,23 @@ mod tests {
             )
         }
 
+        fn open_catalog(
+            &self,
+            identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(ReadyCatalogFactory {
+                factory: self.clone(),
+                identity,
+            })
+        }
+    }
+
+    struct ReadyCatalogFactory {
+        factory: ReadyFactory,
+        identity: novarocks_spi::connector::CatalogScopeIdentity,
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for ReadyCatalogFactory {
         fn materialize(
             &self,
             properties: novarocks_spi::connector::NormalizedCatalogProperties,
@@ -692,8 +709,19 @@ mod tests {
         > {
             use futures::FutureExt;
 
-            self.materializations.fetch_add(1, Ordering::Relaxed);
-            let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
+            assert_eq!(
+                properties.as_catalog_properties().provider_id(),
+                self.identity.provider_id(),
+            );
+            assert_eq!(
+                properties.handle().catalog_name(),
+                self.identity.instance_id(),
+            );
+
+            self.factory
+                .materializations
+                .fetch_add(1, Ordering::Relaxed);
+            let incarnation = self.factory.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
             async move {
                 let control =
                     novarocks_catalog_application::test_support::test_control_binding_for(
@@ -735,9 +763,22 @@ mod tests {
             )
         }
 
+        fn open_catalog(
+            &self,
+            identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(UnavailableCatalogFactory { identity })
+        }
+    }
+
+    struct UnavailableCatalogFactory {
+        identity: novarocks_spi::connector::CatalogScopeIdentity,
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for UnavailableCatalogFactory {
         fn materialize(
             &self,
-            _properties: novarocks_spi::connector::NormalizedCatalogProperties,
+            properties: novarocks_spi::connector::NormalizedCatalogProperties,
             _context: novarocks_spi::connector::MaterializationContext,
         ) -> futures::future::BoxFuture<
             'static,
@@ -747,6 +788,15 @@ mod tests {
             >,
         > {
             use futures::FutureExt;
+
+            assert_eq!(
+                properties.as_catalog_properties().provider_id(),
+                self.identity.provider_id(),
+            );
+            assert_eq!(
+                properties.handle().catalog_name(),
+                self.identity.instance_id(),
+            );
 
             async move {
                 Err(novarocks_spi::connector::ConnectorMaterializationError::new(
@@ -948,7 +998,7 @@ mod tests {
         let materializations = Arc::new(AtomicUsize::new(0));
         let control = Arc::new(
             ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory {
-                incarnations: AtomicU8::new(0),
+                incarnations: Arc::new(AtomicU8::new(0)),
                 materializations: Arc::clone(&materializations),
             })])
             .expect("control host"),

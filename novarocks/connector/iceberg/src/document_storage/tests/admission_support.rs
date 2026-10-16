@@ -12,12 +12,10 @@ use async_trait::async_trait;
 use novarocks_spi::connector::ConnectorError;
 
 use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
-use crate::catalog::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use crate::catalog::{
-    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
-    StagedCommitResult, StagedCreateStart,
+    CatalogNamespaceName, CatalogTableName, CatalogTablePage, ConditionalCreateAttempt,
+    ConditionalCreateEvidence, ConditionalCreateReceipt, ConditionalCreateRequest,
+    ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
 #[derive(Debug)]
@@ -25,7 +23,6 @@ pub(super) struct AdmissionCatalogSpy {
     inner: Arc<dyn NovaRocksCatalog>,
     reads: AtomicUsize,
     mutations: AtomicUsize,
-    client_accesses: AtomicUsize,
 }
 
 impl AdmissionCatalogSpy {
@@ -34,7 +31,6 @@ impl AdmissionCatalogSpy {
             inner,
             reads: AtomicUsize::new(0),
             mutations: AtomicUsize::new(0),
-            client_accesses: AtomicUsize::new(0),
         }
     }
 
@@ -44,11 +40,6 @@ impl AdmissionCatalogSpy {
             self.mutations.load(Ordering::SeqCst),
             0,
             "catalog mutations"
-        );
-        assert_eq!(
-            self.client_accesses.load(Ordering::SeqCst),
-            0,
-            "catalog client access"
         );
     }
 
@@ -65,6 +56,58 @@ impl AdmissionCatalogSpy {
 
 #[async_trait]
 impl NovaRocksCatalog for AdmissionCatalogSpy {
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.inner.bind_publication_generation(generation)
+    }
+    fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
+        self.inner.evidence_policy()
+    }
+    async fn prepare_catalog_publication(
+        &self,
+        request: crate::catalog::catalog_request::FrozenCatalogPublication,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+        document: crate::catalog::catalog_request::CatalogResponseDocument,
+        read_binding: crate::access_binding::IcebergReadBinding,
+    ) -> crate::catalog::publication_dispatch::PreparationResult<
+        crate::catalog::publication_dispatch::PreparedPublication,
+    > {
+        let _ = (
+            request,
+            descriptor,
+            generation,
+            preparation,
+            document,
+            read_binding,
+        );
+        self.mutation()
+    }
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: crate::catalog::admission::CatalogOperation,
+        staged_expectation: Option<crate::catalog::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> crate::catalog::publication_dispatch::PreparationResult<
+        crate::catalog::publication_dispatch::PreparedPublication,
+    > {
+        let _ = (
+            request,
+            operation,
+            staged_expectation,
+            descriptor,
+            generation,
+            preparation,
+        );
+        self.mutation()
+    }
+
     fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
         Arc::new(Default::default())
     }
@@ -85,11 +128,6 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         request: &crate::catalog::admission::CatalogAdmissionRequest,
     ) -> Result<crate::catalog::admission::CatalogAdmission, CatalogUnsupported> {
         self.inner.admit_initiation(request)
-    }
-
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
-        self.client_accesses.fetch_add(1, Ordering::SeqCst);
-        panic!("unsupported document admission requested the catalog client");
     }
 
     async fn list_namespaces(
@@ -153,52 +191,11 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         self.read()
     }
 
-    async fn create_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.mutation()
-    }
-
-    async fn drop_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        self.mutation()
-    }
-
-    async fn drop_table(
-        &self,
-        _table: CatalogTableName,
-    ) -> CatalogOutcome<CatalogDropTableReceipt> {
-        self.mutation()
-    }
-
     async fn anchor_written_metadata(
         &self,
         _table: CatalogTableName,
         _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
-        self.mutation()
-    }
-
-    async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {
-        self.mutation()
-    }
-
-    async fn stage_create_table(
-        &self,
-        _namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::TableCreation,
-    ) -> StagedCreateStart {
-        self.mutation()
-    }
-
-    async fn commit_staged_table(
-        &self,
-        _commit: crate::iceberg::TableCommit,
-        _expectation: crate::catalog::StagedPublicationExpectation,
-    ) -> StagedCommitResult {
         self.mutation()
     }
 
@@ -221,20 +218,6 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         _evidence: ConditionalCreateEvidence,
     ) -> Result<ConditionalCreateVerdict, ConnectorError> {
         self.read()
-    }
-
-    async fn new_create_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        self.mutation()
-    }
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        self.mutation()
     }
 }
 

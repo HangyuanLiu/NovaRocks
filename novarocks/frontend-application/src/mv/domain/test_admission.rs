@@ -38,7 +38,7 @@ use novarocks_spi::connector::{
     ProviderBindingEpoch,
 };
 
-fn catalog_properties(
+pub(super) fn catalog_properties(
     instance_id: &ConnectorInstanceId,
 ) -> novarocks_spi::connector::CatalogProperties {
     novarocks_spi::connector::CatalogProperties::new(
@@ -54,9 +54,9 @@ fn catalog_properties(
     .expect("test catalog properties")
 }
 
-struct AdmittingManagement {
-    descriptor: ConnectorInstanceDescriptor,
-    incarnation: ProviderBindingEpoch,
+pub(super) struct AdmittingManagement {
+    pub(super) descriptor: ConnectorInstanceDescriptor,
+    pub(super) incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorDocumentStorageManagement for AdmittingManagement {

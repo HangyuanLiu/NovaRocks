@@ -29,7 +29,7 @@ v11_enabled="${UEA7_RUN_V11:-0}"
   || { echo "UEA7_RUN_V11 must be 0 or 1" >&2; exit 1; }
 name_suffix="$(printf '%s-%s' "${USER:-user}" "$$" | tr -cd '[:alnum:]-')"
 container_name="novarocks-uea7-publication-$name_suffix"
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-uea7-v07.XXXXXX")"
+work_dir=""
 shared_bucket=""
 shared_bucket_created=0
 minio_container=""
@@ -45,12 +45,72 @@ cleanup_shared_bucket() {
   fi
 }
 
-cleanup() {
-  docker rm -f "$container_name" >/dev/null 2>&1 || true
-  cleanup_shared_bucket
-  rm -rf -- "$work_dir"
+# Claim the evidence directory before any fixture action; a failed attempt
+# must never overwrite an earlier attempt's materials.
+if [[ -n "$artifact_dir" ]]; then
+  [[ "$artifact_dir" == /* ]] || { echo "UEA7_ARTIFACT_DIR must be absolute" >&2; exit 1; }
+  mkdir -p "$artifact_dir"
+  if find "$artifact_dir" -mindepth 1 -print -quit | grep -q .; then
+    echo "UEA7_ARTIFACT_DIR must be empty: $artifact_dir" >&2
+    exit 1
+  fi
+fi
+
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-uea7-v07.XXXXXX")"
+
+retain_failed_attempt() {
+  local original_status="$1"
+  [[ -n "$artifact_dir" ]] || return 0
+  # Capture live service state before deleting its only owner. Each probe is
+  # bounded and diagnostic failure never overwrites the primary exit status.
+  if [[ -n "${control_uri:-}" ]] && command -v curl >/dev/null 2>&1; then
+    for endpoint in trace metrics; do
+      curl --noproxy '*' --connect-timeout 1 --max-time 3 --silent --show-error --fail \
+        "$control_uri/$endpoint" >"$work_dir/failure-$endpoint.body" \
+        2>"$work_dir/failure-$endpoint.stderr" || true
+    done
+  fi
+  # Copy before deleting the private work directory or container. Failure to
+  # retain one item must not prevent retaining the others or hide the cause.
+  if cp -R "$work_dir/." "$artifact_dir/"; then
+    retention_complete=1
+  else
+    echo "failed to retain Java fixture work directory: $work_dir" >&2
+  fi
+  printf '%s\n' "$original_status" >"$artifact_dir/failure-exit-status.txt" || true
+  git -C "$repo_root" rev-parse HEAD >"$artifact_dir/failure-source-head.txt" 2>/dev/null || true
+  if command -v docker >/dev/null 2>&1; then
+    docker logs "$container_name" >"$artifact_dir/container.log" 2>&1 || true
+    docker inspect "$container_name" --format '{{.Id}} {{.Image}} {{.State.Running}}' \
+      >"$artifact_dir/failure-container-identity.txt" 2>&1 || true
+  fi
 }
-trap cleanup EXIT INT TERM
+
+cleanup() {
+  local original_status="$?"
+  local retention_complete=0
+  trap - EXIT INT TERM
+  if [[ "$original_status" -ne 0 ]]; then
+    retain_failed_attempt "$original_status"
+  fi
+  local container_cleanup=0
+  docker rm -f "$container_name" >/dev/null 2>&1 || container_cleanup="$?"
+  cleanup_shared_bucket
+  if [[ -n "$artifact_dir" && "$original_status" -ne 0 ]]; then
+    printf '%s\n' "$container_cleanup" >"$artifact_dir/container-cleanup-status.txt" || true
+  fi
+  # Preserve the raw work directory if copying failed, rather than destroying
+  # the only remaining diagnostic input.
+  if [[ -z "$artifact_dir" || "$retention_complete" -eq 1 || "$original_status" -eq 0 ]]; then
+    rm -rf -- "$work_dir"
+  else
+    echo "unarchived Java fixture work directory retained: $work_dir" >&2
+  fi
+  exit "$original_status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() {
   echo "UEA-7 V07 fixture failed: $*" >&2

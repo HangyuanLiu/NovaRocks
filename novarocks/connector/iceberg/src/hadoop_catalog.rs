@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod create_publication;
+mod drop_publication;
 /// HadoopFileSystemCatalog — a Hadoop-catalog-compatible implementation of the
 /// iceberg `Catalog` trait.
 ///
@@ -25,6 +27,8 @@
 /// - `update_table` manually applies requirements/updates instead of delegating
 ///   to `TableCommit::apply()`, which calls `MetadataLocation::from_str()` and
 ///   only accepts the `{version}-{uuid}.metadata.json` format.
+mod publication;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +44,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(test)]
 use novarocks_fs::FileError;
-use novarocks_fs::{ConditionalCreateOutcome, FileCancellation, FileErrorKind};
+#[cfg(test)]
+use novarocks_fs::FileErrorKind;
+use novarocks_fs::{ConditionalCreateOutcome, FileCancellation};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -59,12 +65,14 @@ pub(crate) struct HadoopCreateAttemptFacts {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum HadoopCreateDisposition {
     Created,
     Existing,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct HadoopCreateResult {
     pub(crate) disposition: HadoopCreateDisposition,
     /// Kept for the fault tests, which assert the published attempt's identity
@@ -108,6 +116,26 @@ impl HadoopCreateAttempt {
     pub(crate) fn facts(&self) -> &HadoopCreateAttemptFacts {
         &self.facts
     }
+    pub(crate) fn identifier(&self) -> &TableIdent {
+        &self.ident
+    }
+    pub(crate) fn metadata_bytes(&self) -> &[u8] {
+        &self.metadata_bytes
+    }
+    pub(crate) fn validate_frozen_identity(&self, operation_id: [u8; 16]) -> Result<()> {
+        if self.facts.operation_id != uuid::Uuid::from_bytes(operation_id).simple().to_string()
+            || self.facts.table_uuid != self.metadata.uuid().to_string()
+            || self.facts.metadata_location
+                != HadoopFileSystemCatalog::metadata_path(&self.table_location, 1)
+            || self.facts.metadata_digest != hex_digest(&self.metadata_bytes)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Frozen Hadoop create identity differs from its exact metadata request",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -124,7 +152,16 @@ pub(crate) enum HadoopCreateReconciliation {
 enum HadoopCatalogTestFault {
     BeforeConditionalRequest,
     AfterConditionalResponseLoss,
+    AfterConditionalUnsupported,
+    AfterExistingConditionalResponseLoss,
+    BeforeConditionalReadEvidenceExpiry,
+    BeforeCanonicalDrop,
+    AfterCanonicalDropResponseLoss,
+    AfterDropHintEvidenceExpiry,
+    BeforeDropHintDelete,
+    AfterDropHintResponseLoss,
     BeforeHintWrite,
+    AfterMetadataWriteEvidenceExpiry,
     AfterHintWriteResponseLoss,
     AuthoritativeV1Read,
 }
@@ -546,33 +583,6 @@ impl HadoopFileSystemCatalog {
         result
     }
 
-    /// Persist table metadata at `v{version}.metadata.json` and update
-    /// `version-hint.text`.
-    async fn write_metadata(
-        &self,
-        table_location: &str,
-        metadata: &TableMetadata,
-        version: u32,
-    ) -> Result<String> {
-        let metadata_path = Self::metadata_path(table_location, version);
-        async {
-            let bytes = serde_json::to_vec(metadata)?;
-            self.file_io
-                .new_output(&metadata_path)?
-                .write(bytes.into())
-                .await
-        }
-        .await
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("write metadata to {}: {}", metadata_path, e),
-            )
-        })?;
-        self.write_version_hint(table_location, version).await?;
-        Ok(metadata_path)
-    }
-
     /// Build a `Table` value from metadata and a metadata location.
     fn build_table(
         &self,
@@ -587,6 +597,84 @@ impl HadoopFileSystemCatalog {
             .identifier(ident)
             .metadata_location(metadata_location)
             .build()
+    }
+
+    // The optional grant only bounds starting the existing protocol's steps.
+    // Catalog FileIO, hint recovery and numbering remain unchanged until IRU-6c.
+    fn check_publication_budget(
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<()> {
+        if budget.is_some_and(|budget| budget.expired()) {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "Hadoop publication evidence deadline elapsed",
+            )
+            .with_source(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
+                "Hadoop publication evidence deadline elapsed",
+            )));
+        }
+        Ok(())
+    }
+
+    async fn table_cache_with_budget(
+        &self,
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<tokio::sync::MutexGuard<'_, HashMap<String, String>>> {
+        let guard = match budget {
+            Some(budget) => tokio::time::timeout_at(budget.deadline().into(), self.tables.lock())
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Hadoop publication cache wait deadline elapsed",
+                    )
+                    .with_source(
+                        novarocks_spi::connector::ConnectorError::new(
+                            novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
+                            "Hadoop publication cache wait deadline elapsed",
+                        ),
+                    )
+                })?,
+            None => self.tables.lock().await,
+        };
+        Self::check_publication_budget(budget)?;
+        Ok(guard)
+    }
+
+    async fn load_existing_table_with_budget(
+        &self,
+        table: &TableIdent,
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<Table> {
+        Self::check_publication_budget(budget)?;
+        let key = Self::table_key(table);
+        let metadata_location = match self
+            .try_cache_existing_table_with_budget(table, budget)
+            .await?
+        {
+            Some(location) => location,
+            None => {
+                self.table_cache_with_budget(budget).await?.remove(&key);
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("table not found: {}", key),
+                ));
+            }
+        };
+
+        Self::check_publication_budget(budget)?;
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("read metadata from {}: {}", metadata_location, e),
+                )
+            })?;
+
+        Self::check_publication_budget(budget)?;
+        self.build_table(table.clone(), metadata, metadata_location)
     }
 
     /// Use one request-bound FileIO for every read needed to resolve the
@@ -706,13 +794,24 @@ impl HadoopFileSystemCatalog {
     /// filesystem probe also populates the cache, making subsequent calls
     /// cache-hit fast.
     async fn try_cache_existing_table(&self, table: &TableIdent) -> Result<Option<String>> {
+        self.try_cache_existing_table_with_budget(table, None).await
+    }
+
+    async fn try_cache_existing_table_with_budget(
+        &self,
+        table: &TableIdent,
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<Option<String>> {
+        Self::check_publication_budget(budget)?;
         let table_location = self.table_location(table);
         let version = self.read_version_hint(&table_location).await;
+        Self::check_publication_budget(budget)?;
         let metadata_location = if version == 0 {
             let v1 = Self::metadata_path(&table_location, 1);
             if !self.file_io.exists(&v1).await? {
                 return Ok(None);
             }
+            Self::check_publication_budget(budget)?;
             TableMetadata::read_from(&self.file_io, &v1)
                 .await
                 .map_err(|error| {
@@ -721,6 +820,7 @@ impl HadoopFileSystemCatalog {
                         format!("read canonical Hadoop table metadata {v1}: {error}"),
                     )
                 })?;
+            Self::check_publication_budget(budget)?;
             if let Err(error) = self.write_version_hint(&table_location, 1).await {
                 tracing::warn!(
                     "failed to repair Hadoop catalog version hint from canonical v1 metadata: {error}"
@@ -728,6 +828,7 @@ impl HadoopFileSystemCatalog {
             }
             v1
         } else {
+            Self::check_publication_budget(budget)?;
             let hinted = Self::metadata_path(&table_location, version);
             if !self.file_io.exists(&hinted).await? {
                 return Err(Error::new(
@@ -735,6 +836,7 @@ impl HadoopFileSystemCatalog {
                     format!("Hadoop catalog version hint points to missing metadata: {hinted}"),
                 ));
             }
+            Self::check_publication_budget(budget)?;
             TableMetadata::read_from(&self.file_io, &hinted)
                 .await
                 .map_err(|error| {
@@ -746,9 +848,8 @@ impl HadoopFileSystemCatalog {
             hinted
         };
         let key = Self::table_key(table);
-        self.tables
-            .lock()
-            .await
+        self.table_cache_with_budget(budget)
+            .await?
             .insert(key, metadata_location.clone());
         Ok(Some(metadata_location))
     }
@@ -807,6 +908,59 @@ impl HadoopFileSystemCatalog {
         })
     }
 
+    /// Local fixtures publish through the real owner and the original binding.
+    #[cfg(test)]
+    pub(crate) async fn create_fixture_table(
+        self: &Arc<Self>,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<Table> {
+        assert_eq!(
+            namespace.as_ref().len(),
+            1,
+            "Fixture requires one exact namespace component"
+        );
+        let binding = self
+            .binding
+            .clone()
+            .expect("fixture original storage binding");
+        let owner = crate::catalog::factory::NovaRocksCatalogFactory::adopt_hadoop_for_test(
+            Arc::clone(self),
+        );
+        Ok(
+            crate::catalog::admission_test_support::create_static_fixture_table_with_owner(
+                owner,
+                binding,
+                novarocks_spi::connector::ProviderBindingEpoch::from_bytes([0x71; 16]),
+                crate::catalog::CatalogNamespaceName::new(namespace.as_ref()[0].clone()),
+                creation,
+            )
+            .await,
+        )
+    }
+
+    #[cfg(test)]
+    async fn publish_fixture_catalog(
+        self: &Arc<Self>,
+        request: crate::catalog::catalog_request::CatalogPublicationRequest,
+    ) -> crate::catalog::error::CatalogOutcome<crate::catalog::transaction::CommitProof> {
+        let binding = self
+            .binding
+            .clone()
+            .expect("fixture original storage binding");
+        let owner = crate::catalog::factory::NovaRocksCatalogFactory::adopt_hadoop_for_test(
+            Arc::clone(self),
+        );
+        crate::catalog::admission_test_support::publish_catalog_fixture_with_owner(
+            owner,
+            binding,
+            novarocks_spi::connector::ProviderBindingEpoch::from_bytes([0x71; 16]),
+            request,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn create_table_fenced(
         &self,
         namespace: &NamespaceIdent,
@@ -817,6 +971,7 @@ impl HadoopFileSystemCatalog {
         self.publish_create_attempt(attempt).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn publish_create_attempt(
         &self,
         attempt: HadoopCreateAttempt,
@@ -944,6 +1099,7 @@ impl HadoopFileSystemCatalog {
         })
     }
 
+    #[cfg(test)]
     async fn classify_existing_v1(
         &self,
         attempt: &HadoopCreateAttempt,
@@ -1003,42 +1159,121 @@ impl HadoopFileSystemCatalog {
         expected_metadata_location: &str,
         expected_metadata_digest: &str,
     ) -> std::result::Result<HadoopCreateReconciliation, String> {
-        let ident = TableIdent::from_strs([namespace, table])
-            .map_err(|error| format!("build Hadoop table identity: {error}"))?;
+        self.reconcile_create_using_io(
+            namespace,
+            table,
+            expected_uuid,
+            expected_metadata_location,
+            expected_metadata_digest,
+            &self.file_io,
+            || Ok(()),
+            crate::catalog::error::map_read_error,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn reconcile_create_attempt_for_read(
+        &self,
+        namespace: &str,
+        table: &str,
+        expected_uuid: &str,
+        expected_metadata_location: &str,
+        expected_metadata_digest: &str,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> std::result::Result<HadoopCreateReconciliation, novarocks_spi::connector::ConnectorError>
+    {
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, ConnectorOperationControl,
+        };
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Conditional-create observation requires the original request context",
+            )
+        })?;
+        context.check_active()?;
+        let ident = TableIdent::from_strs([namespace, table]).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("build Hadoop table identity: {error}"),
+            )
+        })?;
+        let file_io =
+            crate::fs_io::build_file_io_for_location(&self.table_location(&ident), binding);
+        self.reconcile_create_using_io(
+            namespace,
+            table,
+            expected_uuid,
+            expected_metadata_location,
+            expected_metadata_digest,
+            &file_io,
+            || context.check_active(),
+            |error| {
+                context
+                    .check_active()
+                    .err()
+                    .unwrap_or_else(|| crate::catalog::error::map_read_error(error))
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_create_using_io(
+        &self,
+        namespace: &str,
+        table: &str,
+        expected_uuid: &str,
+        expected_metadata_location: &str,
+        expected_metadata_digest: &str,
+        file_io: &FileIO,
+        check: impl Fn() -> std::result::Result<(), novarocks_spi::connector::ConnectorError>,
+        map_read_failure: impl Fn(&Error) -> novarocks_spi::connector::ConnectorError,
+    ) -> std::result::Result<HadoopCreateReconciliation, novarocks_spi::connector::ConnectorError>
+    {
+        let ident = TableIdent::from_strs([namespace, table]).map_err(|error| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                format!("build Hadoop table identity: {error}"),
+            )
+        })?;
         let table_location = self.table_location(&ident);
         let canonical_v1 = Self::metadata_path(&table_location, 1);
         if canonical_v1 != expected_metadata_location {
             return Ok(HadoopCreateReconciliation::Foreign);
         }
-        if !self
-            .file_io
+        check()?;
+        let exists = file_io
             .exists(&canonical_v1)
             .await
-            .map_err(|error| format!("probe authoritative Hadoop v1 metadata: {error}"))?
-        {
+            .map_err(|error| map_read_failure(&error))?;
+        check()?;
+        if !exists {
             return Ok(HadoopCreateReconciliation::Absent);
         }
-        let bytes = self
-            .file_io
+        let bytes = file_io
             .new_input(&canonical_v1)
-            .map_err(|error| format!("open authoritative Hadoop v1 metadata: {error}"))?
+            .map_err(|error| map_read_failure(&error))?
             .read()
             .await
-            .map_err(|error| format!("read authoritative Hadoop v1 metadata: {error}"))?;
-        let metadata: TableMetadata = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("decode authoritative Hadoop v1 metadata: {error}"))?;
+            .map_err(|error| map_read_failure(&error))?;
+        check()?;
+        let metadata: TableMetadata = serde_json::from_slice(&bytes).map_err(|error| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                format!("decode authoritative Hadoop v1 metadata: {error}"),
+            )
+        })?;
         if metadata.uuid().to_string() != expected_uuid
             || hex_digest(&bytes) != expected_metadata_digest
         {
             return Ok(HadoopCreateReconciliation::Foreign);
         }
-        let finalization_failure = self
-            .write_version_hint(&table_location, 1)
-            .await
-            .err()
-            .map(|error| format!("repair committed Hadoop catalog version hint: {error}"));
+        // Observation never repairs hints or acquires a second mutation grant.
+        // A journal-owned finalizer may repair only after retaining this proof.
         Ok(HadoopCreateReconciliation::Committed {
-            finalization_failure,
+            finalization_failure: None,
         })
     }
 }
@@ -1124,18 +1359,16 @@ impl Catalog for HadoopFileSystemCatalog {
         )
         .await
     }
-
+    /// SDK mutations cannot enter catalog publication.
     async fn create_namespace(
         &self,
-        namespace: &NamespaceIdent,
-        properties: HashMap<String, String>,
+        _namespace: &NamespaceIdent,
+        _properties: HashMap<String, String>,
     ) -> Result<Namespace> {
-        let marker = self.namespace_marker_location(namespace);
-        self.file_io
-            .new_output(&marker)?
-            .write(Vec::new().into())
-            .await?;
-        Ok(Namespace::with_properties(namespace.clone(), properties))
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
 
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
@@ -1163,53 +1396,38 @@ impl Catalog for HadoopFileSystemCatalog {
             "Bounded Hadoop namespace discovery requires the provider-owned filesystem binding",
         ))
     }
-
+    /// SDK mutations cannot enter catalog publication.
     async fn update_namespace(
         &self,
         _namespace: &NamespaceIdent,
         _properties: HashMap<String, String>,
     ) -> Result<()> {
-        Ok(())
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
-
-    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
-        self.file_io
-            .delete(self.namespace_marker_location(namespace))
-            .await
+    /// SDK mutations cannot enter catalog publication.
+    async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
         self.external_tables(namespace).await
     }
-
-    /// Create a table: write `v1.metadata.json` and `version-hint.text=1`.
-    ///
-    /// If `creation.location` is `None` the table location is inferred from
-    /// the warehouse location and the table identifier.
+    /// SDK mutations cannot enter catalog publication.
     async fn create_table(
         &self,
-        namespace: &NamespaceIdent,
-        creation: TableCreation,
+        _namespace: &NamespaceIdent,
+        _creation: TableCreation,
     ) -> Result<Table> {
-        let result = self
-            .create_table_fenced(namespace, creation, uuid::Uuid::now_v7().to_string())
-            .await
-            .map_err(|failure| {
-                let kind = match failure.kind {
-                    HadoopCreateFailureKind::Invalid => ErrorKind::DataInvalid,
-                    HadoopCreateFailureKind::Unsupported => ErrorKind::FeatureUnsupported,
-                    HadoopCreateFailureKind::Uncommitted => ErrorKind::Unexpected,
-                    HadoopCreateFailureKind::Unknown => ErrorKind::Unexpected,
-                };
-                Error::new(kind, failure.message)
-            })?;
-        if result.disposition == HadoopCreateDisposition::Existing {
-            return Err(Error::new(
-                ErrorKind::TableAlreadyExists,
-                format!("table already exists: {}", result.table.identifier()),
-            ));
-        }
-        Ok(result.table)
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
 
     /// Load a table through the filesystem-owned catalog pointer.
@@ -1219,68 +1437,14 @@ impl Catalog for HadoopFileSystemCatalog {
     /// location without first resolving `version-hint.text` would make this
     /// client observe a stale table identity.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        let key = Self::table_key(table);
-        let metadata_location = match self.try_cache_existing_table(table).await? {
-            Some(location) => location,
-            None => {
-                self.tables.lock().await.remove(&key);
-                return Err(Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("table not found: {}", key),
-                ));
-            }
-        };
-
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {}: {}", metadata_location, e),
-                )
-            })?;
-
-        self.build_table(table.clone(), metadata, metadata_location)
+        self.load_existing_table_with_budget(table, None).await
     }
-
-    /// Drop the table from the catalog.
-    ///
-    /// For a filesystem catalog the catalog entry *is* storage: existence
-    /// resolves through `version-hint.text` and, failing that, the canonical
-    /// `v1.metadata.json`. Removing those two is therefore the catalog
-    /// operation, mirroring ADR-0077, where writing `v1.metadata.json` is what
-    /// makes a table exist. Data files and superseded metadata are objects, and
-    /// they are not touched here.
-    ///
-    /// This used to prefix-delete the whole table directory, which was wrong in
-    /// four ways at once: it ignored the caller's data disposition, so a drop
-    /// asking to retain data destroyed it anyway; it gave concurrent readers no
-    /// window, so a reader that had just resolved this table lost its files
-    /// mid-scan; it matched a lexical prefix rather than the table's exact
-    /// object identity; and it swallowed its own failures, so a partial delete
-    /// still reported success. Object deletion now belongs to the post-commit
-    /// cleanup handoff, which runs only after the drop is proven committed,
-    /// only against exact identity, and only once the age window has passed.
-    /// See ADR-0118.
-    ///
-    /// The order matters. The hint goes first, so a failure between the two
-    /// steps leaves the table resolvable through `v1.metadata.json` and the
-    /// hint self-repairs on the next read: the drop simply did not commit, and
-    /// retrying is safe. Removing `v1.metadata.json` is the commit point.
-    async fn drop_table(&self, table: &TableIdent) -> Result<()> {
-        let key = Self::table_key(table);
-        self.tables.lock().await.remove(&key);
-
-        let table_location = self.table_location(table);
-        let hint = Self::version_hint_path(&table_location);
-        if self.file_io.exists(&hint).await? {
-            self.file_io.delete(&hint).await?;
-        }
-        let canonical = Self::metadata_path(&table_location, 1);
-        if self.file_io.exists(&canonical).await? {
-            self.file_io.delete(&canonical).await?;
-        }
-        Ok(())
+    /// SDK mutations cannot enter catalog publication.
+    async fn drop_table(&self, _table: &TableIdent) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
 
     async fn purge_table(&self, _table: &TableIdent) -> Result<()> {
@@ -1300,96 +1464,30 @@ impl Catalog for HadoopFileSystemCatalog {
         }
         Ok(exists)
     }
-
-    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
-        let src_key = Self::table_key(src);
-        let dest_key = Self::table_key(dest);
-        let mut guard = self.tables.lock().await;
-        if let Some(loc) = guard.remove(&src_key) {
-            guard.insert(dest_key, loc);
-        }
-        Ok(())
+    /// SDK mutations cannot enter catalog publication.
+    async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
-
-    /// Register an existing table that already has metadata written at
-    /// `metadata_location`.
-    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {}: {}", metadata_location, e),
-                )
-            })?;
-
-        let key = Self::table_key(table);
-        self.tables
-            .lock()
-            .await
-            .insert(key, metadata_location.clone());
-
-        self.build_table(table.clone(), metadata, metadata_location)
+    /// SDK mutations cannot enter catalog publication.
+    async fn register_table(
+        &self,
+        _table: &TableIdent,
+        _metadata_location: String,
+    ) -> Result<Table> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
-
-    /// Apply a table commit (requirements + updates) and write a new versioned
-    /// metadata file.
-    ///
-    /// This method bypasses `TableCommit::apply()` which internally calls
-    /// `MetadataLocation::from_str()`. That function rejects the Hadoop
-    /// `vN.metadata.json` naming convention, so we manually apply requirements
-    /// and updates here.
-    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
-        let ident = commit.identifier().clone();
-
-        // Load the current metadata.
-        let current_table = self.load_table(&ident).await?;
-        let current_metadata_location = current_table
-            .metadata_location()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "no metadata location for table: {}",
-                        Self::table_key(&ident)
-                    ),
-                )
-            })?
-            .to_string();
-        let current_metadata = current_table.metadata();
-
-        // Check all requirements against the current metadata.
-        for requirement in commit.take_requirements() {
-            requirement.check(Some(current_metadata))?;
-        }
-
-        // Apply all updates to produce new metadata.
-        let mut builder = current_metadata
-            .clone()
-            .into_builder(Some(current_metadata_location));
-        for update in commit.take_updates() {
-            builder = update.apply(builder)?;
-        }
-        let new_metadata = builder.build()?.metadata;
-
-        // Determine the next version number.
-        let table_location = current_metadata.location().to_string();
-        let current_version = self.read_version_hint(&table_location).await;
-        let next_version = current_version + 1;
-
-        // Write the new metadata and update version-hint.text.
-        let new_metadata_location = self
-            .write_metadata(&table_location, &new_metadata, next_version)
-            .await?;
-
-        // Update the in-memory registry.
-        let key = Self::table_key(&ident);
-        self.tables
-            .lock()
-            .await
-            .insert(key, new_metadata_location.clone());
-
-        self.build_table(ident, new_metadata, new_metadata_location)
+    /// SDK mutations cannot enter catalog publication.
+    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Catalog mutation must use its prepared publication journal",
+        ))
     }
 }
 
@@ -1422,7 +1520,7 @@ mod tests {
         )
     }
 
-    fn test_catalog(location: &str) -> HadoopFileSystemCatalog {
+    pub(super) fn test_catalog(location: &str) -> HadoopFileSystemCatalog {
         let binding = local_test_binding();
         let file_io = crate::fs_io::build_file_io_for_location(location, binding.clone());
         HadoopFileSystemCatalog::new_with_binding(
@@ -1836,7 +1934,7 @@ mod tests {
             .expect("catalog generation remains usable");
     }
 
-    fn test_creation(name: &str) -> TableCreation {
+    pub(super) fn test_creation(name: &str) -> TableCreation {
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -1888,25 +1986,51 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
 
-        let catalog = test_catalog(&location);
+        let catalog = Arc::new(test_catalog(&location));
         assert!(!catalog.namespace_exists(&namespace).await.unwrap());
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .unwrap();
+        let outcome = catalog
+            .publish_fixture_catalog(
+                crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new("analytics"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+            ),
+            "{outcome:?}"
+        );
         assert!(catalog.namespace_exists(&namespace).await.unwrap());
         assert_eq!(
             catalog.list_namespaces(None).await.unwrap(),
             vec![namespace.clone()]
         );
 
-        let restored = test_catalog(&location);
+        let restored = Arc::new(test_catalog(&location));
         assert!(restored.namespace_exists(&namespace).await.unwrap());
         assert_eq!(
             restored.list_namespaces(None).await.unwrap(),
             vec![namespace.clone()]
         );
-        restored.drop_namespace(&namespace).await.unwrap();
+        let outcome = restored
+            .publish_fixture_catalog(
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new("analytics"),
+                    no_op_if_missing: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+            ),
+            "{outcome:?}"
+        );
         assert!(!restored.namespace_exists(&namespace).await.unwrap());
     }
 
@@ -1991,7 +2115,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = test_catalog(&location);
+        let catalog = Arc::new(test_catalog(&location));
         catalog
             .create_table_fenced(
                 &namespace,
@@ -2012,7 +2136,23 @@ mod tests {
             .await
             .expect("write data file");
 
-        catalog.drop_table(&ident).await.expect("drop table");
+        let outcome = catalog
+            .publish_fixture_catalog(
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
+                    table: crate::catalog::CatalogTableName::from_identifier(&ident),
+                    no_op_if_missing: false,
+                    purge: false,
+                    capture: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+            ),
+            "{outcome:?}"
+        );
 
         assert!(
             !catalog.table_exists(&ident).await.expect("existence"),
@@ -2035,7 +2175,7 @@ mod tests {
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
         let server_catalog = test_catalog(&location);
-        let external_catalog = test_catalog(&location);
+        let external_catalog = Arc::new(test_catalog(&location));
 
         server_catalog
             .create_table_fenced(
@@ -2052,10 +2192,23 @@ mod tests {
                 .expect("cache table existence")
         );
 
-        external_catalog
-            .drop_table(&ident)
-            .await
-            .expect("drop table through an external client");
+        let outcome = external_catalog
+            .publish_fixture_catalog(
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
+                    table: crate::catalog::CatalogTableName::from_identifier(&ident),
+                    no_op_if_missing: false,
+                    purge: false,
+                    capture: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+            ),
+            "{outcome:?}"
+        );
 
         assert!(
             !server_catalog

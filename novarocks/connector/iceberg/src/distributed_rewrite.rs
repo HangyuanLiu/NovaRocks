@@ -2068,32 +2068,32 @@ mod tests {
             Type::Primitive(PrimitiveType::Uuid),
         ] {
             let (executor, warehouse, runtime, _listener) = admission_runtime("hadoop");
-            let catalog = runtime.novarocks_catalog().vendored_client();
-            executor.block_on(async {
-                let namespace = crate::iceberg::NamespaceIdent::new("db".to_owned());
-                catalog
-                    .create_namespace(&namespace, std::collections::HashMap::new())
-                    .await
-                    .unwrap();
-                catalog
-                    .create_table(
-                        &namespace,
-                        crate::iceberg::TableCreation::builder()
-                            .name("t".to_owned())
-                            .schema(
-                                Schema::builder()
-                                    .with_fields(vec![
-                                        NestedField::optional(1, "payload", data_type).into(),
-                                    ])
-                                    .build()
-                                    .unwrap(),
-                            )
-                            .format_version(FormatVersion::V3)
-                            .build(),
-                    )
-                    .await
-                    .unwrap();
-            });
+            // Model a table authored by another engine. Product CREATE/ALTER
+            // admission remains closed to new Variant and uuid columns.
+            let table_root = warehouse.path().join("db/t");
+            let metadata_root = table_root.join("metadata");
+            std::fs::create_dir_all(&metadata_root).unwrap();
+            let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+                Schema::builder()
+                    .with_fields(vec![NestedField::optional(1, "payload", data_type).into()])
+                    .build()
+                    .unwrap(),
+                crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+                crate::iceberg::spec::SortOrder::unsorted_order(),
+                format!("file://{}", table_root.display()),
+                FormatVersion::V3,
+                std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            std::fs::write(
+                metadata_root.join("v1.metadata.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(metadata_root.join("version-hint.text"), b"1").unwrap();
             let descriptor = ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
                 instance_id: ConnectorInstanceId::parse("ice").unwrap(),

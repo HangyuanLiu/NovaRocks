@@ -59,6 +59,15 @@ bounded NDJSON trace, exact mutation/object-I/O counters, request/response
 bodies, container log, and a manifest binding the evidence to the Git HEAD and
 exact image identities.
 
+The directory is checked before fixture actions. A failed run captures bounded
+live trace/metrics diagnostics before cleanup, retains the available work files,
+container log and identity, and records the original exit status separately from
+the container cleanup status. INT and TERM retain exit statuses 130 and 143.
+Diagnostic or cleanup failures do not replace the original failure. If copying
+the work files fails, the script preserves their original directory and prints
+its exact path. Missing diagnostics remain unavailable; a cleanup status alone
+does not prove that every service or HTTP actor has exited.
+
 For the V11 main-ref requirement oracle, run `run-v11.sh` with the same
 environment and artifact options. It includes the V07 scenarios, then tests
 four format-v3 tables. Two start without a main snapshot; two first publish a
@@ -130,3 +139,77 @@ sixteen successes, three real JDBC conflicts, and zero unclassified failures.
 In the two old-first cases the later frozen request is rejected by its main
 requirement before delegation; both new-first cases retry only after the real
 JDBC conflict and then reject the original requirement.
+
+## Publication lifecycle observations
+
+`tests/cluster-harness/src/publication.rs` owns the private Java REST service,
+transparent proxy, their cancellation, and actual joins for native system
+scenarios. SQL suites consume the same `publication_catalog` and
+`publication_service` owners; the original MV conflict oracle still requires
+its original six ordered events, exact base/updated identity, one competitor,
+and no second stale delegation.
+
+The service accepts `POST /arm?table=namespace.table&stage=...`:
+
+- `before-persistent-commit` is the existing requirements-passed hold.
+- `after-persistent-commit` holds after the real delegate succeeds and before
+  `TableOperations.commit` returns to the REST handler's metadata reload.
+
+A post-commit arm is claimed by exactly one request before persistence. Its
+trace records `delegate-commit-success`,
+`persistent-commit-before-handler-reload`, and `hold-reached`. Releasing it
+allows the handler to load a successor committed by a competitor. Every held
+request separately records `commit-method-exited`. `Control::wait_for_original_exit`
+returns the actual original success/conflict/failure; it does not prescribe a
+conflict. A release ACK alone is not exit evidence. Owner cleanup may pass
+`cancel=true` to disarm an unused hold; ordinary release before the boundary
+continues to return 409.
+
+The shared proxy's `stream-response` fault forwards the real request once,
+then streams each byte of the real successful body every 50 ms. Each interval
+is below the ordinary read idle timeout. The proxy records stream start,
+chunks, and actual body drop. A client deadline, explicit release, or fixture
+shutdown ends the stream. Bodyless success statuses retain their decisive
+status. This fault never invents catalog state or a successful mutation.
+
+These facilities are test-only. Quick proxy/control tests belong to the normal
+cluster-harness publication unit filter; Java/native cases are explicit and
+run when publication or maintenance semantics change and at final acceptance.
+The image uses local pinned inputs and `--pull=false`. Missing input is a
+fixture precondition failure. Keep raw failed attempts, trace, image identity,
+container logs, SQL error/result, release result and actual-exit evidence;
+retries use a fresh artifact directory and preserve the original failure.
+
+The native `catalog-publication/expiry-concurrency` scenario uses fresh tables
+for each property. It checks an external move of an existing ref (actual REST
+409 and a fresh successful attempt), a new branch followed by an append (exact
+branch snapshot and manifest-list plus branch reads), and an externally added
+tag removed by the frozen expiry (Applied error containing the lost tag,
+snapshot and manifest-list). For the lost tag it independently registers the
+pre-expiry metadata under a source name, then reads that exact old snapshot
+after GC. The seed ends with a full overwrite so this first snapshot's data
+is absent from current main. This other catalog entry is invisible to the expiry's protection
+scan: its successful read and the exact manifest-list HEAD prove retained
+source files, rather than inferring preservation from current main row counts.
+
+The same scenario observes a local ref in `SHOW FULL PROCESSLIST` while a
+same-catalog expiry is held, requires zero ref dispatch before conclusion,
+and requires rejection of the removed snapshot afterwards. A separate short
+budget phase observes expiry Unknown, successfully creates a local tag in
+that same logical catalog, then releases the original request and observes
+the late expiry remove it. Files must remain readable. This phase documents
+the explicit limit of local serialization after Unknown; it does not claim
+that the lock prevents the late application window. Cross-generation lock
+identity, cancellation and different-table progress are tested by the
+catalog lifecycle owner, not inferred from this same-generation scenario.
+
+For every slow-body mutation, `stream-deadline` preserves the complete arm
+trace (`sequence`, `arm_id`, `event`), SQL outcome and before/after actual HTTP
+counters before asserting one forwarded mutation. Stream exit verification
+still runs if saving the initial trace fails. Native service-held actors
+aggregate primary phase, release, SQL join, exact original Java wrapper exit
+and trace-write failures, and retain each result in `*-actors.json`. A release
+failure never skips joining the SQL actor. These are executable assertions;
+changing them does not constitute a same-SHA native acceptance receipt. Run
+each of the four explicit scenario names individually with `--only` and a
+fresh artifact root when collecting final evidence.

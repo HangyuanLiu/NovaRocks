@@ -38,3 +38,63 @@ pub fn resolve_branch_head_snapshot_id(
         }
     }
 }
+
+/// Move an existing ref without replacing its retention policy. A new branch
+/// inherits table defaults rather than copying the defaults into overrides.
+pub(crate) fn moved_reference(
+    existing: Option<&crate::iceberg::spec::SnapshotReference>,
+    snapshot_id: i64,
+    branch: bool,
+) -> crate::iceberg::spec::SnapshotReference {
+    use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+    let retention = existing
+        .map(|reference| reference.retention.clone())
+        .unwrap_or_else(|| {
+            if branch {
+                SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                }
+            } else {
+                SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
+                }
+            }
+        });
+    SnapshotReference::new(snapshot_id, retention)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+
+    #[test]
+    fn moving_existing_ref_preserves_all_policy_overrides() {
+        let policy = SnapshotRetention::Branch {
+            min_snapshots_to_keep: Some(7),
+            max_snapshot_age_ms: Some(1000),
+            max_ref_age_ms: Some(2000),
+        };
+        let old = SnapshotReference::new(10, policy.clone());
+        let moved = moved_reference(Some(&old), 11, true);
+        assert_eq!(moved.snapshot_id, 11);
+        assert_eq!(moved.retention, policy);
+        assert_eq!(old.snapshot_id, 10);
+        assert_eq!(
+            moved_reference(None, 12, true).retention,
+            SnapshotRetention::Branch {
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+                max_ref_age_ms: None,
+            }
+        );
+        assert_eq!(
+            moved_reference(None, 13, false).retention,
+            SnapshotRetention::Tag {
+                max_ref_age_ms: None
+            }
+        );
+    }
+}
