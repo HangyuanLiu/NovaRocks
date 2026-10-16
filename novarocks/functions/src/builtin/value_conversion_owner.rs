@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One immutable owner binds, refines and prepares all six exact conversions.
+//! One immutable owner binds, refines and prepares all exact conversions.
 
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ use crate::{
     SelectedValues,
 };
 
-fn implementation_pairs() -> [(&'static str, &'static str); 7] {
+fn implementation_pairs() -> [(&'static str, &'static str); 8] {
     [
         (
             value_conversion::JSON_TEXT,
@@ -62,6 +62,10 @@ fn implementation_pairs() -> [(&'static str, &'static str); 7] {
         (
             value_conversion::LARGEINT_TEXT,
             "builtin.scalar/value_domain_conversion/largeint_to_utf8_text/selected-v1",
+        ),
+        (
+            value_conversion::UTF8_LARGEINT,
+            "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/selected-v1",
         ),
         (
             value_conversion::NULL_LIFT,

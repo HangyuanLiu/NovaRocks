@@ -2514,11 +2514,7 @@ fn cast_largeint_binary_to_boolean(child_array: &ArrayRef) -> Result<ArrayRef, S
 }
 
 fn parse_utf8_to_largeint(value: &str) -> Option<i128> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<i128>().ok()
+    novarocks_functions::largeint_text::parse_utf8(value)
 }
 
 fn cast_utf8_to_largeint_binary(child_array: &ArrayRef) -> Result<ArrayRef, String> {

@@ -815,3 +815,6 @@ fn opaque_domain_erasure_executes_existing_same_shape_bytes_and_preserves_origin
         }
     }
 }
+
+#[path = "utf8_largeint_tests.rs"]
+mod utf8_largeint_tests;

@@ -63,13 +63,16 @@ pub(super) const LARGEINT_FLOAT: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_float_round/v1";
 pub(super) const LARGEINT_TEXT: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_utf8_text/v1";
+pub(super) const UTF8_LARGEINT: &str =
+    "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/v1";
 pub(super) const NULL_LIFT: &str =
     "builtin.scalar/value_domain_conversion/null_to_typed_nullable/v1";
 
 /// Full effects shared by these total value conversions. Overflow NULL is a
 /// result of the signed narrowing overload, not suppression of a child,
 /// control, resource, contract or lifecycle failure. JSON bytes are preserved;
-/// signed integers extend exactly; floats use the existing i128 `as` rounding.
+/// signed integers extend exactly; floats use the existing i128 `as` rounding;
+/// text parse failure is an original successful NULL, never a row error.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -102,6 +105,7 @@ pub(super) fn definition_parts()
         (LARGEINT_SIGNED, "LargeInt(FixedSizeBinary16)->Physical(Int8|Int16|Int32|Int64)", "explicit nullable exact target; out-of-range value returns NULL; NULL preserved"),
         (LARGEINT_FLOAT, "LargeInt(FixedSizeBinary16)->Physical(Float32|Float64)", "explicit exact target; existing i128 as float rounding; NULL preserved"),
         (LARGEINT_TEXT, "LargeInt(FixedSizeBinary16)->Physical(Utf8)", "explicit exact target; original signed big-endian i128 text; NULL preserved"),
+        (UTF8_LARGEINT, "Physical Utf8->LargeInt(FixedSizeBinary16)", "explicit nullable exact LargeInt target; trim then signed i128 parse; invalid or out-of-range text returns NULL; NULL preserved"),
         (NULL_LIFT, "Physical Null(nullable=true)->explicit complete nullable target", "evaluate child eagerly; strict NULL protocol produces typed NULL without row implementation"),
     ]
     .into_iter()
@@ -189,6 +193,7 @@ pub(super) fn recipe_family(
         LARGEINT_SIGNED,
         LARGEINT_FLOAT,
         LARGEINT_TEXT,
+        UTF8_LARGEINT,
         NULL_LIFT,
     ]
     .into_iter()
@@ -411,6 +416,13 @@ fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType
                 && target.logical_type() == ValueLogicalType::Physical
                 && target.data_type() == &DataType::Utf8
         }
+        UTF8_LARGEINT => {
+            source.logical_type() == ValueLogicalType::Physical
+                && source.data_type() == &DataType::Utf8
+                && target.logical_type() == ValueLogicalType::LargeInt
+                && target.data_type() == &DataType::FixedSizeBinary(16)
+                && target.nullable()
+        }
         NULL_LIFT => {
             source.logical_type() == ValueLogicalType::Physical
                 && source.data_type() == &DataType::Null
@@ -469,6 +481,7 @@ impl FunctionBindingResolver for ValueConversionResolver {
                 LARGEINT_SIGNED,
                 LARGEINT_FLOAT,
                 LARGEINT_TEXT,
+                UTF8_LARGEINT,
                 NULL_LIFT,
             ] {
                 work.step()?;
@@ -670,7 +683,8 @@ mod tests {
                 LARGEINT_TEXT,
                 NULL_LIFT,
                 OPAQUE_BINARY,
-                SIGNED_LARGEINT
+                SIGNED_LARGEINT,
+                UTF8_LARGEINT
             ]
         );
         for overload in declaration.overloads() {
@@ -1172,6 +1186,11 @@ pub fn is_default_percentile_binary_keep_overload(overload: &FunctionOverloadId)
 pub fn is_default_scalar_carrier_cast_overload(overload: &FunctionOverloadId) -> bool {
     matches!(
         overload.as_str(),
-        SIGNED_LARGEINT | LARGEINT_SIGNED | LARGEINT_FLOAT | LARGEINT_TEXT | NULL_LIFT
+        SIGNED_LARGEINT
+            | LARGEINT_SIGNED
+            | LARGEINT_FLOAT
+            | LARGEINT_TEXT
+            | UTF8_LARGEINT
+            | NULL_LIFT
     )
 }

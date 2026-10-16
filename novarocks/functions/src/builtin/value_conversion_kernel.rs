@@ -21,7 +21,7 @@
 
 use super::value_conversion::{
     JSON_TEXT, LARGEINT_FLOAT, LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY,
-    SIGNED_LARGEINT,
+    SIGNED_LARGEINT, UTF8_LARGEINT,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
@@ -71,6 +71,7 @@ enum Operation {
     LargeIntF32,
     LargeIntF64,
     LargeIntText,
+    Utf8LargeInt,
     NullLift,
 }
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +130,7 @@ impl ConversionRecipe {
                     _ => return Err(invalid("conversion has a foreign frozen float target")),
                 },
                 LARGEINT_TEXT => Operation::LargeIntText,
+                UTF8_LARGEINT => Operation::Utf8LargeInt,
                 NULL_LIFT => Operation::NullLift,
                 _ => return Err(invalid("conversion has an unknown canonical overload")),
             };
@@ -321,6 +323,7 @@ impl ConversionRecipe {
                         })?
                     }
                     Operation::LargeIntText => largeint_text(*argument, selection, &mut work)?,
+                    Operation::Utf8LargeInt => utf8_largeint(*argument, selection, &mut work)?,
                     Operation::NullLift => {
                         return Err(internal("NULL lift active domain was not excluded"));
                     }
@@ -602,6 +605,42 @@ fn signed_largeint(
         Signed::I64 => run!(Int64Type),
     }
 }
+fn utf8_largeint(
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let source: &arrow_array::StringArray = downcast(argument.array())?;
+    extent(selection.len(), 16)?;
+    work.flush()?;
+    let mut output = FixedSizeBinaryBuilder::with_capacity(selection.len(), 16);
+    work.flush()?;
+    for (ordinal, row) in selection.iter().enumerate() {
+        let row = argument.value_row(ordinal, row);
+        work.step()?;
+        let value = if source.is_null(row) {
+            None
+        } else {
+            work.flush()?;
+            let value = crate::largeint_text::parse_utf8(source.value(row));
+            work.flush()?;
+            value
+        };
+        if let Some(value) = value {
+            output
+                .append_value(value.to_be_bytes())
+                .map_err(|_| internal("conversion LargeInt append violated its fixed width"))?;
+        } else {
+            output.append_null();
+        }
+        work.step()?;
+    }
+    work.flush()?;
+    let output = Arc::new(output.finish()) as ArrayRef;
+    work.flush()?;
+    Ok(output)
+}
+
 fn largeint_text(
     argument: EvaluatedArgument<'_>,
     selection: Selection<'_>,

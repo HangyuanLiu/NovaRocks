@@ -111,7 +111,7 @@ pub(super) fn prepare(
     )
     .map(|result| result.into_prepared())
 }
-fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str); 5] {
+fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str); 6] {
     [
         (
             nominal(DataType::Utf8, nullable, ValueLogicalType::Json),
@@ -134,6 +134,11 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
             value_conversion::LARGEINT_FLOAT,
         ),
         (
+            ty(DataType::Utf8, nullable),
+            large(true),
+            value_conversion::UTF8_LARGEINT,
+        ),
+        (
             ty(DataType::Null, true),
             nominal(DataType::Utf8, true, ValueLogicalType::Json),
             value_conversion::NULL_LIFT,
@@ -142,7 +147,7 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
 }
 
 #[test]
-fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_seven_implementation_records() {
+fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_eight_implementation_records() {
     let owner = owner();
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
     let actual = catalog
@@ -178,6 +183,10 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_seven_implementat
         (
             value_conversion::LARGEINT_TEXT,
             "builtin.scalar/value_domain_conversion/largeint_to_utf8_text/selected-v1",
+        ),
+        (
+            value_conversion::UTF8_LARGEINT,
+            "builtin.scalar/value_domain_conversion/utf8_to_largeint_null_invalid/selected-v1",
         ),
         (
             value_conversion::NULL_LIFT,
