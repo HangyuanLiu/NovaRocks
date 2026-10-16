@@ -1424,6 +1424,112 @@ mod tests {
         assert!(!next.file_io().exists(unused.path()).await.unwrap());
     }
     #[tokio::test]
+    async fn every_published_snapshot_retains_its_operation_manifest_after_final_head_removes_it() {
+        let fixture = Fixture::new();
+        let (metadata, selected, unused) = operation_manifest_fixture(&fixture).await;
+        let selected_object = ObjectIdentity::new(&selected.manifest_path).unwrap();
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let (request, retained) = prepare(
+            &attempt,
+            &intent,
+            StagingBase::Existing {
+                metadata,
+                metadata_location: "file:///base.json".into(),
+            },
+            &PreparedChange::default(),
+            &[&ReusedManifest(selected), &RemoveAfterAppend],
+        )
+        .await
+        .unwrap();
+        let snapshots = request
+            .updates()
+            .iter()
+            .filter_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 2);
+        assert_ne!(snapshots[0].snapshot_id(), snapshots[1].snapshot_id());
+        assert_eq!(
+            snapshots[1].parent_snapshot_id(),
+            Some(snapshots[0].snapshot_id())
+        );
+        assert!(request.updates().iter().rev().any(|update| matches!(
+            update,
+            TableUpdate::SetSnapshotRef { ref_name, reference }
+                if ref_name == "main" && reference.snapshot_id == snapshots[1].snapshot_id()
+        )));
+        // Decode the actual two lists rather than deriving the expected roots
+        // from the frozen artifact set under test.
+        let read_list = |snapshot: &crate::iceberg::spec::Snapshot| {
+            let input = attempt
+                .file_io()
+                .new_input(snapshot.manifest_list())
+                .unwrap();
+            async move {
+                crate::iceberg::spec::ManifestList::parse_with_version(
+                    &input.read().await.unwrap(),
+                    FormatVersion::V2,
+                )
+                .unwrap()
+            }
+        };
+        let earlier = read_list(snapshots[0]).await;
+        let final_head = read_list(snapshots[1]).await;
+        assert_eq!(earlier.entries().len(), 1);
+        assert_eq!(earlier.entries()[0].manifest_path, selected_object.path());
+        assert!(
+            final_head
+                .entries()
+                .iter()
+                .all(|manifest| manifest.manifest_path != selected_object.path())
+        );
+        assert_eq!(final_head.entries().len(), 1);
+        let deleted = crate::manifest::load_manifest(&final_head.entries()[0], attempt.file_io())
+            .await
+            .unwrap();
+        assert_eq!(deleted.entries().len(), 1);
+        assert!(
+            deleted
+                .entries()
+                .iter()
+                .all(|entry| { entry.status == crate::iceberg::spec::ManifestStatus::Deleted })
+        );
+        assert_eq!(
+            request.artifacts().operation_references(),
+            [selected_object.clone()]
+        );
+        assert!(!retained.contains(&unused));
+        fixture.operation.cleanup_after_commit(&retained).await;
+        assert!(
+            attempt
+                .file_io()
+                .exists(selected_object.path())
+                .await
+                .unwrap()
+        );
+        assert!(!attempt.file_io().exists(unused.path()).await.unwrap());
+        let preserved = read_list(snapshots[0]).await;
+        let manifest = crate::manifest::load_manifest(&preserved.entries()[0], attempt.file_io())
+            .await
+            .unwrap();
+        assert_eq!(manifest.entries().len(), 1);
+        assert_eq!(
+            manifest.entries()[0].data_file().file_path(),
+            "file:///external-data.parquet"
+        );
+        let final_preserved = read_list(snapshots[1]).await;
+        assert!(
+            final_preserved
+                .entries()
+                .iter()
+                .all(|manifest| manifest.manifest_path != selected_object.path())
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_reused_manifest_request_retains_all_possible_operation_outputs() {
         let fixture = Fixture::new();
         let (metadata, selected, unused) = operation_manifest_fixture(&fixture).await;

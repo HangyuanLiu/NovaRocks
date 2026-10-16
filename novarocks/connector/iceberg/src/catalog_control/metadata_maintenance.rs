@@ -1926,6 +1926,455 @@ mod tests {
             .unwrap();
     }
     #[test]
+    fn gc_disabled_real_lease_refuses_before_dispatch_and_preserves_shared_source_rows_and_files() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use futures::TryStreamExt;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn rows(table: &crate::iceberg::table::Table, snapshot: Option<i64>) -> Vec<i64> {
+            let mut builder = table.scan().select_all();
+            if let Some(snapshot) = snapshot {
+                builder = builder.snapshot_id(snapshot);
+            }
+            let scan = builder.build().unwrap();
+            let batches = scan
+                .to_arrow()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut values = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            values.sort_unstable();
+            values
+        }
+
+        let (executor, _warehouse, base, key) = adapter();
+        let table = create_local_table(&executor, &base);
+        // These are readable Parquet objects, not the synthetic bytes used by
+        // append_local_file. An independent frozen source reads their rows.
+        for value in [11_i64, 22] {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, false)
+                    .with_metadata(HashMap::from([("PARQUET:field_id".into(), "1".into())])),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![value]))],
+            )
+            .unwrap();
+            let mut bytes = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            executor.block_on(async {
+                let current = crate::catalog::admission_test_support::load_static_fixture_table(
+                    &base.runtime,
+                    table.identifier(),
+                )
+                .await;
+                let path = format!(
+                    "{}/data/real-{value}.parquet",
+                    current.metadata().location()
+                );
+                let length = bytes.len() as u64;
+                current
+                    .file_io()
+                    .new_output(&path)
+                    .unwrap()
+                    .write(Bytes::from(bytes))
+                    .await
+                    .unwrap();
+                let file = crate::iceberg::spec::DataFileBuilder::default()
+                    .content(crate::iceberg::spec::DataContentType::Data)
+                    .file_path(path)
+                    .file_format(crate::iceberg::spec::DataFileFormat::Parquet)
+                    .record_count(1)
+                    .file_size_in_bytes(length)
+                    .partition(crate::iceberg::spec::Struct::empty())
+                    .build()
+                    .unwrap();
+                let content = crate::commit::model::AddedContent::new_logical_data(
+                    file,
+                    current.metadata().default_partition_spec_id(),
+                )
+                .unwrap();
+                crate::commit::run::append_contents_for_test(
+                    crate::metadata::IcebergMetadata::new(
+                        base.descriptor.clone(),
+                        key.incarnation,
+                        Arc::clone(&base.runtime),
+                    ),
+                    current,
+                    vec![content],
+                    "main".into(),
+                    BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        let source = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
+        let read_source = || executor.block_on(rows(&source, None));
+        assert_eq!(source.metadata().snapshots().len(), 2);
+        assert_eq!(read_source(), vec![11, 22]);
+        let copy_ident = crate::iceberg::TableIdent::new(
+            source.identifier().namespace().clone(),
+            "snapshot_copy".into(),
+        );
+        let copied_snapshot = executor.block_on(async {
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &base.runtime,
+                key.incarnation,
+                crate::catalog::catalog_request::CatalogPublicationRequest::CreateTable {
+                    namespace: crate::catalog::CatalogNamespaceName::new("maintenance_test"),
+                    creation: crate::iceberg::TableCreation::builder()
+                        .name("snapshot_copy".into())
+                        .schema(source.metadata().current_schema().as_ref().clone())
+                        .format_version(crate::iceberg::spec::FormatVersion::V2)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+            ));
+            let copy = crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                &copy_ident,
+            )
+            .await;
+            assert_ne!(copy.metadata().uuid(), source.metadata().uuid());
+            let list = crate::manifest::load_manifest_list(
+                source.metadata().current_snapshot().unwrap(),
+                source.file_io(),
+                source.metadata(),
+            )
+            .await
+            .unwrap();
+            let mut contents = Vec::new();
+            for descriptor in list.entries() {
+                let manifest = crate::manifest::load_manifest(descriptor, source.file_io())
+                    .await
+                    .unwrap();
+                for entry in manifest.entries() {
+                    assert_ne!(entry.status, crate::iceberg::spec::ManifestStatus::Deleted);
+                    contents.push(
+                        crate::commit::model::AddedContent::new_logical_data(
+                            entry.data_file().clone(),
+                            descriptor.partition_spec_id,
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+            assert_eq!(contents.len(), 2);
+            let provider = || {
+                crate::metadata::IcebergMetadata::new(
+                    base.descriptor.clone(),
+                    key.incarnation,
+                    Arc::clone(&base.runtime),
+                )
+            };
+            let copied_snapshot = crate::commit::run::append_contents_for_test(
+                provider(),
+                copy,
+                contents,
+                "main".into(),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+            let copy = crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                &copy_ident,
+            )
+            .await;
+            assert_eq!(rows(&copy, None).await, vec![11, 22]);
+            let copied_list = crate::manifest::load_manifest_list(
+                copy.metadata().current_snapshot().unwrap(),
+                copy.file_io(),
+                copy.metadata(),
+            )
+            .await
+            .unwrap();
+            let mut shared_paths = Vec::new();
+            for descriptor in copied_list.entries() {
+                let manifest = crate::manifest::load_manifest(descriptor, copy.file_io())
+                    .await
+                    .unwrap();
+                shared_paths.extend(
+                    manifest
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.data_file().file_path().to_owned()),
+                );
+            }
+            shared_paths.sort();
+            assert_eq!(
+                shared_paths,
+                vec![
+                    format!("{}/data/real-11.parquet", source.metadata().location()),
+                    format!("{}/data/real-22.parquet", source.metadata().location()),
+                ]
+            );
+
+            // Overwrite the copy with a new physical object. The old shared
+            // objects are now absent from its live head, but serve source.
+            let bytes = source
+                .file_io()
+                .new_input(&format!(
+                    "{}/data/real-11.parquet",
+                    source.metadata().location()
+                ))
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let replacement_path =
+                format!("{}/data/replacement.parquet", copy.metadata().location());
+            let length = bytes.len() as u64;
+            copy.file_io()
+                .new_output(&replacement_path)
+                .unwrap()
+                .write(bytes)
+                .await
+                .unwrap();
+            let replacement = crate::iceberg::spec::DataFileBuilder::default()
+                .content(crate::iceberg::spec::DataContentType::Data)
+                .file_path(replacement_path)
+                .file_format(crate::iceberg::spec::DataFileFormat::Parquet)
+                .record_count(1)
+                .file_size_in_bytes(length)
+                .partition(crate::iceberg::spec::Struct::empty())
+                .build()
+                .unwrap();
+            let preparation = context();
+            let operation = IcebergCommitOperation::new(
+                OperationToken::from_mutation(ConnectorMutationOperationId::new()),
+                copy.metadata().location(),
+                base.runtime.resources().planning_binding().clone(),
+                preparation.clone(),
+                base.runtime.resources().catalog_runtime().clone(),
+                OperationLimits::default(),
+            )
+            .unwrap();
+            let attempt = operation.begin_attempt().unwrap();
+            let intent = OperationIntent::new(OperationIntentParts {
+                target: TableTarget {
+                    ident: copy_ident.clone(),
+                    uuid: Some(copy.metadata().uuid()),
+                },
+                target_ref: "main".into(),
+                start: None,
+                changes: FileChanges {
+                    added: vec![
+                        crate::commit::model::AddedContent::new_logical_data(
+                            replacement,
+                            copy.metadata().default_partition_spec_id(),
+                        )
+                        .unwrap(),
+                    ],
+                    removed: Vec::new(),
+                },
+                dependencies: vec![Dependency::NoReadDependency],
+                isolation: IsolationLevel::Serializable,
+                shape: RequestShape::SnapshotProducing,
+                summary: BTreeMap::new(),
+                token: operation.token(),
+            })
+            .unwrap();
+            let mut engine = crate::commit::staging::StagingEngine::begin(
+                crate::commit::staging::StagingBase::Existing {
+                    metadata: copy.metadata().clone(),
+                    metadata_location: copy.metadata_location().unwrap().into(),
+                },
+                &intent,
+                &attempt,
+            )
+            .unwrap();
+            engine
+                .stage(&crate::commit::overwrite::OverwritePreparer)
+                .await
+                .unwrap();
+            let frozen = engine.freeze(&[]).unwrap();
+            assert!(frozen.updates().iter().any(|update| matches!(update,
+                crate::iceberg::TableUpdate::AddSnapshot { snapshot }
+                if snapshot.summary().operation == crate::iceberg::spec::Operation::Overwrite
+            )));
+            let outcome = crate::catalog::admission_test_support::publish_frozen(
+                Arc::clone(base.runtime.novarocks_catalog()),
+                base.descriptor.clone(),
+                key.incarnation,
+                frozen,
+                CatalogOperation::Overwrite,
+                preparation,
+                None,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                crate::catalog::error::CatalogOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    finalization: ExternalMutationFinalization::Complete,
+                    ..
+                }
+            ));
+            copied_snapshot
+        });
+        foreign_properties(
+            base.runtime.resources().catalog_runtime().clone(),
+            competing_adapter(&base),
+            copy_ident.clone(),
+            HashMap::from([("gc.enabled".into(), "false".into())]),
+        );
+        let target = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                &copy_ident,
+            ),
+        );
+        assert_ne!(target.metadata().uuid(), source.metadata().uuid());
+        assert_eq!(target.metadata().snapshots().len(), 2);
+        assert!(target.metadata().snapshot_by_id(copied_snapshot).is_some());
+        assert_ne!(
+            target.metadata().current_snapshot().unwrap().snapshot_id(),
+            copied_snapshot
+        );
+        assert_eq!(executor.block_on(rows(&target, None)), vec![11]);
+        assert_eq!(
+            executor.block_on(rows(&target, Some(copied_snapshot))),
+            vec![11, 22]
+        );
+        let metadata_location = target.metadata_location().unwrap().to_owned();
+        let metadata_bytes = executor
+            .block_on(
+                target
+                    .file_io()
+                    .new_input(&metadata_location)
+                    .unwrap()
+                    .read(),
+            )
+            .unwrap();
+        let location = novarocks_fs::FsLocation::parse(source.metadata().location()).unwrap();
+        let copy_location = novarocks_fs::FsLocation::parse(target.metadata().location()).unwrap();
+        let inventory = || {
+            inventory_without_private_artifacts(std::path::Path::new(location.path()))
+                .into_iter()
+                .chain(inventory_without_private_artifacts(std::path::Path::new(
+                    copy_location.path(),
+                )))
+                .filter(|path| path.is_file())
+                .map(|path| {
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let physical_before = inventory();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&dispatches);
+        let lease = real_maintenance_lease(recorded_adapter(
+            &base,
+            Arc::new(move |_, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        ));
+        let handle = ConnectorTableHandle::try_new(key.instance_id.clone(), Bytes::from_static(
+            br#"{"namespace":"maintenance_test","table":"snapshot_copy","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#,
+        )).unwrap();
+        let plan = lease
+            .plan_maintenance(
+                ConnectorMetadataMaintenancePlanningRequest::try_new(
+                    ConnectorMutationOperationId::new(),
+                    key.clone(),
+                    ConnectorMetadataMaintenanceOperation::expire_table_versions(
+                        handle,
+                        Some(i64::MAX),
+                        Some(1),
+                    )
+                    .unwrap(),
+                    context(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let fixed_payload = plan.provider_payload().clone();
+        let fixed_intent = plan.intent_digest();
+        let outcome = lease
+            .execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
+                    .unwrap(),
+            )
+            .unwrap();
+        let ExternalMutationOutcome::KnownUncommitted { failure, cleanup } = outcome else {
+            panic!("gc.enabled=false must reject the real maintenance entry before publication")
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+        assert!(failure.message().contains("gc.enabled is false"));
+        assert_eq!(cleanup, ExternalMutationFinalization::Complete);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(plan.provider_payload(), &fixed_payload);
+        assert_eq!(plan.intent_digest(), fixed_intent);
+        let current = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                &copy_ident,
+            ),
+        );
+        assert_eq!(
+            current.metadata_location(),
+            Some(metadata_location.as_str())
+        );
+        assert_eq!(current.metadata().uuid(), target.metadata().uuid());
+        assert_eq!(current.metadata().refs(), target.metadata().refs());
+        assert_eq!(
+            executor
+                .block_on(
+                    current
+                        .file_io()
+                        .new_input(&metadata_location)
+                        .unwrap()
+                        .read()
+                )
+                .unwrap(),
+            metadata_bytes
+        );
+        assert_eq!(
+            inventory(),
+            physical_before,
+            "No metadata, manifest, data or planning object may change"
+        );
+        assert_eq!(
+            read_source(),
+            vec![11, 22],
+            "The independently retained source remains readable"
+        );
+    }
+
+    #[test]
     fn expire_conflict_reloads_policy_without_accumulating_old_candidates_or_changing_fixed_intent()
     {
         use std::sync::atomic::{AtomicUsize, Ordering};

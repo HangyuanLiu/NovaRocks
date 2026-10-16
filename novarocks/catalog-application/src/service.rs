@@ -2555,4 +2555,656 @@ mod tests {
         port.retire_projection(&instance);
         assert!(port.catalog_materializers.lock().unwrap().is_empty());
     }
+
+    mod generation_expiry_ref {
+        use super::*;
+        use novarocks_connector_iceberg::access_binding::{
+            IcebergReadBinding, IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+        };
+        use novarocks_connector_iceberg::{IcebergControlRoleBindingFactory, iceberg};
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        use novarocks_spi::connector::{
+            CatalogActivityPhase, ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutationResolver, ConnectorError, ConnectorErrorKind,
+            ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceOperation,
+            ConnectorMetadataMaintenanceResolver, ConnectorMutationFailureKind,
+            ConnectorMutationOperationId, ConnectorRefAction, ConnectorRefKind,
+            ConnectorRequestContext, ConnectorStopOwner, ConnectorTableHandle,
+            ConnectorTableIdentity, CreateOrReplacePolicy, ExternalMutationEffect,
+            ExternalMutationOutcome,
+        };
+        use serde_json::{Value, json};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Condvar, atomic::AtomicBool};
+
+        struct Identity;
+        impl IcebergStaticCredentialResolver for Identity {
+            fn resolve_object_store_static(
+                &self,
+                _: &StaticCredentialReference,
+            ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, ConnectorError> {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "No object-store identity in this local fixture",
+                ))
+            }
+            fn resolve_catalog_control(
+                &self,
+                reference: &StaticCredentialReference,
+            ) -> Result<IcebergRestAuthMaterial, ConnectorError> {
+                Ok(IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new(format!(
+                        "generation-{}",
+                        reference.generation()
+                    )),
+                })
+            }
+        }
+        #[derive(Clone)]
+        struct Request {
+            method: String,
+            path: String,
+            authorization: String,
+            body: Value,
+        }
+        struct State {
+            tables: BTreeMap<String, Value>,
+            records: Vec<Request>,
+            expiry_entered: bool,
+        }
+        struct Server {
+            address: std::net::SocketAddr,
+            state: Arc<Mutex<State>>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+            stop: Arc<AtomicBool>,
+            acceptor: Option<std::thread::JoinHandle<()>>,
+            connections: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+        }
+        impl Server {
+            fn start(tables: BTreeMap<String, Value>) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let address = listener.local_addr().unwrap();
+                let state = Arc::new(Mutex::new(State {
+                    tables,
+                    records: vec![],
+                    expiry_entered: false,
+                }));
+                let release = Arc::new((Mutex::new(false), Condvar::new()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let connections = Arc::new(Mutex::new(vec![]));
+                let (s, r, done, joins) = (
+                    state.clone(),
+                    release.clone(),
+                    stop.clone(),
+                    connections.clone(),
+                );
+                let acceptor = std::thread::spawn(move || {
+                    while !done.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let (s, r) = (s.clone(), r.clone());
+                                joins
+                                    .lock()
+                                    .unwrap()
+                                    .push(std::thread::spawn(move || Self::respond(stream, s, r)));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1))
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    }
+                });
+                Self {
+                    address,
+                    state,
+                    release,
+                    stop,
+                    acceptor: Some(acceptor),
+                    connections,
+                }
+            }
+            fn respond(
+                mut stream: TcpStream,
+                state: Arc<Mutex<State>>,
+                release: Arc<(Mutex<bool>, Condvar)>,
+            ) {
+                // Accepted sockets can inherit the listener's nonblocking mode
+                // on macOS. Each owned connection uses blocking, bounded I/O.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = vec![];
+                let head_end = loop {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                    assert!(bytes.len() < 65536);
+                };
+                let head = String::from_utf8(bytes[..head_end].to_vec()).unwrap();
+                let mut first = head.lines().next().unwrap().split_whitespace();
+                let method = first.next().unwrap().to_owned();
+                let path = first.next().unwrap().split('?').next().unwrap().to_owned();
+                let headers: BTreeMap<_, _> = head
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_owned()))
+                    .collect();
+                let length: usize = headers
+                    .get("content-length")
+                    .map(|v| v.parse().unwrap())
+                    .unwrap_or(0);
+                while bytes.len() - head_end < length {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let body = if length == 0 {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes[head_end..head_end + length]).unwrap()
+                };
+                let request = Request {
+                    method: method.clone(),
+                    path: path.clone(),
+                    authorization: headers.get("authorization").cloned().unwrap_or_default(),
+                    body,
+                };
+                let expiry = method == "POST"
+                    && request.body["updates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|update| update["action"] == "remove-snapshot-ref");
+                {
+                    let mut state = state.lock().unwrap();
+                    state.records.push(request.clone());
+                    if expiry {
+                        state.expiry_entered = true;
+                    }
+                }
+                if expiry {
+                    let (lock, changed) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = changed.wait(released).unwrap();
+                    }
+                }
+                let response = if path == "/v1/config" {
+                    json!({"defaults":{},"overrides":{}})
+                } else {
+                    let name = path.rsplit('/').next().unwrap();
+                    let mut state = state.lock().unwrap();
+                    let response = state
+                        .tables
+                        .get_mut(name)
+                        .expect("only declared tables are requested");
+                    if method == "POST" {
+                        let previous = response["metadata-location"].as_str().unwrap().to_owned();
+                        let previous_time =
+                            response["metadata"]["last-updated-ms"].as_i64().unwrap();
+                        let version = response["metadata"]["metadata-log"]
+                            .as_array()
+                            .unwrap()
+                            .len()
+                            + 2;
+                        for update in request.body["updates"].as_array().unwrap() {
+                            match update["action"].as_str().unwrap() {
+                                "remove-snapshot-ref" => {
+                                    response["metadata"]["refs"]
+                                        .as_object_mut()
+                                        .unwrap()
+                                        .remove(update["ref-name"].as_str().unwrap());
+                                }
+                                "set-snapshot-ref" => {
+                                    response["metadata"]["refs"]
+                                        [update["ref-name"].as_str().unwrap()] = json!({"snapshot-id":update["snapshot-id"],"type":update["type"]});
+                                }
+                                "set-properties" => {
+                                    for (key, value) in update["updates"].as_object().unwrap() {
+                                        response["metadata"]["properties"][key] = value.clone();
+                                    }
+                                }
+                                other => panic!("unexpected publication update {other}"),
+                            }
+                        }
+                        if expiry {
+                            // A refreshed success may include a later writer's head.
+                            // The waiting G2 must use 3, never its pre-lock head 2.
+                            let mut snapshot = response["metadata"]["snapshots"][1].clone();
+                            snapshot["snapshot-id"] = json!(3);
+                            snapshot["parent-snapshot-id"] = json!(2);
+                            snapshot["sequence-number"] = json!(3);
+                            snapshot["manifest-list"] = json!(format!(
+                                "{}/list-3.avro",
+                                response["metadata"]["location"].as_str().unwrap()
+                            ));
+                            response["metadata"]["snapshots"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(snapshot);
+                            response["metadata"]["current-snapshot-id"] = json!(3);
+                            response["metadata"]["last-sequence-number"] = json!(3);
+                            response["metadata"]["refs"]["main"]["snapshot-id"] = json!(3);
+                        }
+                        response["metadata"]["metadata-log"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"timestamp-ms":previous_time,"metadata-file":previous}));
+                        response["metadata"]["last-updated-ms"] = json!(previous_time + 1);
+                        let next = format!(
+                            "{}/v{version}.metadata.json",
+                            response["metadata"]["location"].as_str().unwrap()
+                        );
+                        std::fs::write(&next, serde_json::to_vec(&response["metadata"]).unwrap())
+                            .unwrap();
+                        response["metadata-location"] = json!(next);
+                    }
+                    response.clone()
+                };
+                let body = serde_json::to_vec(&response).unwrap();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).and_then(|_| stream.write_all(&body));
+            }
+            fn release(&self) {
+                let (lock, changed) = &*self.release;
+                *lock.lock().unwrap() = true;
+                changed.notify_all();
+            }
+            fn posts(&self, name: &str) -> Vec<Request> {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .records
+                    .iter()
+                    .filter(|r| r.method == "POST" && r.path.ends_with(&format!("/tables/{name}")))
+                    .cloned()
+                    .collect()
+            }
+        }
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.release();
+                self.stop.store(true, Ordering::SeqCst);
+                self.acceptor.take().unwrap().join().unwrap();
+                let mut panicked = false;
+                for connection in self.connections.lock().unwrap().drain(..) {
+                    panicked |= connection.join().is_err();
+                }
+                if !std::thread::panicking() {
+                    assert!(!panicked, "fixture connection thread panicked");
+                }
+            }
+        }
+        fn context(stop: &ConnectorStopOwner, budget: Duration) -> ConnectorRequestContext {
+            ConnectorRequestContext::try_new(
+                Instant::now() + budget,
+                stop.view(),
+                64 * 1024,
+                1024 * 1024,
+            )
+            .unwrap()
+        }
+        async fn until(mut predicate: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !predicate() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("controlled stage did not arrive");
+        }
+        fn tag(
+            lease: ConnectorCatalogMutationLease,
+            instance: ConnectorInstanceId,
+            table: &str,
+            name: &str,
+            context: ConnectorRequestContext,
+        ) -> impl FnOnce() -> Result<
+            ExternalMutationOutcome<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+            ConnectorError,
+        > + Send
+        + 'static {
+            let operation = ConnectorCatalogMutationOperation::AlterRef {
+                table: ConnectorTableIdentity {
+                    instance_id: instance,
+                    namespace: "db".into(),
+                    table: table.into(),
+                },
+                action: ConnectorRefAction::Create {
+                    kind: ConnectorRefKind::Tag,
+                    name: name.into(),
+                    snapshot_id: None,
+                    policy: CreateOrReplacePolicy::FailIfExists,
+                    expected_table_uuid: None,
+                },
+            };
+            move || lease.execute_operation(ConnectorMutationOperationId::new(), operation, context)
+        }
+        fn assert_stopped(
+            outcome: Result<
+                ExternalMutationOutcome<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+                ConnectorError,
+            >,
+            expected: ConnectorMutationFailureKind,
+        ) {
+            let ExternalMutationOutcome::KnownUncommitted { failure, .. } = outcome.unwrap() else {
+                panic!("waiting mutation must be definitely undispatched")
+            };
+            assert_eq!(failure.kind(), expected);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn real_service_generations_serialize_expiry_and_refs_with_fresh_authenticated_observations()
+         {
+            let warehouse = tempfile::tempdir().unwrap();
+            let io = iceberg::io::FileIO::new_with_fs();
+            let mut tables = BTreeMap::new();
+            for (name, uuid) in [("t", Uuid::from_u128(1)), ("other", Uuid::from_u128(2))] {
+                let location = warehouse.path().canonicalize().unwrap().join(name);
+                std::fs::create_dir_all(&location).unwrap();
+                for id in 1..=3 {
+                    iceberg::spec::ManifestListWriter::v2(
+                        io.new_output(location.join(format!("list-{id}.avro")).to_str().unwrap())
+                            .unwrap()
+                            .writer()
+                            .await
+                            .unwrap(),
+                        id,
+                        (id > 1).then_some(id - 1),
+                        id,
+                    )
+                    .close()
+                    .await
+                    .unwrap();
+                }
+                let schema = iceberg::spec::Schema::builder()
+                    .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                    ))])
+                    .build()
+                    .unwrap();
+                let metadata = iceberg::spec::TableMetadataBuilder::new(
+                    schema,
+                    iceberg::spec::PartitionSpec::unpartition_spec(),
+                    iceberg::spec::SortOrder::unsorted_order(),
+                    location.display().to_string(),
+                    iceberg::spec::FormatVersion::V2,
+                    Default::default(),
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+                let mut metadata = serde_json::to_value(metadata).unwrap();
+                metadata["table-uuid"] = json!(uuid);
+                metadata["last-updated-ms"] = json!(1700000000000_i64);
+                metadata["last-sequence-number"] = json!(2);
+                metadata["current-snapshot-id"] = json!(2);
+                metadata["snapshots"] = json!([
+                    {"snapshot-id":1,"sequence-number":1,"timestamp-ms":1,"manifest-list":location.join("list-1.avro"),"schema-id":0,"summary":{"operation":"append"}},
+                    {"snapshot-id":2,"parent-snapshot-id":1,"sequence-number":2,"timestamp-ms":2,"manifest-list":location.join("list-2.avro"),"schema-id":0,"summary":{"operation":"append"}}
+                ]);
+                metadata["refs"] = json!({"main":{"snapshot-id":2,"type":"branch"},"expired":{"snapshot-id":1,"type":"tag","max-ref-age-ms":1}});
+                metadata["metadata-log"] = json!([]);
+                let _: iceberg::spec::TableMetadata =
+                    serde_json::from_value(metadata.clone()).unwrap();
+                let path = location.join("v1.metadata.json");
+                std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+                tables.insert(
+                    name.to_owned(),
+                    json!({"metadata-location":path,"metadata":metadata}),
+                );
+            }
+            let server = Server::start(tables);
+            let runtime = tokio::runtime::Handle::current();
+            let fs = novarocks_fs::FsAccessResources::new(
+                Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
+                FsAccessResolver::new(),
+                Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+                Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+            );
+            let access = IcebergReadBinding::with_static_metadata_credential_resolver(
+                fs,
+                Arc::new(Identity),
+            );
+            let factory = Arc::new(IcebergControlRoleBindingFactory::new(
+                novarocks_connector_iceberg::resources::IcebergMetadataResources::new(
+                    access,
+                    runtime.clone(),
+                ),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            ));
+            let control =
+                Arc::new(ConnectorControlHost::with_role_factories(vec![factory]).unwrap());
+            let port = Arc::new(CatalogApplicationService::unavailable(
+                control.clone(),
+                Arc::new(TestRuntimePublisher),
+                runtime,
+                Arc::new(TestReferenceReader),
+            ));
+            let instance = ConnectorInstanceId::parse("catalog.generation-race").unwrap();
+            let identity = Uuid::now_v7();
+            let entry = |version| {
+                CatalogDesiredStateEntry::new(
+                    crate::CatalogSourceEntryIdentity::new(identity),
+                    crate::CatalogLogicalConfig::try_new(
+                        instance.clone(),
+                        ConnectorProviderId::parse("iceberg").unwrap(),
+                        "Generation race",
+                        vec![
+                            ("iceberg.catalog.type".into(), "rest".into()),
+                            ("uri".into(), format!("http://{}", server.address)),
+                            (
+                                "iceberg.catalog.warehouse".into(),
+                                warehouse.path().display().to_string(),
+                            ),
+                        ],
+                        vec![
+                            CatalogCredentialBinding::try_new(
+                                CatalogCredentialPurpose::CatalogControl,
+                                CredentialConsumerRole::Frontend,
+                                CatalogCredentialMode::Static(
+                                    StaticCredentialReference::try_new("control", version).unwrap(),
+                                ),
+                            )
+                            .unwrap(),
+                        ],
+                        1,
+                    )
+                    .unwrap(),
+                )
+            };
+            let mode = CatalogDesiredStateSourceMode::DynamicStateStore;
+            let (_, work) = port
+                .submit_materialization(entry("v1"), mode, None)
+                .unwrap();
+            port.run_materialization(work.unwrap()).await;
+            let first = control
+                .acquire_current_metadata_maintenance(&instance)
+                .unwrap();
+            // This request-only handle freezes names, never a guessed UUID/base.
+            // The real provider plans and executes against its fresh catalog facts.
+            let handle = ConnectorTableHandle::try_new(instance.clone(), bytes::Bytes::from_static(br#"{"namespace":"db","table":"t","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#)).unwrap();
+            let stop = ConnectorStopOwner::new();
+            let planning = context(&stop, Duration::from_secs(20));
+            let plan = first
+                .plan_operation(
+                    ConnectorMutationOperationId::new(),
+                    ConnectorMetadataMaintenanceOperation::expire_table_versions(
+                        handle,
+                        Some(i64::MAX),
+                        Some(2),
+                    )
+                    .unwrap(),
+                    planning.clone(),
+                )
+                .unwrap();
+            let first_id = first.control_runtime_id();
+            let expiry = tokio::task::spawn_blocking(move || {
+                first.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, planning).unwrap(),
+                )
+            });
+            until(|| server.state.lock().unwrap().expiry_entered).await;
+            assert_eq!(server.posts("t").len(), 1);
+            port.unpublish_all();
+            let (_, work) = port
+                .submit_materialization(entry("v2"), mode, None)
+                .unwrap();
+            port.run_materialization(work.unwrap()).await;
+            let second_generation = control.acquire_current(&instance).unwrap();
+            assert_ne!(second_generation.binding().control_runtime_id(), first_id);
+            let second_epoch =
+                Uuid::from_bytes(second_generation.binding().incarnation().to_bytes());
+            let second = control.acquire_current_mutation(&instance).unwrap();
+            let waiting_count = || {
+                port.catalog_activity_sources()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|source| source.reader.as_ref())
+                    .flat_map(|reader| reader.snapshot().generations)
+                    .filter(|generation| generation.generation == Some(second_epoch))
+                    .map(|generation| {
+                        generation
+                            .phases
+                            .iter()
+                            .find(|phase| phase.phase == CatalogActivityPhase::TableCoordination)
+                            .unwrap()
+                            .inflight
+                    })
+                    .sum::<u64>()
+            };
+            let waiting = tokio::task::spawn_blocking(tag(
+                second.clone(),
+                instance.clone(),
+                "t",
+                "after",
+                context(&stop, Duration::from_secs(20)),
+            ));
+            until(|| waiting_count() == 1).await;
+            assert!(!waiting.is_finished());
+            assert_eq!(
+                server.posts("t").len(),
+                1,
+                "G2 must not dispatch through G1's live lock"
+            );
+            let other = tokio::task::spawn_blocking(tag(
+                second.clone(),
+                instance.clone(),
+                "other",
+                "parallel",
+                context(&stop, Duration::from_secs(10)),
+            ));
+            assert!(matches!(
+                other.await.unwrap().unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert_eq!(server.posts("other").len(), 1);
+            assert_eq!(server.posts("t").len(), 1);
+            let cancelled = ConnectorStopOwner::new();
+            let cancel_task = tokio::task::spawn_blocking(tag(
+                second.clone(),
+                instance.clone(),
+                "t",
+                "cancelled",
+                context(&cancelled, Duration::from_secs(10)),
+            ));
+            until(|| waiting_count() == 2).await;
+            cancelled.request_stop();
+            assert_stopped(
+                cancel_task.await.unwrap(),
+                ConnectorMutationFailureKind::Cancelled,
+            );
+            let deadline_task = tokio::task::spawn_blocking(tag(
+                second,
+                instance.clone(),
+                "t",
+                "expired-waiter",
+                context(&stop, Duration::from_millis(200)),
+            ));
+            until(|| waiting_count() == 2).await;
+            assert_stopped(
+                deadline_task.await.unwrap(),
+                ConnectorMutationFailureKind::DeadlineExceeded,
+            );
+            assert_eq!(waiting_count(), 1);
+            assert_eq!(server.posts("t").len(), 1);
+            let release_index = server.state.lock().unwrap().records.len();
+            server.release();
+            assert!(matches!(
+                expiry.await.unwrap().unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                waiting.await.unwrap().unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert_eq!(waiting_count(), 0);
+            let posts = server.posts("t");
+            assert_eq!(posts.len(), 2);
+            assert_eq!(posts[0].authorization, "Bearer generation-v1");
+            assert_eq!(posts[1].authorization, "Bearer generation-v2");
+            let set_ref = posts[1].body["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|update| update["action"] == "set-snapshot-ref")
+                .unwrap();
+            assert_eq!(set_ref["ref-name"], "after");
+            assert_eq!(
+                set_ref["snapshot-id"], 3,
+                "G2 must lower from the post-lock fresh head"
+            );
+            let state = server.state.lock().unwrap();
+            assert!(
+                state.records[release_index..]
+                    .iter()
+                    .any(|r| r.method == "GET"
+                        && r.path.ends_with("/tables/t")
+                        && r.authorization == "Bearer generation-v2")
+            );
+            assert_eq!(
+                state.tables["t"]["metadata"]["refs"]["after"]["snapshot-id"],
+                3
+            );
+            assert!(
+                state.tables["t"]["metadata"]["refs"]
+                    .get("cancelled")
+                    .is_none()
+            );
+            assert!(
+                state.tables["t"]["metadata"]["refs"]
+                    .get("expired-waiter")
+                    .is_none()
+            );
+            drop(state);
+            // Server Drop releases any gate and joins every actual HTTP thread.
+            drop(server);
+        }
+    }
 }
