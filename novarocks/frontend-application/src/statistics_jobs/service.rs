@@ -177,6 +177,9 @@ impl FrontendStatisticsApplicationPort {
         command: application::StatisticsApplicationCommand,
         submitted_at_ms: i64,
         connector_context: Option<novarocks_spi::connector::ConnectorRequestContext>,
+        #[cfg(feature = "test-controls")] nomination: Option<
+            Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+        >,
     ) -> Result<StatisticsStatementResult, application::StatisticsApplicationError> {
         match command {
             application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
@@ -193,6 +196,15 @@ impl FrontendStatisticsApplicationPort {
                     .begin_statistics_job()
                     .map_err(application::StatisticsApplicationError::new)?;
                 let admission = admit_statistics_job_root(root, &context).await?;
+                #[cfg(feature = "test-controls")]
+                let admission = match nomination {
+                    Some(nomination) => admission
+                        .with_test_statement_nomination(nomination)
+                        .map_err(|error| {
+                            application::StatisticsApplicationError::new(error.to_string())
+                        })?,
+                    None => admission,
+                };
                 let columns = match columns {
                     application::StatisticsColumnIntent::AllColumns => StatisticsColumns::All,
                     application::StatisticsColumnIntent::Explicit(columns) => {
@@ -295,8 +307,17 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
         };
         let at_ms = now_ms().map_err(application::StatisticsApplicationError::new)?;
         let result = tokio::task::block_in_place(|| {
-            self.runtime
-                .block_on(self.execute_command(command, at_ms, connector_context))
+            self.runtime.block_on(
+                self.execute_command(
+                    command,
+                    at_ms,
+                    connector_context,
+                    #[cfg(feature = "test-controls")]
+                    execution
+                        .and_then(|execution| execution.test_statement_nomination())
+                        .cloned(),
+                ),
+            )
         })?;
         Ok(map_application_result(result))
     }

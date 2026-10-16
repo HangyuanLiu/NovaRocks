@@ -465,6 +465,16 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                         novarocks_sql::compiler::SessionOptimizerSettings::default(),
                         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                     ).with_result_capacity(capacity.clone()).map_err(|error| Self::failure(error.to_string()))?;
+                #[cfg(feature = "test-controls")]
+                let execution = match phase
+                    .take_test_statement_nomination()
+                    .map_err(|error| Self::failure(error.to_string()))?
+                {
+                    Some(nomination) => execution
+                        .with_test_statement_nomination(nomination)
+                        .map_err(Self::failure)?,
+                    None => execution,
+                };
                 let relation =
                     crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
                         request.connector_instance_id.as_str(),

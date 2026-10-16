@@ -280,6 +280,9 @@ impl std::error::Error for StatisticsRepositoryError {}
 /// Move-only receipt for one independently admitted statistics business root.
 /// All three inputs must name the exact host/root; no capacity is acquired here.
 pub struct StatisticsJobAdmission {
+    #[cfg(feature = "test-controls")]
+    test_statement_nomination:
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     owner: WorkOwner,
     query_concurrency: QueryConcurrencyPermit,
     result_capacity: QueryResultCapacityBinding,
@@ -310,17 +313,68 @@ impl StatisticsJobAdmission {
             owner,
             query_concurrency,
             result_capacity,
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: None,
         })
+    }
+
+    /// Preserve only the explicitly originating ANALYZE statement's evidence.
+    /// This carries no cancellation, capacity, execution binding or new grant.
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_statement_nomination(
+        mut self,
+        nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+    ) -> Result<Self, StatisticsRepositoryError> {
+        nomination.validate().map_err(|error| {
+            StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                error.to_string(),
+            )
+        })?;
+        if self
+            .test_statement_nomination
+            .as_ref()
+            .is_some_and(|current| current != &nomination)
+        {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics admission has a foreign statement nomination",
+            ));
+        }
+        self.test_statement_nomination = Some(nomination);
+        Ok(self)
     }
 }
 
 /// A phase's cancellation/attribution scope and the independently owned job's
 /// original capacity are separate facts. Preparation may exit before collect.
 pub struct StatisticsAttemptContext {
+    #[cfg(feature = "test-controls")]
+    test_statement_nomination:
+        Mutex<Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>>,
     stage_scope: WorkScope,
     root_result_capacity: QueryResultCapacityBinding,
 }
 impl StatisticsAttemptContext {
+    /// Move the one preparation nomination into its actual collection request.
+    #[cfg(feature = "test-controls")]
+    pub fn take_test_statement_nomination(
+        &self,
+    ) -> Result<
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
+        StatisticsRepositoryError,
+    > {
+        self.test_statement_nomination
+            .lock()
+            .map(|mut nomination| nomination.take())
+            .map_err(|_| {
+                StatisticsRepositoryError::new(
+                    StatisticsRepositoryErrorKind::Conflict,
+                    "statistics preparation nomination lock poisoned",
+                )
+            })
+    }
+
     pub fn stage_scope(&self) -> &WorkScope {
         &self.stage_scope
     }
@@ -330,6 +384,9 @@ impl StatisticsAttemptContext {
 }
 
 struct LiveJob {
+    #[cfg(feature = "test-controls")]
+    test_statement_nomination:
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     job: StatisticsJob,
     /// The business root remains owned until actual runtime convergence, not
     /// merely until a terminal job conclusion becomes observable.
@@ -377,6 +434,8 @@ impl StatisticsJobRepository {
             owner,
             query_concurrency,
             result_capacity,
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination,
         } = admission;
         let mut state = self.lock()?;
         if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
@@ -389,6 +448,8 @@ impl StatisticsJobRepository {
         state.active.insert(
             job.id,
             LiveJob {
+                #[cfg(feature = "test-controls")]
+                test_statement_nomination,
                 job: job.clone(),
                 owner: Some(owner),
                 query_concurrency: Some(query_concurrency),
@@ -528,6 +589,8 @@ impl StatisticsJobRepository {
                 execution_resources_released: true,
                 provider_session_closed: true,
             };
+            #[cfg(feature = "test-controls")]
+            drop(entry.test_statement_nomination.take());
             drop(entry.query_concurrency.take());
             drop(entry.result_capacity.take());
             if let Some(owner) = entry.owner.take() {
@@ -585,6 +648,8 @@ impl StatisticsJobRepository {
                 execution_resources_released: true,
                 provider_session_closed: true,
             };
+            #[cfg(feature = "test-controls")]
+            drop(entry.test_statement_nomination.take());
             drop(entry.query_concurrency.take());
             drop(entry.result_capacity.take());
             if let Some(owner) = entry.owner.take() {
@@ -719,6 +784,10 @@ impl StatisticsJobRepository {
             convergence.execution_resources_released;
         entry.job.convergence.provider_session_closed |= convergence.provider_session_closed;
         entry.job.updated_at_ms = at_ms;
+        #[cfg(feature = "test-controls")]
+        if entry.job.convergence.is_complete() {
+            drop(entry.test_statement_nomination.take());
+        }
         if entry.job.state.is_terminal() && entry.job.convergence.is_complete() {
             drop(entry.query_concurrency.take());
             drop(entry.result_capacity.take());
@@ -858,21 +927,26 @@ impl StatisticsWorker {
             return Ok(None);
         };
         let (root_scope, result_capacity) = self.root_scope_and_capacity(job.id)?;
+        #[cfg(feature = "test-controls")]
+        let nomination = self.take_preparation_nomination(job.id)?;
         let preparation = root_scope
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
         let preparation_scope = StatisticsAttemptContext {
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: Mutex::new(nomination),
             stage_scope: preparation.scope(),
             root_result_capacity: result_capacity.clone(),
         };
-        if let Err(error) = self.executor.prepare(&job, &preparation_scope) {
-            preparation.complete();
+        let prepared = self.executor.prepare(&job, &preparation_scope);
+        drop(preparation_scope);
+        preparation.complete();
+        if let Err(error) = prepared {
             return self
                 .conclude_error(job, StatisticsJobPhase::Preparing, error, at_ms)
                 .await
                 .map(Some);
         }
-        preparation.complete();
         self.repository
             .phase(
                 job.id,
@@ -885,6 +959,8 @@ impl StatisticsWorker {
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
         let collection_scope = StatisticsAttemptContext {
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: Mutex::new(None),
             stage_scope: collection.scope(),
             root_result_capacity: result_capacity.clone(),
         };
@@ -930,6 +1006,8 @@ impl StatisticsWorker {
             .child(WorkRequest::new(WorkClass::Statistics))
             .map_err(work_error)?;
         let publication_scope = StatisticsAttemptContext {
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: Mutex::new(None),
             stage_scope: publication.scope(),
             root_result_capacity: result_capacity.clone(),
         };
@@ -1015,6 +1093,28 @@ impl StatisticsWorker {
             )
             .await?;
         Ok(Some(terminal))
+    }
+
+    #[cfg(feature = "test-controls")]
+    fn take_preparation_nomination(
+        &self,
+        id: StatisticsJobId,
+    ) -> Result<
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
+        StatisticsRepositoryError,
+    > {
+        let mut state = self.repository.lock()?;
+        let entry = state
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| StatisticsJobRepository::not_found(id))?;
+        if entry.job.state != StatisticsJobState::Active(StatisticsJobPhase::Preparing) {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics nomination requires its exact preparing job",
+            ));
+        }
+        Ok(entry.test_statement_nomination.take())
     }
 
     fn root_scope_and_capacity(

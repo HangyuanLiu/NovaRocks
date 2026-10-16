@@ -1254,6 +1254,9 @@ mod session_owner_tests {
             .unwrap()
             .unwrap();
         let nomination = handle.nomination().unwrap();
+        // Explicitly submitted background work may bind after SQL returns.
+        // Only the finite observation owner and exact journal grant evidence.
+        statement.finish();
         let first = execution(41, 1);
         let other_cohort = execution(42, 1);
         let replacement = execution(41, 2);
@@ -1341,7 +1344,6 @@ mod session_owner_tests {
         assert_eq!(handle.nomination(), Some(nomination));
         fixture.owner.drain("cohorts").unwrap();
         assert!(handle.nomination_for_exact_execution(replacement).is_none());
-        statement.finish();
     }
 
     #[test]
