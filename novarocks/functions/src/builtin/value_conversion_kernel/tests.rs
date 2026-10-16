@@ -821,3 +821,6 @@ mod utf8_largeint_tests;
 
 #[path = "largeint_datetime_tests.rs"]
 mod largeint_datetime_tests;
+
+#[path = "largeint_decimal_tests.rs"]
+mod largeint_decimal_tests;

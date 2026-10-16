@@ -20,8 +20,8 @@
 //! work bracketed by the original control. No allocation grant is claimed.
 
 use super::value_conversion::{
-    JSON_TEXT, LARGEINT_FLOAT, LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY,
-    SIGNED_LARGEINT, UTF8_LARGEINT,
+    JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT, LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT,
+    OPAQUE_BINARY, SIGNED_LARGEINT, UTF8_LARGEINT,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
@@ -68,6 +68,7 @@ enum Operation {
     SameShape,
     SignedLargeInt(Signed),
     LargeIntSigned(Signed),
+    LargeIntDecimal(super::value_conversion::largeint_decimal::DecimalRecipe),
     LargeIntF32,
     LargeIntF64,
     LargeIntText,
@@ -124,6 +125,12 @@ impl ConversionRecipe {
                 LARGEINT_SIGNED => {
                     Operation::LargeIntSigned(Signed::from_type(target.data_type())?)
                 }
+                LARGEINT_DECIMAL => Operation::LargeIntDecimal(
+                    super::value_conversion::largeint_decimal::DecimalRecipe::try_new(
+                        target.data_type(),
+                    )
+                    .ok_or_else(|| invalid("conversion has a foreign frozen Decimal target"))?,
+                ),
                 LARGEINT_FLOAT => match target.data_type() {
                     DataType::Float32 => Operation::LargeIntF32,
                     DataType::Float64 => Operation::LargeIntF64,
@@ -293,6 +300,7 @@ impl ConversionRecipe {
                     "strict NULL lift received a nonempty active call domain",
                 ));
             }
+            let mut errors = Vec::new();
             let output = if selection.is_empty() {
                 work.flush()?;
                 let output = new_empty_array(target.data_type());
@@ -312,6 +320,14 @@ impl ConversionRecipe {
                     Operation::LargeIntSigned(width) => {
                         largeint_signed(width, *argument, selection, &mut work)?
                     }
+                    Operation::LargeIntDecimal(recipe) => largeint_decimal(
+                        recipe,
+                        self.policy,
+                        *argument,
+                        selection,
+                        &mut errors,
+                        &mut work,
+                    )?,
                     Operation::LargeIntF32 => {
                         largeint_float::<Float32Type>(*argument, selection, &mut work, |value| {
                             value as f32
@@ -333,7 +349,7 @@ impl ConversionRecipe {
                 selection,
                 target.data_type(),
                 output,
-                Box::default(),
+                errors.into_boxed_slice(),
                 || work.step(),
             )
         })();
@@ -605,6 +621,64 @@ fn signed_largeint(
         Signed::I64 => run!(Int64Type),
     }
 }
+fn largeint_decimal(
+    recipe: super::value_conversion::largeint_decimal::DecimalRecipe,
+    policy: DecimalOverflowPolicy,
+    argument: EvaluatedArgument<'_>,
+    selection: Selection<'_>,
+    errors: &mut Vec<crate::RowDataError>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    let source = large_source(argument)?;
+    extent(
+        selection.len(),
+        if recipe.is_decimal128() { 16 } else { 32 },
+    )?;
+    macro_rules! convert {
+        ($ty:ty, $extract:expr) => {{
+            work.flush()?;
+            let mut output = PrimitiveBuilder::<$ty>::with_capacity(selection.len())
+                .with_precision_and_scale(recipe.precision(), recipe.scale())
+                .map_err(|_| invalid("conversion Decimal output differs from its frozen parameters"))?;
+            work.flush()?;
+            for (ordinal, logical_row) in selection.iter().enumerate() {
+                let row = argument.value_row(ordinal, logical_row);
+                work.step()?;
+                if source.is_null(row) {
+                    output.append_null();
+                    continue;
+                }
+                let value = recipe.convert(large_value(source, row)?);
+                if let Some(value) = value {
+                    output.append_value(($extract)(value)?);
+                } else {
+                    output.append_null();
+                    if policy == DecimalOverflowPolicy::ReportError {
+                        work.flush()?;
+                        errors.push(crate::RowDataError::new(ordinal,
+                            "Expr evaluate meet error: The numeric type cast involving decimal overflows"));
+                        work.flush()?;
+                    }
+                }
+                work.step()?;
+            }
+            work.flush()?;
+            let output = Arc::new(output.finish()) as ArrayRef;
+            work.flush()?;
+            Ok(output)
+        }};
+    }
+    if recipe.is_decimal128() {
+        convert!(Decimal128Type, |value: arrow_buffer::i256| value
+            .to_i128()
+            .ok_or_else(|| internal(
+                "conversion Decimal128 coefficient escaped its precision"
+            )))
+    } else {
+        convert!(Decimal256Type, |value| Ok::<_, KernelFailure>(value))
+    }
+}
+
 fn utf8_largeint(
     argument: EvaluatedArgument<'_>,
     selection: Selection<'_>,

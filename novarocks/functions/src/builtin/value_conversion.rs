@@ -59,6 +59,8 @@ pub(super) const SIGNED_LARGEINT: &str =
     "builtin.scalar/value_domain_conversion/signed_to_largeint/v1";
 pub(super) const LARGEINT_SIGNED: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_signed_null_overflow/v1";
+pub(super) const LARGEINT_DECIMAL: &str =
+    "builtin.scalar/value_domain_conversion/largeint_to_decimal_exact/v1";
 pub(super) const LARGEINT_FLOAT: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_float_round/v1";
 pub(super) const LARGEINT_TEXT: &str =
@@ -86,6 +88,19 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
     }
 }
 
+/// Decimal overflow remains a row error under the frozen ReportError policy.
+/// The other families retain their original total-value declaration.
+pub(super) fn overload_effects(id: &str) -> FunctionEffectDeclaration {
+    let mut effects = effects();
+    if id == LARGEINT_DECIMAL {
+        effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    }
+    effects
+}
+
+#[path = "value_conversion/largeint_decimal.rs"]
+pub(super) mod largeint_decimal;
+
 /// Install the exact internal binder and all of its pure scalar families.
 pub fn value_conversion_definition() -> Result<FunctionDefinition, FunctionCatalogError> {
     let (declaration, resolver) = definition_parts()?;
@@ -103,6 +118,7 @@ pub(super) fn definition_parts()
         (OPAQUE_BINARY, "Hll/Bitmap/Object/Percentile/Variant->PhysicalBinary, or identical container shape with those opaque children->PhysicalBinary", "explicit exact target; original bytes and NULL preserved; no inverse domain establishment"),
         (SIGNED_LARGEINT, "Physical(Int8|Int16|Int32|Int64)->LargeInt(FixedSizeBinary16)", "explicit exact LargeInt target; signed i128 extension; NULL preserved"),
         (LARGEINT_SIGNED, "LargeInt(FixedSizeBinary16)->Physical(Int8|Int16|Int32|Int64)", "explicit nullable exact target; out-of-range value returns NULL; NULL preserved"),
+        (LARGEINT_DECIMAL, "LargeInt(FixedSizeBinary16)->Physical(Decimal128|Decimal256)", "explicit exact decimal target; checked integer scaling; negative scale truncates toward zero; frozen decimal overflow policy; NULL preserved"),
         (LARGEINT_FLOAT, "LargeInt(FixedSizeBinary16)->Physical(Float32|Float64)", "explicit exact target; existing i128 as float rounding; NULL preserved"),
         (LARGEINT_TEXT, "LargeInt(FixedSizeBinary16)->Physical(Utf8)", "explicit exact target; original signed big-endian i128 text; NULL preserved"),
         (UTF8_LARGEINT, "Physical Utf8->LargeInt(FixedSizeBinary16)", "explicit nullable exact LargeInt target; trim then signed i128 parse; invalid or out-of-range text returns NULL; NULL preserved"),
@@ -115,7 +131,7 @@ pub(super) fn definition_parts()
             argument_pattern,
             result_pattern,
             None,
-            effects(),
+            overload_effects(id),
         ))
     })
     .collect::<Result<Vec<_>, FunctionCatalogError>>()?;
@@ -191,6 +207,7 @@ pub(super) fn recipe_family(
         OPAQUE_BINARY,
         SIGNED_LARGEINT,
         LARGEINT_SIGNED,
+        LARGEINT_DECIMAL,
         LARGEINT_FLOAT,
         LARGEINT_TEXT,
         UTF8_LARGEINT,
@@ -417,6 +434,13 @@ fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType
                 && signed(target.data_type())
                 && target.nullable()
         }
+        LARGEINT_DECIMAL => {
+            source.logical_type() == ValueLogicalType::LargeInt
+                && source.data_type() == &DataType::FixedSizeBinary(16)
+                && target.logical_type() == ValueLogicalType::Physical
+                && largeint_decimal::DecimalRecipe::try_new(target.data_type())
+                    .is_some_and(|recipe| target.nullable() || !recipe.can_overflow())
+        }
         LARGEINT_FLOAT => {
             source.logical_type() == ValueLogicalType::LargeInt
                 && source.data_type() == &DataType::FixedSizeBinary(16)
@@ -492,6 +516,7 @@ impl FunctionBindingResolver for ValueConversionResolver {
                 OPAQUE_BINARY,
                 SIGNED_LARGEINT,
                 LARGEINT_SIGNED,
+                LARGEINT_DECIMAL,
                 LARGEINT_FLOAT,
                 LARGEINT_TEXT,
                 UTF8_LARGEINT,
@@ -691,6 +716,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 JSON_TEXT,
+                LARGEINT_DECIMAL,
                 LARGEINT_FLOAT,
                 LARGEINT_SIGNED,
                 LARGEINT_TEXT,
@@ -701,7 +727,10 @@ mod tests {
             ]
         );
         for overload in declaration.overloads() {
-            assert_eq!(overload.effects.as_ref().unwrap(), &effects());
+            assert_eq!(
+                overload.effects.as_ref().unwrap(),
+                &overload_effects(overload.identity.as_str())
+            );
         }
         let mut changed_overloads = declaration.overloads().to_vec();
         changed_overloads[0].result_pattern = "different declared NULL/overflow policy".into();
@@ -861,7 +890,7 @@ mod tests {
             ),
             (physical(DataType::UInt64, false), large.clone()),
             (large.clone(), physical(DataType::Int64, false)),
-            (large.clone(), physical(DataType::Decimal128(18, 2), true)),
+            (large.clone(), physical(DataType::Decimal128(18, 2), false)),
             (
                 logical(DataType::Utf8, true, ValueLogicalType::Json),
                 physical(DataType::Utf8, false),
@@ -1201,6 +1230,7 @@ pub fn is_default_scalar_carrier_cast_overload(overload: &FunctionOverloadId) ->
         overload.as_str(),
         SIGNED_LARGEINT
             | LARGEINT_SIGNED
+            | LARGEINT_DECIMAL
             | LARGEINT_FLOAT
             | LARGEINT_TEXT
             | UTF8_LARGEINT

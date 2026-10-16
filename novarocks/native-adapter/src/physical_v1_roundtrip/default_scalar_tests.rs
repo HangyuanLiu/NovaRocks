@@ -2318,3 +2318,168 @@ fn default_real_sql_map_null_values_keep_valid_null_storage() {
         assert_eq!(lookups, 1, "{sql}");
     }
 }
+
+#[test]
+fn default_real_sql_largeint_to_decimal_keeps_exact_numeric_admission() {
+    use novarocks_physical_plan::ScanReadBudget;
+    use novarocks_sql::compiler::*;
+    for (sql, expected_coefficient) in [
+        (
+            "SELECT CAST(CAST('9223372036854775808' AS LARGEINT) AS DECIMAL(38,0))",
+            "9223372036854775808",
+        ),
+        (
+            "SELECT CAST(CAST('170141183460469231731687303715884105727' AS LARGEINT) AS DECIMAL(41,2))",
+            "17014118346046923173168730371588410572700",
+        ),
+        (
+            "SELECT field(CAST('170141183460469231731687303715884105727' AS LARGEINT), CAST('170141183460469231731687303715884105727.00' AS DECIMAL(41,2)))",
+            "17014118346046923173168730371588410572700",
+        ),
+    ] {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([98; 16]).unwrap(),
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: None,
+                current_database: "fixture".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    enable_materialized_view_rewrite: Some(false),
+                    enable_common_subexpr_reuse: Some(false),
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            catalog.snapshot(),
+            noop_constant_evaluator(),
+            policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: 64,
+                max_batch_bytes: 1 << 20,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+        .try_into_completion()
+        .unwrap();
+        let owner = SqlCompiler::start(request, &control)
+            .unwrap()
+            .into_complete()
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+            .into_plan();
+        let calls = owner
+            .plan()
+            .fragments()
+            .values()
+            .flat_map(|fragment| {
+                fragment
+                    .expressions()
+                    .iter()
+                    .filter_map(move |(_, expression)| {
+                        matches!(&expression.kind, ExprKind::FunctionCall { function, .. }
+                    if function.overload.as_str().contains("/largeint_to_decimal"))
+                        .then_some((fragment, expression))
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1, "{sql}");
+        let (fragment, expression) = calls[0];
+        let ExprKind::FunctionCall { function, .. } = &expression.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            function.overload.as_str(),
+            "builtin.scalar/value_domain_conversion/largeint_to_decimal_exact/v1"
+        );
+        let novarocks_type_contract::FunctionArgumentType::Value(source_type) =
+            &function.argument_types[0]
+        else {
+            panic!("one exact value source")
+        };
+        assert_eq!(source_type.logical_type(), ValueLogicalType::LargeInt);
+        assert_eq!(source_type.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(expression.ty.logical_type(), ValueLogicalType::Physical);
+        assert!(matches!(
+            expression.ty.data_type(),
+            DataType::Decimal128(..) | DataType::Decimal256(..)
+        ));
+        let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+            owner.plan(),
+            &catalog,
+            &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+            false,
+            compile_control(),
+        )
+        .unwrap();
+        let source = encoded
+            .fragments
+            .iter()
+            .find(|source| source.fragment_id == fragment.id().get())
+            .unwrap();
+        let mut arena = ExprArena::default();
+        decode_node(
+            source,
+            source.root.as_ref().unwrap(),
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .unwrap();
+        let mut roots = Vec::new();
+        let mut index = 0;
+        while let Some(node) = arena.node(novarocks_execution::exec::expr::ExprId(index)) {
+            let id = novarocks_execution::exec::expr::ExprId(index);
+            if matches!(node, novarocks_execution::exec::expr::ExprNode::Cast(..))
+                && arena.value_type(id).is_some_and(|ty| ty == &expression.ty)
+            {
+                roots.push(id);
+            }
+            index += 1;
+        }
+        // FIELD also has a text-to-decimal candidate; only the LARGEINT source
+        // identifies the conversion whose exact coefficient is asserted here.
+        let roots = roots
+            .into_iter()
+            .filter(|id| {
+                let Some(novarocks_execution::exec::expr::ExprNode::Cast(child, _)) =
+                    arena.node(*id)
+                else {
+                    return false;
+                };
+                arena
+                    .value_type(*child)
+                    .is_some_and(|ty| ty.logical_type() == ValueLogicalType::LargeInt)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1, "{sql}");
+        let value = arena.eval(roots[0], &empty_input()).unwrap();
+        assert_eq!(value.len(), 1);
+        assert!(!value.is_null(0), "{sql}");
+        let coefficient = match value.data_type() {
+            DataType::Decimal128(..) => value
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .unwrap()
+                .value(0)
+                .to_string(),
+            DataType::Decimal256(..) => value
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal256Array>()
+                .unwrap()
+                .value(0)
+                .to_string(),
+            _ => panic!("exact selected decimal carrier"),
+        };
+        assert_eq!(coefficient, expected_coefficient, "{sql}");
+    }
+}
