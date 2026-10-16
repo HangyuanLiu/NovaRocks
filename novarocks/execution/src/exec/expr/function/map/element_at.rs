@@ -21,12 +21,12 @@ use novarocks_functions::builtin::map_lookup_core::{
     MapLookupFailure, MapLookupInputs, lookup_observed,
 };
 use std::convert::Infallible;
-pub fn eval_element_at(
-    arena: &ExprArena,
+pub fn eval_element_at<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let map_arr = arena.eval(args[0], chunk)?;
     let key_arr = arena.eval(args[1], chunk)?;
     let check_arr = if args.len() == 3 {
@@ -36,7 +36,7 @@ pub fn eval_element_at(
     };
     let inputs = MapLookupInputs::new(&map_arr, &key_arr, check_arr.as_ref())?;
     inputs.validate_legacy_lengths()?;
-    lookup_observed(
+    Ok((lookup_observed(
         &inputs,
         novarocks_functions::Selection::all(inputs.map.len()),
         |_, row| Ok::<_, Infallible>(inputs.legacy_rows(row)),
@@ -48,5 +48,5 @@ pub fn eval_element_at(
     .map_err(|failure| match failure {
         MapLookupFailure::Data(message) => message,
         MapLookupFailure::Control(never) => match never {},
-    })
+    }))?)
 }

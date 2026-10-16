@@ -22,12 +22,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use novarocks_types::value::variant::{VariantValue, variant_typeof};
 
-pub fn eval_variant_typeof(
-    arena: &ExprArena,
+pub fn eval_variant_typeof<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let variant_array = super::common::eval_variant_arg(arena, args, chunk, "variant_typeof")?;
     let variant_arr = super::common::downcast_variant_arg(&variant_array, "variant_typeof")?;
 

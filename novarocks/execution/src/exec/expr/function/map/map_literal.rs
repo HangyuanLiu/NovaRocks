@@ -22,17 +22,18 @@ use arrow_buffer::OffsetBuffer;
 use arrow_data::transform::MutableArrayData;
 use std::sync::Arc;
 
-pub fn eval_map_literal(
-    arena: &ExprArena,
+pub fn eval_map_literal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if !args.len().is_multiple_of(2) {
-        return Err(format!(
+        return Err((format!(
             "map literal expects an even number of key/value arguments, got {}",
             args.len()
-        ));
+        ))
+        .into());
     }
 
     let num_rows = chunk.len();
@@ -61,10 +62,10 @@ pub fn eval_map_literal(
     let (map_field, ordered) =
         super::common::output_map_field(arena.data_type(expr), &key_hint, &value_hint, "map")?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err("map literal map entries type must be Struct".to_string());
+        return Err(("map literal map entries type must be Struct".to_string()).into());
     };
     if fields.len() != 2 {
-        return Err("map literal map entries type must have 2 fields".to_string());
+        return Err(("map literal map entries type must have 2 fields".to_string()).into());
     }
 
     let key_field = fields[0].clone();
@@ -92,7 +93,7 @@ pub fn eval_map_literal(
     for _ in 0..num_rows {
         current += pair_count as i64;
         if current > i32::MAX as i64 {
-            return Err("map literal offset overflow".to_string());
+            return Err(("map literal offset overflow".to_string()).into());
         }
         offsets.push(current as i32);
     }

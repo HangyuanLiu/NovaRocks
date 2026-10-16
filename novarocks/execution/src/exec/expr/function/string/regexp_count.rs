@@ -19,12 +19,12 @@ use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::regexp_count::{self, PatternSource};
 
-pub fn eval_regexp_count(
-    arena: &ExprArena,
+pub fn eval_regexp_count<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     let _ = expr;
     let len = chunk.len();
     let str_arr = arena.eval(args[0], chunk)?;
@@ -40,5 +40,5 @@ pub fn eval_regexp_count(
     } else {
         PatternSource::Other
     };
-    regexp_count::evaluate_legacy(&[str_arr, pat_arr], len, source)
+    Ok((regexp_count::evaluate_legacy(&[str_arr, pat_arr], len, source))?)
 }

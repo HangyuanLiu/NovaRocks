@@ -3314,6 +3314,7 @@ pub(super) fn scalar_definition_parts(
                     "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
                     "json_object" => Some(super::json_object_owner::effects()),
+                    "array_sortby" => Some(super::array_sortby_owner::effects()),
                     "percentile_hash" => Some(super::percentile_hash_owner::effects()),
                     "hll_hash" => Some(super::hll_hash_owner::effects()),
                     name if super::string_measure_owner::operation(name).is_some() => {
@@ -3535,6 +3536,7 @@ pub(super) fn dynamic_definition_parts(
             value: error.to_string().into(),
         })?;
     let pure_effects = match name {
+        "__array_struct_subfield" => Some(super::array_struct_subfield_owner::effects()),
         "map_entries" => Some(super::map_entries_owner::effects()),
         name if super::array_difference_owner::operation(name).is_some() => {
             Some(super::array_difference_owner::effects())
@@ -3594,6 +3596,9 @@ pub fn contribute_builtin_functions(
     for name in DYNAMIC_SCALAR_FUNCTIONS {
         let (declaration, resolver) = dynamic_definition_parts(name)?;
         let definition = match *name {
+            "__array_struct_subfield" => {
+                super::array_struct_subfield_owner::definition(name, declaration, resolver)?
+            }
             "map_entries" => super::map_entries_owner::definition(name, declaration, resolver)?,
             name if super::array_difference_owner::operation(name).is_some() => {
                 super::array_difference_owner::definition(name, declaration, resolver)?
@@ -3667,6 +3672,7 @@ pub fn contribute_builtin_functions(
             "bitmap_to_string" => super::bitmap_to_string_owner::definition(declaration, resolver)?,
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "json_object" => super::json_object_owner::definition(declaration, resolver)?,
+            "array_sortby" => super::array_sortby_owner::definition(declaration, resolver)?,
             "percentile_hash" => super::percentile_hash_owner::definition(declaration, resolver)?,
             "hll_hash" => super::hll_hash_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {

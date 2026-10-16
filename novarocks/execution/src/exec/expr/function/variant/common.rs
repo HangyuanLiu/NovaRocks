@@ -19,20 +19,16 @@ use arrow::array::{ArrayRef, LargeBinaryArray};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
-pub(super) fn eval_variant_arg(
-    arena: &ExprArena,
+pub(super) fn eval_variant_arg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
     fn_name: &str,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, __Eval::Error> {
     if args.len() != 1 {
-        return Err(format!(
-            "{} expects 1 argument, got {}",
-            fn_name,
-            args.len()
-        ));
+        return Err((format!("{} expects 1 argument, got {}", fn_name, args.len())).into());
     }
-    arena.eval(args[0], chunk)
+    Ok((arena.eval(args[0], chunk))?)
 }
 
 pub(super) fn downcast_variant_arg<'a>(

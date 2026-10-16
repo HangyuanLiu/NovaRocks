@@ -293,15 +293,49 @@ impl AnalyticSharedState {
         Ok(())
     }
 
+    pub(crate) fn finish_created(
+        &self,
+        state: &RuntimeState,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.finish_with(state, |chunk, exprs| {
+            if exprs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let owner = factory.begin_input_construction(chunk)?;
+            let control =
+                super::compiled_expression::RuntimeKernelControl::new(state.error_state());
+            let evaluation = crate::exec::expr::ExprEvaluationContext::new(
+                &self.arena,
+                owner.as_ref(),
+                &control,
+            );
+            exprs.iter().map(|id| evaluation.eval(*id, chunk)).collect()
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn finish(&self, state: &RuntimeState) -> Result<(), String> {
+        self.finish_with(state, |chunk, exprs| {
+            self.eval_exprs(chunk, exprs).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn finish_with<F>(
+        &self,
+        state: &RuntimeState,
+        evaluate: F,
+    ) -> crate::runtime::fragment::ExecutionResult<()>
+    where
+        F: FnMut(&Chunk, &[ExprId]) -> crate::runtime::fragment::ExecutionResult<Vec<ArrayRef>>,
+    {
         let notify = self.observable.defer_notify();
         let aggregate_tracker = self.aggregate_mem_tracker(state);
         let mut guard = self.inner.lock().expect("analytic state lock");
         guard.sink_finishing = true;
         if !guard.computed {
-            let outputs = self
-                .compute_outputs(&guard.input, aggregate_tracker)
-                .map_err(|e| e.to_string())?;
+            let outputs = self.compute_outputs_with(&guard.input, aggregate_tracker, evaluate)?;
             let mut outputs = outputs;
             if let Some(tracker) = self.queue_mem_tracker(state).as_ref() {
                 for chunk in outputs.iter_mut() {
@@ -353,11 +387,27 @@ impl AnalyticSharedState {
         guard.sink_complete && guard.output.is_empty() && guard.pending.is_empty()
     }
 
+    #[cfg(test)]
     fn compute_outputs(
         &self,
         input: &[Chunk],
         aggregate_tracker: Option<Arc<MemTracker>>,
     ) -> Result<VecDeque<Chunk>, String> {
+        self.compute_outputs_with(input, aggregate_tracker, |chunk, exprs| {
+            self.eval_exprs(chunk, exprs).map_err(Into::into)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn compute_outputs_with<F>(
+        &self,
+        input: &[Chunk],
+        aggregate_tracker: Option<Arc<MemTracker>>,
+        mut evaluate: F,
+    ) -> crate::runtime::fragment::ExecutionResult<VecDeque<Chunk>>
+    where
+        F: FnMut(&Chunk, &[ExprId]) -> crate::runtime::fragment::ExecutionResult<Vec<ArrayRef>>,
+    {
         if input.is_empty() {
             return Ok(VecDeque::new());
         }
@@ -373,8 +423,8 @@ impl AnalyticSharedState {
         if total_rows == 0 {
             return Ok(VecDeque::new());
         }
-        let mut partition_keys = self.eval_exprs(&ordered_chunk, &self.partition_exprs)?;
-        let mut order_keys = self.eval_exprs(&ordered_chunk, &self.order_by_exprs)?;
+        let mut partition_keys = evaluate(&ordered_chunk, &self.partition_exprs)?;
+        let mut order_keys = evaluate(&ordered_chunk, &self.order_by_exprs)?;
 
         // Hash-based analytic plans may emit the same partition key in non-contiguous blocks.
         // For partition-only full-frame window aggregates, regroup rows by partition key first.
@@ -387,8 +437,8 @@ impl AnalyticSharedState {
                 reordered.try_transfer_to(tracker)?;
             }
             ordered_chunk = reordered;
-            partition_keys = self.eval_exprs(&ordered_chunk, &self.partition_exprs)?;
-            order_keys = self.eval_exprs(&ordered_chunk, &self.order_by_exprs)?;
+            partition_keys = evaluate(&ordered_chunk, &self.partition_exprs)?;
+            order_keys = evaluate(&ordered_chunk, &self.order_by_exprs)?;
         }
 
         let partitions = compute_partitions(&partition_keys, total_rows)?;
@@ -397,7 +447,7 @@ impl AnalyticSharedState {
 
         let mut func_outputs: Vec<ArrayRef> = Vec::with_capacity(self.functions.len());
         for (func_idx, func) in self.functions.iter().enumerate() {
-            let arrays = self.eval_exprs(&ordered_chunk, &func.args)?;
+            let arrays = evaluate(&ordered_chunk, &func.args)?;
             let out = compute_window_function(
                 &self.arena,
                 func,
@@ -432,9 +482,14 @@ impl AnalyticSharedState {
         }
 
         validate_analytic_output_columns(&columns, &output_chunk_schema, total_rows)?;
-        split_analytic_output_chunks(output_chunk_schema, &columns, input)
+        Ok(split_analytic_output_chunks(
+            output_chunk_schema,
+            &columns,
+            input,
+        )?)
     }
 
+    #[cfg(test)]
     fn eval_exprs(&self, chunk: &Chunk, exprs: &[ExprId]) -> Result<Vec<ArrayRef>, String> {
         let mut out = Vec::with_capacity(exprs.len());
         for id in exprs {
