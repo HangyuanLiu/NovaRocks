@@ -256,7 +256,7 @@ impl RegistryTaskExecutionIngress {
                 Ok(encoded)
             }
             DecodedOperation::UpdateTask(request) => {
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 let replay_target = self
                     .test_controls
                     .get()
@@ -264,7 +264,7 @@ impl RegistryTaskExecutionIngress {
                     .transpose()
                     .map_err(tonic::Status::failed_precondition)?
                     .flatten();
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 let mut replay_gate = replay_target
                     .as_ref()
                     .map(|target| {

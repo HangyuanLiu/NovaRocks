@@ -394,7 +394,7 @@ pub trait RunnableTask: fmt::Debug + Send + Sync {
 }
 
 /// A test-only reservation rolls back unless the real ACK-drop takes custody.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub trait TestTaskUpdateConsumptionReservation: Send {
     /// Called only after the actual accepted terminal ACK-drop claim exists.
     fn activate(&mut self) -> Result<(), String>;
@@ -475,7 +475,7 @@ pub trait TaskExecutionHost: Send + Sync {
     ) -> Result<Arc<dyn RunnableTask>, HostRejection>;
 
     /// Reserves a finite input pause for an explicitly opted-in test fault.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn reserve_test_update_consumption(
         &self,
         _request: &novarocks_execution_contract::UpdateTask,
@@ -487,7 +487,7 @@ pub trait TaskExecutionHost: Send + Sync {
         ))
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn apply_task_domain_for_operation(
         &self,
         descriptor: &TaskDescriptor,

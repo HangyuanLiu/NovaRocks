@@ -2546,7 +2546,7 @@ fn a_split_receipt_reports_the_queue_depth_the_offer_left_behind() {
     );
 }
 
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 #[test]
 fn an_opted_in_replay_gate_fails_explicitly_on_a_host_without_that_capability() {
     let fixture = Fixture::new();

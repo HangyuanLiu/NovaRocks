@@ -275,7 +275,7 @@ struct SplitQueueState<S> {
     duplicate_splits_skipped: u64,
     no_more_splits: bool,
     closed: bool,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     consumption_gate: Option<Arc<TestSplitConsumptionGate>>,
 }
 
@@ -287,12 +287,12 @@ enum SplitDecision {
 
 /// A finite test owner may pause consumption without stopping split delivery.
 /// Releasing it wakes the same queue observation used by ordinary empty input.
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 pub struct TestSplitConsumptionGate {
     held: AtomicBool,
     observable: Arc<Observable>,
 }
-#[cfg(feature = "test-controls")]
+#[cfg(novarocks_dev_controls)]
 impl TestSplitConsumptionGate {
     pub fn release(&self) {
         let notify = self.observable.defer_notify();
@@ -329,7 +329,7 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                 duplicate_splits_skipped: 0,
                 no_more_splits: false,
                 closed: false,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 consumption_gate: None,
             }),
             observable: Arc::new(Observable::new()),
@@ -541,7 +541,7 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
 
     /// Reserves a real input-consumption pause before a test-faulted enqueue.
     /// A closed queue can never be reopened, including by a controlled test.
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn reserve_test_consumption_gate(&self) -> Result<Arc<TestSplitConsumptionGate>, String> {
         let mut state = self.state.lock().expect("split queue lock");
         if state.closed {
@@ -569,7 +569,7 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
         if state.closed {
             return SplitPoll::Exhausted;
         }
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(gate) = state.consumption_gate.as_ref() {
             if gate.is_held() {
                 return SplitPoll::Blocked;
@@ -605,12 +605,12 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
             return;
         }
         state.closed = true;
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         let gate = state.consumption_gate.take();
         state.pending.clear();
         state.queued_bytes = 0;
         drop(state);
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(gate) = gate {
             gate.release();
         }
@@ -1181,7 +1181,7 @@ mod tests {
         assert_eq!(queue.stats().queued_splits, 1);
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn reserved_consumption_keeps_original_input_for_live_duplicate_then_wakes_once() {
         let queue = queue();
@@ -1214,7 +1214,7 @@ mod tests {
         assert!(!queue.is_closed());
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn consumption_gate_cannot_delay_close_or_reopen_closed_input() {
         let queue = queue();
@@ -1231,7 +1231,7 @@ mod tests {
         assert!(matches!(queue.poll(), SplitPoll::Exhausted));
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     #[test]
     fn a_reservation_precedes_enqueue_even_when_the_consumer_is_already_polling() {
         let queue = queue();

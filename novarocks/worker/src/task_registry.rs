@@ -1852,7 +1852,7 @@ impl TaskExecutionRegistry {
 
     // ----------------------------------------------------------- update task
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     pub fn reserve_test_update_consumption(
         &self,
         request: &UpdateTask,
@@ -1959,7 +1959,7 @@ impl TaskExecutionRegistry {
             &descriptor,
             request.domains(),
             &plan,
-            #[cfg(feature = "test-controls")]
+            #[cfg(novarocks_dev_controls)]
             Some(operation),
         ) {
             Ok(queued) => queued,

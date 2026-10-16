@@ -281,7 +281,7 @@ struct TaskRuntime {
     exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
     edges: Arc<ExchangeEdgeGates>,
     splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     replay_gate: Mutex<Option<Arc<super::task_update_replay_gate::TaskUpdateReplayGate>>>,
     read_context: Arc<TypedReadAttemptContext>,
     /// Retains preparation accounting until activation or receiver rollback.
@@ -927,7 +927,7 @@ impl NativeTaskExecutionHost {
                 exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 replay_gate: Mutex::new(None),
                 read_context,
                 registration: Mutex::new(Some(registration)),
@@ -1011,7 +1011,7 @@ impl NativeTaskExecutionHost {
         identity: TaskIdentity,
         fragment_instance_id: UniqueId,
         assignment: &SplitAssignment,
-        #[cfg(feature = "test-controls")] operation: Option<
+        #[cfg(novarocks_dev_controls)] operation: Option<
             novarocks_execution_contract::TaskOperationId,
         >,
     ) -> Result<u64, HostRejection> {
@@ -1149,7 +1149,7 @@ impl NativeTaskExecutionHost {
         // and invite it to keep filling a queue that is already full.
         // Only this successful, open-queue duplicate path can release input.
         // Closed/retired answers and an Idempotent registry verdict cannot.
-        #[cfg(feature = "test-controls")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(operation) = operation {
             if let Some(gate) = runtime
                 .replay_gate
@@ -1529,7 +1529,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
-                #[cfg(feature = "test-controls")]
+                #[cfg(novarocks_dev_controls)]
                 replay_gate: Mutex::new(None),
                 read_context,
                 registration: Mutex::new(Some(registration)),
@@ -1738,7 +1738,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         Ok(task)
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn reserve_test_update_consumption(
         &self,
         request: &novarocks_execution_contract::UpdateTask,
@@ -1773,7 +1773,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         ))
     }
 
-    #[cfg(feature = "test-controls")]
+    #[cfg(novarocks_dev_controls)]
     fn apply_task_domain_for_operation(
         &self,
         descriptor: &TaskDescriptor,
@@ -1828,7 +1828,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     identity,
                     descriptor.fragment_instance_id(),
                     &assignment,
-                    #[cfg(feature = "test-controls")]
+                    #[cfg(novarocks_dev_controls)]
                     None,
                 )
                 .map(Some)
