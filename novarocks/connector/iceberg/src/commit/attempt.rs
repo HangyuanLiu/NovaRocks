@@ -35,7 +35,7 @@ use super::model::{
 };
 use super::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use super::staging::{PreparedChange, Preparer, StagingBase, StagingEngine};
-use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome, uncommitted_failure_kind};
+use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome, preparation_failure_kind};
 use crate::catalog::transaction::CommitProof;
 use crate::iceberg::spec::TableProperties;
 use crate::iceberg::{Error, ErrorKind, Result};
@@ -462,7 +462,7 @@ pub(crate) fn before_dispatch_failure(error: &Error) -> ConnectorMutationFailure
         }
         source = cause.source();
     }
-    ConnectorMutationFailure::new(uncommitted_failure_kind(error), error.to_string())
+    ConnectorMutationFailure::new(preparation_failure_kind(error), error.to_string())
 }
 
 #[cfg(test)]

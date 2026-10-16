@@ -101,8 +101,6 @@ impl CatalogCommitEvidence {
         }
     }
 
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
     #[allow(dead_code)]
     pub(crate) fn with_commit_uuid(mut self, commit_uuid: impl Into<Arc<str>>) -> Self {
         self.commit_uuid = Some(commit_uuid.into());
@@ -114,16 +112,12 @@ impl CatalogCommitEvidence {
         self
     }
 
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
     #[allow(dead_code)]
     pub(crate) fn with_target_ref(mut self, target_ref: impl Into<Arc<str>>) -> Self {
         self.target_ref = Some(target_ref.into());
         self
     }
 
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
     #[allow(dead_code)]
     pub(crate) fn with_base_snapshot_id(mut self, base: Option<i64>) -> Self {
         self.base_snapshot_id = base;
@@ -224,16 +218,12 @@ impl<T> CatalogOutcome<T> {
 
     /// True when the caller still owns every resource the request touched, so
     /// cleanup of caller-owned temporary state is safe.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
     #[allow(dead_code)]
     pub(crate) fn permits_cleanup(&self) -> bool {
         matches!(self, Self::Unsupported(_) | Self::KnownUncommitted { .. })
     }
 
     /// True when no further mutation may be issued for this frontier.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
     #[allow(dead_code)]
     pub(crate) fn closes_mutation_authority(&self) -> bool {
         matches!(self, Self::CommitUnknown { .. })
@@ -286,51 +276,12 @@ pub(crate) fn read_error_kind(kind: crate::iceberg::ErrorKind) -> ConnectorError
     }
 }
 
-/// Whether a vendored catalog error proves the mutation was **not** applied.
-///
-/// This is the single place the dispatch question is answered, and it answers
-/// conservatively: only errors that a catalog raises as a definite rejection
-/// count as proof. Everything else — most importantly `Unexpected`, which is
-/// what a lost or truncated response surfaces as — leaves the outcome unknown.
-///
-/// `Error::retryable()` is deliberately not consulted. It describes whether the
-/// vendored client would resend, which is a different question from whether the
-/// request already took effect, and acting on it here is exactly the behavior
-/// this owner exists to prevent.
-#[cfg(test)]
-pub(crate) fn proves_uncommitted(error: &crate::iceberg::Error) -> bool {
-    use crate::iceberg::ErrorKind;
-    // A REST failure carries its typed evidence; only the evidence decides
-    // (L14). Kind inference remains for catalogs without evidence (Hadoop).
-    if let Some(evidence) = crate::rest_protocol::adapter::rest_evidence(error) {
-        return evidence_proves_uncommitted(evidence);
-    }
-    matches!(
-        error.kind(),
-        ErrorKind::NamespaceNotFound
-            | ErrorKind::TableNotFound
-            | ErrorKind::NamespaceAlreadyExists
-            | ErrorKind::TableAlreadyExists
-            | ErrorKind::PreconditionFailed
-            | ErrorKind::CatalogCommitConflicts
-            | ErrorKind::DataInvalid
-            | ErrorKind::FeatureUnsupported
-    )
-}
-
-/// Map a definite-rejection catalog error to its neutral failure kind.
-///
-/// Only meaningful for errors [`proves_uncommitted`] accepted.
-pub(crate) fn uncommitted_failure_kind(
+/// Map a preparation error whose caller already proves no dispatch occurred.
+/// This conversion grants no post-dispatch verdict or retry authority.
+pub(crate) fn preparation_failure_kind(
     error: &crate::iceberg::Error,
 ) -> ConnectorMutationFailureKind {
     use crate::iceberg::ErrorKind;
-    #[cfg(test)]
-    if let Some(evidence) = crate::rest_protocol::adapter::rest_evidence(error)
-        && let Some(failure) = evidence.failure()
-    {
-        return failure.kind();
-    }
     match error.kind() {
         ErrorKind::NamespaceNotFound | ErrorKind::TableNotFound => {
             ConnectorMutationFailureKind::NotFound
@@ -347,61 +298,11 @@ pub(crate) fn uncommitted_failure_kind(
     }
 }
 
-/// Whether REST evidence proves nothing was applied: never dispatched, or
-/// rejected with a status the server raises before publishing (D13).
-#[cfg(test)]
-fn evidence_proves_uncommitted(evidence: &crate::rest_protocol::evidence::RestEvidence) -> bool {
-    matches!(
-        evidence,
-        crate::rest_protocol::evidence::RestEvidence::NotDispatched { .. }
-            | crate::rest_protocol::evidence::RestEvidence::Rejected { .. }
-    )
-}
-
-/// Classify a vendored catalog error raised by a request that **was already
-/// dispatched**, or whose dispatch state the caller cannot rule out.
-///
-/// The `Unsupported` arm is unreachable from here by construction: once a
-/// request may have left the process, refusing it is no longer an option.
-#[cfg(test)]
-pub(crate) fn classify_dispatched_error<T>(
-    error: &crate::iceberg::Error,
-    evidence: impl FnOnce() -> CatalogCommitEvidence,
-) -> CatalogOutcome<T> {
-    if proves_uncommitted(error) {
-        return CatalogOutcome::KnownUncommitted {
-            failure: ConnectorMutationFailure::new(
-                uncommitted_failure_kind(error),
-                error.to_string(),
-            ),
-        };
-    }
-    CatalogOutcome::unknown(error.to_string(), evidence())
-}
-
-/// A catalog-runtime bridge failure (thread spawn or panic while polling).
-///
-/// The bridge fails around the future, so it cannot say whether the wrapped
-/// request was dispatched. Treat it exactly like a lost response.
-// No production caller yet: the wired bridge sites classify inline.
-#[allow(dead_code)]
-#[cfg(test)]
-pub(crate) fn classify_bridge_failure<T>(
-    message: &str,
-    evidence: CatalogCommitEvidence,
-) -> CatalogOutcome<T> {
-    CatalogOutcome::unknown(
-        format!("Iceberg catalog runtime bridge: {message}"),
-        evidence,
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    //! Correctness coverage for the REST owner's temporary proof rule. The
-    //! expected set follows the received-409 contract; SDK retryability is not
-    //! an oracle. These local tests run with the connector suite and are owned
-    //! by the catalog maintainer until IRU-13a replaces this seam.
+    //! Immutable outcome projections preserve typed protocol evidence and
+    //! cleanup boundaries. Dispatch-once and bridge failures are tested on the
+    //! actual publication journal, without an SDK error carrier.
     use super::*;
     use crate::iceberg::{Error as IcebergError, ErrorKind};
 
@@ -429,122 +330,75 @@ mod tests {
     }
 
     #[test]
-    fn only_definite_rejections_prove_a_mutation_did_not_land() {
-        for kind in [
-            ErrorKind::NamespaceNotFound,
-            ErrorKind::TableNotFound,
-            ErrorKind::NamespaceAlreadyExists,
-            ErrorKind::TableAlreadyExists,
-            ErrorKind::PreconditionFailed,
-            ErrorKind::CatalogCommitConflicts,
-            ErrorKind::DataInvalid,
-            ErrorKind::FeatureUnsupported,
-        ] {
-            assert!(proves_uncommitted(&err(kind)), "{kind:?} should be proof");
-        }
-        assert!(
-            !proves_uncommitted(&err(ErrorKind::Unexpected)),
-            "a lost or ambiguous response proves nothing"
-        );
-    }
-
-    #[test]
-    fn lost_response_becomes_unknown_and_closes_mutation_authority() {
-        let outcome: CatalogOutcome<()> =
-            classify_dispatched_error(&err(ErrorKind::Unexpected), || {
-                CatalogCommitEvidence::for_target("db.t").with_commit_uuid("commit-uuid")
-            });
-        let CatalogOutcome::CommitUnknown { evidence, .. } = &outcome else {
-            panic!("expected CommitUnknown, got {outcome:?}");
-        };
-        assert_eq!(evidence.target.as_deref(), Some("db.t"));
-        assert_eq!(evidence.commit_uuid.as_deref(), Some("commit-uuid"));
-        assert!(outcome.closes_mutation_authority());
-        assert!(
-            !outcome.permits_cleanup(),
-            "unknown must not authorize cleanup"
-        );
-    }
-
-    #[test]
-    fn retryable_flag_does_not_change_the_dispatch_verdict() {
-        // `Unexpected` is what the vendored client raises for a lost response
-        // and it is the kind it marks retryable. Retryability describes the
-        // client's resend policy, not whether the request took effect.
-        let retryable = err(ErrorKind::Unexpected).with_retryable(true);
-        let not_retryable = err(ErrorKind::Unexpected).with_retryable(false);
-        assert!(!proves_uncommitted(&retryable));
-        assert!(!proves_uncommitted(&not_retryable));
-    }
-
-    #[test]
-    fn conflict_is_uncommitted_not_unknown() {
-        let outcome: CatalogOutcome<()> =
-            classify_dispatched_error(&err(ErrorKind::CatalogCommitConflicts), || {
-                panic!("evidence must not be built for a definite rejection")
-            });
-        let CatalogOutcome::KnownUncommitted { failure } = &outcome else {
-            panic!("expected KnownUncommitted, got {outcome:?}");
-        };
-        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
-        assert!(outcome.permits_cleanup());
-        assert!(!outcome.closes_mutation_authority());
-    }
-
-    #[test]
-    fn rest_evidence_decides_before_the_error_kind() {
-        use crate::rest_protocol::adapter::RestEvidenceCarrier;
+    fn typed_not_dispatched_and_server_rejection_permit_cleanup() {
         use crate::rest_protocol::evidence::{NotDispatchedCause, NotWrittenCause, RestEvidence};
-
-        let carried = |kind: ErrorKind, evidence: RestEvidence| {
-            crate::iceberg::Error::new(kind, "adapter failure")
-                .with_source(RestEvidenceCarrier::new(evidence))
-        };
-        // A typed rejection proves "not applied" whatever the kind says.
-        let rejected = carried(
-            ErrorKind::Unexpected,
-            RestEvidence::Rejected {
-                status: 403,
-                kind: ConnectorMutationFailureKind::PermissionDenied,
-            },
-        );
-        assert!(proves_uncommitted(&rejected));
-        assert_eq!(
-            uncommitted_failure_kind(&rejected),
-            ConnectorMutationFailureKind::PermissionDenied
-        );
-        let not_dispatched = carried(
-            ErrorKind::Unexpected,
+        for evidence in [
             RestEvidence::NotDispatched {
                 kind: ConnectorMutationFailureKind::Unavailable,
                 cause: NotDispatchedCause::NotWritten(NotWrittenCause::Connect),
             },
-        );
-        assert!(proves_uncommitted(&not_dispatched));
-        // Unknown evidence never proves "not applied", even under a kind the
-        // inference would accept.
-        let unknown = carried(
-            ErrorKind::TableNotFound,
-            crate::rest_protocol::evidence::classify(
-                &crate::rest_protocol::evidence::DispatchStage::Status {
-                    code: 404,
-                    header_names: Vec::new(),
-                },
-                crate::rest_protocol::evidence::BodyRead::NotRead,
-                &crate::rest_protocol::evidence::AttributionExpectation::drop_table(),
-            ),
-        );
-        assert!(!proves_uncommitted(&unknown));
-        let outcome: CatalogOutcome<()> =
-            classify_dispatched_error(&unknown, || CatalogCommitEvidence::for_target("db.t"));
-        assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+            RestEvidence::Rejected {
+                status: 401,
+                kind: ConnectorMutationFailureKind::Unauthenticated,
+            },
+            RestEvidence::Rejected {
+                status: 403,
+                kind: ConnectorMutationFailureKind::PermissionDenied,
+            },
+            RestEvidence::Rejected {
+                status: 409,
+                kind: ConnectorMutationFailureKind::Conflict,
+            },
+        ] {
+            let outcome = evidence.into_catalog_outcome(CatalogCommitEvidence::for_target("db.t"));
+            assert!(matches!(outcome, CatalogOutcome::KnownUncommitted { .. }));
+            assert!(outcome.permits_cleanup());
+            assert!(!outcome.closes_mutation_authority());
+        }
     }
 
     #[test]
-    fn bridge_failure_is_unknown_because_it_wraps_the_request() {
-        let outcome: CatalogOutcome<()> =
-            classify_bridge_failure("panicked", CatalogCommitEvidence::for_target("db.t"));
+    fn lost_response_retains_original_evidence_and_closes_mutation_authority() {
+        use crate::rest_protocol::evidence::*;
+        let original = CatalogCommitEvidence::for_target("db.t").with_commit_uuid("commit-uuid");
+        let evidence = classify(
+            &DispatchStage::WrittenNoStatus(NoStatusCause::Closed),
+            BodyRead::NotRead,
+            &AttributionExpectation::drop_table(),
+        );
+        let outcome = evidence.into_catalog_outcome(original.clone());
+        let CatalogOutcome::CommitUnknown { evidence, .. } = &outcome else {
+            panic!("lost response must remain unknown")
+        };
+        assert_eq!(evidence, &original);
         assert!(outcome.closes_mutation_authority());
+        assert!(!outcome.permits_cleanup());
+    }
+
+    #[test]
+    fn received_conflict_is_definite_while_other_post_publish_statuses_are_unknown() {
+        use crate::rest_protocol::evidence::*;
+        for status in [400, 404, 409, 500] {
+            let evidence = classify(
+                &DispatchStage::Status {
+                    code: status,
+                    header_names: vec![],
+                },
+                BodyRead::NotRead,
+                &AttributionExpectation::drop_table(),
+            );
+            let outcome = evidence.into_catalog_outcome(CatalogCommitEvidence::for_target("db.t"));
+            if status == 409 {
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownUncommitted { ref failure } if failure.kind() == ConnectorMutationFailureKind::Conflict)
+                );
+                assert!(outcome.permits_cleanup());
+            } else {
+                assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+                assert!(outcome.closes_mutation_authority());
+                assert!(!outcome.permits_cleanup());
+            }
+        }
     }
 
     #[test]

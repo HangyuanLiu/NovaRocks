@@ -49,9 +49,7 @@ use crate::iceberg::spec::{
     FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, StructType, Summary,
     Transform, Type, UnboundPartitionField, UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
-use crate::iceberg::{
-    NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
-};
+use crate::iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::reconcile_payload::{
@@ -1537,7 +1535,7 @@ fn prepare_schema_change(
 /// mark: the server keeps it at the larger of its prior value and the new
 /// schema's highest field ID, and the last-assigned-field-id requirement
 /// fences concurrent schema changes.
-fn prepare_schema_updates(
+pub(crate) fn prepare_schema_updates(
     metadata: &crate::iceberg::spec::TableMetadata,
     change: &ConnectorSchemaChange,
 ) -> Result<crate::commit::staging::PreparedChange, ConnectorError> {
@@ -1579,26 +1577,6 @@ fn prepare_schema_updates(
         ],
         updates,
     })
-}
-
-#[cfg(test)]
-pub(crate) fn schema_change_commit(
-    ident: TableIdent,
-    metadata: &crate::iceberg::spec::TableMetadata,
-    change: &ConnectorSchemaChange,
-) -> Result<Option<TableCommit>, ConnectorError> {
-    let prepared = prepare_schema_updates(metadata, change)?;
-    if prepared.updates.is_empty() {
-        return Ok(None);
-    }
-    crate::commit::existing_commit::existing_table_commit(
-        ident,
-        metadata,
-        prepared.requirements,
-        prepared.updates,
-    )
-    .map(Some)
-    .map_err(|error| internal(error.to_string()))
 }
 
 fn scalar_integer_modify_is_noop(
@@ -3563,13 +3541,6 @@ fn failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
         ConnectorErrorKind::CorruptData => ConnectorMutationFailureKind::CorruptData,
         ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
     }
-}
-
-fn commit_may_be_unknown(kind: ConnectorErrorKind) -> bool {
-    matches!(
-        kind,
-        ConnectorErrorKind::Unavailable | ConnectorErrorKind::Internal
-    )
 }
 
 fn map_iceberg(error: crate::iceberg::Error) -> ConnectorError {
@@ -7405,21 +7376,36 @@ mod tests {
     }
 
     #[test]
-    fn response_loss_classification_is_narrow() {
-        assert!(commit_may_be_unknown(ConnectorErrorKind::Unavailable));
-        assert!(commit_may_be_unknown(ConnectorErrorKind::Internal));
-        for kind in [
-            ConnectorErrorKind::InvalidRequest,
-            ConnectorErrorKind::NotFound,
-            ConnectorErrorKind::PermissionDenied,
-            ConnectorErrorKind::Unsupported,
-            ConnectorErrorKind::Cancelled,
-            ConnectorErrorKind::DeadlineExceeded,
-            ConnectorErrorKind::ResourceExhausted,
-            ConnectorErrorKind::CorruptData,
+    fn response_loss_after_dispatch_keeps_publication_unknown() {
+        use crate::rest_protocol::evidence::*;
+        for cause in [
+            NoStatusCause::Closed,
+            NoStatusCause::DeadlineExceeded,
+            NoStatusCause::ReadTimeout,
+            NoStatusCause::Other,
         ] {
-            assert!(!commit_may_be_unknown(kind), "{kind:?}");
+            let evidence = classify(
+                &DispatchStage::WrittenNoStatus(cause),
+                BodyRead::NotRead,
+                &AttributionExpectation::drop_table(),
+            );
+            let outcome = evidence.into_catalog_outcome(
+                crate::catalog::error::CatalogCommitEvidence::for_target("db.t"),
+            );
+            assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+            assert!(outcome.closes_mutation_authority());
+            assert!(!outcome.permits_cleanup());
         }
+        let evidence = classify(
+            &DispatchStage::NotWritten(NotWrittenCause::Connect),
+            BodyRead::NotRead,
+            &AttributionExpectation::drop_table(),
+        );
+        let outcome = evidence.into_catalog_outcome(
+            crate::catalog::error::CatalogCommitEvidence::for_target("db.t"),
+        );
+        assert!(matches!(outcome, CatalogOutcome::KnownUncommitted { .. }));
+        assert!(outcome.permits_cleanup());
     }
 
     #[test]
@@ -8316,32 +8302,30 @@ mod tests {
     }
 
     #[test]
-    fn a_rest_failure_reaches_the_direct_path_classifier_as_unknown_unless_409() {
-        use crate::rest_protocol::adapter::RestEvidenceCarrier;
-        use crate::rest_protocol::evidence::{
-            AttributionExpectation, BodyRead, DispatchStage, classify,
-        };
-        let adapter_error = |kind, status| {
+    fn rest_404_stays_unknown_and_409_is_a_typed_conflict() {
+        use crate::rest_protocol::evidence::*;
+        for status in [404, 409] {
             let evidence = classify(
                 &DispatchStage::Status {
                     code: status,
-                    header_names: Vec::new(),
+                    header_names: vec![],
                 },
                 BodyRead::NotRead,
                 &AttributionExpectation::drop_table(),
             );
-            crate::iceberg::Error::new(kind, "adapter failure")
-                .with_source(RestEvidenceCarrier::new(evidence))
-        };
-        // The adapter never raises TableNotFound for a 404 (L13), so the
-        // direct path's own classifier reports an unknown outcome.
-        let not_found = map_iceberg(adapter_error(crate::iceberg::ErrorKind::Unexpected, 404));
-        assert!(commit_may_be_unknown(not_found.kind()));
-        let conflict = map_iceberg(adapter_error(
-            crate::iceberg::ErrorKind::CatalogCommitConflicts,
-            409,
-        ));
-        assert!(!commit_may_be_unknown(conflict.kind()));
+            let outcome = evidence.into_catalog_outcome(
+                crate::catalog::error::CatalogCommitEvidence::for_target("db.t"),
+            );
+            if status == 404 {
+                assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+                assert!(!outcome.permits_cleanup());
+            } else {
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownUncommitted { ref failure } if failure.kind() == ConnectorMutationFailureKind::Conflict)
+                );
+                assert!(outcome.permits_cleanup());
+            }
+        }
     }
     /// The REST spy detects catalog requests; the existing refusing FileIO
     /// owner makes either synchronous or spawned object access fail the test.
@@ -8720,10 +8704,10 @@ mod tests {
                 .expect("existing Variant does not make metadata read-only");
             apply_schema_change(&fields, &change, &mut 3)
                 .expect("existing schema-change semantics remain legal");
-            let commit = schema_change_commit(ident(), &metadata, &change)
+            let commit = prepare_schema_updates(&metadata, &change)
                 .expect("existing schema change reaches its commit owner");
             assert_eq!(
-                commit.is_none(),
+                commit.updates.is_empty(),
                 matches!(change, ConnectorSchemaChange::ModifyColumn { .. }),
                 "the unchanged MODIFY must not publish an identical schema"
             );
@@ -8735,29 +8719,24 @@ mod tests {
             data_type,
         };
         assert!(
-            schema_change_commit(ident(), &metadata, &ordinary_modify(ConnectorDataType::Int))
+            prepare_schema_updates(&metadata, &ordinary_modify(ConnectorDataType::Int))
                 .unwrap()
-                .is_none(),
+                .updates
+                .is_empty(),
             "ordinary same-type MODIFY is also a no-op"
         );
         assert!(
-            schema_change_commit(
-                ident(),
-                &metadata,
-                &ordinary_modify(ConnectorDataType::BigInt)
-            )
-            .unwrap()
-            .is_some(),
+            !prepare_schema_updates(&metadata, &ordinary_modify(ConnectorDataType::BigInt))
+                .unwrap()
+                .updates
+                .is_empty(),
             "a real widening must still publish a schema"
         );
         assert_eq!(
-            schema_change_commit(
-                ident(),
-                &metadata,
-                &ordinary_modify(ConnectorDataType::Variant)
-            )
-            .unwrap_err()
-            .kind(),
+            prepare_schema_updates(&metadata, &ordinary_modify(ConnectorDataType::Variant))
+                .err()
+                .expect("MODIFY introducing Variant is refused")
+                .kind(),
             ConnectorErrorKind::Unsupported,
             "MODIFY cannot introduce Variant"
         );

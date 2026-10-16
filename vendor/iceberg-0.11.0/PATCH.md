@@ -36,15 +36,6 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 
 No patches applied in the initial source commit.
 
-## P2 — public terminal TableCommit builder
-
-- Purpose: preserve the 0.9 patch that exposes `TableCommit::builder().build()`.
-- Files: `src/catalog/mod.rs`.
-- Upstream status: no tracked upstream issue; rc.2 keeps the builder crate-private.
-- Production dependency: NovaRocks FrozenRequest converts one complete terminal request for `Catalog::update_table`; SDK actions do not own publication.
-- Exit: IRU-6a removes this patch when its publication boundary no longer needs the SDK terminal builder.
-- Coverage: existing connector FrozenRequest and commit tests; V2 standalone core check.
-
 ## U3 — snapshot reference map accessor
 
 - Purpose: preserve the 0.9 `TableMetadata::refs()` read-only accessor.

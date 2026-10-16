@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewSchema};
 use crate::iceberg::spec::Schema;
-use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent};
+use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::rest_protocol::binding::SessionBinding;
 use crate::rest_protocol::endpoints::{RestEndpoints, VENDED_CREDENTIALS};
 use crate::rest_protocol::evidence::{
@@ -186,16 +186,15 @@ impl RestEndpoints {
     #[cfg(test)]
     pub(crate) async fn commit_table(
         &self,
-        mut commit: TableCommit,
+        body: CommitTableRequest,
         expect: &AttributionExpectation,
         keep_document: bool,
     ) -> MutationOutcome {
-        let ident = commit.identifier().clone();
-        let body = CommitTableRequest {
-            identifier: Some(ident.clone()),
-            requirements: commit.take_requirements(),
-            updates: commit.take_updates(),
-        };
+        let ident = body
+            .identifier
+            .as_ref()
+            .expect("Protocol fixture must name an exact table")
+            .clone();
         self.mutate(
             Method::POST,
             |binding| binding.table_url(&ident),
@@ -487,10 +486,11 @@ mod tests {
     use crate::catalog::error::CatalogCommitEvidence;
     use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewDefinition};
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type, ViewMetadata};
-    use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent, TableRequirement};
+    use crate::iceberg::{NamespaceIdent, TableIdent, TableRequirement};
     use crate::rest_protocol::endpoints::RestEndpoints;
     use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot, RestEvidence};
     use crate::rest_protocol::test_server::{BodyPlan, Reply, Script, TestServer};
+    use crate::rest_protocol::wire::CommitTableRequest;
 
     const TABLE_UUID: &str = "1a2b3c4d-0000-4000-8000-000000000001";
     const VIEW_UUID: &str = "1a2b3c4d-0000-4000-8000-000000000002";
@@ -713,23 +713,23 @@ mod tests {
         let snapshot = || Some(ExpectedSnapshot::new(SNAPSHOT, Some("main".to_string())));
         match endpoint {
             Endpoint::TableCommit => {
-                let commit = TableCommit::builder()
-                    .ident(table())
-                    .requirements(vec![TableRequirement::UuidMatch {
+                let commit = CommitTableRequest {
+                    identifier: Some(table()),
+                    requirements: vec![TableRequirement::UuidMatch {
                         uuid: uuid(TABLE_UUID),
-                    }])
-                    .updates(vec![])
-                    .build();
+                    }],
+                    updates: vec![],
+                };
                 let expect =
                     AttributionExpectation::table_commit(uuid(TABLE_UUID), snapshot()).unwrap();
                 endpoints.commit_table(commit, &expect, false).await
             }
             Endpoint::CtasFinalCommit => {
-                let commit = TableCommit::builder()
-                    .ident(table())
-                    .requirements(vec![TableRequirement::NotExist])
-                    .updates(vec![])
-                    .build();
+                let commit = CommitTableRequest {
+                    identifier: Some(table()),
+                    requirements: vec![TableRequirement::NotExist],
+                    updates: vec![],
+                };
                 let expect = AttributionExpectation::ctas_final_commit(
                     uuid(TABLE_UUID),
                     snapshot(),

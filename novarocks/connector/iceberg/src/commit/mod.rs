@@ -26,8 +26,6 @@ mod data_file;
 pub mod data_writer;
 pub(crate) mod dependency;
 pub mod equality_delete_writer;
-#[cfg(test)]
-pub(crate) mod existing_commit;
 pub(crate) mod fast_append;
 pub mod frozen_write;
 pub(crate) mod helpers;
