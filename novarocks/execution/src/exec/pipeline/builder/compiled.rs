@@ -53,6 +53,7 @@ use crate::exec::operators::compiled_expression::{
     CompiledFilterProcessorFactory, CompiledProjectProcessorFactory,
 };
 use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
+use crate::exec::operators::compiled_grouped_topn::CompiledGroupedTopNProcessorFactory;
 use crate::exec::operators::compiled_repeat::CompiledRepeatProcessorFactory;
 use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
 use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
@@ -325,6 +326,37 @@ fn compiled_runtime_filter_consumers(
         Arc::clone(error),
     )
     .map(|consumers| Some(Arc::new(consumers)))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The test port preserves the production graph builder inputs"
+)]
+pub fn build_compiled_pipeline_graph_for_test(
+    program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    dep_manager: DependencyManager,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    error: Arc<RuntimeErrorState>,
+) -> Result<PipelineGraph, String> {
+    build_compiled_pipeline_graph(
+        program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_filter_session,
+        dep_manager,
+        pipeline_dop,
+        root_sink_dop,
+        function_set,
+        error,
+    )
 }
 
 #[expect(
@@ -612,6 +644,18 @@ fn build_node(
         }
         ProgramNodeKind::UnionAll { inputs } => {
             build_union_all(program, id, node_id, inputs, ctx, error)
+        }
+        ProgramNodeKind::GroupedTopN { input, .. } => {
+            let factory = CompiledGroupedTopNProcessorFactory::try_new(
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
+            )?;
+            let build = build_node(program, *input, ctx, error)?;
+            let mut build = gather_to_one(build, ctx, node_id);
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::single();
+            Ok(build)
         }
         ProgramNodeKind::Aggregate { input, .. } => {
             // Preserve the original driver-local Partial -> exchange -> Final
@@ -981,7 +1025,7 @@ mod topn_split_tests;
 
 #[cfg(test)]
 #[path = "compiled_values_tests.rs"]
-mod values_tests;
+pub(crate) mod values_tests;
 
 #[cfg(test)]
 #[path = "compiled_generate_series_tests.rs"]
@@ -1018,3 +1062,7 @@ mod window_fixture;
 #[cfg(test)]
 #[path = "compiled_window_tests.rs"]
 mod compiled_window_tests;
+
+#[cfg(test)]
+#[path = "compiled_window_metadata_tests.rs"]
+mod compiled_window_metadata_tests;

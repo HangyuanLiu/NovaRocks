@@ -40,6 +40,7 @@ pub enum NativeTypeConstructionError {
     Control(CompileControlError),
     Capacity(String),
     Resource(LayoutResourceError),
+    Funding(Box<crate::backend_task_execution::TypeMaterializationRefusal>),
 }
 impl From<LayoutResourceError> for NativeTypeConstructionError {
     fn from(error: LayoutResourceError) -> Self {
@@ -57,10 +58,18 @@ impl fmt::Display for NativeTypeConstructionError {
             Self::Control(error) => error.fmt(f),
             Self::Capacity(error) => write!(f, "native type construction capacity: {error}"),
             Self::Resource(error) => write!(f, "native type construction layout: {error:?}"),
+            Self::Funding(error) => error.fmt(f),
         }
     }
 }
-impl std::error::Error for NativeTypeConstructionError {}
+impl std::error::Error for NativeTypeConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Funding(cause) => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 struct TypeReservation {
     tracker: Arc<MemTracker>,
@@ -78,8 +87,11 @@ impl Drop for TypeReservation {
     }
 }
 impl TypeReservation {
+    fn pure_allocation_layout() -> Result<Layout, LayoutResourceError> {
+        arc_layout(Layout::new::<Self>())
+    }
     fn allocation_layout() -> Result<Layout, NativeTypeConstructionError> {
-        arc_layout(Layout::new::<Self>()).map_err(Into::into)
+        Self::pure_allocation_layout().map_err(Into::into)
     }
     fn try_new(
         tracker: Arc<MemTracker>,
@@ -395,6 +407,15 @@ impl novarocks_type_contract::ValueSchemaCreationFactory<NativeTypeConstructionE
         = NativeFactoryScope<'a>
     where
         Self: 'a;
+    fn visit_scope_allocation_layouts<E>(
+        &self,
+        visit: &mut dyn FnMut(Layout) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<LayoutResourceError>,
+    {
+        visit(TypeReservation::pure_allocation_layout()?)
+    }
     fn begin_scope(&self) -> Result<Self::Scope<'_>, NativeTypeConstructionError> {
         let holder = NativeTypeScope::reservation_allocation_layout()?;
         let next = self.request_upper.get().checked_add(holder.size()).ok_or(

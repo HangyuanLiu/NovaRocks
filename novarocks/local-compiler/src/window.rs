@@ -287,7 +287,7 @@ pub(crate) fn effective_frame(
 /// Lower one admitted Window whose output is its whole input followed by one
 /// value per call, in call order. Pass-through columns keep their input
 /// channels; `slots` is the planned output, input slots first.
-pub(crate) fn lower_window_with_creation<H>(
+pub(crate) fn lower_window_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
@@ -296,6 +296,7 @@ pub(crate) fn lower_window_with_creation<H>(
     slots: &[SlotId],
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    metadata: &mut crate::project_metadata::ProjectMetadataMode<'_, P>,
 ) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = lower_core_with_creation(
@@ -307,11 +308,12 @@ pub(crate) fn lower_window_with_creation<H>(
         slots,
         &mut work,
         creation,
+        metadata,
     );
     crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core_with_creation<H>(
+fn lower_core_with_creation<H, P: crate::project_metadata::ProjectMetadataScope>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
@@ -320,6 +322,7 @@ fn lower_core_with_creation<H>(
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    metadata: &mut crate::project_metadata::ProjectMetadataMode<'_, P>,
 ) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let NodeKind::Window(spec) = &node.kind else {
         return Err((FragmentCompileError::Invalid("Window kind differs")).into());
@@ -437,41 +440,85 @@ fn lower_core_with_creation<H>(
     let result = package
         .result()
         .filter(|result| result.output.columns == node.output.columns);
-    let mut typed_layout =
-        crate::typed_layout::TypedLayoutBuilder::new_with_creation(total, work, creation)?;
-    for (ordinal, value) in node.output.columns.iter().enumerate() {
-        let ty = &values
-            .get(value)
-            .ok_or(FragmentCompileError::Invalid("missing window output type"))?
-            .ty;
-        // Full result labels are authoritative only when this window's entire
-        // ordered output is the result port's.
-        let name = match result {
-            Some(result) => {
-                let field = result
-                    .fields
-                    .get(ordinal)
-                    .ok_or(FragmentCompileError::Invalid("missing window result label"))?;
-                crate::typed_layout::copy_name_with_creation(
-                    field.alias.as_deref().unwrap_or(&field.name),
+    let requests = if matches!(
+        metadata,
+        crate::project_metadata::ProjectMetadataMode::Funded(_)
+    ) {
+        Some(crate::project_metadata::window_output_requests(
+            node.id,
+            total,
+            node.output
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(ordinal, value)| {
+                    let ty = &values
+                        .get(value)
+                        .ok_or(FragmentCompileError::Invalid("missing window output type"))?
+                        .ty;
+                    let label =
+                        match result {
+                            Some(result) => {
+                                let field = result.fields.get(ordinal).ok_or(
+                                    FragmentCompileError::Invalid("missing window result label"),
+                                )?;
+                                Some(field.alias.as_deref().unwrap_or(&field.name))
+                            }
+                            None => None,
+                        };
+                    Ok((ty, label))
+                }),
+            work,
+        )?)
+    } else {
+        None
+    };
+    let mut build = || -> Result<crate::project_metadata::ProjectMetadataOutput, crate::FragmentCreationError<H>> {
+        let mut typed_layout =
+            crate::typed_layout::TypedLayoutBuilder::new_with_creation(total, work, creation)?;
+        for (ordinal, value) in node.output.columns.iter().enumerate() {
+            let ty = &values
+                .get(value)
+                .ok_or(FragmentCompileError::Invalid("missing window output type"))?
+                .ty;
+            // Full result labels are authoritative only when this window's entire
+            // ordered output is the result port's.
+            let name = match result {
+                Some(result) => {
+                    let field = result
+                        .fields
+                        .get(ordinal)
+                        .ok_or(FragmentCompileError::Invalid("missing window result label"))?;
+                    crate::typed_layout::copy_name_with_creation(
+                        field.alias.as_deref().unwrap_or(&field.name),
+                        work,
+                        creation,
+                    )?
+                }
+                None => crate::typed_layout::local_name_with_creation(
+                    "local_window",
+                    node.id.get(),
+                    ordinal,
                     work,
                     creation,
-                )?
-            }
-            None => crate::typed_layout::local_name_with_creation(
-                "local_window",
-                node.id.get(),
-                ordinal,
-                work,
-                creation,
-            )?,
-        };
+                )?,
+            };
+            work.flush()?;
+            typed_layout.push_with_creation(ty, name, work, creation)?;
+            work.step()?;
+        }
         work.flush()?;
-        typed_layout.push_with_creation(ty, name, work, creation)?;
-        work.step()?;
-    }
-    work.flush()?;
-    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
+        let layout = typed_layout.finish_with_creation(slots, work, creation)?;
+        Ok(crate::project_metadata::ProjectMetadataOutput {
+            layout,
+            exprs: Vec::new(),
+            expr_slot_ids: Vec::new(),
+        })
+    };
+    let layout = match requests {
+        Some(requests) => metadata.materialize(&requests, build)?.layout,
+        None => build()?.layout,
+    };
     work.flush()?;
     Ok((
         ProgramNodeKind::Analytic {

@@ -226,6 +226,8 @@ range/planning输入准备与校验见保留的 [range fixture](../benchmarks/ue
 
 MV 旧场景及独立 oracle 保留，禁止扩展旧屏障/CALL/directive。7B3 唯一承接非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交和管理接续；7B4 承接 spine SUM/COUNT、聚合状态、聚合冷恢复与后续刷新；7B5 承接 V/S 身份、发现/CREATE/DROP、REST 路由和实际 materialized S/fallback；7B11 同格式切换承接 `mv_recovery.rs` / `mv_uea7_storage.rs` 的 document graph 与 shared-document-revisions。替代保护实际通过后逐项退出，最后消费者退出再删共享载体；G2 不新建启动期缓存缺失或通用擦除接口。
 
+### MV documents (explicit)
+
 The explicit MV document stages are `mv/document-expiry-channel`,
 `mv/document-consistent-read`, and `mv/document-keyed-writes`. They require private
 REST/S3/Spark fixtures and native 1FE+3BE. The expiry and consistent-read stages
@@ -244,3 +246,41 @@ loads from the Full expiry load. Scenario evidence records inline property and
 snapshot-record byte counts and historical interpretation diagnostics. A unit
 or registry pass does not replace running these native stages on the integrated
 candidate.
+
+### Catalog publication (explicit)
+
+The `catalog-publication/*` scenarios require the local publication Java image
+inputs, the normal fixture BOM, and native 1FE+3BE. They are excluded from the
+default suite. Select each exact name with a fresh `--artifact-root`:
+
+- `catalog-publication/late-commit-observation` holds an ordinary ALTER after
+  server-side requirements validation. SQL must report Unknown while metadata
+  remains old and exactly one mutation was forwarded. Releasing the original
+  request must yield a real service success and actual exit. A second phase
+  holds an already committed request before handler reload, commits successor
+  metadata externally, then requires the original SQL success to preserve its
+  applied schema and the successor's property.
+- `catalog-publication/stream-deadline` streams real responses for table commit,
+  create table, namespace and view operations under an explicit 500 ms catalog
+  evidence budget. SQL must return Unknown while the slow body still makes
+  progress; bodyless drop responses must preserve Applied. Each body owner
+  must exit. The outer query/scenario deadline must leave at least 15 seconds
+  of margin; the normal production policy remains unchanged.
+- `catalog-publication/expiry-concurrency` freezes expiry at the real JDBC
+  boundary, adds a tag pointing to an exact candidate snapshot externally,
+  observes the original CAS conflict, and requires reprepare to retain that
+  ref, snapshot, and manifest-list object. Exact source rows remain readable.
+- `catalog-publication/manifest-reprepare` freezes rewrite manifests, appends
+  through a separate logical catalog, observes a real CAS conflict, then
+  requires successful reprepare to preserve the append snapshot, its exact
+  manifest-list object and the independently specified row set.
+
+Each scenario owns a private catalog/warehouse/proxy and retains its original
+SQL actor through actual join. Service NDJSON and before/after metadata are
+written inside its normal scenario artifacts. Expected row/snapshot/ref facts
+come from the scenario inputs and the competitor's real REST result, not the
+maintenance candidate planner. Object checks sign independent HEAD requests
+against the owned MinIO bucket. These cases do not claim coverage for every
+expiry interleaving, all protection roots, or cross-generation coordination;
+those have additional provider/application tests and separate acceptance rows.
+A before-forward proxy hold cannot substitute for the late-request scene.

@@ -1684,6 +1684,14 @@ impl FrontendApplicationHost {
             .bind_application(application)
     }
 
+    /// Observe the role-owned service without retaining its StateStore inputs
+    /// through Host shutdown. The published query wrapper is not the owner.
+    pub(crate) fn catalog_activity_observer(
+        &self,
+    ) -> std::sync::Weak<dyn novarocks_catalog_application::CatalogApplicationPort> {
+        Arc::downgrade(&self.catalog_role_runtime().catalog_application_port())
+    }
+
     fn catalog_role_runtime(&self) -> &FrontendCatalogRoleRuntime {
         self.catalog_role_runtime
             .as_ref()

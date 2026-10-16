@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StructArray, UInt64Array, make_array};
 use arrow::buffer::NullBuffer;
-use arrow::compute::cast;
+use arrow::compute::{CastOptions, cast, cast_with_options};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use novarocks_spi::connector::ConnectorError;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -62,9 +62,8 @@ use crate::row_lineage_synth::{
     stored_row_lineage_indices, synthesize_last_updated_sequence_number, synthesize_row_id,
 };
 use crate::schema_mapping::{
-    apply_name_mapping_to_schema, field_id_for_arrow_field, is_variant_struct_data_type,
-    schema_field_id_coverage, sql_read_schema_from_iceberg,
-    unidentified_fields_are_only_opaque_variants,
+    apply_name_mapping_to_schema, field_id_for_arrow_field, schema_field_id_coverage,
+    sql_read_schema_from_iceberg, unidentified_fields_are_only_opaque_variants,
 };
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
@@ -415,8 +414,18 @@ impl IcebergSchemaBinding {
                             facts.path
                         ))
                     })?;
-                    let base =
-                        adapt_array(batch.column(index), bound.base_target.as_ref(), facts.path)?;
+                    let base = adapt_array(
+                        batch.column(index),
+                        bound.base_target.as_ref(),
+                        facts.path,
+                        matches!(
+                            super::column_handle::parse_type(
+                                bound.handle.base_type_json(),
+                                "base_type_json"
+                            )?,
+                            Type::Variant(_)
+                        ),
+                    )?;
                     let value =
                         dereference_struct_path(&base, bound.base_target.as_ref(), dereference)?;
                     match bound.handle.scalar_integer_domain() {
@@ -575,6 +584,7 @@ pub fn file_field_id_coverage(
 pub fn physical_adaptation(
     source: &DataType,
     target: &DataType,
+    logical_variant: bool,
 ) -> Result<IcebergPhysicalAdaptation, ConnectorError> {
     if source == target {
         return Ok(IcebergPhysicalAdaptation::Identity);
@@ -585,13 +595,16 @@ pub fn physical_adaptation(
             IcebergTypePromotion::UnknownToAny,
         ));
     }
-    if matches!(target, DataType::LargeBinary) && is_variant_struct_data_type(source) {
+    if logical_variant
+        && matches!(target, DataType::LargeBinary)
+        && matches!(source, DataType::Struct(_))
+    {
         return Ok(IcebergPhysicalAdaptation::CollapseVariant);
     }
     // A dictionary page is an encoding of its value type, never a distinct
     // Iceberg type, so it is unwrapped before any further judgement.
     if let DataType::Dictionary(_, values) = source {
-        return match physical_adaptation(values.as_ref(), target)? {
+        return match physical_adaptation(values.as_ref(), target, logical_variant)? {
             IcebergPhysicalAdaptation::Identity => {
                 Ok(IcebergPhysicalAdaptation::RepresentationCast)
             }
@@ -606,6 +619,9 @@ pub fn physical_adaptation(
     }
     if differ_only_by_nested_field_metadata(source, target) {
         return Ok(IcebergPhysicalAdaptation::RetagNestedMetadata);
+    }
+    if nested_representation_equivalent(source, target) {
+        return Ok(IcebergPhysicalAdaptation::RepresentationCast);
     }
     Err(corrupt(format!(
         "iceberg physical field carries {source:?} where the table schema requires {target:?}"
@@ -683,6 +699,34 @@ fn differ_only_by_nested_field_metadata(source: &DataType, target: &DataType) ->
                 })
         }
         _ => source == target,
+    }
+}
+
+/// Recursively admit only the same closed leaf representations already legal
+/// at the root. Container shape/order stays fixed; schema evolution and field
+/// reordering remain separate binding decisions.
+fn nested_representation_equivalent(source: &DataType, target: &DataType) -> bool {
+    match (source, target) {
+        (DataType::List(source), DataType::List(target))
+        | (DataType::LargeList(source), DataType::LargeList(target)) => {
+            nested_representation_equivalent(source.data_type(), target.data_type())
+        }
+        (DataType::FixedSizeList(source, n), DataType::FixedSizeList(target, m)) => {
+            n == m && nested_representation_equivalent(source.data_type(), target.data_type())
+        }
+        (DataType::Map(source, s), DataType::Map(target, t)) => {
+            s == t && nested_representation_equivalent(source.data_type(), target.data_type())
+        }
+        (DataType::Struct(source), DataType::Struct(target)) => {
+            source.len() == target.len()
+                && source.iter().zip(target).all(|(source, target)| {
+                    nested_representation_equivalent(source.data_type(), target.data_type())
+                })
+        }
+        (DataType::Dictionary(_, values), target) => {
+            nested_representation_equivalent(values, target)
+        }
+        _ => source == target || representation_equivalent(source, target),
     }
 }
 
@@ -965,7 +1009,7 @@ fn annotate_field(field: &Field, frozen: &NestedField) -> Result<Field, Connecto
 fn annotate_data_type(field: &Field, frozen: &NestedField) -> Result<DataType, ConnectorError> {
     // A VARIANT is one Iceberg primitive whose physical carrier happens to be
     // a struct; its children are encoding details, not nested fields.
-    if is_variant_struct_data_type(field.data_type()) {
+    if matches!(frozen.field_type.as_ref(), Type::Variant(_)) {
         return Ok(field.data_type().clone());
     }
     Ok(match (field.data_type(), frozen.field_type.as_ref()) {
@@ -1096,8 +1140,13 @@ fn identity_partition_values(
     Ok(result)
 }
 
-fn adapt_array(source: &ArrayRef, target: &Field, path: &str) -> Result<ArrayRef, ConnectorError> {
-    match physical_adaptation(source.data_type(), target.data_type())? {
+fn adapt_array(
+    source: &ArrayRef,
+    target: &Field,
+    path: &str,
+    logical_variant: bool,
+) -> Result<ArrayRef, ConnectorError> {
+    match physical_adaptation(source.data_type(), target.data_type(), logical_variant)? {
         IcebergPhysicalAdaptation::Identity => Ok(Arc::clone(source)),
         IcebergPhysicalAdaptation::RetagNestedMetadata => {
             crate::file_reader::retag_iceberg_array(source, target.data_type()).map_err(|error| {
@@ -1115,17 +1164,88 @@ fn adapt_array(source: &ArrayRef, target: &Field, path: &str) -> Result<ArrayRef
                 ))
             })
         }
-        IcebergPhysicalAdaptation::RepresentationCast | IcebergPhysicalAdaptation::Promotion(_) => {
-            cast(source.as_ref(), target.data_type()).map_err(|error| {
+        IcebergPhysicalAdaptation::RepresentationCast => adapt_representation(source, target, path),
+        IcebergPhysicalAdaptation::Promotion(_) => cast(source.as_ref(), target.data_type())
+            .map_err(|error| {
                 corrupt(format!(
                     "iceberg field {} in {path} cannot be converted from {:?} to {:?}: {error}",
                     target.name(),
                     source.data_type(),
                     target.data_type()
                 ))
-            })
-        }
+            }),
     }
+}
+
+/// Preserve container offsets, slices and validity while adapting each leaf.
+/// Rebuilding uses the same runtime-nullability rule as metadata retagging;
+/// a nullable physical child is not evidence that any value is NULL.
+fn adapt_representation(
+    source: &ArrayRef,
+    target: &Field,
+    path: &str,
+) -> Result<ArrayRef, ConnectorError> {
+    let data = source.to_data();
+    let child_fields: Option<Vec<FieldRef>> = match (source.data_type(), target.data_type()) {
+        (DataType::Struct(_), DataType::Struct(fields)) => Some(fields.iter().cloned().collect()),
+        (DataType::List(_), DataType::List(field))
+        | (DataType::LargeList(_), DataType::LargeList(field))
+        | (DataType::FixedSizeList(_, _), DataType::FixedSizeList(field, _))
+        | (DataType::Map(_, _), DataType::Map(field, _)) => Some(vec![Arc::clone(field)]),
+        _ => None,
+    };
+    let conversion_error = |error: &dyn std::fmt::Display| {
+        corrupt(format!(
+            "iceberg field {} in {path} cannot be converted from {:?} to {:?}: {error}",
+            target.name(),
+            source.data_type(),
+            target.data_type()
+        ))
+    };
+    let Some(fields) = child_fields else {
+        // Arrow's default safe cast can replace offset overflow with NULL.
+        // Representation changes are lossless or fail with the original
+        // provider CorruptData category; no row may silently disappear.
+        return cast_with_options(
+            source.as_ref(),
+            target.data_type(),
+            &CastOptions {
+                safe: false,
+                ..CastOptions::default()
+            },
+        )
+        .map_err(|error| conversion_error(&error));
+    };
+    let mut children = Vec::with_capacity(fields.len());
+    let mut runtime_fields = Vec::with_capacity(fields.len());
+    for (child, field) in data.child_data().iter().zip(&fields) {
+        let array = adapt_array(&make_array(child.clone()), field, path, false)?;
+        runtime_fields.push(Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(array.data_type().clone())
+                .with_nullable(field.is_nullable() || array.null_count() > 0),
+        ));
+        children.push(array.to_data());
+    }
+    let data_type = match target.data_type() {
+        DataType::Struct(_) => DataType::Struct(runtime_fields.into()),
+        DataType::List(_) => DataType::List(runtime_fields.remove(0)),
+        DataType::LargeList(_) => DataType::LargeList(runtime_fields.remove(0)),
+        DataType::FixedSizeList(_, size) => {
+            DataType::FixedSizeList(runtime_fields.remove(0), *size)
+        }
+        DataType::Map(_, sorted) => DataType::Map(runtime_fields.remove(0), *sorted),
+        _ => unreachable!("nested representation container was matched above"),
+    };
+    let converted = data
+        .into_builder()
+        .data_type(data_type)
+        .child_data(children)
+        .build()
+        .map_err(|error| conversion_error(&error))?;
+    Ok(make_array(converted))
 }
 
 /// Extract a nested struct field, propagating every ancestor's null mask.
@@ -1407,6 +1527,65 @@ mod tests {
     }
 
     #[test]
+    fn metadata_value_struct_keeps_nested_identity_and_values() {
+        use arrow::array::BinaryArray;
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "payload",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(
+                            2,
+                            "metadata",
+                            Type::Primitive(PrimitiveType::Binary),
+                        )
+                        .into(),
+                        NestedField::required(3, "value", Type::Primitive(PrimitiveType::Binary))
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let target = annotated_read_schema(&schema).unwrap();
+        let DataType::Struct(children) = target.field(0).data_type() else {
+            panic!("ordinary struct");
+        };
+        assert_eq!(field_id_for_arrow_field(&children[0]).unwrap(), Some(2));
+        assert_eq!(field_id_for_arrow_field(&children[1]).unwrap(), Some(3));
+        let values: ArrayRef = Arc::new(StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(BinaryArray::from_vec(vec![b"opaque metadata"])),
+                Arc::new(BinaryArray::from_vec(vec![b"opaque value"])),
+            ],
+            None,
+        ));
+        let batch = RecordBatch::try_new(target.clone(), vec![values.clone()]).unwrap();
+        let columns = [handle(&schema, 1)];
+        let binding = bind_scan_columns(empty_binding_request(&schema, &target, &columns)).unwrap();
+        let output = binding
+            .materialize(
+                &batch,
+                None,
+                &IcebergSplitFacts {
+                    path: "struct.parquet",
+                    file_first_row_id: None,
+                    data_sequence_number: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(output[0].to_data(), values.to_data());
+        assert!(physical_adaptation(values.data_type(), &DataType::LargeBinary, false).is_err());
+        assert_eq!(
+            physical_adaptation(values.data_type(), &DataType::LargeBinary, true).unwrap(),
+            IcebergPhysicalAdaptation::CollapseVariant
+        );
+    }
+
+    #[test]
     fn a_matching_field_id_binds_to_the_physical_field() {
         let schema = table_schema();
         let file_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
@@ -1656,7 +1835,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                physical_adaptation(&source, &target).expect("legal promotion"),
+                physical_adaptation(&source, &target, false).expect("legal promotion"),
                 IcebergPhysicalAdaptation::Promotion(expected),
                 "{source:?} -> {target:?}"
             );
@@ -1670,7 +1849,7 @@ mod tests {
             (DataType::Decimal128(9, 2), DataType::Decimal128(18, 4)),
             (DataType::Utf8, DataType::Int64),
         ] {
-            let error = physical_adaptation(&source, &target)
+            let error = physical_adaptation(&source, &target, false)
                 .expect_err("an illegal same-field-id mismatch must fail closed");
             assert_eq!(
                 error.kind(),
@@ -2064,7 +2243,7 @@ mod tests {
             vec![Some(-128), None, Some(127)]
         );
         assert!(
-            physical_adaptation(&DataType::Int32, &DataType::Int8).is_err(),
+            physical_adaptation(&DataType::Int32, &DataType::Int8, false).is_err(),
             "unclaimed physical narrowing stays closed"
         );
         let corrupt_batch = RecordBatch::try_new(
@@ -2150,6 +2329,453 @@ mod tests {
                 Some(&Literal::Primitive(PrimitiveLiteral::Int(128))),
                 &field,
                 2
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nominal_targets_preserve_physical_buffers_nulls_and_repeated_occurrences() {
+        use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
+        use arrow::array::{BinaryArray, FixedSizeBinaryArray};
+
+        for domain in [
+            NominalSourceDomain::LargeInt,
+            NominalSourceDomain::Hll,
+            NominalSourceDomain::Bitmap,
+        ] {
+            let (primitive, carrier, input): (_, _, ArrayRef) = match domain {
+                NominalSourceDomain::LargeInt => {
+                    let first = i128::MIN.to_be_bytes();
+                    let last = i128::MAX.to_be_bytes();
+                    (
+                        PrimitiveType::Fixed(16),
+                        DataType::FixedSizeBinary(16),
+                        Arc::new(
+                            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                                [Some(first.as_slice()), None, Some(last.as_slice())].into_iter(),
+                                16,
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                }
+                _ => (
+                    PrimitiveType::Binary,
+                    DataType::Binary,
+                    Arc::new(BinaryArray::from(vec![
+                        Some(b"first".as_slice()),
+                        None,
+                        Some(b"last".as_slice()),
+                    ])),
+                ),
+            };
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    17,
+                    "declared",
+                    Type::Primitive(primitive),
+                ))])
+                .build()
+                .unwrap();
+            let physical = Arc::new(ArrowSchema::new(vec![
+                Field::new("stored", carrier, true).with_metadata(field_id_metadata(17)),
+            ]));
+            let columns = [
+                handle(&schema, 17),
+                handle(&schema, 17),
+                handle(&schema, 17),
+            ];
+            // Provider declarations select the complete value domain, while
+            // physical column handles remain domain-free.
+            let mut request = |_: std::alloc::Layout| Ok(());
+            let mut work = |_: usize| Ok(());
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut request,
+                    &mut work,
+                );
+            let value = crate::schema_mapping::typed_value::from_declaration(
+                schema.as_struct().fields()[0].field_type.as_ref(),
+                true,
+                Some(domain.logical_type()),
+                None,
+                &mut creation,
+            )
+            .unwrap();
+            assert_eq!(value.binding.logical_type(), domain.logical_type());
+            let binding =
+                bind_scan_columns(empty_binding_request(&schema, &physical, &columns)).unwrap();
+            assert_eq!(binding.physical_base_field_ids(), &[17]);
+            for ordinal in [0, 2] {
+                assert_eq!(
+                    binding.columns()[ordinal].target().metadata()[PARQUET_FIELD_ID_META_KEY],
+                    "17"
+                );
+            }
+            assert!(
+                !binding.columns()[1]
+                    .target()
+                    .metadata()
+                    .contains_key(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+            );
+            let batch = RecordBatch::try_new(physical, vec![input.slice(1, 2)]).unwrap();
+            let values = binding
+                .materialize(
+                    &batch,
+                    None,
+                    &IcebergSplitFacts {
+                        path: "memory://nominal",
+                        file_first_row_id: None,
+                        data_sequence_number: None,
+                    },
+                )
+                .unwrap();
+            for output in &values {
+                assert_eq!(output.to_data(), batch.column(0).to_data());
+                assert!(
+                    Arc::ptr_eq(output, batch.column(0)),
+                    "identity metadata does not copy values"
+                );
+                assert!(output.is_null(0));
+            }
+        }
+    }
+
+    #[test]
+    fn nominal_largeint_defaults_keep_original_refusal_and_missing_nulls() {
+        use crate::iceberg::spec::PrimitiveLiteral;
+        use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
+        use arrow::array::FixedSizeBinaryArray;
+        for default in [Some(i128::MIN.to_be_bytes()), None] {
+            let mut field =
+                NestedField::optional(23, "n", Type::Primitive(PrimitiveType::Fixed(16)));
+            if let Some(bytes) = default {
+                field = field.with_initial_default(Literal::Primitive(PrimitiveLiteral::Binary(
+                    bytes.to_vec(),
+                )));
+            }
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![Arc::new(field)])
+                .build()
+                .unwrap();
+            let columns = [handle(&schema, 23)];
+            let mut request = |_: std::alloc::Layout| Ok(());
+            let mut work = |_: usize| Ok(());
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut request,
+                    &mut work,
+                );
+            let value = crate::schema_mapping::typed_value::from_declaration(
+                schema.as_struct().fields()[0].field_type.as_ref(),
+                true,
+                Some(NominalSourceDomain::LargeInt.logical_type()),
+                None,
+                &mut creation,
+            )
+            .unwrap();
+            assert_eq!(
+                value.binding.logical_type(),
+                novarocks_type_contract::ValueLogicalType::LargeInt
+            );
+            let empty = Arc::new(ArrowSchema::empty());
+            let binding =
+                bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
+            assert!(
+                !binding.columns()[0]
+                    .target()
+                    .metadata()
+                    .contains_key(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+            );
+            let batch = RecordBatch::try_new_with_options(
+                empty,
+                vec![],
+                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(2)),
+            )
+            .unwrap();
+            let facts = IcebergSplitFacts {
+                path: "memory://nominal-default",
+                file_first_row_id: None,
+                data_sequence_number: None,
+            };
+            let result = binding.materialize(&batch, None, &facts);
+            if default.is_some() {
+                let plain_columns = [handle(&schema, 23)];
+                let plain_binding = bind_scan_columns(empty_binding_request(
+                    &schema,
+                    &batch.schema(),
+                    &plain_columns,
+                ))
+                .unwrap();
+                let original = plain_binding.materialize(&batch, None, &facts).unwrap_err();
+                let declared = result.unwrap_err();
+                assert_eq!(declared.kind(), original.kind());
+                assert_eq!(declared.message(), original.message());
+                assert_eq!(
+                    declared.message(),
+                    "iceberg initial default: unsupported initial-default for column n: arrow type FixedSizeBinary(16) cannot carry an iceberg default"
+                );
+            } else {
+                let values = result.unwrap();
+                let values = values[0]
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .unwrap();
+                assert_eq!(values.null_count(), 2);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sdk_nested_representation_tests {
+    use super::*;
+    use crate::access_binding::IcebergReadBinding;
+    use crate::commit::frozen_write::{
+        FrozenDataWriteFacts, staged_write_context_from_frozen_facts,
+    };
+    use arrow::array::{BinaryArray, ListArray, MapArray, StringArray, TimestampMicrosecondArray};
+    use arrow::buffer::OffsetBuffer;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    fn schema() -> Schema {
+        serde_json::from_value(serde_json::json!({"type":"struct","schema-id":42,"fields":[
+            {"id":1,"name":"record","required":false,"type":{"type":"struct","fields":[
+                {"id":2,"name":"blob","required":false,"type":"binary"},
+                {"id":3,"name":"zone","required":false,"type":"timestamptz"},
+                {"id":4,"name":"items","required":false,"type":{"type":"list","element-id":5,"element-required":false,"element":"binary"}}
+            ]}},
+            {"id":6,"name":"mapping","required":false,"type":{"type":"map","key-id":7,"key":"string","value-id":8,"value-required":false,"value":{"type":"struct","fields":[
+                {"id":9,"name":"blob","required":false,"type":"binary"},
+                {"id":10,"name":"zone","required":false,"type":"timestamptz"}
+            ]}}}
+        ]})).unwrap()
+    }
+    fn input(schema: &Schema) -> RecordBatch {
+        let arrow = annotated_read_schema(schema).unwrap();
+        let DataType::Struct(record_fields) = arrow.field(0).data_type() else {
+            panic!("record");
+        };
+        let DataType::List(element) = record_fields[2].data_type() else {
+            panic!("list");
+        };
+        let items = ListArray::try_new(
+            element.clone(),
+            OffsetBuffer::new(vec![0, 2, 2, 3].into()),
+            Arc::new(BinaryArray::from(vec![
+                Some(&[1_u8][..]),
+                None,
+                Some(&[2_u8][..]),
+            ])),
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let record = StructArray::try_new(
+            record_fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    Some(&[0xff_u8, 0][..]),
+                    None,
+                    Some(&[][..]),
+                ])),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(123_i64),
+                    Some(456),
+                    None,
+                ])),
+                Arc::new(items),
+            ],
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let DataType::Map(entry_field, sorted) = arrow.field(1).data_type() else {
+            panic!("map");
+        };
+        let DataType::Struct(entry_fields) = entry_field.data_type() else {
+            panic!("entries");
+        };
+        let DataType::Struct(value_fields) = entry_fields[1].data_type() else {
+            panic!("value");
+        };
+        let values = StructArray::try_new(
+            value_fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(&[4_u8, 5][..]), None])),
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(-123_i64), None])),
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(values),
+            ],
+            None,
+        )
+        .unwrap();
+        let mapping = MapArray::try_new(
+            entry_field.clone(),
+            OffsetBuffer::new(vec![0, 1, 1, 2].into()),
+            entries,
+            Some(NullBuffer::from(vec![true, false, true])),
+            *sorted,
+        )
+        .unwrap();
+        RecordBatch::try_new(arrow, vec![Arc::new(record), Arc::new(mapping)]).unwrap()
+    }
+    fn assert_values(arrays: &[ArrayRef]) {
+        let record = arrays[0].as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(record.is_null(1));
+        let blob = record
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(blob.value(0), &[0xff, 0]);
+        assert_eq!(blob.value(2), &[] as &[u8]);
+        let zone = record
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(zone.value(0), 123);
+        assert!(zone.is_null(2));
+        assert_eq!(zone.timezone(), None);
+        let list = record
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 2, 3]);
+        assert!(list.is_null(1));
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), &[1]);
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), &[2]);
+        let map = arrays[1].as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.value_offsets(), &[0, 1, 1, 2]);
+        assert!(map.is_null(1));
+        let values = map.values().as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(values.is_null(1));
+        let blob = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(blob.value(0), &[4, 5]);
+        let zone = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(zone.value(0), -123);
+        assert_eq!(zone.timezone(), None);
+    }
+    #[tokio::test]
+    async fn sdk_file_nested_binary_and_timestamptz_bind_to_sql_carriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let table_schema = schema();
+        let input = input(&table_schema);
+        let runtime = tokio::runtime::Handle::current();
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        );
+        let facts = FrozenDataWriteFacts {
+            format_version: 3,
+            table_location: location.clone(),
+            data_location: format!("{location}/data"),
+            target_partition_spec_id: 0,
+            partition_source_column_names: vec![],
+            partition_column_names: vec![],
+            transform_exprs: vec![],
+            target_schema_json: serde_json::to_string(&table_schema).unwrap(),
+            parquet_row_group_size_bytes: None,
+        };
+        let context =
+            staged_write_context_from_frozen_facts(&binding, &input.schema(), facts).unwrap();
+        let files = crate::commit::data_writer::write_record_batches(&context, vec![input])
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let path = files[0].data_file.file_path();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(path.strip_prefix("file://").unwrap_or(path)).unwrap(),
+        )
+        .unwrap();
+        let file_schema = builder.schema().clone();
+        let DataType::Struct(fields) = file_schema.field(0).data_type() else {
+            panic!("record file carrier");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            fields[1].data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
+        );
+        let columns = [
+            IcebergColumnHandle::base_column_of(&table_schema, 1).unwrap(),
+            IcebergColumnHandle::base_column_of(&table_schema, 6).unwrap(),
+        ];
+        let scan = bind_scan_columns(IcebergSchemaBindingRequest {
+            table_schema: &table_schema,
+            file_schema: &file_schema,
+            name_mapping: None,
+            partition_spec: None,
+            partition_values: None,
+            columns: &columns,
+        })
+        .unwrap();
+        let batch = builder.build().unwrap().next().unwrap().unwrap();
+        let facts = IcebergSplitFacts {
+            path,
+            file_first_row_id: None,
+            data_sequence_number: None,
+        };
+        let arrays = scan.materialize(&batch, None, &facts).unwrap();
+        assert_values(&arrays);
+        let sliced = scan.materialize(&batch.slice(1, 2), None, &facts).unwrap();
+        let record = sliced[0].as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(record.len(), 2);
+        assert!(record.is_null(0));
+        let list = record
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.value_offsets(), &[2, 2, 3]);
+        let map = sliced[1].as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(map.is_null(0));
+        assert_eq!(map.value_offsets(), &[1, 1, 2]);
+    }
+    #[test]
+    fn recursive_representation_keeps_closed_leaf_and_container_rules() {
+        let list = |ty| DataType::List(Arc::new(Field::new("element", ty, true)));
+        assert_eq!(
+            physical_adaptation(&list(DataType::LargeBinary), &list(DataType::Binary), false)
+                .unwrap(),
+            IcebergPhysicalAdaptation::RepresentationCast
+        );
+        assert!(
+            physical_adaptation(&list(DataType::Int32), &list(DataType::Int64), false).is_err()
+        );
+        assert!(
+            physical_adaptation(
+                &list(DataType::LargeBinary),
+                &DataType::LargeList(Arc::new(Field::new("element", DataType::Binary, true))),
+                false
             )
             .is_err()
         );

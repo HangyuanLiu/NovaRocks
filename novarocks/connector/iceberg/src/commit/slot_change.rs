@@ -16,7 +16,7 @@
 // under the License.
 
 //! Main-conditioned, zero-file slot changes. No conflict may rebase this intent.
-// Design: ADR-0178 (docs/adr/ADR-0178-inline-keyed-documents-and-snapshot-records.md)
+// Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
 
 use super::{
     model::{Dependency, OperationIntent, RequestShape},

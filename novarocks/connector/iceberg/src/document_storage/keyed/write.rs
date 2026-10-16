@@ -16,7 +16,7 @@
 // under the License.
 
 //! Inline document updates contain only this channel's exact keys.
-// Design: ADR-0178 (docs/adr/ADR-0178-inline-keyed-documents-and-snapshot-records.md)
+// Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
 
 use super::{envelope, keys, limits, record, view};
 use crate::iceberg::TableUpdate;

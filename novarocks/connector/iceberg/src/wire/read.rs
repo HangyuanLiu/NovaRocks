@@ -2848,6 +2848,7 @@ fn decode_manifest(
 
 fn encode_files_split(value: &FilesTableSplit) -> dto::FilesTableSplit {
     dto::FilesTableSplit {
+        table_has_variant_history: value.table_has_variant_history(),
         manifest: Some(encode_manifest(value.manifest())),
         table_schema_json: value.table_schema_json().to_string(),
         metadata_table_schema_json: value.metadata_table_schema_json().to_string(),
@@ -2871,6 +2872,7 @@ fn decode_files_split(
     let result = (|| {
         {
             let opaque_arguments = (FilesTableSplitParams {
+                table_has_variant_history: raw.table_has_variant_history,
                 manifest: decode_manifest(
                     raw.manifest.as_ref().ok_or_else(|| {
                         codec_error(

@@ -306,6 +306,58 @@ impl NativeFragmentQueryRuntime {
         Ok(tracker)
     }
 
+    /// The SAME original query owner, obtained before compiled type births.
+    /// The caller must hold this fragment's original registration lease.
+    pub(crate) fn prepare_query_memory_typed(
+        &self,
+        execution_id: QueryExecutionId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        exec_mem_limit: Option<i64>,
+    ) -> Result<NativeQueryPreparationMemory, NativeFragmentAdmissionError> {
+        let (query_mem_tracker, query_memory) = self.establish_query_resources(
+            execution_id,
+            delivery_expire,
+            query_expire,
+            exec_mem_limit,
+        )?;
+        let query_memory = query_memory.ok_or_else(|| {
+            NativeFragmentAdmissionError::Existing(
+                "native preparation requires the established query memory binding".into(),
+            )
+        })?;
+        Ok(NativeQueryPreparationMemory {
+            query_memory,
+            query_mem_tracker,
+        })
+    }
+
+    /// Consume the early binding rather than minting a second query account.
+    pub(crate) fn prepare_admission_with_memory(
+        &self,
+        fragment_instance_id: UniqueId,
+        memory: NativeQueryPreparationMemory,
+        runtime_filter: Option<RuntimeFilterSessionRef>,
+    ) -> NativeFragmentAdmissionResources {
+        let NativeQueryPreparationMemory {
+            query_memory,
+            query_mem_tracker,
+        } = memory;
+        let fragment_label = format!(
+            "fragment_{:x}_{:x}",
+            fragment_instance_id.high(),
+            fragment_instance_id.low()
+        );
+        let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
+        let resources = NativeFragmentAdmissionResources {
+            query_memory: Some(query_memory),
+            query_mem_tracker,
+            fragment_mem_tracker,
+            runtime_filter,
+        };
+        resources
+    }
+
     pub fn register_fragment_execution(
         &self,
         execution_id: QueryExecutionId,
@@ -408,6 +460,17 @@ impl std::fmt::Display for NativeFragmentAdmissionError {
     }
 }
 impl std::error::Error for NativeFragmentAdmissionError {}
+
+/// Borrowed by metadata preparation, then consumed by the original admission.
+pub(crate) struct NativeQueryPreparationMemory {
+    query_memory: QueryMemoryBinding,
+    query_mem_tracker: Arc<MemTracker>,
+}
+impl NativeQueryPreparationMemory {
+    pub(crate) fn binding(&self) -> &QueryMemoryBinding {
+        &self.query_memory
+    }
+}
 
 pub struct NativeFragmentAdmissionResources {
     query_memory: Option<QueryMemoryBinding>,

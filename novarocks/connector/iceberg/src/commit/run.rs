@@ -46,18 +46,40 @@ fn operation_for_test(
 /// Seed test state through the same frozen request and catalog owner as a write.
 #[cfg(test)]
 pub(crate) async fn append_snapshot_for_test(
-    runtime: std::sync::Arc<crate::metadata_context::IcebergMetadataContext>,
+    provider: crate::metadata::IcebergMetadata,
     table: crate::iceberg::table::Table,
     files: Vec<super::WrittenFile>,
     target_ref: String,
     summary: std::collections::BTreeMap<String, String>,
 ) -> crate::iceberg::Result<i64> {
-    use super::attempt::{OwnerPublisher, Publisher, TransitionalPublisher};
+    let contents = files
+        .iter()
+        .map(|file| {
+            super::model::AddedContent::new_logical_data(
+                super::data_file::from_written_file(file)?,
+                file.partition_spec_id,
+            )
+        })
+        .collect::<crate::iceberg::Result<Vec<_>>>()?;
+    append_contents_for_test(provider, table, contents, target_ref, summary).await
+}
+
+/// Seed exact caller-authored logical data through normal staging and the
+/// prepared owner. Each item carries its original explicit partition spec.
+#[cfg(test)]
+pub(crate) async fn append_contents_for_test(
+    provider: crate::metadata::IcebergMetadata,
+    table: crate::iceberg::table::Table,
+    contents: Vec<super::model::AddedContent>,
+    target_ref: String,
+    summary: std::collections::BTreeMap<String, String>,
+) -> crate::iceberg::Result<i64> {
     use super::model::{
-        AddedContent, Dependency, FileChanges, IsolationLevel, OperationIntent,
-        OperationIntentParts, RequestShape, StartSnapshot, TableTarget,
+        Dependency, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
+        RequestShape, StartSnapshot, TableTarget,
     };
     use super::staging::{StagingBase, StagingEngine};
+    let runtime = provider.runtime();
     let operation = operation_for_test(runtime.as_ref(), &table)?;
     let attempt = operation.begin_attempt()?;
     let source = table.metadata();
@@ -74,15 +96,7 @@ pub(crate) async fn append_snapshot_for_test(
                 sequence_number: snapshot.sequence_number(),
             }),
         changes: FileChanges {
-            added: files
-                .iter()
-                .map(|file| {
-                    AddedContent::new_logical_data(
-                        super::data_file::from_written_file(file)?,
-                        file.partition_spec_id,
-                    )
-                })
-                .collect::<crate::iceberg::Result<Vec<_>>>()?,
+            added: contents,
             removed: Vec::new(),
         },
         dependencies: vec![Dependency::NoReadDependency],
@@ -121,29 +135,17 @@ pub(crate) async fn append_snapshot_for_test(
         })?
         .snapshot_id();
     let request = engine.freeze(&[])?;
-    let publisher = OwnerPublisher {
-        target: TransitionalPublisher {
-            catalog: std::sync::Arc::clone(runtime.novarocks_catalog()),
-            ident: table.identifier().clone(),
-            target_ref,
-            evidence: crate::catalog::error::CatalogCommitEvidence::for_target(
-                table.identifier().to_string(),
-            ),
-            recovery_preflight: std::sync::Arc::new(|_, _| Ok(())),
-        },
-        operation: operation.token(),
-        marker: summary
-            .get(super::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
-            .map(|value| {
-                (
-                    std::sync::Arc::from(
-                        super::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY,
-                    ),
-                    std::sync::Arc::from(value.as_str()),
-                )
-            }),
-    };
-    match publisher.dispatch_once(request).await {
+    let outcome = crate::catalog::admission_test_support::publish_frozen(
+        std::sync::Arc::clone(runtime.novarocks_catalog()),
+        provider.descriptor().clone(),
+        provider.incarnation(),
+        request,
+        crate::catalog::admission::CatalogOperation::Append,
+        operation.request_context().clone(),
+        None,
+    )
+    .await;
+    match outcome {
         crate::catalog::error::CatalogOutcome::KnownCommitted {
             effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
             finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
@@ -184,7 +186,6 @@ mod keyed_publication_trace_tests {
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::{DataType, Field};
-    use async_trait::async_trait;
     use bytes::Bytes;
     use novarocks_spi::connector::write_stack::session::{
         ConnectorWriteBeginRequest, ConnectorWriteControl, ConnectorWriteFinishPublication,
@@ -211,11 +212,7 @@ mod keyed_publication_trace_tests {
     };
 
     use super::*;
-    use crate::catalog::CatalogTableName;
-    use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
-    use crate::catalog::transaction::{
-        CatalogCommitDispatch, CommitProof, TransactionIdentity, TransactionShape,
-    };
+    use crate::catalog::error::CatalogOutcome;
     use crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY;
     use crate::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
@@ -223,8 +220,7 @@ mod keyed_publication_trace_tests {
     };
     use crate::iceberg::table::Table;
     use crate::iceberg::{
-        Catalog, Namespace, NamespaceIdent, TableCreation, TableIdent, TableRequirement,
-        TableUpdate,
+        Catalog, NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate,
     };
     use uuid::Uuid;
 
@@ -242,7 +238,7 @@ mod keyed_publication_trace_tests {
         inner: Arc<dyn Catalog>,
         commits: Mutex<Vec<RecordedCommit>>,
         raw_updates: Mutex<Vec<Vec<TableUpdate>>>,
-        next_error: Mutex<Option<crate::iceberg::ErrorKind>>,
+        next_error: Arc<Mutex<Option<crate::iceberg::ErrorKind>>>,
     }
 
     impl RecordingCatalog {
@@ -251,7 +247,7 @@ mod keyed_publication_trace_tests {
                 inner,
                 commits: Mutex::new(Vec::new()),
                 raw_updates: Mutex::new(Vec::new()),
-                next_error: Mutex::new(None),
+                next_error: Arc::new(Mutex::new(None)),
             })
         }
 
@@ -259,118 +255,7 @@ mod keyed_publication_trace_tests {
             self.commits.lock().expect("recording catalog lock").clone()
         }
 
-        fn clear(&self) {
-            self.commits.lock().expect("recording catalog lock").clear();
-            self.raw_updates.lock().unwrap().clear();
-        }
-    }
-
-    impl RecordingCatalog {
-        fn raw_updates(&self) -> Vec<Vec<TableUpdate>> {
-            self.raw_updates.lock().unwrap().clone()
-        }
-        fn fail_next(&self, kind: crate::iceberg::ErrorKind) {
-            assert!(self.next_error.lock().unwrap().replace(kind).is_none());
-        }
-    }
-
-    #[async_trait]
-    impl Catalog for RecordingCatalog {
-        async fn list_namespaces(
-            &self,
-            parent: Option<&NamespaceIdent>,
-        ) -> crate::iceberg::Result<Vec<NamespaceIdent>> {
-            self.inner.list_namespaces(parent).await
-        }
-
-        async fn create_namespace(
-            &self,
-            namespace: &NamespaceIdent,
-            properties: HashMap<String, String>,
-        ) -> crate::iceberg::Result<Namespace> {
-            self.inner.create_namespace(namespace, properties).await
-        }
-
-        async fn get_namespace(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<Namespace> {
-            self.inner.get_namespace(namespace).await
-        }
-
-        async fn namespace_exists(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<bool> {
-            self.inner.namespace_exists(namespace).await
-        }
-
-        async fn update_namespace(
-            &self,
-            namespace: &NamespaceIdent,
-            properties: HashMap<String, String>,
-        ) -> crate::iceberg::Result<()> {
-            self.inner.update_namespace(namespace, properties).await
-        }
-
-        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> crate::iceberg::Result<()> {
-            self.inner.drop_namespace(namespace).await
-        }
-
-        async fn list_tables(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<Vec<TableIdent>> {
-            self.inner.list_tables(namespace).await
-        }
-
-        async fn create_table(
-            &self,
-            namespace: &NamespaceIdent,
-            creation: TableCreation,
-        ) -> crate::iceberg::Result<Table> {
-            self.inner.create_table(namespace, creation).await
-        }
-
-        async fn load_table(&self, table: &TableIdent) -> crate::iceberg::Result<Table> {
-            self.inner.load_table(table).await
-        }
-
-        async fn drop_table(&self, table: &TableIdent) -> crate::iceberg::Result<()> {
-            self.inner.drop_table(table).await
-        }
-
-        async fn purge_table(&self, table: &TableIdent) -> crate::iceberg::Result<()> {
-            self.inner.purge_table(table).await
-        }
-
-        async fn table_exists(&self, table: &TableIdent) -> crate::iceberg::Result<bool> {
-            self.inner.table_exists(table).await
-        }
-
-        async fn rename_table(
-            &self,
-            src: &TableIdent,
-            dest: &TableIdent,
-        ) -> crate::iceberg::Result<()> {
-            self.inner.rename_table(src, dest).await
-        }
-
-        async fn register_table(
-            &self,
-            table: &TableIdent,
-            metadata_location: String,
-        ) -> crate::iceberg::Result<Table> {
-            self.inner.register_table(table, metadata_location).await
-        }
-
-        async fn update_table(
-            &self,
-            mut commit: crate::iceberg::TableCommit,
-        ) -> crate::iceberg::Result<Table> {
-            let ident = commit.identifier().clone();
-            let requirements = commit.take_requirements();
-            let updates = commit.take_updates();
+        fn record_frozen(&self, requirements: &[TableRequirement], updates: &[TableUpdate]) {
             let recorded = RecordedCommit {
                 requirement_kinds: requirements.iter().map(requirement_kind).collect(),
                 uuid_requirements: requirements
@@ -405,23 +290,26 @@ mod keyed_publication_trace_tests {
                 .lock()
                 .expect("recording catalog lock")
                 .push(recorded);
-            self.raw_updates.lock().unwrap().push(updates.clone());
-            let injected = self.next_error.lock().unwrap().take();
-            if let Some(kind) = injected {
-                return Err(crate::iceberg::Error::new(
-                    kind,
-                    "injected publication response",
-                ));
-            }
-            self.inner
-                .update_table(
-                    crate::iceberg::TableCommit::builder()
-                        .ident(ident)
-                        .requirements(requirements)
-                        .updates(updates)
-                        .build(),
-                )
-                .await
+            self.raw_updates.lock().unwrap().push(updates.to_vec());
+        }
+
+        fn clear(&self) {
+            self.commits.lock().expect("recording catalog lock").clear();
+            self.raw_updates.lock().unwrap().clear();
+        }
+
+        fn raw_updates(&self) -> Vec<Vec<TableUpdate>> {
+            self.raw_updates.lock().unwrap().clone()
+        }
+
+        fn fail_next(&self, kind: crate::iceberg::ErrorKind) {
+            assert!(self.next_error.lock().unwrap().replace(kind).is_none());
+        }
+    }
+
+    impl RecordingCatalog {
+        async fn load_table(&self, table: &TableIdent) -> crate::iceberg::Result<Table> {
+            self.inner.load_table(table).await
         }
     }
 
@@ -548,11 +436,6 @@ mod keyed_publication_trace_tests {
             ),
         );
         let inner: Arc<dyn Catalog> = concrete.clone();
-        let namespace = NamespaceIdent::new("db".to_string());
-        inner
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .expect("create namespace");
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -561,24 +444,6 @@ mod keyed_publication_trace_tests {
             ))])
             .build()
             .expect("schema");
-        let table = inner
-            .create_table(
-                &namespace,
-                TableCreation::builder()
-                    .name("t".to_string())
-                    .schema(schema)
-                    .properties(HashMap::from([
-                        (
-                            crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
-                            "false".to_string(),
-                        ),
-                        ("write.row-lineage".to_string(), row_lineage.to_string()),
-                    ]))
-                    .format_version(format_version)
-                    .build(),
-            )
-            .await
-            .expect("create table");
         let catalog = RecordingCatalog::new(inner);
         let descriptor = novarocks_spi::connector::ConnectorInstanceDescriptor {
             provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
@@ -603,20 +468,19 @@ mod keyed_publication_trace_tests {
             binding,
             tokio::runtime::Handle::current(),
         );
-        // Eager finish obtains a fresh provider-private transaction. Its
-        // dispatch must share this same recording vendored client; wrapping
-        // only the legacy `vendored_client()` getter would miss that mutation.
+        // Record only a real prepared dispatch after its journal grant.
+        // SDK reads and fixture setup never count as publication.
         let owner =
-            crate::catalog::factory::NovaRocksCatalogFactory::adopt_recording_hadoop_for_test(
-                concrete,
-                catalog.clone(),
-            );
+            crate::catalog::factory::NovaRocksCatalogFactory::adopt_hadoop_for_test(concrete);
         // These tests exercise publication protocol outcomes under an explicit
         // admitted owner, independent of Hadoop's product document policy.
         let load_modes = Arc::new(Mutex::new(Vec::new()));
-        let owner = crate::catalog::admission_test_support::all_admitted_with_snapshot_trace(
+        let recording = catalog.clone();
+        let owner = crate::catalog::admission_test_support::all_admitted_recording_with_snapshot_trace_and_dispatch_fault(
             owner,
+            Arc::new(move |requirements, updates| recording.record_frozen(requirements, updates)),
             Arc::clone(&load_modes),
+            Arc::clone(&catalog.next_error),
         );
         let runtime = Arc::new(
             crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
@@ -625,6 +489,24 @@ mod keyed_publication_trace_tests {
                 owner,
             ),
         );
+        let table = crate::catalog::admission_test_support::create_static_fixture_table(
+            &runtime,
+            incarnation,
+            crate::catalog::CatalogNamespaceName::new("db"),
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema)
+                .properties(HashMap::from([
+                    (
+                        crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+                        "false".to_string(),
+                    ),
+                    ("write.row-lineage".to_string(), row_lineage.to_string()),
+                ]))
+                .format_version(format_version)
+                .build(),
+        )
+        .await;
         let provider = crate::metadata::IcebergMetadata::new(descriptor, incarnation, runtime);
         Fixture {
             load_modes,
@@ -723,7 +605,7 @@ mod keyed_publication_trace_tests {
 
     async fn seed_empty_snapshot(fixture: &Fixture) {
         append_snapshot_for_test(
-            Arc::clone(fixture.provider.runtime()),
+            fixture.provider.clone(),
             fixture.table.clone(),
             Vec::new(),
             "main".into(),
@@ -806,7 +688,11 @@ mod keyed_publication_trace_tests {
         committed_snapshot_id: i64,
     ) {
         let commits = fixture.catalog.commits();
-        assert_eq!(commits.len(), 1, "publication must update_table once");
+        assert_eq!(
+            commits.len(),
+            1,
+            "publication must dispatch one frozen request"
+        );
         assert_eq!(
             commits[0].uuid_requirements,
             vec![fixture.table.metadata().uuid()]
@@ -826,7 +712,7 @@ mod keyed_publication_trace_tests {
     async fn ordinary_zero_row_append_preserves_live_data_and_publishes_one_session_marker() {
         let fixture = fixture().await;
         append_snapshot_for_test(
-            Arc::clone(fixture.provider.runtime()),
+            fixture.provider.clone(),
             fixture.table.clone(),
             vec![written_file(&fixture.table, "ordinary-zero-row-base")],
             "main".into(),
@@ -883,7 +769,7 @@ mod keyed_publication_trace_tests {
             finalization: ExternalMutationFinalization::Complete,
         } = outcome
         else {
-            panic!("ordinary append must publish its session marker");
+            panic!("ordinary append must publish its session marker: {outcome:?}");
         };
         let snapshot_id = receipt
             .committed_version()

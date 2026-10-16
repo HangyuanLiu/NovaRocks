@@ -70,6 +70,12 @@ pub enum IcebergMutationEvidenceTarget {
         view: String,
         should_exist: bool,
     },
+    ViewOperation {
+        namespace: String,
+        view: String,
+        view_uuid: String,
+        operation_marker: String,
+    },
     TableVersion {
         namespace: String,
         table: String,

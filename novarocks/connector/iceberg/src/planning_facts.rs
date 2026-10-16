@@ -574,6 +574,7 @@ mod tests {
             location: "s3://warehouse/db/t".to_string(),
             schema: IcebergSchemaDef {
                 fields: vec![IcebergSchemaFieldDef {
+                    is_variant: false,
                     field_id: 7,
                     name: "id".to_string(),
                     initial_default: None,

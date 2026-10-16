@@ -96,6 +96,7 @@ pub enum StaticFunctionKind {
     Upper,
     Split,
     Year,
+    HourFromUnixtime,
     AssertTrue,
     If,
     IfNull,

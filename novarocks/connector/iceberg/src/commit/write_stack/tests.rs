@@ -3865,13 +3865,7 @@ impl FrozenRewriteLake {
             CatalogHandle::new(descriptor.instance_id, CatalogVersion::from_bytes([6; 32])),
             runtime.clone(),
         );
-        let catalog = runtime.novarocks_catalog().vendored_client();
         executor.block_on(async {
-            let namespace = crate::iceberg::NamespaceIdent::new("db".to_string());
-            catalog
-                .create_namespace(&namespace, std::collections::HashMap::new())
-                .await
-                .unwrap();
             let schema = crate::iceberg::spec::Schema::builder()
                 .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
                     1,
@@ -3882,27 +3876,27 @@ impl FrozenRewriteLake {
                 ))])
                 .build()
                 .unwrap();
-            catalog
-                .create_table(
-                    &namespace,
-                    crate::iceberg::TableCreation::builder()
-                        .name("t".to_string())
-                        .schema(schema)
-                        .format_version(version)
-                        .properties(std::collections::HashMap::from([
-                            (
-                                "write.metadata.metrics.default".to_string(),
-                                "none".to_string(),
-                            ),
-                            (
-                                crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
-                                "false".to_string(),
-                            ),
-                        ]))
-                        .build(),
-                )
-                .await
-                .unwrap();
+            crate::catalog::admission_test_support::create_static_fixture_table(
+                &runtime,
+                incarnation,
+                crate::catalog::CatalogNamespaceName::new("db"),
+                crate::iceberg::TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .format_version(version)
+                    .properties(std::collections::HashMap::from([
+                        (
+                            "write.metadata.metrics.default".to_string(),
+                            "none".to_string(),
+                        ),
+                        (
+                            crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+                            "false".to_string(),
+                        ),
+                    ]))
+                    .build(),
+            )
+            .await;
         });
         Self {
             executor,
@@ -3914,17 +3908,15 @@ impl FrozenRewriteLake {
         }
     }
     fn table(&self) -> crate::iceberg::table::Table {
-        self.executor
-            .block_on(
-                self.runtime
-                    .novarocks_catalog()
-                    .vendored_client()
-                    .load_table(&crate::iceberg::TableIdent::new(
-                        crate::iceberg::NamespaceIdent::new("db".to_string()),
-                        "t".to_string(),
-                    )),
-            )
-            .unwrap()
+        self.executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &self.runtime,
+                &crate::iceberg::TableIdent::new(
+                    crate::iceberg::NamespaceIdent::new("db".to_string()),
+                    "t".to_string(),
+                ),
+            ),
+        )
     }
     fn plan(&self, position: bool) -> novarocks_spi::connector::ConnectorDistributedRewritePlan {
         use novarocks_spi::connector::{

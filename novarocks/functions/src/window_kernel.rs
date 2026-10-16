@@ -17,16 +17,15 @@
 
 //! Pure window preparation and complete-input partition lifecycles.
 
-use crate::aggregate_kernel::finish_lifecycle;
+use crate::aggregate_kernel::{finish_lifecycle, specialize_aggregate_once};
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
-    AggregatePreparationOptions, CallEffectInput, FullPartitionWindowInput, FunctionBindingError,
-    FunctionBindingResolver, FunctionBindingSelection, FunctionCallContract, FunctionEffectOwner,
-    FunctionSpecializationFailure, KernelEvaluationControl, KernelFailure, PreparedAggregateKernel,
-    PureAggregateImplementation, ScopedExpressionEffects, SelectedValues, Selection,
-    WindowCallContract, WindowCallOptions, WindowOutputProjection, specialize_aggregate,
-    specialize_frozen_aggregate,
+    AggregateCallContract, AggregatePreparationOptions, CallEffectInput, FullPartitionWindowInput,
+    FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection, FunctionCallContract,
+    FunctionEffectOwner, FunctionSpecializationFailure, KernelEvaluationControl, KernelFailure,
+    PreparedAggregateKernel, PureAggregateImplementation, ScopedExpressionEffects, SelectedValues,
+    Selection, WindowCallContract, WindowCallOptions, WindowOutputProjection,
 };
 use novarocks_type_contract::{
     CallEffects, CompilePhase, PureCompileControl, WindowFrameExclusion,
@@ -265,6 +264,28 @@ pub trait PureWindowImplementation:
 /// The argument is a real immutable typed Single kernel, already refined and
 /// prepared once. This entry does not resolve a new Window-kind overload.
 pub trait PureAggregateWindowImplementation: PureAggregateImplementation {
+    /// Prepare the exact Single aggregate at its window use point. Default
+    /// owners retain their original method and control trace without a wrapper.
+    fn prepare_aggregate_for_window(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, KernelFailure> {
+        self.prepare_aggregate(input, contract, control)
+    }
+
+    /// Preserve the same use-point distinction under checked binding authorship.
+    fn prepare_aggregate_for_window_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_aggregate_checked(input, checked, contract, control)
+    }
+
     fn prepare_aggregate_window(
         &self,
         aggregate: Arc<Self::Kernel>,
@@ -471,11 +492,16 @@ fn specialize_aggregate_window_once<O: PureAggregateWindowImplementation + ?Size
     options: AggregateWindowPreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
-    specialize_aggregate_window_once_core(owner, input, options, control, |options| match frozen {
-        Some(frozen) => {
-            specialize_frozen_aggregate(owner, input, selected, frozen, arguments, options, control)
-        }
-        None => specialize_aggregate(owner, input, selected, arguments, options, control),
+    specialize_aggregate_window_once_core(owner, input, options, control, |options| {
+        specialize_aggregate_once(
+            (owner, O::prepare_aggregate_for_window),
+            input,
+            selected,
+            frozen,
+            arguments,
+            options,
+            control,
+        )
     })
 }
 
@@ -492,8 +518,18 @@ pub(crate) fn specialize_aggregate_window_once_checked<
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
     specialize_aggregate_window_once_core(owner, input, options, control, |options| {
-        crate::aggregate_kernel::specialize_aggregate_once_checked(
-            owner, checked, input, selected, frozen, arguments, options, control,
+        crate::aggregate_kernel::specialize_aggregate_once_checked_with_preparation(
+            owner,
+            checked,
+            input,
+            selected,
+            frozen,
+            arguments,
+            options,
+            control,
+            |contract| {
+                owner.prepare_aggregate_for_window_checked(input, checked, contract, control)
+            },
         )
     })
 }

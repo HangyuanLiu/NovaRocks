@@ -20,6 +20,7 @@
 use super::super::{domain::*, test_support::table_facts};
 use super::*;
 use crate::delete_file::IcebergFileFormat;
+use crate::scan_model::IcebergSchemaFieldDef;
 use crate::wire::dto;
 use arrow::datatypes::{DataType, Field};
 use novarocks_connector_contract::{
@@ -80,6 +81,7 @@ fn field(
 fn source(name: &str, id: i32) -> IcebergSchemaFieldDef {
     IcebergSchemaFieldDef {
         field_id: id,
+        is_variant: false,
         name: name.into(),
         children: vec![],
         initial_default: None,
@@ -101,7 +103,7 @@ fn data_handle(fields: Option<Vec<IcebergSchemaFieldDef>>) -> dto::IcebergWriter
         table_facts(),
         output(IcebergFileFormat::Parquet),
         IcebergDataBranchRecipe::try_new(
-            fields.map(|fields| IcebergSchemaDef { fields }),
+            fields.map(|fields| serde_json::json!({"type":"struct", "schema-id":1, "fields":fields.iter().map(|field| serde_json::json!({"id":field.field_id,"name":field.name,"required":false,"type":"long"})).collect::<Vec<_>>()}).to_string()),
             vec![],
             vec![],
             vec![],
@@ -133,15 +135,15 @@ fn equality_handle() -> dto::IcebergWriterHandle {
     // is authored independently of target ID order, as the existing owner does.
     let columns = [("b", 22, "Utf8", true), ("a", 11, "Int64", false)]
         .into_iter()
-        .map(|(name, id, ty, nullable)| {
-            IcebergEqualityDeleteColumnFacts::try_new(name.into(), id, ty.into(), nullable).unwrap()
+        .map(|(name, id, _ty, _nullable)| {
+            IcebergEqualityDeleteColumnFacts::try_new(name.into(), id).unwrap()
         })
         .collect();
     encode(
         &IcebergWriterHandle::try_new_equality_delete(
             table_facts(),
             output(IcebergFileFormat::Parquet),
-            IcebergEqualityDeleteRecipe::try_new(columns).unwrap(),
+            IcebergEqualityDeleteRecipe::try_new(columns, serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":22,"name":"b","required":false,"type":"string"},{"id":11,"name":"a","required":true,"type":"long"}]}).to_string()).unwrap(),
         )
         .unwrap(),
     )
@@ -353,7 +355,7 @@ fn private_delete_roles_preserve_legacy_positional_columns_and_public_groups() {
 }
 
 #[test]
-fn equality_requires_exact_name_type_nullability_order_and_public_role() {
+fn equality_requires_exact_names_order_and_public_role_with_provider_target_types() {
     let raw = equality_handle();
     assert_unchanged(&draft(&raw, equality_input()));
     let variants = [
@@ -366,25 +368,39 @@ fn equality_requires_exact_name_type_nullability_order_and_public_role() {
             field("a", DataType::Int64, false, 911, 1),
         ],
         vec![
-            field("b", DataType::Utf8, false, 922, 2),
-            field("a", DataType::Int64, false, 911, 1),
-        ],
-        vec![
             field("a", DataType::Int64, false, 911, 1),
             field("b", DataType::Utf8, true, 922, 2),
         ],
     ];
     for fields in variants {
-        assert_provider_failure(
-            &draft(
-                &raw,
-                ConnectorWriteInputShape::EqualityDelete {
-                    equality_fields: fields,
-                },
-            ),
-            "does not match fragment input",
+        let candidate = draft(
+            &raw,
+            ConnectorWriteInputShape::EqualityDelete {
+                equality_fields: fields,
+            },
         );
+        assert!(matches!(
+            compile(&candidate, &Control::default()),
+            Err(ConnectorWriteRecipeCompileError::Provider(_))
+        ));
     }
+    // Carrier type and nullable differences no longer replace provider target
+    // facts. The closed batch adapter checks actual values before file output.
+    assert_unchanged(&draft(
+        &raw,
+        ConnectorWriteInputShape::EqualityDelete {
+            equality_fields: vec![
+                field(
+                    "b",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8)),
+                    false,
+                    922,
+                    2,
+                ),
+                field("a", DataType::Int64, true, 911, 1),
+            ],
+        },
+    ));
     assert_provider_failure(
         &draft(
             &raw,
@@ -409,9 +425,9 @@ fn data_requires_real_private_source_and_keeps_shared_schema_refusals() {
     );
     assert_provider_failure(
         &draft(&data_handle(Some(vec![source("another", 1)])), data_input()),
-        "missing its frozen schema field",
+        "absent from frozen target schema",
     );
-    let raw = data_handle(Some(vec![source("k1", 1)]));
+    let mut raw = data_handle(Some(vec![source("k1", 1)]));
     assert_provider_failure(
         &draft(
             &raw,
@@ -425,8 +441,15 @@ fn data_requires_real_private_source_and_keeps_shared_schema_refusals() {
                 )],
             },
         ),
-        "unsupported Arrow type",
+        "unsupported",
     );
+    raw.data.as_mut().unwrap().target_schema_json=Some(serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"k1","required":false,"type":"int"}]}).to_string());
+    assert_unchanged(&draft(
+        &raw,
+        ConnectorWriteInputShape::Data {
+            fields: vec![field("k1", DataType::Int8, false, 900, 1)],
+        },
+    ));
 }
 
 #[test]

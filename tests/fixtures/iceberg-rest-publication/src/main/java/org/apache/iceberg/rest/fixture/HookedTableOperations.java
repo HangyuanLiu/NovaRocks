@@ -51,10 +51,15 @@ final class HookedTableOperations implements TableOperations {
         FaultControlServer.beforePersistentCommit(table, base, updated);
     try {
       delegate.commit(base, updated);
-      FaultControlServer.commitSucceeded(table, attempt);
     } catch (RuntimeException failure) {
       FaultControlServer.commitFailed(table, attempt, failure);
+      FaultControlServer.commitMethodExited(table, attempt);
       throw failure;
+    }
+    try {
+      FaultControlServer.commitSucceeded(table, attempt);
+    } finally {
+      FaultControlServer.commitMethodExited(table, attempt);
     }
   }
 

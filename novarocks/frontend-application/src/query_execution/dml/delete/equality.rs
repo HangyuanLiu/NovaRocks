@@ -80,14 +80,9 @@ pub(crate) fn prepare_equality_delete_statement(
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;
 
-    // The three table-shape gates this entry point used to answer -- Iceberg v1,
-    // an evolved partition spec, and a partitioned target -- are Iceberg facts,
-    // so they now run inside `ConnectorWriteControl::prepare_write` against the
-    // frozen admitted metadata (keyed on the equality-delete input shape, which
-    // no other row-delta write declares). Their messages are unchanged; they now
-    // arrive with the `Iceberg write admission denied:` prefix the SPI `Denied`
-    // outcome adds, and they fire after column and literal validation rather
-    // than before it.
+    // Provider-owned table and equality-key admission precedes the frontend's
+    // literal carrier checks. UUID and fixed binary share a physical carrier;
+    // only the provider's frozen logical facts can decide which may be written.
     let table_metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &planning_lease,
         connector_context.clone(),
@@ -106,33 +101,43 @@ pub(crate) fn prepare_equality_delete_statement(
         .iter()
         .map(|row| row.iter().map(lower_literal).collect())
         .collect::<Result<Vec<Vec<_>>, _>>()?;
-    let delete_columns = equality_delete_key_columns(&table_metadata, &column_names, &rows)?;
-    if rows.is_empty() {
-        return Err("ADD EQUALITY DELETE requires at least one row".to_string());
-    }
-    let delete_fields = equality_delete_input_fields(&table_metadata, &delete_columns)?;
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
+    let (delete_fields, (current_snapshot_id, write_session)) =
+        prepare_equality_delete_input(&table_metadata, &column_names, &rows, |fields| {
+            // Preserve the journal's original read-before-begin ordering on
+            // this planning generation, before freezing the one write session.
+            let current_snapshot_id =
+                crate::connector::metadata_read_reference_facts_with_planning_lease(
+                    planning_lease.clone(),
+                    connector_context.clone(),
+                    &target.namespace,
+                    &target.table,
+                )?
+                .current_snapshot_id();
+            let session = begin_equality_delete_write_session(
+                state,
+                &target,
+                fields,
+                &planning_lease,
+                &write_lease,
+                connector_context,
+            )?;
+            Ok((current_snapshot_id, session))
+        })?;
     let values_query = build_equality_delete_sink_query(&delete_fields, &rows)?;
 
-    // The durable operation journal records the snapshot this attempt is based
-    // on. It is read through the same planning lease rather than a concrete
-    // table, so this entry point no longer opens an Iceberg catalog.
-    let current_snapshot_id = crate::connector::metadata_read_reference_facts_with_planning_lease(
-        planning_lease.clone(),
-        connector_context.clone(),
-        &target.namespace,
-        &target.table,
-    )?
-    .current_snapshot_id();
     // Route non-empty input through the distributed sink transaction.
     prepare_equality_delete_distributed_write(
         state,
         &target,
         current_snapshot_id,
-        &delete_fields,
         values_query,
         execution,
         connector_context,
         planning_lease,
+        write_session,
         publication_id,
     )
 }
@@ -244,34 +249,26 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prepare_equality_delete_distributed_write(
+fn begin_equality_delete_write_session(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    current_snapshot_id: Option<i64>,
     delete_columns: &[ConnectorWriteFieldRequest],
-    values_query: Query,
-    execution: &QueryExecutionContext,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedDelete, String> {
-    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let write_lease = planning_lease
-        .derive_write_lease()
-        .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
+) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
     let input = ConnectorWriteInputRequest::EqualityDelete {
         equality_fields: delete_columns.to_vec(),
     };
     // One logical equality-delete branch on the generation that resolved the
     // target. ADD EQUALITY DELETE appends delete files rather than mutating
     // rows in place, so it is an ordinary write, not a row mutation.
-    let write_session = crate::query_execution::write_session::begin_connector_write_session(
+    crate::query_execution::write_session::begin_connector_write_session(
         crate::connector::write_target::derive_write_stack_lease(
             state.typed_connector_control(),
-            &planning_lease,
+            planning_lease,
         )?,
-        &write_lease,
+        write_lease,
         crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
             target,
             "main",
@@ -281,7 +278,22 @@ fn prepare_equality_delete_distributed_write(
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
             connector_context.clone(),
         )?,
-    )?;
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_equality_delete_distributed_write(
+    state: &DmlExecutionKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    current_snapshot_id: Option<i64>,
+    values_query: Query,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+) -> Result<PreparedDelete, String> {
+    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     // The plan's target is the one the session sealed, so the plan and the
     // writer's recipe carry the same signed input.
     let target_binding = admit_session_connector_write_target(
@@ -489,7 +501,7 @@ fn sql_identifier(name: &str) -> String {
 /// columns marked rather than removed, and `write_target_type` is the
 /// provider-signed DML write type for the columns whose write encoding differs
 /// from their read encoding (ADR-0055 decision 5).
-fn equality_delete_key_columns(
+fn resolve_equality_delete_key_columns(
     table_metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     column_names: &[String],
     rows: &[Vec<Literal>],
@@ -531,7 +543,6 @@ fn equality_delete_key_columns(
             .and_then(|fact| fact.write_target_type())
             .cloned()
             .unwrap_or_else(|| field.data_type().clone());
-        ensure_supported_equality_key_type(&data_type, field.name())?;
         delete_columns.push(Field::new(
             field.name().clone(),
             data_type,
@@ -539,11 +550,53 @@ fn equality_delete_key_columns(
         ));
     }
 
-    for (ordinal, column) in delete_columns.iter().enumerate() {
+    Ok(delete_columns)
+}
+
+fn validate_equality_delete_columns(
+    columns: &[Field],
+    rows: &[Vec<Literal>],
+) -> Result<(), String> {
+    for column in columns {
+        ensure_supported_equality_key_type(column.data_type(), column.name())?;
+    }
+    for (ordinal, column) in columns.iter().enumerate() {
         let values = rows.iter().map(|row| &row[ordinal]).collect::<Vec<_>>();
         validate_equality_literals(column, &values)?;
     }
-    Ok(delete_columns)
+    Ok(())
+}
+
+/// The legacy local projection remains useful for isolated literal validation
+/// tests. Production first asks its exact provider generation for admission.
+#[cfg(test)]
+fn equality_delete_key_columns(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    names: &[String],
+    rows: &[Vec<Literal>],
+) -> Result<Vec<Field>, String> {
+    let columns = resolve_equality_delete_key_columns(metadata, names, rows)?;
+    validate_equality_delete_columns(&columns, rows)?;
+    Ok(columns)
+}
+
+fn prepare_equality_delete_input<T>(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    names: &[String],
+    rows: &[Vec<Literal>],
+    begin_session: impl FnOnce(&[ConnectorWriteFieldRequest]) -> Result<T, String>,
+) -> Result<(Vec<ConnectorWriteFieldRequest>, T), String> {
+    let columns = resolve_equality_delete_key_columns(metadata, names, rows)?;
+    if rows.is_empty() {
+        return Err("ADD EQUALITY DELETE requires at least one row".to_string());
+    }
+    let fields = equality_delete_input_fields(metadata, &columns)?;
+    // The existing session admission checks the provider's logical key types.
+    // Legacy prepare_write has dormant v1/spec-history policy that this SQL
+    // path must not reactivate merely to distinguish uuid from fixed binary.
+    let session = begin_session(&fields)?;
+    validate_equality_delete_columns(&columns, rows)?;
+    Ok((fields, session))
 }
 
 /// Reject an equality key column whose write type this statement cannot encode.
@@ -1186,5 +1239,125 @@ mod tests {
         assert!(sql.contains("id"));
         assert!(sql.contains("category"));
         assert!(sql.contains("NULL"));
+    }
+    #[test]
+    fn equality_session_admission_precedes_carrier_validation_and_keeps_original_failures() {
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (declaration, domain) in [
+            (
+                novarocks_types::schema::SqlType::Uuid,
+                novarocks_type_contract::ValueLogicalType::Uuid,
+            ),
+            (
+                novarocks_types::schema::SqlType::LargeInt,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            ),
+        ] {
+            for kind in [
+                ConnectorErrorKind::Unsupported,
+                ConnectorErrorKind::ResourceExhausted,
+                ConnectorErrorKind::Cancelled,
+                ConnectorErrorKind::DeadlineExceeded,
+            ] {
+                let metadata = loaded_table(
+                    vec![(Field::new("k", DataType::FixedSizeBinary(16), true), None)],
+                    vec![declaration.clone()],
+                );
+                let calls = AtomicUsize::new(0);
+                let refusal = ConnectorError::new(kind, "original equality session refusal");
+                let error = super::prepare_equality_delete_input::<()>(
+                    &metadata,
+                    &["k".to_owned()],
+                    &[vec![Literal::Null]],
+                    |fields| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(fields.len(), 1);
+                        assert_eq!(fields[0].execution_type().unwrap().logical_type(), domain);
+                        assert_eq!(
+                            fields[0].field().data_type(),
+                            &DataType::FixedSizeBinary(16)
+                        );
+                        Err(refusal.to_string())
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error, refusal.to_string());
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn equality_fixed_binary_is_not_reclassified_as_uuid_and_unused_session_is_released() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Session(Arc<AtomicUsize>);
+        impl Drop for Session {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let metadata = loaded_table(
+            vec![(Field::new("k", DataType::FixedSizeBinary(16), true), None)],
+            vec![novarocks_types::schema::SqlType::LargeInt],
+        );
+        let released = Arc::new(AtomicUsize::new(0));
+        let result = super::prepare_equality_delete_input(
+            &metadata,
+            &["k".to_owned()],
+            &[vec![Literal::Null]],
+            |fields| {
+                assert_eq!(
+                    fields[0].execution_type().unwrap().logical_type(),
+                    novarocks_type_contract::ValueLogicalType::LargeInt
+                );
+                Ok(Session(Arc::clone(&released)))
+            },
+        );
+        // The provider accepted ordinary fixed data. Its existing frontend
+        // literal-carrier restriction still applies after session admission.
+        assert!(result.err().unwrap().contains("FixedSizeBinary(16)"));
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn equality_session_admits_only_the_selected_id_on_a_uuid_table_and_retains_one_owner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let metadata = loaded_table(
+            vec![
+                (Field::new("id", DataType::Int32, false), None),
+                (
+                    Field::new("uuid_column", DataType::FixedSizeBinary(16), true),
+                    None,
+                ),
+            ],
+            vec![
+                novarocks_types::schema::SqlType::Int,
+                novarocks_types::schema::SqlType::Uuid,
+            ],
+        );
+        let calls = AtomicUsize::new(0);
+        let original_session = Arc::new(());
+        let (fields, session) = super::prepare_equality_delete_input(
+            &metadata,
+            &["id".to_owned()],
+            &[vec![Literal::Int(7)]],
+            |fields| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].field().name(), "id");
+                assert_eq!(
+                    fields[0].execution_type(),
+                    metadata.execution_schema().bindings().first()
+                );
+                Ok(Arc::clone(&original_session))
+            },
+        )
+        .expect("the selected id does not write the table's uuid column");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&session, &original_session));
+        let query =
+            super::build_equality_delete_sink_query(&fields, &[vec![Literal::Int(7)]]).unwrap();
+        assert!(novarocks_parser::printer::print_query(&query).contains("id"));
     }
 }

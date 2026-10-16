@@ -89,7 +89,44 @@ native-compatibility-test-fixture = ["novarocks-version/native-compatibility-tes
 # plan-tree interpreter.
 physical-wire-v2-candidate = ["dep:novarocks-arrow-ipc-frame", "dep:novarocks-plan-codec"]
 
+[[test]]
+name = "be_type_metadata_funding"
+required-features = ["physical-wire-v2-candidate"]
+
+[[test]]
+name = "project_metadata_funding"
+required-features = ["physical-wire-v2-candidate"]
+
+[[test]]
+name = "int64_shift_runtime_funding"
+required-features = ["physical-wire-v2-candidate"]
+
+[[test]]
+name = "narrow_shift_runtime_funding"
+required-features = ["physical-wire-v2-candidate"]
+
+[[test]]
+name = "bitwise_runtime_funding"
+required-features = ["physical-wire-v2-candidate"]
+
+[[test]]
+name = "json_object_invocation_runtime_funding"
+required-features = ["physical-wire-v2-candidate"]
+
+[[test]]
+name = "window_output_schema_funding"
+required-features = ["physical-wire-v2-candidate"]
+
 [dev-dependencies]
+novarocks-result-contract.workspace = true
+novarocks-local-program.workspace = true
+novarocks-execution = { workspace = true, features = ["test-support"] }
+arrow.workspace = true
+prost.workspace = true
+novarocks-native-adapter = { workspace = true, features = ["test-support"] }
+novarocks-plan-codec = { workspace = true, features = ["test-support"] }
+novarocks-proto-models.workspace = true
+novarocks-worker = { workspace = true, features = ["test-support"] }
 arrow-schema.workspace = true
 # `server_binary_smoke` spawns the real `novarocks` binary and drives it over
 # MySQL; `state_store_app_config` asserts config/composition by direct call.

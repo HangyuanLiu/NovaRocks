@@ -301,6 +301,18 @@ if ! grep -Fx \
   exit 1
 fi
 if ! grep -Fx \
+  "Iceberg provider dependency boundary|iceberg-provider-dependency-boundary.log|python3 tools/ci/check-iceberg-provider-dependency-boundary.py --manifest-path Cargo.toml" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must run the Iceberg provider dependency boundary stage" >&2
+  exit 1
+fi
+if ! grep -Fx \
+  "Iceberg provider dependency boundary mutations|iceberg-provider-dependency-boundary-test.log|tools/ci/tests/iceberg-provider-dependency-boundary-test.sh" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must run the Iceberg provider dependency boundary mutation stage" >&2
+  exit 1
+fi
+if ! grep -Fx \
   "NCP-8 statistics boundary|ncp8-statistics-boundary.log|tools/ci/check-ncp8-statistics-boundary.py" \
   "$stage_capture" >/dev/null; then
   echo "local full CI must run the NCP-8 statistics boundary stage" >&2

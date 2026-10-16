@@ -1,0 +1,9 @@
+-- query 2
+id	kind	number
+1	Int32	42
+2	Null	NULL
+3	NULL	NULL
+
+-- query 3
+id
+1

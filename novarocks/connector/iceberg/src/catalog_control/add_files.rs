@@ -113,6 +113,10 @@ pub(crate) fn plan_manifest_for_table(
             "ADD FILES supports only unpartitioned Iceberg tables",
         ));
     }
+    crate::commit::validation::deny_variant_registration(
+        table.metadata().current_schema(),
+        &table.identifier().to_string(),
+    )?;
     let target_schema = Arc::new(
         crate::iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
             |error| {
@@ -1062,6 +1066,74 @@ mod tests {
             PARQUET_FIELD_ID_META_KEY.to_string(),
             id.to_string(),
         )]))
+    }
+
+    #[test]
+    fn variant_add_files_denies_before_source_access_while_uuid_reaches_source_admission() {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
+            SortOrder, TableMetadataBuilder, Type, VariantType,
+        };
+        use novarocks_spi::connector::ConnectorErrorKind;
+        let (owner, runtime) = catalog_runtime();
+        let binding = binding(&owner, None);
+        for (data_type, expected_kind) in [
+            (Type::Variant(VariantType), ConnectorErrorKind::Unsupported),
+            (
+                Type::Primitive(PrimitiveType::Uuid),
+                ConnectorErrorKind::InvalidRequest,
+            ),
+        ] {
+            let metadata = TableMetadataBuilder::new(
+                IcebergSchema::builder()
+                    .with_fields(vec![NestedField::optional(1, "payload", data_type).into()])
+                    .build()
+                    .unwrap(),
+                PartitionSpec::unpartition_spec().into_unbound(),
+                SortOrder::unsorted_order(),
+                "file:///warehouse/t".to_owned(),
+                FormatVersion::V3,
+                HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            let table = crate::iceberg::table::Table::builder()
+                .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+                .file_io(crate::fs_io::build_file_io_for_location(
+                    "file:///warehouse/t",
+                    binding.clone(),
+                ))
+                .metadata(metadata)
+                .runtime(runtime.iceberg_runtime().clone())
+                .build()
+                .unwrap();
+            // No source request context or valid source path is supplied. A
+            // Variant refusal must precede either source admission or I/O;
+            // uuid is permitted to reach the original source-context gate.
+            let error = match super::plan_manifest_for_table(
+                &table,
+                "not-a-source-uri",
+                &binding,
+                &runtime,
+                Arc::new(crate::catalog::listing_admission::ListingAdmission::default()),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("unadmitted source cannot be listed"),
+            };
+            assert_eq!(error.kind(), expected_kind, "{error}");
+            assert!(
+                error
+                    .message()
+                    .contains(if expected_kind == ConnectorErrorKind::Unsupported {
+                        "column payload"
+                    } else {
+                        "request context"
+                    }),
+                "{error}"
+            );
+        }
     }
 
     #[test]

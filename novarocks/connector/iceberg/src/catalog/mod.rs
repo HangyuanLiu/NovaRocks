@@ -48,15 +48,15 @@
 //! covers the operations the provider actually performs, and grows only when a
 //! real caller appears.
 //!
-//! There is no `register_table` either. Every catalog could forward one, but
-//! nothing called it: production anchors an already-written metadata file
-//! through `anchor_written_metadata`, which is the operation the provider
-//! actually performs. A trait method whose only content is a forward to a
-//! primitive no caller wants is a second way to do one thing.
+//! There is no `register_table`: every supported write protocol already
+//! publishes its own metadata pointer. The retained `anchor_written_metadata`
+//! call performs pure admission and returns NoOp; it cannot create namespaces
+//! or register another pointer after a write has committed.
 
 pub(crate) mod admission;
 #[cfg(test)]
 pub(crate) mod admission_test_support;
+pub(crate) mod catalog_request;
 pub(crate) mod delegate;
 pub(crate) mod dispatch;
 pub(crate) mod error;
@@ -66,7 +66,13 @@ pub(crate) mod hive;
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]
 pub(crate) mod hms_listing_observer;
 pub(crate) mod listing_admission;
+pub(crate) mod metadata_read;
+#[cfg(test)]
+mod metadata_read_tests;
+pub(crate) mod publication;
+pub(crate) mod publication_dispatch;
 pub(crate) mod rest;
+pub(crate) mod table_coordination;
 pub(crate) mod view_request;
 
 use std::fmt::Debug;
@@ -76,6 +82,7 @@ use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorListingBound, ConnectorMutationFailure};
 
 use self::error::{CatalogOutcome, CatalogUnsupported};
+pub(crate) use self::metadata_read::{CatalogMetadataLoad, CatalogMetadataValidator};
 
 /// Snapshot metadata requested from a catalog. Other catalogs may return all
 /// snapshots; REST requests omit the parameter for the default full load.
@@ -196,48 +203,6 @@ impl CatalogCreateIntent {
     }
 }
 
-/// The result of asking a catalog to begin a transaction.
-///
-/// The `Ready` arm is what separates this from a plain outcome: admission
-/// succeeded and the caller now holds the single frontier for this operation.
-/// The other three arms are terminal, and `Unsupported` among them is the only
-/// one that promises nothing was attempted.
-#[derive(Debug)]
-pub(crate) enum CatalogTransactionStart {
-    Ready(Box<transaction::Transaction>),
-    /// Refused before any external side effect. Safe to report to the user as
-    /// "this catalog cannot do that", and safe to clean up caller-owned state.
-    Unsupported(CatalogUnsupported),
-    /// Admission failed with proof that nothing external was mutated.
-    KnownUncommitted {
-        failure: novarocks_spi::connector::ConnectorMutationFailure,
-    },
-    /// Admission itself may have dispatched a request — a REST staged create
-    /// is a real catalog mutation. Callers must not retry or clean up.
-    // Not constructed yet: no wired constructor dispatches during admission.
-    #[allow(dead_code)]
-    CommitUnknown {
-        failure: novarocks_spi::connector::ConnectorMutationFailure,
-        evidence: error::CatalogCommitEvidence,
-    },
-}
-
-impl CatalogTransactionStart {
-    /// True when admission failed and left the caller owning everything it
-    /// touched, so caller-owned temporary state is safe to release.
-    ///
-    /// This answers a question only the terminal arms have: a `Ready`
-    /// transaction has not failed at all, and releasing its state is
-    /// [`transaction::Transaction::abort`]'s business, which refuses once the
-    /// outcome is unknown.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
-    #[allow(dead_code)]
-    pub(crate) fn permits_cleanup(&self) -> bool {
-        matches!(self, Self::Unsupported(_) | Self::KnownUncommitted { .. })
-    }
-}
-
 /// A drop that committed, with the exact identity captured before the drop.
 ///
 /// The identity is captured ahead of the catalog request precisely because it
@@ -255,6 +220,7 @@ pub(crate) struct CatalogDropTableReceipt {
 
 /// Inputs for a conditional create.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct ConditionalCreateRequest {
     pub(crate) namespace: CatalogNamespaceName,
     pub(crate) creation: crate::iceberg::TableCreation,
@@ -268,6 +234,7 @@ pub(crate) struct ConditionalCreateRequest {
 /// Opaque above this module: the concrete attempt state belongs to whichever
 /// implementation prepared it.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct ConditionalCreateAttempt {
     pub(crate) target: CatalogTableName,
     pub(crate) facts: ConditionalCreateFacts,
@@ -275,9 +242,12 @@ pub(crate) struct ConditionalCreateAttempt {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum ConditionalCreateAttemptState {
     Hadoop(Box<crate::hadoop_catalog::HadoopCreateAttempt>),
 }
+
+#[cfg(test)]
 
 impl ConditionalCreateAttempt {
     pub(crate) fn hadoop(
@@ -313,6 +283,7 @@ pub(crate) struct ConditionalCreateFacts {
 // Produced only by `publish_conditional_create`; see the note there.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct ConditionalCreateReceipt {
     pub(crate) facts: ConditionalCreateFacts,
     pub(crate) already_existed: bool,
@@ -348,31 +319,10 @@ pub(crate) enum ConditionalCreateVerdict {
     Foreign,
 }
 
-/// What a staged create produced, keeping every dispatch distinction the
-/// underlying protocol makes.
-///
-/// The arms mirror the REST client's typed staged-create result rather than
-/// collapsing it: `Conflict` is a definite server rejection, `KnownUncommitted`
-/// proves the request never went out, and `CommitUnknown` means it may have.
-/// Flattening these is how a lost response becomes a duplicate publication.
-pub(crate) enum StagedCreateStart {
-    Staged {
-        /// The table response must not select a FileIO before a vended
-        /// delegation, when present, has entered the query-attempt collector.
-        table: crate::loaded_table::IcebergLoadedTableMaterialization,
-        initialization_updates: Vec<crate::iceberg::TableUpdate>,
-        /// Response-local vended material.  It is intentionally not part of
-        /// the table or staged-write payload; the caller must hand it to the
-        /// query-attempt lease owner or refuse the operation.
-        access_delegation: crate::loaded_table::IcebergAccessDelegation,
-    },
-    Conflict(String),
-    /// Proven not applied: never dispatched, or rejected before publication
-    /// (D13). The failure keeps its kind.
-    KnownUncommitted(ConnectorMutationFailure),
-    CommitUnknown(String),
-    /// This catalog has no staged-create protocol. Proven zero side effect.
-    Unsupported(CatalogUnsupported),
+pub(crate) struct StagedCreateMaterial {
+    pub table: crate::loaded_table::IcebergLoadedTableMaterialization,
+    pub initialization_updates: Vec<crate::iceberg::TableUpdate>,
+    pub access_delegation: crate::loaded_table::IcebergAccessDelegation,
 }
 
 /// What the final publication of a staged create must show to be attributed
@@ -386,19 +336,6 @@ pub(crate) struct StagedPublicationExpectation {
     /// Properties NovaRocks itself names: the operation marker and any
     /// document properties.
     pub(crate) properties: Vec<(String, String)>,
-}
-
-/// What committing a staged create produced.
-#[derive(Debug)]
-pub(crate) enum StagedCommitResult {
-    /// The receipt: this publication's snapshot and the table UUID.
-    Committed(transaction::CommitProof),
-    /// A received 409: another table holds the name.
-    Conflict(ConnectorMutationFailure),
-    /// Proven not applied: never dispatched, or rejected before publication.
-    KnownUncommitted(ConnectorMutationFailure),
-    CommitUnknown(String),
-    Unsupported(CatalogUnsupported),
 }
 
 /// The single semantic owner of Iceberg catalog behavior.
@@ -431,32 +368,138 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     #[allow(dead_code)]
     fn implementation_name(&self) -> &'static str;
 
-    /// The vendored client this owner wraps.
-    ///
-    /// Migration seam, removed with the last unmigrated caller. It exists so a
-    /// generation holds exactly *one* catalog while the operation families move
-    /// across one at a time. Building a second client for the legacy handle
-    /// instead would give two clients with separate in-memory state that
-    /// disagree about the same lake — a dropped table still visible through the
-    /// other handle, for instance.
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog>;
-
-    /// The single-dispatch mechanism for one existing-table publication.
-    ///
-    /// Every catalog shares the vendored `update_table` mechanism; the REST
-    /// owner replaces it with its evidence-producing commit (L12).
-    fn commit_dispatch(
+    #[cfg(not(test))]
+    fn bind_publication_generation(
         &self,
-        ident: crate::iceberg::TableIdent,
-        target_ref: Arc<str>,
-        marker: Option<(Arc<str>, Arc<str>)>,
-    ) -> Arc<dyn transaction::CatalogCommitDispatch> {
-        Arc::new(dispatch::UpdateTableDispatch::new(
-            self.vendored_client(),
-            ident,
-            target_ref,
-            marker,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError>;
+    #[cfg(test)]
+    fn bind_publication_generation(
+        &self,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    /// A read-only positive attribution proves publication, but cannot claim
+    /// that a lost owner's independent local finalization actually ran.
+    #[cfg(not(test))]
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization;
+    #[cfg(test)]
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        novarocks_spi::connector::ExternalMutationFinalization::Complete
+    }
+
+    #[cfg(not(test))]
+    fn evidence_policy(&self) -> publication::CatalogEvidencePolicy;
+    #[cfg(test)]
+    fn evidence_policy(&self) -> publication::CatalogEvidencePolicy {
+        publication::CatalogEvidencePolicy::default()
+    }
+
+    #[cfg(not(test))]
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: admission::CatalogOperation,
+        staged_expectation: Option<StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication>;
+
+    /// Freeze one ordinary create using the admitted owner's exact mechanism.
+    /// This synchronous boundary builds immutable facts only.
+    #[cfg(not(test))]
+    fn freeze_create_publication(
+        &self,
+        request: catalog_request::CatalogCreatePublicationRequest,
+    ) -> publication_dispatch::PreparationResult<catalog_request::FrozenCatalogPublication>;
+    #[cfg(test)]
+    fn freeze_create_publication(
+        &self,
+        _request: catalog_request::CatalogCreatePublicationRequest,
+    ) -> publication_dispatch::PreparationResult<catalog_request::FrozenCatalogPublication> {
+        Err(publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Catalog has no local create freezer",
+            ),
         ))
+    }
+
+    /// Artifactless requests use the same journal executor as frozen commits.
+    /// Catalogs without this mechanism refuse before external side effects.
+    async fn prepare_catalog_publication(
+        &self,
+        _request: catalog_request::FrozenCatalogPublication,
+        _descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+        _preparation: novarocks_spi::connector::ConnectorRequestContext,
+        _document: catalog_request::CatalogResponseDocument,
+        _read_binding: crate::access_binding::IcebergReadBinding,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication> {
+        Err(publication_dispatch::PreparationFailure(
+            ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Catalog has no prepared artifactless publication mechanism",
+            ),
+        ))
+    }
+
+    /// Post-proof materialization has no authority to decide publication.
+    fn materialize_staged_create_response(
+        &self,
+        _table: CatalogTableName,
+        _document: Vec<u8>,
+    ) -> Result<StagedCreateMaterial, ConnectorError> {
+        Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "Catalog has no staged-create response materialization",
+        ))
+    }
+    #[cfg(test)]
+    async fn prepare_frozen_publication(
+        &self,
+        _request: crate::commit::model::FrozenRequest,
+        _operation: admission::CatalogOperation,
+        _staged_expectation: Option<StagedPublicationExpectation>,
+        _descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+        _preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication> {
+        Err(publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Test catalog has not installed a prepared publication mechanism",
+            ),
+        ))
+    }
+
+    /// Explicit test admission capability; production has no policy bypass.
+    #[cfg(test)]
+    async fn prepare_frozen_for_admission_test(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: admission::CatalogOperation,
+        staged_expectation: Option<StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication> {
+        self.prepare_frozen_publication(
+            request,
+            operation,
+            staged_expectation,
+            descriptor,
+            generation,
+            preparation,
+        )
+        .await
     }
 
     /// The provider-private REST client that may refresh an already-admitted
@@ -580,19 +623,50 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         self.load_table(table).await
     }
 
+    /// Read a complete authoritative metadata representation for reclamation.
+    /// The caller retains its original storage authority and full baseline.
+    /// Non-REST owners return a fresh representation without a validator.
+    async fn load_complete_metadata_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+        validator: Option<&CatalogMetadataValidator>,
+    ) -> Result<CatalogMetadataLoad, ConnectorError> {
+        use novarocks_spi::connector::{ConnectorErrorKind, ConnectorOperationControl};
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Complete metadata load requires the original admitted request context",
+            )
+        })?;
+        context.check_active()?;
+        if validator.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "This catalog cannot validate a REST metadata representation",
+            ));
+        }
+        let loaded = self.load_table_for_read(table, binding).await?;
+        context.check_active()?;
+        metadata_read::complete_metadata(
+            loaded.metadata().clone(),
+            loaded.metadata_location(),
+            None,
+        )
+    }
+
     /// Reload commit metadata using the operation's authorized object-store
     /// I/O. Catalog HTTP calls remain catalog-owned; filesystem pointer and
     /// metadata reads must use the supplied governor, never a cached FileIO.
     async fn load_commit_base(
         &self,
-        table: CatalogTableName,
+        _table: CatalogTableName,
         _file_io: crate::iceberg::io::FileIO,
     ) -> crate::iceberg::Result<CatalogCommitBase> {
-        let ident = delegate::table_ident(&table).map_err(|error| {
-            crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
-                .with_source(error)
-        })?;
-        CatalogCommitBase::from_table(self.vendored_client().load_table(&ident).await?)
+        Err(crate::iceberg::Error::new(
+            crate::iceberg::ErrorKind::FeatureUnsupported,
+            "Catalog has no admitted commit-base loading mechanism",
+        ))
     }
 
     /// Reload an operation baseline with the requested snapshot scope.
@@ -612,6 +686,43 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// as a hint may map `Unsupported` to "not a view" themselves; callers that
     /// need an authoritative enumeration must surface the refusal.
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError>;
+
+    #[cfg(not(test))]
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError>;
+    #[cfg(test)]
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        let result = self.view_exists(view).await?;
+        context.check_active()?;
+        Ok(result)
+    }
+    #[cfg(not(test))]
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError>;
+    #[cfg(test)]
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        let result = self.load_view(view).await?;
+        context.check_active()?;
+        Ok(result)
+    }
 
     /// Enumerate views. See [`NovaRocksCatalog::view_exists`] on why this is
     /// not allowed to answer with an empty vector when it cannot answer.
@@ -652,101 +763,14 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     // ---- B. Direct mutations -------------------------------------------
 
-    /// Create a view. A catalog without views answers `Unsupported`.
-    async fn create_view(
-        &self,
-        namespace: CatalogNamespaceName,
-        _creation: view_request::ViewCreate,
-    ) -> CatalogOutcome<CatalogTableName> {
-        CatalogOutcome::unsupported(format!(
-            "{} Iceberg catalog does not support views (namespace {})",
-            self.implementation_name(),
-            namespace.namespace
-        ))
-    }
-
-    /// Replace a view's definition; the replacement freezes the view UUID.
-    async fn replace_view(
-        &self,
-        replace: view_request::ValidatedViewReplace,
-    ) -> CatalogOutcome<CatalogTableName> {
-        CatalogOutcome::unsupported(format!(
-            "{} Iceberg catalog does not support views ({})",
-            self.implementation_name(),
-            replace.ident()
-        ))
-    }
-
-    /// Drop a view.
-    async fn drop_view(&self, view: CatalogTableName) -> CatalogOutcome<CatalogTableName> {
-        CatalogOutcome::unsupported(format!(
-            "{} Iceberg catalog does not support views ({view})",
-            self.implementation_name()
-        ))
-    }
-
-    async fn create_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName>;
-
-    async fn drop_namespace(
-        &self,
-        namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName>;
-
-    /// Drop a table from the catalog.
-    ///
-    /// This removes catalog visibility only. Object deletion is the filesystem
-    /// owner's job and may only proceed on `KnownCommitted`; see ADR-0118.
-    async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
-
-    /// Make a write's freshly published metadata reachable through this
-    /// catalog.
-    ///
-    /// Catalogs that track metadata locations themselves have nothing to do and
-    /// answer with a no-op. A filesystem catalog, whose entry *is* the metadata
-    /// pointer, has to anchor it.
-    ///
-    /// This exists so the write path stops asking "is this a remote catalog?".
-    /// That question was answered outside the factory, by a helper that also
-    /// swallowed the errors from the namespace it created along the way.
+    /// Admit an already committed write without another external mutation.
+    /// Supported write protocols publish their own pointer. Unsupported
+    /// catalogs still refuse; this boundary grants no registration authority.
     async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,
         metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName>;
-
-    // ---- C. Transaction constructors ------------------------------------
-
-    /// Begin a transaction against an existing table.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
-    #[allow(dead_code)]
-    async fn new_transaction(
-        &self,
-        request: transaction::TransactionRequest,
-    ) -> CatalogTransactionStart;
-
-    /// Create an invisible target for a staged publication.
-    ///
-    /// The staged table is not reachable through the catalog until it is
-    /// committed, which is what makes a CTAS absent-or-complete. A catalog with
-    /// no such protocol answers `Unsupported`, and never by creating a visible
-    /// empty table to fill in afterwards.
-    async fn stage_create_table(
-        &self,
-        namespace: CatalogNamespaceName,
-        creation: crate::iceberg::TableCreation,
-    ) -> StagedCreateStart;
-
-    /// Publish a staged create with exactly one assert-create request,
-    /// attributed against `expectation` before any evidence is reported.
-    async fn commit_staged_table(
-        &self,
-        commit: crate::iceberg::TableCommit,
-        expectation: StagedPublicationExpectation,
-    ) -> StagedCommitResult;
 
     /// Stage a conditional create against storage, without publishing it.
     ///
@@ -757,6 +781,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// how a catalog kind used to escape the factory.
     ///
     /// Preparing is local: it builds metadata and sends nothing.
+    #[cfg(test)]
     async fn prepare_conditional_create(
         &self,
         request: ConditionalCreateRequest,
@@ -766,6 +791,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     // Reached only by tests, which is the only way the lost-response path can
     // be exercised at all: production publishes through `ConditionalCreateDispatch`.
     #[allow(dead_code)]
+    #[cfg(test)]
     async fn publish_conditional_create(
         &self,
         attempt: ConditionalCreateAttempt,
@@ -779,6 +805,17 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         &self,
         evidence: ConditionalCreateEvidence,
     ) -> Result<ConditionalCreateVerdict, ConnectorError>;
+
+    async fn adjudicate_conditional_create_for_read(
+        &self,
+        _evidence: ConditionalCreateEvidence,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "This catalog has no request-bound conditional-create observation",
+        ))
+    }
 
     /// One local operation rule, shared by admission and the mutation owner.
     fn admit_operation(
@@ -803,24 +840,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         self.admit_operation(&request.operation, &request.target)?;
         self.admit_initiation(request)
     }
-
-    /// Begin a transaction that creates a table.
-    ///
-    /// The request carries [`CatalogCreateIntent`], and implementations may
-    /// accept one intent while refusing another on the same catalog.
-    async fn new_create_table_transaction(
-        &self,
-        request: transaction::CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart;
-
-    /// Begin a transaction that creates a table or replaces it in place.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
-    #[allow(dead_code)]
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        request: transaction::CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart;
 }
 
 /// The answer of a catalog that cannot hold views. It is given by the owner
@@ -833,93 +852,6 @@ pub(super) fn views_unsupported(operation: &str) -> ConnectorError {
 }
 
 pub(crate) mod transaction;
-
-/// Begin a publication against an existing table.
-///
-/// Every catalog shares this: the frontier is one `update_table`, and the
-/// updates arrive after the writer runs. Admission here is the identity and
-/// name check, which is exactly the work that must happen before a source
-/// executes.
-// No production caller yet: see the note on `new_transaction`.
-#[allow(dead_code)]
-fn start_update_table_transaction(
-    owner: &(impl NovaRocksCatalog + ?Sized),
-    request: transaction::TransactionRequest,
-) -> CatalogTransactionStart {
-    let ident = match delegate::table_ident(&request.target) {
-        Ok(ident) => ident,
-        Err(error) => {
-            return CatalogTransactionStart::KnownUncommitted {
-                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                ),
-            };
-        }
-    };
-    let mut evidence = error::CatalogCommitEvidence::for_target(request.target.canonical())
-        .with_target_ref(Arc::clone(&request.target_ref))
-        .with_base_snapshot_id(request.base_snapshot_id);
-    if let Some(uuid) = &request.expected_table_uuid {
-        evidence = evidence.with_target_uuid(Arc::clone(uuid));
-    }
-    let dispatch = owner.commit_dispatch(
-        ident,
-        Arc::clone(&request.target_ref),
-        request.marker.clone(),
-    );
-    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
-        request.identity,
-        request.target,
-        transaction::TransactionShape::Existing,
-        evidence,
-        dispatch,
-    )))
-}
-
-/// Begin a publication that creates a table through one catalog request.
-fn start_create_table_transaction(
-    delegate: &delegate::CatalogDelegate,
-    request: transaction::CreateTableTransactionRequest,
-) -> CatalogTransactionStart {
-    let namespace = CatalogNamespaceName::new(Arc::clone(&request.target.namespace));
-    let namespace_ident = match delegate::namespace_ident(&namespace) {
-        Ok(ident) => ident,
-        Err(error) => {
-            return CatalogTransactionStart::KnownUncommitted {
-                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                ),
-            };
-        }
-    };
-    let table_ident = match delegate::table_ident(&request.target) {
-        Ok(ident) => ident,
-        Err(error) => {
-            return CatalogTransactionStart::KnownUncommitted {
-                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                ),
-            };
-        }
-    };
-    let evidence = error::CatalogCommitEvidence::for_target(request.target.canonical());
-    let dispatch = Arc::new(dispatch::CreateTableDispatch::new(
-        Arc::clone(delegate.client()),
-        namespace_ident,
-        request.creation,
-        table_ident,
-    ));
-    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
-        request.identity,
-        request.target,
-        transaction::TransactionShape::Create(request.intent),
-        evidence,
-        dispatch,
-    )))
-}
 
 #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
 #[path = "../hms_listing_probe_tests.rs"]

@@ -21,12 +21,14 @@ use super::{
     requirements,
 };
 use crate::commit::model::{
-    ArtifactWriter, BaseIdentity, FrozenRequest, FrozenRequestParts, ObjectIdentity,
-    OperationIntent, RequestShape, StagedCreateIdentity,
+    ArtifactWriter, AttemptArtifacts, AttemptToken, BaseIdentity, FileChanges, FrozenRequest,
+    FrozenRequestParts, IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts,
+    RequestShape, StagedCreateIdentity, TableTarget,
 };
 use crate::iceberg::spec::TableMetadata;
-use crate::iceberg::{Result, TableRequirement, TableUpdate};
+use crate::iceberg::{Error, ErrorKind, Result, TableIdent, TableRequirement, TableUpdate};
 use async_trait::async_trait;
+use novarocks_spi::connector::{ConnectorOperationControl, ConnectorRequestContext};
 
 #[derive(Clone)]
 pub enum StagingBase {
@@ -55,12 +57,12 @@ pub trait Preparer: Send + Sync {
     ) -> Result<PreparedChange>;
 }
 
-pub struct StagingEngine<'a> {
+// Canonical replay and requirement derivation are pure. Artifact-producing
+// preparers and metadata-only callers share this state without sharing I/O.
+struct StagingState {
     base: TableMetadata,
     identity: BaseIdentity,
     location: Option<String>,
-    intent: &'a OperationIntent,
-    artifacts: &'a dyn ArtifactWriter,
     metadata: TableMetadata,
     selections: Selections,
     updates: Vec<TableUpdate>,
@@ -68,18 +70,8 @@ pub struct StagingEngine<'a> {
     requirements: Vec<TableRequirement>,
 }
 
-impl<'a> StagingEngine<'a> {
-    pub fn begin(
-        base: StagingBase,
-        intent: &'a OperationIntent,
-        artifacts: &'a dyn ArtifactWriter,
-    ) -> Result<Self> {
-        artifacts.check_active()?;
-        if artifacts.attempt_token().operation() != intent.token() {
-            return Err(invalid(
-                "Staging attempt does not own this operation intent",
-            ));
-        }
+impl StagingState {
+    fn begin(base: StagingBase, intent: &OperationIntent) -> Result<Self> {
         let mut selections = Selections::default();
         let (base, identity, location, updates, mut requirements) = match base {
             StagingBase::Existing {
@@ -173,42 +165,25 @@ impl<'a> StagingEngine<'a> {
             base,
             identity,
             location,
-            intent,
-            artifacts,
             selections,
             updates,
             initialization_len,
             requirements,
         })
     }
-    pub fn metadata(&self) -> &TableMetadata {
-        &self.metadata
-    }
-    pub fn updates(&self) -> &[TableUpdate] {
-        &self.updates
-    }
-    pub fn view(&self) -> StagedView<'_> {
-        StagedView::new(&self.metadata, self.intent, self.artifacts)
-    }
-    pub async fn stage(&mut self, preparer: &dyn Preparer) -> Result<()> {
-        self.artifacts.check_active()?;
-        let prepared = preparer.prepare(&self.view(), self.intent).await?;
-        self.stage_change(prepared)
-    }
-    pub fn stage_change(&mut self, change: PreparedChange) -> Result<()> {
-        self.artifacts.check_active()?;
+    fn stage_change(&mut self, intent: &OperationIntent, change: PreparedChange) -> Result<()> {
         let mut requirements = self.requirements.clone();
         for requirement in &change.requirements {
             requirement.check(
                 if *requirement == TableRequirement::NotExist
-                    && self.intent.shape() == RequestShape::Create
+                    && intent.shape() == RequestShape::Create
                 {
                     None
                 } else {
                     Some(&self.metadata)
                 },
             )?;
-            if self.intent.shape() != RequestShape::Create {
+            if intent.shape() != RequestShape::Create {
                 requirements::push_unique(
                     &mut requirements,
                     requirements::against_base(requirement, &self.base),
@@ -219,10 +194,13 @@ impl<'a> StagingEngine<'a> {
         let mut updates = self.updates.clone();
         let mut metadata = self.metadata.clone();
         for update in change.updates {
-            if self.intent.shape() == RequestShape::DocumentExpiry {
+            if intent.shape() == RequestShape::DocumentExpiry {
                 crate::commit::model::validate_document_expiry_update(&update)?;
             }
-            if self.intent.shape() == RequestShape::MetadataOnly
+            if intent.shape() == RequestShape::RefRetention {
+                crate::commit::model::validate_ref_retention_update(&update)?;
+            }
+            if intent.shape() == RequestShape::MetadataOnly
                 && matches!(
                     update,
                     TableUpdate::AddSnapshot { .. } | TableUpdate::SetSnapshotRef { .. }
@@ -239,26 +217,135 @@ impl<'a> StagingEngine<'a> {
                 )?;
             }
         }
-        requirements::implicit(&self.base, self.intent.shape(), &updates, &mut requirements);
+        requirements::implicit(&self.base, intent.shape(), &updates, &mut requirements);
         self.updates = updates;
         self.metadata = metadata;
         self.selections = selections;
         self.requirements = requirements;
         Ok(())
     }
-    // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
-    pub fn freeze(self, owned_references: &[ObjectIdentity]) -> Result<FrozenRequest> {
-        self.artifacts.check_active()?;
+    fn freeze(
+        self,
+        intent: &OperationIntent,
+        artifacts: AttemptArtifacts,
+    ) -> Result<FrozenRequest> {
         FrozenRequest::new(FrozenRequestParts {
-            shape: self.intent.shape(),
-            target: self.intent.target().ident.clone(),
-            target_ref: self.intent.target_ref().to_owned(),
+            shape: intent.shape(),
+            target: intent.target().ident.clone(),
+            target_ref: intent.target_ref().to_owned(),
             base: self.identity,
             requirements: self.requirements,
             updates: self.updates,
-            artifacts: self.artifacts.snapshot_artifacts(owned_references)?,
+            artifacts: artifacts,
+        })?
+        .with_base_facts(&self.base)
+    }
+}
+
+pub struct StagingEngine<'a> {
+    state: StagingState,
+    intent: &'a OperationIntent,
+    artifacts: &'a dyn ArtifactWriter,
+}
+
+impl<'a> StagingEngine<'a> {
+    pub fn begin(
+        base: StagingBase,
+        intent: &'a OperationIntent,
+        artifacts: &'a dyn ArtifactWriter,
+    ) -> Result<Self> {
+        artifacts.check_active()?;
+        if artifacts.attempt_token().operation() != intent.token() {
+            return Err(invalid(
+                "Staging attempt does not own this operation intent",
+            ));
+        }
+        Ok(Self {
+            state: StagingState::begin(base, intent)?,
+            intent,
+            artifacts,
         })
     }
+    pub fn metadata(&self) -> &TableMetadata {
+        &self.state.metadata
+    }
+    pub fn updates(&self) -> &[TableUpdate] {
+        &self.state.updates
+    }
+    pub fn view(&self) -> StagedView<'_> {
+        StagedView::new(&self.state.metadata, self.intent, self.artifacts)
+    }
+    pub async fn stage(&mut self, preparer: &dyn Preparer) -> Result<()> {
+        self.artifacts.check_active()?;
+        let prepared = preparer.prepare(&self.view(), self.intent).await?;
+        self.stage_change(prepared)
+    }
+    pub fn stage_change(&mut self, change: PreparedChange) -> Result<()> {
+        self.artifacts.check_active()?;
+        self.state.stage_change(self.intent, change)
+    }
+    // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
+    pub fn freeze(self, owned_references: &[ObjectIdentity]) -> Result<FrozenRequest> {
+        self.artifacts.check_active()?;
+        self.state.freeze(
+            self.intent,
+            self.artifacts.snapshot_artifacts(owned_references)?,
+        )
+    }
+}
+
+/// Freeze an existing-table metadata/ref change through canonical staging.
+/// This capability owns no FileIO and cannot allocate or adopt any artifact.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn freeze_existing_change(
+    target: TableIdent,
+    target_ref: &str,
+    base: &TableMetadata,
+    metadata_location: &str,
+    shape: RequestShape,
+    attempt: AttemptToken,
+    change: PreparedChange,
+    context: &ConnectorRequestContext,
+) -> Result<FrozenRequest> {
+    let check = || {
+        context.check_active().map_err(|error| {
+            Error::new(ErrorKind::Unexpected, "Iceberg staging preparation stopped")
+                .with_source(error)
+        })
+    };
+    check()?;
+    if !matches!(
+        shape,
+        RequestShape::MetadataOnly | RequestShape::RefRetention
+    ) {
+        return Err(invalid(
+            "Artifactless staging requires a metadata or ref-retention shape",
+        ));
+    }
+    let intent = OperationIntent::new(OperationIntentParts {
+        target: TableTarget {
+            ident: target,
+            uuid: Some(base.uuid()),
+        },
+        target_ref: target_ref.to_owned(),
+        start: None,
+        changes: FileChanges::default(),
+        dependencies: Vec::new(),
+        isolation: IsolationLevel::Snapshot,
+        shape,
+        summary: Default::default(),
+        token: attempt.operation(),
+    })?;
+    let mut state = StagingState::begin(
+        StagingBase::Existing {
+            metadata: base.clone(),
+            metadata_location: metadata_location.to_owned(),
+        },
+        &intent,
+    )?;
+    state.stage_change(&intent, change)?;
+    check()?;
+    state.freeze(&intent, AttemptArtifacts::empty(attempt))
 }
 
 fn validate_initialization(base: &TableMetadata, updates: &[TableUpdate]) -> Result<()> {

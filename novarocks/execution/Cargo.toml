@@ -13,6 +13,7 @@ doctest = false
 [features]
 normal-build = ["novarocks-failpoint?/normal-build"]
 test-controls = ["dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
+test-support = []
 core-pipeline-integration = []
 
 [dependencies]
@@ -32,7 +33,6 @@ futures.workspace = true
 hashbrown = { workspace = true, features = ["raw"] }
 allocator-api2.workspace = true
 hex.workspace = true
-libm = "0.2"
 md-5.workspace = true
 novarocks-arrow-ipc-frame.workspace = true
 novarocks-types.workspace = true
@@ -72,6 +72,6 @@ novarocks-local-compiler.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
-novarocks-plan-codec.workspace = true
+novarocks-plan-codec = { workspace = true, features = ["test-support"] }
 novarocks-sql = { workspace = true, features = ["test-support"] }
 novarocks-parser.workspace = true

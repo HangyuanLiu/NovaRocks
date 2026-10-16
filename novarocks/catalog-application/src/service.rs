@@ -118,11 +118,40 @@ struct ProjectionAttempt {
     >,
 }
 
+struct CatalogMaterializer {
+    identity: novarocks_spi::connector::CatalogScopeIdentity,
+    factory: Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory>,
+    reader: Option<Arc<dyn novarocks_spi::connector::CatalogActivityReader>>,
+}
+
+#[derive(Default)]
+struct CatalogMaterializers {
+    current: BTreeMap<ConnectorInstanceId, CatalogMaterializer>,
+    draining: Vec<(
+        novarocks_spi::connector::CatalogScopeIdentity,
+        std::sync::Weak<dyn novarocks_spi::connector::CatalogActivityReader>,
+    )>,
+}
+impl CatalogMaterializers {
+    fn retain_draining(&mut self, owner: &CatalogMaterializer) {
+        self.draining
+            .retain(|(_, reader)| reader.strong_count() > 0);
+        if let Some(reader) = &owner.reader {
+            self.draining
+                .push((owner.identity.clone(), Arc::downgrade(reader)));
+        }
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.current.is_empty()
+    }
+}
+
 struct MaterializationSubmission {
     entry: CatalogDesiredStateEntry,
     provider_id: ConnectorProviderId,
     properties: NormalizedCatalogProperties,
-    factory: Arc<dyn novarocks_spi::connector::ConnectorControlRoleBindingFactory>,
+    factory: Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory>,
     key: CatalogHandle,
     token: u64,
     context: MaterializationContext,
@@ -199,6 +228,8 @@ pub struct CatalogApplicationService {
     runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
     runtime: Handle,
     projections: Mutex<BTreeMap<ConnectorInstanceId, LocalProjection>>,
+    /// Desired-entry lifetime, independent of current/retiring generations.
+    catalog_materializers: Mutex<CatalogMaterializers>,
     complete_reachable_catalogs: Mutex<Option<BTreeSet<CatalogHandle>>>,
     next_generation: AtomicU64,
     scheduler: ProjectionScheduler,
@@ -218,6 +249,7 @@ impl CatalogApplicationService {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            catalog_materializers: Mutex::new(CatalogMaterializers::default()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(CatalogMaterializationConfig::default()),
@@ -256,6 +288,7 @@ impl CatalogApplicationService {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            catalog_materializers: Mutex::new(CatalogMaterializers::default()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(materialization_config),
@@ -694,11 +727,16 @@ impl CatalogApplicationService {
                     error.to_string(),
                 )
             })?;
+        let identity = novarocks_spi::connector::CatalogScopeIdentity::new(
+            provider_id.clone(),
+            instance_id.clone(),
+            attachment_id,
+        );
         let key = properties.handle().clone();
         let context =
             MaterializationContext::new(Instant::now() + self.scheduler.config.attempt_timeout);
         let token = self.scheduler.next_token.fetch_add(1, Ordering::Relaxed);
-        {
+        let factory = {
             let mut attempts = self.scheduler.attempts.lock().map_err(|_| {
                 CatalogApplicationError::new(
                     CatalogApplicationErrorKind::Internal,
@@ -728,7 +766,7 @@ impl CatalogApplicationService {
                                 if *installed_id == attachment_id
                         )
                     })
-                && self.control.observe_current_binding(&instance_id).is_ok()
+                && self.control.has_current_definition(&key).unwrap_or(false)
             {
                 return Ok((true, None));
             }
@@ -759,7 +797,34 @@ impl CatalogApplicationService {
                     completion_waiters: completion.into_iter().collect(),
                 },
             );
-        }
+            let mut owners = self.catalog_materializers.lock().map_err(|_| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Internal,
+                    "catalog materialization owner lock is poisoned",
+                )
+            })?;
+            if owners
+                .current
+                .get(&instance_id)
+                .is_some_and(|owner| owner.identity != identity)
+            {
+                let old = owners.current.remove(&instance_id).expect("existing owner");
+                owners.retain_draining(&old);
+            }
+            let owner = owners
+                .current
+                .entry(instance_id.clone())
+                .or_insert_with(|| {
+                    let opened = factory.open_catalog(identity.clone());
+                    let reader = opened.activity_reader();
+                    CatalogMaterializer {
+                        identity,
+                        factory: opened,
+                        reader,
+                    }
+                });
+            Arc::clone(&owner.factory)
+        };
         self.mark_unavailable(
             &instance_id,
             attachment_id,
@@ -964,7 +1029,14 @@ impl CatalogApplicationService {
                 })
             })
             .unwrap_or(false)
-            && self.control.observe_current_binding(&instance_id).is_ok();
+            && entry
+                .catalog_properties(mode)
+                .ok()
+                .is_some_and(|properties| {
+                    self.control
+                        .has_current_definition(properties.handle())
+                        .unwrap_or(false)
+                });
         if installed {
             return;
         }
@@ -1061,6 +1133,11 @@ impl CatalogApplicationService {
 
     fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
         if let Ok(mut attempts) = self.scheduler.attempts.lock() {
+            if let Ok(mut owners) = self.catalog_materializers.lock() {
+                if let Some(old) = owners.current.remove(instance_id) {
+                    owners.retain_draining(&old);
+                }
+            }
             attempts.retain(|_, attempt| {
                 if &attempt.instance_id == instance_id {
                     attempt.context.cancel();
@@ -1091,6 +1168,38 @@ impl CatalogApplicationService {
 }
 
 impl CatalogApplicationPort for CatalogApplicationService {
+    fn catalog_activity_sources(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::CatalogActivitySource>, CatalogApplicationError> {
+        let mut owners = self.catalog_materializers.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog activity owner lock is poisoned",
+            )
+        })?;
+        owners
+            .draining
+            .retain(|(_, reader)| reader.strong_count() > 0);
+        let mut sources = owners
+            .current
+            .values()
+            .map(|owner| novarocks_spi::connector::CatalogActivitySource {
+                identity: owner.identity.clone(),
+                current: true,
+                reader: owner.reader.clone(),
+            })
+            .collect::<Vec<_>>();
+        sources.extend(owners.draining.iter().filter_map(|(identity, weak)| {
+            weak.upgrade()
+                .map(|reader| novarocks_spi::connector::CatalogActivitySource {
+                    identity: identity.clone(),
+                    current: false,
+                    reader: Some(reader),
+                })
+        }));
+        Ok(sources)
+    }
+
     fn create_catalog(
         &self,
         command: CatalogCreateCommand,
@@ -1533,6 +1642,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct FailingRoleFactory {
         disposition: ConnectorMaterializationRetryDisposition,
         calls: Arc<AtomicUsize>,
@@ -1560,6 +1670,15 @@ mod tests {
             })
         }
 
+        fn open_catalog(
+            &self,
+            _identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(self.clone())
+        }
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for FailingRoleFactory {
         fn materialize(
             &self,
             _properties: NormalizedCatalogProperties,
@@ -1669,6 +1788,7 @@ mod tests {
     }
 
     /// Counts materializations and hands back a live control binding.
+    #[derive(Clone)]
     struct CountingRoleFactory {
         calls: Arc<AtomicUsize>,
     }
@@ -1695,6 +1815,15 @@ mod tests {
             })
         }
 
+        fn open_catalog(
+            &self,
+            _identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(self.clone())
+        }
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for CountingRoleFactory {
         fn materialize(
             &self,
             properties: NormalizedCatalogProperties,
@@ -2014,5 +2143,1068 @@ mod tests {
                 .expect("local catalog definition");
         assert!(bindings.is_empty());
         assert_eq!(properties, vec![("type".to_string(), "local".to_string())]);
+    }
+    struct DrainingControlResolver {
+        entered: tokio::sync::Notify,
+        gate: (std::sync::Mutex<bool>, std::sync::Condvar),
+        old_calls: std::sync::atomic::AtomicUsize,
+        new_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl DrainingControlResolver {
+        fn release(&self) {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+    }
+    struct ReleaseDrainingControl(Arc<DrainingControlResolver>);
+    impl Drop for ReleaseDrainingControl {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver
+        for DrainingControlResolver
+    {
+        fn resolve_object_store_static(
+            &self,
+            _: &StaticCredentialReference,
+        ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, novarocks_spi::connector::ConnectorError>
+        {
+            Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test owns only catalog-control identity",
+            ))
+        }
+        fn resolve_catalog_control(
+            &self,
+            reference: &StaticCredentialReference,
+        ) -> Result<
+            novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert_eq!(reference.name(), "control");
+            match reference.generation() {
+                "old" => {
+                    self.old_calls.fetch_add(1, SeqCst);
+                    self.entered.notify_one();
+                    drop(
+                        self.gate
+                            .1
+                            .wait_timeout_while(
+                                self.gate.0.lock().unwrap(),
+                                Duration::from_secs(20),
+                                |released| !*released,
+                            )
+                            .unwrap(),
+                    );
+                }
+                "new" => {
+                    self.new_calls.fetch_add(1, SeqCst);
+                }
+                _ => panic!("unexpected test identity generation"),
+            }
+            Ok(
+                novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new("local-test-token"),
+                },
+            )
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_draining_scope_survives_wrapper_deadline_until_actual_worker_exit() {
+        use novarocks_connector_iceberg::{
+            IcebergControlRoleBindingFactory, access_binding::IcebergReadBinding,
+            resources::IcebergMetadataResources,
+        };
+        use novarocks_spi::connector::CatalogActivityPhase as P;
+        use std::sync::atomic::Ordering::SeqCst;
+        let resolver = Arc::new(DrainingControlResolver {
+            entered: tokio::sync::Notify::new(),
+            gate: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            old_calls: std::sync::atomic::AtomicUsize::new(0),
+            new_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _release = ReleaseDrainingControl(resolver.clone());
+        let handle = tokio::runtime::Handle::current();
+        let fs = novarocks_fs::FsAccessResources::new(
+            Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+        );
+        let access =
+            IcebergReadBinding::with_static_metadata_credential_resolver(fs, resolver.clone());
+        let role = Arc::new(IcebergControlRoleBindingFactory::new(
+            IcebergMetadataResources::new(access, handle.clone()),
+            std::num::NonZeroUsize::new(2).unwrap(),
+        ));
+        let control = Arc::new(ConnectorControlHost::with_role_factories(vec![role]).unwrap());
+        let mut service = CatalogApplicationService::unavailable(
+            control.clone(),
+            Arc::new(TestRuntimePublisher),
+            handle,
+            Arc::new(TestReferenceReader),
+        );
+        service.scheduler = ProjectionScheduler::new(
+            CatalogMaterializationConfig::try_new(
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                2,
+            )
+            .unwrap(),
+        );
+        let port = Arc::new(service);
+        let instance = ConnectorInstanceId::parse("catalog.draining").unwrap();
+        let old_id = Uuid::now_v7();
+        let new_id = Uuid::now_v7();
+        assert_ne!(old_id, new_id);
+        let entry = |identity, generation: &str| {
+            CatalogDesiredStateEntry::new(
+                crate::CatalogSourceEntryIdentity::new(identity),
+                crate::CatalogLogicalConfig::try_new(
+                    instance.clone(),
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    "Draining",
+                    vec![
+                        ("iceberg.catalog.type".into(), "rest".into()),
+                        ("uri".into(), "http://127.0.0.1:1".into()),
+                    ],
+                    vec![
+                        CatalogCredentialBinding::try_new(
+                            CatalogCredentialPurpose::CatalogControl,
+                            CredentialConsumerRole::Frontend,
+                            CatalogCredentialMode::Static(
+                                StaticCredentialReference::try_new("control", generation).unwrap(),
+                            ),
+                        )
+                        .unwrap(),
+                    ],
+                    1,
+                )
+                .unwrap(),
+            )
+        };
+        let mode = CatalogDesiredStateSourceMode::DynamicStateStore;
+        let (_, work) = port
+            .submit_materialization(entry(old_id, "old"), mode, None)
+            .unwrap();
+        let task_port = port.clone();
+        let old_wrapper =
+            tokio::spawn(async move { task_port.run_materialization(work.unwrap()).await });
+        tokio::time::timeout(Duration::from_secs(5), resolver.entered.notified())
+            .await
+            .expect("old real worker entered");
+        let (_, work) = port
+            .submit_materialization(entry(new_id, "new"), mode, None)
+            .unwrap();
+        port.run_materialization(work.unwrap()).await;
+        let new_epoch = {
+            let lease = control
+                .acquire_current(&instance)
+                .expect("new scope progresses while old worker blocks");
+            lease.binding().incarnation()
+        };
+        // Replacement cancels the old context, but the existing wrapper waits
+        // for its original deadline. It is not manually aborted in this test.
+        tokio::time::timeout(Duration::from_secs(4), old_wrapper)
+            .await
+            .unwrap()
+            .unwrap();
+        fn snapshots(
+            port: &CatalogApplicationService,
+        ) -> Vec<(
+            Uuid,
+            bool,
+            novarocks_spi::connector::CatalogActivitySnapshot,
+        )> {
+            port.catalog_activity_sources()
+                .unwrap()
+                .into_iter()
+                .map(|source| {
+                    let snapshot = source.reader.as_ref().unwrap().snapshot();
+                    (source.identity.source_entry_id(), source.current, snapshot)
+                })
+                .collect()
+        }
+        let rows = snapshots(&port);
+        assert_eq!(rows.len(), 2);
+        let old = rows.iter().find(|row| row.0 == old_id).unwrap();
+        assert!(!old.1);
+        assert_eq!(old.2.phases[P::MaterializationWorker as usize].inflight, 1);
+        assert_eq!(old.2.phases[P::Bridge as usize].inflight, 1);
+        assert_eq!(old.2.generations.len(), 1);
+        assert_eq!(old.2.generations[0].generation, None);
+        let new = rows.iter().find(|row| row.0 == new_id).unwrap();
+        assert!(new.1);
+        assert!(new.2.phases.iter().all(|phase| phase.inflight == 0));
+        assert_eq!(
+            new.2.generations[0].generation.unwrap().as_bytes(),
+            &new_epoch.to_bytes()
+        );
+        assert_eq!(resolver.old_calls.load(SeqCst), 1);
+        assert_eq!(resolver.new_calls.load(SeqCst), 1);
+        drop(rows);
+        resolver.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = snapshots(&port);
+                if rows.len() == 1 && rows[0].0 == new_id && rows[0].1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old actual exit removes the draining weak reader");
+        assert_eq!(
+            control
+                .acquire_current(&instance)
+                .unwrap()
+                .binding()
+                .incarnation(),
+            new_epoch
+        );
+    }
+
+    // Lifecycle integration uses the production Iceberg role factory and real
+    // generation leases. Local Hadoop construction performs no remote I/O;
+    // test-owned runtimes and warehouses are released after every lease exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_owner_spans_real_iceberg_generations_and_freshness_outage() {
+        use novarocks_connector_iceberg::IcebergControlRoleBindingFactory;
+        use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+        use novarocks_connector_iceberg::resources::IcebergMetadataResources;
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let runtime = tokio::runtime::Handle::current();
+        let access = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+        );
+        let factory = Arc::new(IcebergControlRoleBindingFactory::new(
+            IcebergMetadataResources::new(access, runtime.clone()),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        ));
+        let control = Arc::new(ConnectorControlHost::with_role_factories(vec![factory]).unwrap());
+        let port = Arc::new(CatalogApplicationService::unavailable(
+            Arc::clone(&control),
+            Arc::new(TestRuntimePublisher),
+            runtime,
+            Arc::new(TestReferenceReader),
+        ));
+        let instance = ConnectorInstanceId::parse("catalog.lifecycle").unwrap();
+        let identity = Uuid::now_v7();
+        let entry = |identity, credential_generation| {
+            CatalogDesiredStateEntry::new(
+                crate::CatalogSourceEntryIdentity::new(identity),
+                crate::CatalogLogicalConfig::try_new(
+                    instance.clone(),
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    "Lifecycle",
+                    vec![(
+                        "iceberg.catalog.warehouse".to_string(),
+                        warehouse.path().display().to_string(),
+                    )],
+                    vec![
+                        CatalogCredentialBinding::try_new(
+                            CatalogCredentialPurpose::CatalogControl,
+                            CredentialConsumerRole::Frontend,
+                            CatalogCredentialMode::Static(
+                                StaticCredentialReference::try_new(
+                                    "control",
+                                    credential_generation,
+                                )
+                                .unwrap(),
+                            ),
+                        )
+                        .unwrap(),
+                    ],
+                    1,
+                )
+                .unwrap(),
+            )
+        };
+        let first_entry = entry(identity, "v1");
+        let mode = CatalogDesiredStateSourceMode::DynamicStateStore;
+        let (_, first_work) = port
+            .submit_materialization(first_entry.clone(), mode, None)
+            .unwrap();
+        let first_work = first_work.expect("G1 submission");
+        let scoped_owner = Arc::clone(&first_work.factory);
+        port.run_materialization(first_work).await;
+        let first = control.acquire_current(&instance).expect("real G1 lease");
+        let first_runtime = first.binding().control_runtime_id();
+        let sources = port.catalog_activity_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        let first_activity = sources[0]
+            .reader
+            .as_ref()
+            .expect("Iceberg reader")
+            .snapshot();
+        assert_eq!(first_activity.source_entry_id, identity);
+        assert_eq!(first_activity.generations.len(), 1);
+        assert_eq!(
+            first_activity.generations[0].generation.unwrap().as_bytes(),
+            &first.binding().incarnation().to_bytes()
+        );
+        drop(sources);
+
+        let first_properties = first.binding().catalog_properties().unwrap().clone();
+        assert_eq!(
+            first_properties.credential_bindings(),
+            first_entry.config().credential_bindings()
+        );
+
+        // A temporary loss of freshness retires G1, but does not retire the
+        // logical domain that G1's already-admitted operation still needs.
+        port.unpublish_all();
+        assert!(control.acquire_current(&instance).is_err());
+        let (_, second_work) = port
+            .submit_materialization(entry(identity, "v2"), mode, None)
+            .unwrap();
+        let second_work = second_work.expect("G2 submission");
+        assert!(Arc::ptr_eq(&scoped_owner, &second_work.factory));
+        assert_ne!(
+            first_properties,
+            *second_work.properties.as_catalog_properties()
+        );
+        port.run_materialization(second_work).await;
+        let second = control.acquire_current(&instance).expect("real G2 lease");
+        assert_ne!(first_runtime, second.binding().control_runtime_id());
+        let sources = port.catalog_activity_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        let both = sources[0].reader.as_ref().unwrap().snapshot();
+        assert_eq!(both.generations.len(), 2);
+        for lease in [&first, &second] {
+            assert!(
+                both.generations
+                    .iter()
+                    .any(|row| row.generation.unwrap().as_bytes()
+                        == &lease.binding().incarnation().to_bytes())
+            );
+        }
+        drop(sources);
+
+        assert_eq!(
+            first.binding().catalog_properties().unwrap(),
+            &first_properties
+        );
+        assert_ne!(
+            first
+                .binding()
+                .catalog_properties()
+                .unwrap()
+                .credential_bindings(),
+            second
+                .binding()
+                .catalog_properties()
+                .unwrap()
+                .credential_bindings()
+        );
+
+        // Configuration/credential replacement alone also changes the runtime
+        // while retaining the same catalog scope, without requiring an outage.
+        let (_, third_work) = port
+            .submit_materialization(entry(identity, "v3"), mode, None)
+            .unwrap();
+        let third_work = third_work.expect("changed definition requires G3");
+        assert!(Arc::ptr_eq(&scoped_owner, &third_work.factory));
+        port.run_materialization(third_work).await;
+        assert_eq!(first.binding().control_runtime_id(), first_runtime);
+
+        // A genuinely new attachment separates domains even with the same
+        // name and a still-live exact lease from the old attachment.
+        let (_, replacement) = port
+            .submit_materialization(entry(Uuid::now_v7(), "v3"), mode, None)
+            .unwrap();
+        let replacement = replacement.expect("new attachment");
+        assert!(!Arc::ptr_eq(&scoped_owner, &replacement.factory));
+        port.run_materialization(replacement).await;
+        let sources = port.catalog_activity_sources().unwrap();
+        assert_eq!(
+            sources.len(),
+            2,
+            "replacement cannot hide the retained old scope"
+        );
+        assert_eq!(sources.iter().filter(|s| s.current).count(), 1);
+        assert!(
+            sources
+                .iter()
+                .any(|s| !s.current && s.identity.source_entry_id() == identity)
+        );
+        let current = sources.iter().find(|s| s.current).unwrap();
+        assert_ne!(current.identity.source_entry_id(), identity);
+        assert_eq!(
+            current
+                .reader
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .generations
+                .len(),
+            1
+        );
+        drop(sources);
+        drop(first);
+        drop(second);
+        port.retire_projection(&instance);
+        assert!(port.catalog_materializers.lock().unwrap().is_empty());
+    }
+
+    mod generation_expiry_ref {
+        use super::*;
+        use novarocks_connector_iceberg::access_binding::{
+            IcebergReadBinding, IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+        };
+        use novarocks_connector_iceberg::{IcebergControlRoleBindingFactory, iceberg};
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        use novarocks_spi::connector::{
+            CatalogActivityPhase, ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutationResolver, ConnectorError, ConnectorErrorKind,
+            ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceOperation,
+            ConnectorMetadataMaintenanceResolver, ConnectorMutationFailureKind,
+            ConnectorMutationOperationId, ConnectorRefAction, ConnectorRefKind,
+            ConnectorRequestContext, ConnectorStopOwner, ConnectorTableHandle,
+            ConnectorTableIdentity, CreateOrReplacePolicy, ExternalMutationEffect,
+            ExternalMutationOutcome,
+        };
+        use serde_json::{Value, json};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Condvar, atomic::AtomicBool};
+
+        struct Identity;
+        impl IcebergStaticCredentialResolver for Identity {
+            fn resolve_object_store_static(
+                &self,
+                _: &StaticCredentialReference,
+            ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, ConnectorError> {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "No object-store identity in this local fixture",
+                ))
+            }
+            fn resolve_catalog_control(
+                &self,
+                reference: &StaticCredentialReference,
+            ) -> Result<IcebergRestAuthMaterial, ConnectorError> {
+                Ok(IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new(format!(
+                        "generation-{}",
+                        reference.generation()
+                    )),
+                })
+            }
+        }
+        #[derive(Clone)]
+        struct Request {
+            method: String,
+            path: String,
+            authorization: String,
+            body: Value,
+        }
+        struct State {
+            tables: BTreeMap<String, Value>,
+            records: Vec<Request>,
+            expiry_entered: bool,
+        }
+        struct Server {
+            address: std::net::SocketAddr,
+            state: Arc<Mutex<State>>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+            stop: Arc<AtomicBool>,
+            acceptor: Option<std::thread::JoinHandle<()>>,
+            connections: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+        }
+        impl Server {
+            fn start(tables: BTreeMap<String, Value>) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let address = listener.local_addr().unwrap();
+                let state = Arc::new(Mutex::new(State {
+                    tables,
+                    records: vec![],
+                    expiry_entered: false,
+                }));
+                let release = Arc::new((Mutex::new(false), Condvar::new()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let connections = Arc::new(Mutex::new(vec![]));
+                let (s, r, done, joins) = (
+                    state.clone(),
+                    release.clone(),
+                    stop.clone(),
+                    connections.clone(),
+                );
+                let acceptor = std::thread::spawn(move || {
+                    while !done.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let (s, r) = (s.clone(), r.clone());
+                                joins
+                                    .lock()
+                                    .unwrap()
+                                    .push(std::thread::spawn(move || Self::respond(stream, s, r)));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1))
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    }
+                });
+                Self {
+                    address,
+                    state,
+                    release,
+                    stop,
+                    acceptor: Some(acceptor),
+                    connections,
+                }
+            }
+            fn respond(
+                mut stream: TcpStream,
+                state: Arc<Mutex<State>>,
+                release: Arc<(Mutex<bool>, Condvar)>,
+            ) {
+                // Accepted sockets can inherit the listener's nonblocking mode
+                // on macOS. Each owned connection uses blocking, bounded I/O.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = vec![];
+                let head_end = loop {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                    assert!(bytes.len() < 65536);
+                };
+                let head = String::from_utf8(bytes[..head_end].to_vec()).unwrap();
+                let mut first = head.lines().next().unwrap().split_whitespace();
+                let method = first.next().unwrap().to_owned();
+                let path = first.next().unwrap().split('?').next().unwrap().to_owned();
+                let headers: BTreeMap<_, _> = head
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_owned()))
+                    .collect();
+                let length: usize = headers
+                    .get("content-length")
+                    .map(|v| v.parse().unwrap())
+                    .unwrap_or(0);
+                while bytes.len() - head_end < length {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let body = if length == 0 {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes[head_end..head_end + length]).unwrap()
+                };
+                let request = Request {
+                    method: method.clone(),
+                    path: path.clone(),
+                    authorization: headers.get("authorization").cloned().unwrap_or_default(),
+                    body,
+                };
+                let expiry = method == "POST"
+                    && request.body["updates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|update| update["action"] == "remove-snapshot-ref");
+                {
+                    let mut state = state.lock().unwrap();
+                    state.records.push(request.clone());
+                    if expiry {
+                        state.expiry_entered = true;
+                    }
+                }
+                if expiry {
+                    let (lock, changed) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = changed.wait(released).unwrap();
+                    }
+                }
+                let response = if path == "/v1/config" {
+                    json!({"defaults":{},"overrides":{}})
+                } else {
+                    let name = path.rsplit('/').next().unwrap();
+                    let mut state = state.lock().unwrap();
+                    let response = state
+                        .tables
+                        .get_mut(name)
+                        .expect("only declared tables are requested");
+                    if method == "POST" {
+                        let previous = response["metadata-location"].as_str().unwrap().to_owned();
+                        let previous_time =
+                            response["metadata"]["last-updated-ms"].as_i64().unwrap();
+                        let version = response["metadata"]["metadata-log"]
+                            .as_array()
+                            .unwrap()
+                            .len()
+                            + 2;
+                        for update in request.body["updates"].as_array().unwrap() {
+                            match update["action"].as_str().unwrap() {
+                                "remove-snapshot-ref" => {
+                                    response["metadata"]["refs"]
+                                        .as_object_mut()
+                                        .unwrap()
+                                        .remove(update["ref-name"].as_str().unwrap());
+                                }
+                                "set-snapshot-ref" => {
+                                    response["metadata"]["refs"]
+                                        [update["ref-name"].as_str().unwrap()] = json!({"snapshot-id":update["snapshot-id"],"type":update["type"]});
+                                }
+                                "set-properties" => {
+                                    for (key, value) in update["updates"].as_object().unwrap() {
+                                        response["metadata"]["properties"][key] = value.clone();
+                                    }
+                                }
+                                other => panic!("unexpected publication update {other}"),
+                            }
+                        }
+                        if expiry {
+                            // A refreshed success may include a later writer's head.
+                            // The waiting G2 must use 3, never its pre-lock head 2.
+                            let mut snapshot = response["metadata"]["snapshots"][1].clone();
+                            snapshot["snapshot-id"] = json!(3);
+                            snapshot["parent-snapshot-id"] = json!(2);
+                            snapshot["sequence-number"] = json!(3);
+                            snapshot["manifest-list"] = json!(format!(
+                                "{}/list-3.avro",
+                                response["metadata"]["location"].as_str().unwrap()
+                            ));
+                            response["metadata"]["snapshots"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(snapshot);
+                            response["metadata"]["current-snapshot-id"] = json!(3);
+                            response["metadata"]["last-sequence-number"] = json!(3);
+                            response["metadata"]["refs"]["main"]["snapshot-id"] = json!(3);
+                        }
+                        response["metadata"]["metadata-log"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"timestamp-ms":previous_time,"metadata-file":previous}));
+                        response["metadata"]["last-updated-ms"] = json!(previous_time + 1);
+                        let next = format!(
+                            "{}/v{version}.metadata.json",
+                            response["metadata"]["location"].as_str().unwrap()
+                        );
+                        std::fs::write(&next, serde_json::to_vec(&response["metadata"]).unwrap())
+                            .unwrap();
+                        response["metadata-location"] = json!(next);
+                    }
+                    response.clone()
+                };
+                let body = serde_json::to_vec(&response).unwrap();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).and_then(|_| stream.write_all(&body));
+            }
+            fn release(&self) {
+                let (lock, changed) = &*self.release;
+                *lock.lock().unwrap() = true;
+                changed.notify_all();
+            }
+            fn posts(&self, name: &str) -> Vec<Request> {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .records
+                    .iter()
+                    .filter(|r| r.method == "POST" && r.path.ends_with(&format!("/tables/{name}")))
+                    .cloned()
+                    .collect()
+            }
+        }
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.release();
+                self.stop.store(true, Ordering::SeqCst);
+                self.acceptor.take().unwrap().join().unwrap();
+                let mut panicked = false;
+                for connection in self.connections.lock().unwrap().drain(..) {
+                    panicked |= connection.join().is_err();
+                }
+                if !std::thread::panicking() {
+                    assert!(!panicked, "fixture connection thread panicked");
+                }
+            }
+        }
+        fn context(stop: &ConnectorStopOwner, budget: Duration) -> ConnectorRequestContext {
+            ConnectorRequestContext::try_new(
+                Instant::now() + budget,
+                stop.view(),
+                64 * 1024,
+                1024 * 1024,
+            )
+            .unwrap()
+        }
+        async fn until(mut predicate: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !predicate() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("controlled stage did not arrive");
+        }
+        fn tag(
+            lease: ConnectorCatalogMutationLease,
+            instance: ConnectorInstanceId,
+            table: &str,
+            name: &str,
+            context: ConnectorRequestContext,
+        ) -> impl FnOnce() -> Result<
+            ExternalMutationOutcome<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+            ConnectorError,
+        > + Send
+        + 'static {
+            let operation = ConnectorCatalogMutationOperation::AlterRef {
+                table: ConnectorTableIdentity {
+                    instance_id: instance,
+                    namespace: "db".into(),
+                    table: table.into(),
+                },
+                action: ConnectorRefAction::Create {
+                    kind: ConnectorRefKind::Tag,
+                    name: name.into(),
+                    snapshot_id: None,
+                    policy: CreateOrReplacePolicy::FailIfExists,
+                    expected_table_uuid: None,
+                },
+            };
+            move || lease.execute_operation(ConnectorMutationOperationId::new(), operation, context)
+        }
+        fn assert_stopped(
+            outcome: Result<
+                ExternalMutationOutcome<novarocks_spi::connector::ConnectorCatalogMutationReceipt>,
+                ConnectorError,
+            >,
+            expected: ConnectorMutationFailureKind,
+        ) {
+            let ExternalMutationOutcome::KnownUncommitted { failure, .. } = outcome.unwrap() else {
+                panic!("waiting mutation must be definitely undispatched")
+            };
+            assert_eq!(failure.kind(), expected);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn real_service_generations_serialize_expiry_and_refs_with_fresh_authenticated_observations()
+         {
+            let warehouse = tempfile::tempdir().unwrap();
+            let io = iceberg::io::FileIO::new_with_fs();
+            let mut tables = BTreeMap::new();
+            for (name, uuid) in [("t", Uuid::from_u128(1)), ("other", Uuid::from_u128(2))] {
+                let location = warehouse.path().canonicalize().unwrap().join(name);
+                std::fs::create_dir_all(&location).unwrap();
+                for id in 1..=3 {
+                    iceberg::spec::ManifestListWriter::v2(
+                        io.new_output(location.join(format!("list-{id}.avro")).to_str().unwrap())
+                            .unwrap()
+                            .writer()
+                            .await
+                            .unwrap(),
+                        id,
+                        (id > 1).then_some(id - 1),
+                        id,
+                    )
+                    .close()
+                    .await
+                    .unwrap();
+                }
+                let schema = iceberg::spec::Schema::builder()
+                    .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                    ))])
+                    .build()
+                    .unwrap();
+                let metadata = iceberg::spec::TableMetadataBuilder::new(
+                    schema,
+                    iceberg::spec::PartitionSpec::unpartition_spec(),
+                    iceberg::spec::SortOrder::unsorted_order(),
+                    location.display().to_string(),
+                    iceberg::spec::FormatVersion::V2,
+                    Default::default(),
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+                let mut metadata = serde_json::to_value(metadata).unwrap();
+                metadata["table-uuid"] = json!(uuid);
+                metadata["last-updated-ms"] = json!(1700000000000_i64);
+                metadata["last-sequence-number"] = json!(2);
+                metadata["current-snapshot-id"] = json!(2);
+                metadata["snapshots"] = json!([
+                    {"snapshot-id":1,"sequence-number":1,"timestamp-ms":1,"manifest-list":location.join("list-1.avro"),"schema-id":0,"summary":{"operation":"append"}},
+                    {"snapshot-id":2,"parent-snapshot-id":1,"sequence-number":2,"timestamp-ms":2,"manifest-list":location.join("list-2.avro"),"schema-id":0,"summary":{"operation":"append"}}
+                ]);
+                metadata["refs"] = json!({"main":{"snapshot-id":2,"type":"branch"},"expired":{"snapshot-id":1,"type":"tag","max-ref-age-ms":1}});
+                metadata["metadata-log"] = json!([]);
+                let _: iceberg::spec::TableMetadata =
+                    serde_json::from_value(metadata.clone()).unwrap();
+                let path = location.join("v1.metadata.json");
+                std::fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+                tables.insert(
+                    name.to_owned(),
+                    json!({"metadata-location":path,"metadata":metadata}),
+                );
+            }
+            let server = Server::start(tables);
+            let runtime = tokio::runtime::Handle::current();
+            let fs = novarocks_fs::FsAccessResources::new(
+                Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
+                FsAccessResolver::new(),
+                Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+                Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+            );
+            let access = IcebergReadBinding::with_static_metadata_credential_resolver(
+                fs,
+                Arc::new(Identity),
+            );
+            let factory = Arc::new(IcebergControlRoleBindingFactory::new(
+                novarocks_connector_iceberg::resources::IcebergMetadataResources::new(
+                    access,
+                    runtime.clone(),
+                ),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            ));
+            let control =
+                Arc::new(ConnectorControlHost::with_role_factories(vec![factory]).unwrap());
+            let port = Arc::new(CatalogApplicationService::unavailable(
+                control.clone(),
+                Arc::new(TestRuntimePublisher),
+                runtime,
+                Arc::new(TestReferenceReader),
+            ));
+            let instance = ConnectorInstanceId::parse("catalog.generation-race").unwrap();
+            let identity = Uuid::now_v7();
+            let entry = |version| {
+                CatalogDesiredStateEntry::new(
+                    crate::CatalogSourceEntryIdentity::new(identity),
+                    crate::CatalogLogicalConfig::try_new(
+                        instance.clone(),
+                        ConnectorProviderId::parse("iceberg").unwrap(),
+                        "Generation race",
+                        vec![
+                            ("iceberg.catalog.type".into(), "rest".into()),
+                            ("uri".into(), format!("http://{}", server.address)),
+                            (
+                                "iceberg.catalog.warehouse".into(),
+                                warehouse.path().display().to_string(),
+                            ),
+                        ],
+                        vec![
+                            CatalogCredentialBinding::try_new(
+                                CatalogCredentialPurpose::CatalogControl,
+                                CredentialConsumerRole::Frontend,
+                                CatalogCredentialMode::Static(
+                                    StaticCredentialReference::try_new("control", version).unwrap(),
+                                ),
+                            )
+                            .unwrap(),
+                        ],
+                        1,
+                    )
+                    .unwrap(),
+                )
+            };
+            let mode = CatalogDesiredStateSourceMode::DynamicStateStore;
+            let (_, work) = port
+                .submit_materialization(entry("v1"), mode, None)
+                .unwrap();
+            port.run_materialization(work.unwrap()).await;
+            let first = control
+                .acquire_current_metadata_maintenance(&instance)
+                .unwrap();
+            // This request-only handle freezes names, never a guessed UUID/base.
+            // The real provider plans and executes against its fresh catalog facts.
+            let handle = ConnectorTableHandle::try_new(instance.clone(), bytes::Bytes::from_static(br#"{"namespace":"db","table":"t","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#)).unwrap();
+            let stop = ConnectorStopOwner::new();
+            let planning = context(&stop, Duration::from_secs(20));
+            let plan = first
+                .plan_operation(
+                    ConnectorMutationOperationId::new(),
+                    ConnectorMetadataMaintenanceOperation::expire_table_versions(
+                        handle,
+                        Some(i64::MAX),
+                        Some(2),
+                    )
+                    .unwrap(),
+                    planning.clone(),
+                )
+                .unwrap();
+            let first_id = first.control_runtime_id();
+            let expiry = tokio::task::spawn_blocking(move || {
+                first.execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, planning).unwrap(),
+                )
+            });
+            until(|| server.state.lock().unwrap().expiry_entered).await;
+            assert_eq!(server.posts("t").len(), 1);
+            port.unpublish_all();
+            let (_, work) = port
+                .submit_materialization(entry("v2"), mode, None)
+                .unwrap();
+            port.run_materialization(work.unwrap()).await;
+            let second_generation = control.acquire_current(&instance).unwrap();
+            assert_ne!(second_generation.binding().control_runtime_id(), first_id);
+            let second_epoch =
+                Uuid::from_bytes(second_generation.binding().incarnation().to_bytes());
+            let second = control.acquire_current_mutation(&instance).unwrap();
+            let waiting_count = || {
+                port.catalog_activity_sources()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|source| source.reader.as_ref())
+                    .flat_map(|reader| reader.snapshot().generations)
+                    .filter(|generation| generation.generation == Some(second_epoch))
+                    .map(|generation| {
+                        generation
+                            .phases
+                            .iter()
+                            .find(|phase| phase.phase == CatalogActivityPhase::TableCoordination)
+                            .unwrap()
+                            .inflight
+                    })
+                    .sum::<u64>()
+            };
+            let waiting = tokio::task::spawn_blocking(tag(
+                second.clone(),
+                instance.clone(),
+                "t",
+                "after",
+                context(&stop, Duration::from_secs(20)),
+            ));
+            until(|| waiting_count() == 1).await;
+            assert!(!waiting.is_finished());
+            assert_eq!(
+                server.posts("t").len(),
+                1,
+                "G2 must not dispatch through G1's live lock"
+            );
+            let other = tokio::task::spawn_blocking(tag(
+                second.clone(),
+                instance.clone(),
+                "other",
+                "parallel",
+                context(&stop, Duration::from_secs(10)),
+            ));
+            assert!(matches!(
+                other.await.unwrap().unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert_eq!(server.posts("other").len(), 1);
+            assert_eq!(server.posts("t").len(), 1);
+            let cancelled = ConnectorStopOwner::new();
+            let cancel_task = tokio::task::spawn_blocking(tag(
+                second.clone(),
+                instance.clone(),
+                "t",
+                "cancelled",
+                context(&cancelled, Duration::from_secs(10)),
+            ));
+            until(|| waiting_count() == 2).await;
+            cancelled.request_stop();
+            assert_stopped(
+                cancel_task.await.unwrap(),
+                ConnectorMutationFailureKind::Cancelled,
+            );
+            let deadline_task = tokio::task::spawn_blocking(tag(
+                second,
+                instance.clone(),
+                "t",
+                "expired-waiter",
+                context(&stop, Duration::from_millis(200)),
+            ));
+            until(|| waiting_count() == 2).await;
+            assert_stopped(
+                deadline_task.await.unwrap(),
+                ConnectorMutationFailureKind::DeadlineExceeded,
+            );
+            assert_eq!(waiting_count(), 1);
+            assert_eq!(server.posts("t").len(), 1);
+            let release_index = server.state.lock().unwrap().records.len();
+            server.release();
+            assert!(matches!(
+                expiry.await.unwrap().unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                waiting.await.unwrap().unwrap(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ));
+            assert_eq!(waiting_count(), 0);
+            let posts = server.posts("t");
+            assert_eq!(posts.len(), 2);
+            assert_eq!(posts[0].authorization, "Bearer generation-v1");
+            assert_eq!(posts[1].authorization, "Bearer generation-v2");
+            let set_ref = posts[1].body["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|update| update["action"] == "set-snapshot-ref")
+                .unwrap();
+            assert_eq!(set_ref["ref-name"], "after");
+            assert_eq!(
+                set_ref["snapshot-id"], 3,
+                "G2 must lower from the post-lock fresh head"
+            );
+            let state = server.state.lock().unwrap();
+            assert!(
+                state.records[release_index..]
+                    .iter()
+                    .any(|r| r.method == "GET"
+                        && r.path.ends_with("/tables/t")
+                        && r.authorization == "Bearer generation-v2")
+            );
+            assert_eq!(
+                state.tables["t"]["metadata"]["refs"]["after"]["snapshot-id"],
+                3
+            );
+            assert!(
+                state.tables["t"]["metadata"]["refs"]
+                    .get("cancelled")
+                    .is_none()
+            );
+            assert!(
+                state.tables["t"]["metadata"]["refs"]
+                    .get("expired-waiter")
+                    .is_none()
+            );
+            drop(state);
+            // Server Drop releases any gate and joins every actual HTTP thread.
+            drop(server);
+        }
     }
 }

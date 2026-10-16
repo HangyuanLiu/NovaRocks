@@ -21,7 +21,9 @@
 This check intentionally reasons over Cargo's normal, build, and dev graphs
 instead of source-file counts.  The provider may use the neutral filesystem
 and SPI contracts, but it must not acquire an application, execution, role, or
-other concrete-provider dependency through any dependency kind.
+other concrete-provider dependency through any dependency kind. The REST SDK
+is allowed for dev interoperability fixtures but absent from both the provider
+and production server's normal/build closures, across root features/targets.
 """
 
 import argparse
@@ -34,6 +36,7 @@ from pathlib import Path
 PROVIDER = "novarocks-connector-iceberg"
 SERVER = "novarocks-server"
 FRONTEND_APPLICATION = "novarocks-frontend-application"
+REST_SDK = "iceberg-catalog-rest"
 
 FORBIDDEN_PROVIDER_CLOSURE = {
     "novarocks",
@@ -43,6 +46,9 @@ FORBIDDEN_PROVIDER_CLOSURE = {
     "novarocks-connector-starrocks",
 }
 ALLOWED_PROVIDER_INTERNAL = {
+    "novarocks-connector-contract",
+    "novarocks-type-contract",
+    "novarocks-failpoint",
     "novarocks-connector-iceberg-functions",
     "novarocks-fs",
     "novarocks-proto-codec",
@@ -87,25 +93,38 @@ def dependency_names(item, kinds):
     }
 
 
-def graph_names(manifest_path, package_name):
-    output = cargo_output(
-        manifest_path,
+def graph_names(manifest_path, package_name, kinds="normal,build,dev", *, production=False):
+    arguments = [
         "tree",
         "-p",
         package_name,
         "-e",
-        "normal,build,dev",
+        kinds,
         "--prefix",
         "none",
         "--format",
         "{p}",
-    )
+    ]
+    if production:
+        # The production boundary includes cfg-specific and feature-selected
+        # normal/build paths, but never dev edges or unrelated workspace roots.
+        arguments.extend(["--target", "all", "--all-features"])
+    output = cargo_output(manifest_path, *arguments)
     names = set()
     for line in output.splitlines():
         value = line.strip().split(" ", 1)[0]
         if value:
             names.add(value.split(" v", 1)[0])
+    if package_name not in names:
+        fail(f"Cargo dependency graph is missing its selected root: {package_name}")
     return names
+
+
+def verify_no_production_rest_sdk(manifest_path):
+    for root in (PROVIDER, SERVER):
+        closure = graph_names(manifest_path, root, "normal,build", production=True)
+        if REST_SDK in closure:
+            fail(f"{root} normal/build closure contains forbidden REST SDK: {REST_SDK}")
 
 
 def verify_provider(manifest_path, metadata):
@@ -148,6 +167,7 @@ def main():
     )
     verify_provider(manifest_path, metadata)
     verify_roles(metadata)
+    verify_no_production_rest_sdk(manifest_path)
     print("Iceberg provider dependency boundary: PASS")
 
 

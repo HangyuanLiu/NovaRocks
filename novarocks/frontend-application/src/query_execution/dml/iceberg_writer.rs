@@ -131,22 +131,9 @@ pub(crate) fn prepare_iceberg_write_with_options(
         planning_lease,
     );
 
-    // 2. Write-support validation belongs to the Provider.
-    //
-    // These guards reject table shapes this writer cannot encode: unresolvable
-    // default sort order, variant in partition spec or sort order, evolved
-    // partition specs under INSERT OVERWRITE, pre-existing equality deletes
-    // under INSERT OVERWRITE, unpartitioned targets under OVERWRITE PARTITIONS,
-    // and pre-v3 tables under a branch write. Every one of them is an Iceberg
-    // fact read off table metadata, so they now run inside
-    // `ConnectorWriteControl::prepare_write` against the frozen admitted
-    // metadata, and this layer no longer loads a table to answer them.
-    //
-    // Rejection set is unchanged. Two observable differences, both recorded in
-    // the plan: the message now carries the `Iceberg write admission denied:`
-    // prefix the SPI `Denied` outcome adds, and the guards fire after column
-    // shaping rather than before it, so a statement that violates both a guard
-    // and its column list now surfaces the column-list error first.
+    // 2. Provider admission runs on the exact frozen table before source
+    // shaping renders any SQL casts. Unsupported target types must be refused
+    // by their provider even when SQL has no DDL spelling for that type.
 
     prepare_iceberg_distributed_write(
         state,
@@ -184,8 +171,16 @@ fn prepare_iceberg_distributed_write(
         crate::query_execution::planning::sql_compile_control_from_connector_request(
             connector_context,
         );
-    let (query, write_columns, source_constants) = build_iceberg_write_plan(
-        target,
+    let intent = match overwrite_mode {
+        IcebergWriteMode::Append => ConnectorWriteIntent::Append,
+        IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
+        IcebergWriteMode::DynamicPartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
+    };
+    let (query, source_constants, input) = build_iceberg_write_plan(
+        &write_lease,
+        target_ref,
+        intent,
+        connector_context,
         resolved,
         insert_columns,
         source,
@@ -193,26 +188,6 @@ fn prepare_iceberg_distributed_write(
         state.constant_policy(),
         &source_control,
     )?;
-    let intent = match overwrite_mode {
-        IcebergWriteMode::Append => ConnectorWriteIntent::Append,
-        IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
-        IcebergWriteMode::DynamicPartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
-    };
-    let input = ConnectorWriteInputRequest::Data {
-        fields: write_columns
-            .iter()
-            .map(|column| {
-                let value_type = column
-                    .declared_value_type()
-                    .map_err(|error| error.to_string())?;
-                let field = value_type
-                    .try_to_field(&column.name)
-                    .map_err(|error| error.to_string())?;
-                ConnectorWriteFieldRequest::try_new_typed(field, value_type)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-    };
     // One logical data branch, admitted on the same generation that resolved
     // the target. The session is opened before the plan is compiled because it
     // owns the recipes that plan's writer node carries.
@@ -496,14 +471,14 @@ struct FrozenIcebergWriteSemanticBinding {
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
-/// Build the `(query, Arrow write layout)` pair for an iceberg INSERT/OVERWRITE write
-/// without driving a transaction. The frontend INSERT adapter consumes this
-/// plan through its DML-owned runner; the folded MERGE not-matched INSERT
-/// branch runs the same pair into a shared collector so the INSERT commits in
-/// the same snapshot as the matched branch. Both callers share one query/sink
-/// construction to avoid semantic drift.
+/// Admit the complete provider-declared input before shaping INSERT source
+/// expressions. This opens no write session and performs no external effect.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_iceberg_write_plan(
-    target: &TargetBackend,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    target_ref: &str,
+    intent: ConnectorWriteIntent,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     resolved: &ResolvedTable,
     insert_columns: &[String],
     source: &Query,
@@ -513,8 +488,8 @@ pub(crate) fn build_iceberg_write_plan(
 ) -> Result<
     (
         Query,
-        Vec<ColumnDef>,
         Option<novarocks_sql::compiler::SqlExpressionConstants>,
+        ConnectorWriteInputRequest,
     ),
     String,
 > {
@@ -522,6 +497,41 @@ pub(crate) fn build_iceberg_write_plan(
         metadata,
         &write_defaults_by_name(&resolved.columns),
     )?;
+    let input = ConnectorWriteInputRequest::Data {
+        fields: write_columns
+            .iter()
+            .map(|column| {
+                let value_type = column
+                    .declared_value_type()
+                    .map_err(|error| error.to_string())?;
+                let field = value_type
+                    .try_to_field(&column.name)
+                    .map_err(|error| error.to_string())?;
+                ConnectorWriteFieldRequest::try_new_typed(field, value_type)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    };
+    // This admission trait signs input and checks provider-owned frozen facts;
+    // it cannot open writers, register a session, or perform an external effect.
+    // Keep the original request for begin_write after shaping succeeds.
+    match write_lease
+        .prepare_write(novarocks_spi::connector::ConnectorWritePreparationRequest {
+            table: metadata.table.clone(),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
+                .map_err(|error| error.to_string())?,
+            intent,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: input.clone(),
+            context: connector_context.clone(),
+        })
+        .map_err(|error| error.to_string())?
+    {
+        novarocks_spi::connector::ConnectorWritePreparationOutcome::Prepared(_) => (),
+        novarocks_spi::connector::ConnectorWritePreparationOutcome::Denied(error) => {
+            return Err(format!("Iceberg write admission denied: {error}"));
+        }
+    }
     let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
     let (query, constants) = match crate::dml::insert::shape_insert_source_with_constants(
         source,
@@ -542,8 +552,7 @@ pub(crate) fn build_iceberg_write_plan(
             None,
         ),
     };
-    let _ = target;
-    Ok((query, write_columns, constants))
+    Ok((query, constants, input))
 }
 
 /// A connector read schema can carry execution-only fields (for example
@@ -1073,7 +1082,7 @@ mod tests {
         }
     }
 
-    fn write_metadata(
+    pub(super) fn write_metadata(
         fields: Vec<Field>,
         bindings: Vec<novarocks_type_contract::FunctionValueType>,
     ) -> novarocks_spi::connector::ConnectorTableMetadata {
@@ -1322,7 +1331,7 @@ mod tests {
         );
     }
 
-    fn parse_query(sql: &str) -> Query {
+    pub(super) fn parse_query(sql: &str) -> Query {
         let statements = novarocks_parser::parse(sql).expect("parse query");
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected exactly one query statement");
@@ -1788,5 +1797,148 @@ mod tests {
             !rendered.contains("CAST(CAST(NULL"),
             "omitted complex columns must not produce nested casts, got: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_admission_before_shaping_tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorWriteControl,
+        ConnectorWriteLease, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+        ProviderBindingEpoch,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Control {
+        key: ConnectorProviderBindingKey,
+        calls: AtomicUsize,
+        failure: Option<ConnectorErrorKind>,
+    }
+    impl ConnectorWriteControl for Control {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
+            &self.key
+        }
+        fn prepare_write(
+            &self,
+            request: ConnectorWritePreparationRequest,
+        ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let ConnectorWriteInputRequest::Data { fields } = request.input else {
+                panic!("data admission")
+            };
+            assert_eq!(fields.len(), 1);
+            assert_eq!(
+                fields[0].execution_type().unwrap().logical_type(),
+                novarocks_type_contract::ValueLogicalType::Uuid
+            );
+            if let Some(kind) = self.failure {
+                return Err(ConnectorError::new(kind, "original provider refusal"));
+            }
+            Ok(ConnectorWritePreparationOutcome::Denied(
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Iceberg uuid writes are not supported",
+                ),
+            ))
+        }
+    }
+    fn run(failure: Option<ConnectorErrorKind>) -> (String, Arc<Control>) {
+        let value = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            arrow::datatypes::DataType::FixedSizeBinary(16),
+            true,
+            novarocks_type_contract::ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        let metadata =
+            super::tests::write_metadata(vec![value.try_to_field("key").unwrap()], vec![value]);
+        let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new()).unwrap();
+        // This source cannot be shaped without inventing a SQL UUID spelling.
+        let source = super::tests::parse_query("SELECT NULL");
+        assert!(
+            append_source_to_query_for_write(&source, &[], &columns, &columns)
+                .unwrap_err()
+                .contains("UUID has no SQL DDL type spelling")
+        );
+        let target = TargetBackend {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            catalog: "writer_domain_test".into(),
+            namespace: "db".into(),
+            table: "target".into(),
+        };
+        let resolved = ResolvedTable {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            columns,
+            statistics_pin: None,
+        };
+        let control = Arc::new(Control {
+            key: ConnectorProviderBindingKey {
+                instance_id: metadata.table.owner().clone(),
+                incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+            },
+            calls: AtomicUsize::new(0),
+            failure,
+        });
+        let lease = ConnectorWriteLease::new(control.key.clone(), control.clone(), || {}).unwrap();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::default();
+        let context = novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            stop.view(),
+            64 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+        let policy = novarocks_functions::ConstantPolicy {
+            max_rows: 100,
+            max_array_nodes: 1000,
+            max_logical_elements: 1000,
+            max_retained_buffer_bytes: 1024 * 1024,
+            max_type_depth: 64,
+            max_type_nodes: 1000,
+            max_dictionary_depth: 4,
+            max_metadata_bytes: 64 * 1024,
+            max_library_validation_work: 10000,
+            max_library_validation_bytes: 1024 * 1024,
+        };
+        let error = build_iceberg_write_plan(
+            &lease,
+            "main",
+            ConnectorWriteIntent::Append,
+            &context,
+            &resolved,
+            &[],
+            &source,
+            &metadata,
+            policy,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        );
+        let error = match error {
+            Err(error) => error,
+            Ok(_) => panic!("provider refusal must precede source shaping"),
+        };
+        (error, control)
+    }
+    #[test]
+    fn provider_uuid_denial_precedes_sql_cast_rendering_without_starting_a_session() {
+        let (error, control) = run(None);
+        assert!(error.contains("Iceberg uuid writes are not supported"));
+        assert!(!error.contains("UUID has no SQL DDL type spelling"));
+        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn provider_resource_and_control_refusals_are_not_replaced_by_sql_shaping() {
+        for kind in [
+            ConnectorErrorKind::ResourceExhausted,
+            ConnectorErrorKind::Cancelled,
+            ConnectorErrorKind::DeadlineExceeded,
+        ] {
+            let (error, control) = run(Some(kind));
+            assert_eq!(
+                error,
+                ConnectorError::new(kind, "original provider refusal").to_string()
+            );
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+        }
     }
 }

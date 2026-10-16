@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0179
+    scope: "SDK session and generic mutation facade ownership, caller deadline after dispatch and FE staged-result projection; authentication, header provenance, frozen routing and redaction rules remain active"
+    link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"
   - id: ADR-0176
     scope: "Compromise that the REST-only core patches (staged-create initialization updates, AddSchema.last_column_id, view API) remain and that stage and view requests use their types: the patches are deleted and the Connector owns that vocabulary"
     link: "ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md"
@@ -23,20 +26,20 @@ provenance:
 code-anchors:
   - "novarocks/connector/iceberg/src/catalog_runtime.rs (assemble_rest_generation)"
   - "novarocks/connector/iceberg/src/catalog_config.rs (REST_SERVER_ROUTING_HEADERS_PROPERTY, rest_persistent_definition)"
-  - "novarocks/connector/iceberg/src/rest_protocol/auth.rs (RestAuthOwner, RestAuthManager, PersistentRestConfig)"
+  - "novarocks/connector/iceberg/src/rest_protocol/auth.rs (RestAuthOwner, PersistentRestConfig)"
   - "novarocks/connector/iceberg/src/rest_protocol/binding.rs (SessionBinding, is_authentication_header, is_protocol_header)"
   - "novarocks/connector/iceberg/src/rest_protocol/attempt.rs (AttemptCell, ensure_session)"
-  - "novarocks/connector/iceberg/src/rest_protocol/boundary.rs (probe_veto, sanitize_upstream_error)"
+  - "novarocks/connector/iceberg/src/rest_protocol/boundary.rs (sanitize_upstream_error)"
   - "novarocks/connector/iceberg/src/rest_protocol/http.rs (RestHttpClient, classify_send_error)"
   - "novarocks/connector/iceberg/src/rest_protocol/evidence.rs (classify, MutationEndpoint, AttributionExpectation)"
   - "novarocks/connector/iceberg/src/rest_protocol/mutation.rs (read_view, read_empty)"
   - "novarocks/connector/iceberg/src/rest_protocol/json.rs (JsonScanner)"
   - "novarocks/connector/iceberg/src/rest_protocol/endpoints.rs (RestEndpoints, acquire_routed)"
-  - "novarocks/connector/iceberg/src/rest_protocol/adapter.rs (RestTransitionalAdapter, rest_evidence)"
+  - "novarocks/connector/iceberg/src/commit/attempt/observation.rs (PublicationJournal)"
   - "novarocks/connector/iceberg/src/rest_protocol/routing.rs (route_for_lease, preflight_route)"
   - "novarocks/connector/iceberg/src/metadata_context.rs (vended_renewal_path)"
   - "novarocks/connector/iceberg/src/execution_authority.rs (ExecutionNodeCredentialsEndpointRefresher)"
-  - "novarocks/connector/iceberg/src/catalog/error.rs (proves_uncommitted, uncommitted_failure_kind)"
+  - "novarocks/connector/iceberg/src/catalog/error.rs (CatalogOutcome, preparation_failure_kind)"
   - "novarocks/spi/src/connector/credential_lease.rs (CredentialRoutingContext, CredentialRenewalPath)"
 ---
 
@@ -45,6 +48,8 @@ code-anchors:
 访问 Iceberg REST catalog 时，会话、认证与路由由谁唯一决定；一次变更请求的 HTTP 结果在什么条件下才能当作「已生效」或「确定未生效」的证据？
 
 ## 背景与执行事实
+
+> **当前适用范围：** [ADR-0179](ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 已替代上游会话建立、generic mutation facade、裁决 21 的错误回推，以及裁决 24 中调用方取消/deadline直接结束证据等待的规则。Provider 自有会话冻结一份成功 binding；外发后使用独立证据期限，journal 先固化结果再收尾。下文“直接路径迁移之前”与“CTAS stage Unknown 在 FE 报确定未提交”是历史妥协，已经退出；FE 现在投影同一 Provider 事实。认证、header 来源、冻结路由、状态码分类与脱敏约束继续有效。
 
 REST crate 来自上游 iceberg-rust，留在 vendor 中且不带 NovaRocks 补丁（vendor 政策见 [ADR-0170](ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md) 与 [ADR-0174](ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)）。上游客户端（`RestCatalog`）在首次操作时请求 `/v1/config`，按 defaults < 用户配置 < warehouse < overrides 合并配置，`overrides.uri` 替换 uri，合并结果还决定 prefix；成功后在客户端内缓存会话。NovaRocks 不替换这个客户端，而是经它公开的两个扩展点接入：`with_auth_manager` 注入认证 owner，`with_client` 注入 HTTP 客户端。需要 NovaRocks 自身语义的请求，用从这份会话取得的绑定由 NovaRocks 自己发出。
 

@@ -27,12 +27,12 @@ use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
-use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
-    CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
+    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
+    ConditionalCreateVerdict, NovaRocksCatalog,
 };
+#[cfg(test)]
+use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 
 /// A Hive Metastore Iceberg catalog.
 ///
@@ -45,6 +45,14 @@ pub(super) struct NovaRocksHiveCatalog {
 }
 
 impl NovaRocksHiveCatalog {
+    pub(super) fn with_evidence_policy(
+        mut self,
+        policy: super::publication::CatalogEvidencePolicy,
+    ) -> Self {
+        self.delegate.evidence_policy = policy;
+        self
+    }
+
     fn read_only(operation: CatalogOperation) -> CatalogUnsupported {
         CatalogUnsupported::new(format!(
             "Hive Metastore catalog is a read-only compatibility entry: {} is not supported; use an Iceberg REST or Hadoop catalog to write",
@@ -71,16 +79,62 @@ impl NovaRocksHiveCatalog {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHiveCatalog {
+    fn freeze_create_publication(
+        &self,
+        _request: super::catalog_request::CatalogCreatePublicationRequest,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::catalog_request::FrozenCatalogPublication,
+    > {
+        Err(super::publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Hive Iceberg catalog is a read-only compatibility entry",
+            ),
+        ))
+    }
+
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.delegate.publication_generation.bind(generation)
+    }
+
+    async fn prepare_frozen_publication(
+        &self,
+        _request: crate::commit::model::FrozenRequest,
+        _operation: super::admission::CatalogOperation,
+        _staged_expectation: Option<super::StagedPublicationExpectation>,
+        _descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+        _preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        Err(super::publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Hive Metastore catalog is a read-only compatibility entry",
+            ),
+        ))
+    }
+
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        novarocks_spi::connector::ExternalMutationFinalization::Complete
+    }
+
+    fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
+        self.delegate.evidence_policy
+    }
+
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
         Arc::clone(&self.delegate.listing)
     }
 
     fn implementation_name(&self) -> &'static str {
         "hive"
-    }
-
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
-        Arc::clone(self.delegate.client())
     }
 
     fn admit_operation(
@@ -218,6 +272,26 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         })
     }
 
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.view_exists(view).await
+    }
+
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.load_view(view).await
+    }
+
     async fn view_exists(&self, _view: CatalogTableName) -> Result<bool, ConnectorError> {
         Err(super::views_unsupported("view_exists"))
     }
@@ -237,31 +311,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         Err(super::views_unsupported("load_view"))
     }
 
-    async fn create_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        CatalogOutcome::Unsupported(
-            self.refuse_operation(CatalogOperation::CreateNamespace, _namespace),
-        )
-    }
-
-    async fn drop_namespace(
-        &self,
-        _namespace: CatalogNamespaceName,
-    ) -> CatalogOutcome<CatalogNamespaceName> {
-        CatalogOutcome::Unsupported(
-            self.refuse_operation(CatalogOperation::DropNamespace, _namespace),
-        )
-    }
-
-    async fn drop_table(
-        &self,
-        _table: CatalogTableName,
-    ) -> CatalogOutcome<CatalogDropTableReceipt> {
-        CatalogOutcome::Unsupported(self.refuse_operation(CatalogOperation::DropTable, _table))
-    }
-
     async fn anchor_written_metadata(
         &self,
         _table: CatalogTableName,
@@ -272,27 +321,7 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         )
     }
 
-    async fn stage_create_table(
-        &self,
-        _namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::TableCreation,
-    ) -> super::StagedCreateStart {
-        super::StagedCreateStart::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
-            CatalogTableName::new(Arc::clone(&_namespace.namespace), _creation.name),
-        ))
-    }
-
-    async fn commit_staged_table(
-        &self,
-        _commit: crate::iceberg::TableCommit,
-        _expectation: super::StagedPublicationExpectation,
-    ) -> super::StagedCommitResult {
-        super::StagedCommitResult::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
-            CatalogTableName::from_identifier(_commit.identifier()),
-        ))
-    }
+    #[cfg(test)]
 
     async fn prepare_conditional_create(
         &self,
@@ -306,6 +335,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             ),
         ))
     }
+
+    #[cfg(test)]
 
     async fn publish_conditional_create(
         &self,
@@ -326,32 +357,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
                 CatalogTableName::new(_evidence.namespace, _evidence.table),
             ),
-        ))
-    }
-
-    async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(
-            self.refuse_operation(CatalogOperation::Append, _request.target),
-        )
-    }
-
-    async fn new_create_table_transaction(
-        &self,
-        request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(request.intent),
-            request.target,
-        ))
-    }
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(_request.intent),
-            _request.target,
         ))
     }
 }

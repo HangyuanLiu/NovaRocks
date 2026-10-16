@@ -98,6 +98,16 @@ impl Pipeline {
         &self,
         ctx: &Arc<FragmentContext>,
     ) -> ExecutionResult<Vec<PipelineDriver>> {
+        self.instantiate_drivers_with_schema_preparation(ctx, None)
+    }
+
+    pub(crate) fn instantiate_drivers_with_schema_preparation(
+        &self,
+        ctx: &Arc<FragmentContext>,
+        mut schema_preparation: Option<
+            &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+        >,
+    ) -> ExecutionResult<Vec<PipelineDriver>> {
         for factory in &self.op_factories {
             factory.bind_pipeline_dop(self.dop)?;
         }
@@ -192,7 +202,22 @@ impl Pipeline {
                 // event sink. Install the fragment-owned sink while preparing
                 // so they cannot capture the default no-op recorder later.
                 op.set_fragment_event_sink(ctx.event_sink());
-                op.prepare()?;
+                let site = op
+                    .compiled_schema_preparation_site()
+                    .map(|(program, site)| (Arc::clone(program), site));
+                match (site, schema_preparation.as_mut()) {
+                    (Some((program, site)), Some(observer)) => {
+                        use crate::runtime::preparation_metadata::CompiledSchemaSite;
+                        let node = match site {
+                            CompiledSchemaSite::Project(node)
+                            | CompiledSchemaSite::AnalyticOutput(node) => node,
+                            CompiledSchemaSite::FinalResult => program.graph().root(),
+                        };
+                        let layout = program.graph().nodes()[node.index()].output_layout();
+                        observer.prepare(&program, site, layout, &mut || op.prepare())?;
+                    }
+                    _ => op.prepare()?,
+                }
                 op.bind_runtime_state(ctx.runtime_state())?;
                 operators.push(op);
             }

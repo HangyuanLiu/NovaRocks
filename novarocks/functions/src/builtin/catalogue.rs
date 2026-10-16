@@ -3313,6 +3313,7 @@ pub(super) fn scalar_definition_parts(
                     "crc32" => Some(super::crc32_owner::effects()),
                     "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
+                    "json_object" => Some(super::json_object_owner::effects()),
                     "percentile_hash" => Some(super::percentile_hash_owner::effects()),
                     "hll_hash" => Some(super::hll_hash_owner::effects()),
                     name if super::string_measure_owner::operation(name).is_some() => {
@@ -3665,6 +3666,7 @@ pub fn contribute_builtin_functions(
             "crc32" => super::crc32_owner::definition(declaration, resolver)?,
             "bitmap_to_string" => super::bitmap_to_string_owner::definition(declaration, resolver)?,
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
+            "json_object" => super::json_object_owner::definition(declaration, resolver)?,
             "percentile_hash" => super::percentile_hash_owner::definition(declaration, resolver)?,
             "hll_hash" => super::hll_hash_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {
@@ -3895,6 +3897,7 @@ pub fn contribute_builtin_functions(
                     "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
                         Some(super::aggregate_percentile_owner::effects())
                     }
+                    "mann_whitney_u_test" => Some(super::aggregate_mann_whitney_owner::effects()),
                     "approx_top_k" => Some(super::aggregate_top_k_owner::effects()),
                     "max_by" | "min_by" => Some(super::aggregate_by_owner::effects()),
                     "min_n" | "max_n" => Some(super::aggregate_n_owner::effects()),
@@ -3949,6 +3952,14 @@ pub fn contribute_builtin_functions(
         }
         if matches!(declaration.name, "group_concat" | "string_agg") {
             builder.register(super::aggregate_concat_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if declaration.name == "mann_whitney_u_test" {
+            builder.register(super::aggregate_mann_whitney_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,

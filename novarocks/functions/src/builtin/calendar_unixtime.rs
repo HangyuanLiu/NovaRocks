@@ -314,6 +314,79 @@ pub fn evaluate_legacy_hour_from_unixtime(
     ))
 }
 
+/// Realize the original public HOUR result after its sole legacy computation.
+/// This never evaluates an argument or chooses a timezone. The declaration,
+/// rather than the observed carrier, authorizes this fixed representation.
+pub fn realize_legacy_hour_public_result<H>(
+    raw: &ArrayRef,
+    target: &novarocks_type_contract::FunctionValueType,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    observe: &mut impl FnMut(bool) -> Result<(), H>,
+) -> Result<ArrayRef, crate::selected_copy::CopyConstructionError<H>> {
+    use crate::selected_copy::{CopyConstructionError, CopyError};
+    use arrow_array::{Array, Int32Array, Int64Array};
+    use novarocks_type_contract::ValueLogicalType;
+    use std::alloc::Layout;
+
+    if target.data_type() != &DataType::Int32 || target.logical_type() != ValueLogicalType::Physical
+    {
+        return Err(CopyError::Invalid(
+            "HOUR public result requires its exact Physical Int32 declaration",
+        )
+        .into());
+    }
+    let source = raw
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or(CopyError::Invalid(
+            "HOUR public result requires its original Int64 computation",
+        ))?;
+    if !target.nullable() && source.null_count() != 0 {
+        return Err(CopyError::Invalid(
+            "HOUR public result received NULL for a required declaration",
+        )
+        .into());
+    }
+    observe(true).map_err(CopyConstructionError::Creator)?;
+    creation
+        .request_layout(Layout::array::<i32>(source.len()).map_err(|_| CopyError::Extent)?)
+        .map_err(CopyConstructionError::Creator)?;
+    crate::selected_copy::preflight_primitive_vec_adoption_construction_observed(
+        creation, observe,
+    )?;
+    crate::selected_copy::preflight_flat_arrow_structure_construction(
+        target.data_type(),
+        source.nulls().is_some(),
+        creation,
+        observe,
+    )?;
+    observe(true).map_err(CopyConstructionError::Creator)?;
+    let mut values = Vec::with_capacity(source.len());
+    for row in 0..source.len() {
+        observe(false).map_err(CopyConstructionError::Creator)?;
+        let value = if source.is_null(row) {
+            0
+        } else {
+            let hour = source.value(row);
+            if !(0..=23).contains(&hour) {
+                return Err(CopyError::Invalid(
+                    "HOUR computation produced a value outside its original range",
+                )
+                .into());
+            }
+            hour as i32
+        };
+        values.push(value);
+    }
+    observe(true).map_err(CopyConstructionError::Creator)?;
+    // The original validity backing is shared without allocating or charging a
+    // second bitmap. The caller retains the original input/storage lifetime.
+    Ok(Arc::new(Int32Array::new(
+        values.into(),
+        source.nulls().cloned(),
+    )))
+}
+
 fn exact_format<'a>(
     actual: Option<&'a str>,
     constant: &crate::ConstantValue,

@@ -68,9 +68,7 @@ use novarocks_spi::connector::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::CatalogTransactionStart;
 use crate::catalog::error::CatalogOutcome;
-use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
@@ -292,24 +290,6 @@ pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), 
         ));
     }
     Ok(())
-}
-
-async fn commit_eager_frontier(
-    frontier: &mut crate::catalog::transaction::Transaction,
-    context: &ConnectorRequestContext,
-) -> Result<
-    crate::catalog::error::CatalogOutcome<crate::catalog::transaction::CommitProof>,
-    ConnectorError,
-> {
-    if let Err(mut error) = validate_context(context) {
-        if let Err(abort_error) = frontier.abort().await {
-            error = error.with_cleanup_context(format!(
-                "Iceberg eager transaction abort failed: {abort_error}"
-            ));
-        }
-        return Err(error);
-    }
-    Ok(frontier.commit().await)
 }
 
 /// One typed fragment resolved against the sealed target set.
@@ -969,9 +949,8 @@ fn unsigned_counts(
 
 /// Whether a field id is one of the row-lineage columns Iceberg reserves.
 ///
-/// These ids live outside the table schema on purpose: `annotate_schema_from_scan_model`
-/// stamps them onto the Arrow field directly so a lineage column can ride with
-/// the data without being a table column.
+/// These IDs live outside the table schema. The frozen writer projection adds
+/// their reserved definitions so lineage can ride beside ordinary data columns.
 const fn is_reserved_row_lineage_field(field_id: i32) -> bool {
     field_id == crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID
         || field_id
@@ -998,6 +977,9 @@ fn decode_bounds(
                     "Iceberg staged artifact bound names unknown field id {field_id}"
                 ))
             })?;
+            if matches!(field.field_type.as_ref(), crate::iceberg::spec::Type::Variant(_)) {
+                return Err(corrupt(format!("Iceberg Variant statistics for field id {field_id} are unsupported because Variant writes are unsupported")));
+            }
             let primitive = field.field_type.as_primitive_type().ok_or_else(|| {
                 corrupt(format!(
                     "Iceberg staged artifact bound field id {field_id} is not a primitive"
@@ -1517,33 +1499,14 @@ impl IcebergWriteSessionControl {
         evidence: &ExternalMutationEvidence,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        use crate::commit::attempt::observation::PublicationJournal;
+        use crate::commit::publication_descriptor::PositiveAttributionObservation;
         validate_context(context)?;
         let decoded = self.decode_evidence(handle, evidence)?;
-        let known_snapshot_id = match handle.state()? {
-            IcebergWriteSessionState::KnownCommitted { snapshot_id: None } => {
-                return Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt: unprojected_committed_receipt(),
-                    finalization: handle.terminal_finalization(),
-                });
-            }
-            IcebergWriteSessionState::KnownCommitted { snapshot_id } => snapshot_id,
-            IcebergWriteSessionState::KnownUncommitted { message } => {
-                return Ok(ExternalMutationOutcome::KnownUncommitted {
-                    failure: failure(ConnectorMutationFailureKind::Conflict, message),
-                    cleanup: handle.terminal_finalization(),
-                });
-            }
-            IcebergWriteSessionState::Active => {
+        match handle.state()? {
+            IcebergWriteSessionState::Active | IcebergWriteSessionState::Sealed => {
                 return Err(invalid(
-                    "Iceberg write reconciliation requires a prior commit-unknown outcome",
-                ));
-            }
-            // A seal performs no external commit, so its outcome was never in
-            // doubt and there is nothing for reconciliation to resolve.
-            IcebergWriteSessionState::Sealed => {
-                return Err(invalid(
-                    "Iceberg staged write session has no external commit to reconcile",
+                    "Iceberg write reconciliation requires a prior external publication",
                 ));
             }
             IcebergWriteSessionState::Committing => {
@@ -1551,28 +1514,80 @@ impl IcebergWriteSessionControl {
                     "Iceberg write reconciliation cannot race an in-progress external commit",
                 ));
             }
-            IcebergWriteSessionState::CommitUnknown { .. } => None,
+            _ => {}
+        }
+        let retained = handle.recovery_evidence()?;
+        let owner = PublicationJournal::<ConnectorWriteReceipt>::from_evidence(evidence)?.or(
+            PublicationJournal::<ConnectorWriteReceipt>::from_evidence(&retained)?,
+        );
+        let Some((journal, entry)) = owner else {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "Read-only write reconciliation has no original in-process publication journal",
+                ),
+                evidence: evidence.clone(),
+            });
         };
-
+        let known = match journal.catalog_entry_outcome(entry) {
+            known @ ExternalMutationOutcome::KnownUncommitted { .. } => return Ok(known),
+            known @ ExternalMutationOutcome::KnownCommitted { .. } => {
+                if handle.document_publication().is_none() {
+                    return Ok(known);
+                }
+                Some(known)
+            }
+            ExternalMutationOutcome::CommitUnknown { .. } => None,
+        };
+        let known_snapshot = match journal.commit_outcome(entry) {
+            crate::catalog::error::CatalogOutcome::KnownCommitted { receipt, .. } => {
+                receipt.snapshot_id
+            }
+            _ => None,
+        };
+        if known.is_some() && known_snapshot.is_none() {
+            return Ok(journal.catalog_entry_outcome(entry));
+        }
+        // Once a positive verdict exists, reload is optional finalization and
+        // consumes the original entry's one finite grant.
+        let read_context = if known.is_some() {
+            match journal
+                .finalization_context(entry, self.runtime.novarocks_catalog().evidence_policy())
+                .and_then(|grant| grant.for_io(context))
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(reconciled_known_committed_outcome(
+                        handle,
+                        &journal,
+                        entry,
+                        known_snapshot.unwrap(),
+                        Err(error),
+                    ));
+                }
+            }
+        } else {
+            context.clone()
+        };
+        let _finalizing = known
+            .as_ref()
+            .and_then(|_| journal.finalization_activity(entry));
         let facts = handle.table();
-        // Reconciliation exists to find out whether an external effect landed,
-        // so it must observe the catalog itself. A cached pre-commit view here
-        // would report a committed write as unknown, which is the one answer
-        // this path must never invent.
         let physical = match self.runtime.load_table_for_request(
             facts.namespace(),
             facts.table_name(),
-            &context
-                .clone()
+            &read_context
                 .without_vended_credential_lease_sink()
                 .after_external_effect(),
         ) {
             Ok(physical) => physical,
             Err(error) => {
-                if let Some(snapshot_id) = known_snapshot_id {
+                if let Some(snapshot) = known_snapshot {
                     return Ok(reconciled_known_committed_outcome(
                         handle,
-                        snapshot_id,
+                        &journal,
+                        entry,
+                        snapshot,
                         Err(internal(format!(
                             "read committed Iceberg write during reconciliation: {error}"
                         ))),
@@ -1584,10 +1599,12 @@ impl IcebergWriteSessionControl {
         let table = physical.into_table();
         let metadata = table.metadata();
         if metadata.uuid().to_string() != facts.table_uuid() {
-            if let Some(snapshot_id) = known_snapshot_id {
+            if let Some(snapshot) = known_snapshot {
                 return Ok(reconciled_known_committed_outcome(
                     handle,
-                    snapshot_id,
+                    &journal,
+                    entry,
+                    snapshot,
                     Err(corrupt(
                         "committed Iceberg write target changed identity before reconciliation finalization",
                     )),
@@ -1597,85 +1614,136 @@ impl IcebergWriteSessionControl {
                 "Iceberg write reconciliation loaded a different table identity",
             ));
         }
-        if let Some(snapshot_id) = known_snapshot_id {
+        if let Some(snapshot) = known_snapshot {
             return Ok(reconciled_known_committed_outcome(
                 handle,
-                snapshot_id,
+                &journal,
+                entry,
+                snapshot,
                 Ok(metadata),
             ));
         }
         let expected = handle.session_id().to_string();
-        let mut matched: Option<i64> = None;
+        let mut matched = None;
         for snapshot in metadata.snapshots() {
-            let carried = snapshot
+            let marker = snapshot
                 .summary()
                 .additional_properties
                 .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY);
-            if carried.is_some_and(|value| *value == expected)
-                && matched.replace(snapshot.snapshot_id()).is_some()
-            {
-                return Err(corrupt(
-                    "Iceberg write session marker matches multiple snapshots",
-                ));
-            }
-        }
-        match matched {
-            Some(snapshot_id) => {
-                if decoded.document_record_digest.is_some() {
-                    let records = handle.document_records()?.ok_or_else(|| {
-                        corrupt("keyed publication evidence lost its exact record bytes")
-                    })?;
-                    validate_document_records(
-                        metadata
-                            .snapshot_by_id(snapshot_id)
-                            .ok_or_else(|| corrupt("selected publication snapshot is absent"))?,
-                        &records,
-                    )?;
+            if marker.is_some_and(|value| *value == expected) {
+                if matched
+                    .replace((snapshot.snapshot_id(), marker.unwrap().clone()))
+                    .is_some()
+                {
+                    return Err(corrupt(
+                        "Iceberg write session marker matches multiple snapshots",
+                    ));
                 }
-                let outcome = reconciled_known_committed_outcome(handle, snapshot_id, Ok(metadata));
-                handle.settle(IcebergWriteSessionState::KnownCommitted {
-                    snapshot_id: Some(snapshot_id),
-                })?;
-                Ok(outcome)
             }
-            None => Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(
-                    ConnectorMutationFailureKind::Unavailable,
-                    format!(
-                        "Iceberg write session marker is absent during read-only adjudication; staged files remain at {}",
-                        decoded.staging_dir
-                    ),
-                ),
-                evidence: evidence.clone(),
-            }),
         }
+        let Some((snapshot_id, marker_value)) = matched else {
+            return Ok(journal.catalog_entry_outcome(entry));
+        };
+        if decoded.document_record_digest.is_some() {
+            let records = handle
+                .document_records()?
+                .ok_or_else(|| corrupt("keyed publication evidence lost its exact record bytes"))?;
+            validate_document_records(
+                metadata
+                    .snapshot_by_id(snapshot_id)
+                    .ok_or_else(|| corrupt("selected publication snapshot is absent"))?,
+                &records,
+            )?;
+        }
+        let descriptor = journal
+            .entry_descriptor(entry)
+            .ok_or_else(|| invalid("Write journal entry is unavailable"))?;
+        if journal
+            .append_positive_proof_with_finalization(
+                descriptor.key,
+                PositiveAttributionObservation::SnapshotMarker {
+                    table_uuid: metadata.uuid(),
+                    snapshot_id,
+                    marker_key: ICEBERG_WRITE_SESSION_MARKER_PROPERTY.to_owned(),
+                    marker_value,
+                },
+                self.runtime
+                    .novarocks_catalog()
+                    .positive_attribution_finalization(),
+            )
+            .is_err()
+        {
+            return Ok(journal.catalog_entry_outcome(entry));
+        }
+        handle.settle(IcebergWriteSessionState::KnownCommitted {
+            snapshot_id: Some(snapshot_id),
+        })?;
+        let projection = journal
+            .finalization_context(entry, self.runtime.novarocks_catalog().evidence_policy())
+            .and_then(|grant| grant.for_io(context));
+        let _finalizing = projection
+            .as_ref()
+            .ok()
+            .and_then(|_| journal.finalization_activity(entry));
+        Ok(reconciled_known_committed_outcome(
+            handle,
+            &journal,
+            entry,
+            snapshot_id,
+            projection.map(|_| metadata),
+        ))
     }
 }
 
 fn reconciled_known_committed_outcome(
     handle: &IcebergCommitHandle,
+    journal: &crate::commit::attempt::observation::PublicationJournal<ConnectorWriteReceipt>,
+    entry: crate::commit::attempt::observation::JournalEntryRef,
     snapshot_id: i64,
     metadata: Result<&TableMetadata, ConnectorError>,
 ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
-    let retained = handle.terminal_finalization();
-    let (resulting_row_count, finalization) = match metadata
-        .and_then(|metadata| publication_row_count_from_metadata(handle, metadata, snapshot_id))
-    {
-        Ok(rows) => (rows, retained.clone()),
-        Err(error) => (None, add_finalization_failure(retained, error.message())),
+    let ExternalMutationOutcome::KnownCommitted {
+        effect,
+        receipt,
+        mut finalization,
+    } = journal.catalog_entry_outcome(entry)
+    else {
+        return journal.catalog_entry_outcome(entry);
     };
-    let (receipt, finalization) = committed_write_receipt(
-        snapshot_id,
-        resulting_row_count,
-        handle
-            .repartition()
-            .map(|prepared| prepared.committed().clone()),
-        None,
-        finalization,
-    );
+    let enriched = metadata
+        .and_then(|metadata| publication_row_count_from_metadata(handle, metadata, snapshot_id))
+        .and_then(|rows| {
+            let version = receipt
+                .committed_version()
+                .cloned()
+                .ok_or_else(|| corrupt("Committed write receipt has no frozen version"))?;
+            match receipt.committed_partitioning() {
+                Some(partitioning) => {
+                    ConnectorWriteReceipt::try_new_with_committed_facts_and_partitioning(
+                        receipt.payload().clone(),
+                        version,
+                        rows,
+                        partitioning.clone(),
+                    )
+                }
+                None => ConnectorWriteReceipt::try_new_with_committed_facts(
+                    receipt.payload().clone(),
+                    version,
+                    rows,
+                ),
+            }
+        });
+    let receipt = match enriched {
+        Ok(enriched) => enriched,
+        Err(error) => {
+            finalization = add_finalization_failure(finalization, error.message());
+            receipt
+        }
+    };
+    journal.record_entry_finalization(entry, finalization.clone());
     handle.retain_finalization(finalization.clone());
     ExternalMutationOutcome::KnownCommitted {
-        effect: ExternalMutationEffect::Applied,
+        effect,
         receipt,
         finalization,
     }
@@ -2418,7 +2486,11 @@ impl IcebergWriteSessionControl {
             // pure branch planner.
             equality: match &signed {
                 ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
-                    Some(equality_delete_recipe(writer_metadata, equality_fields)?)
+                    Some(equality_delete_recipe(
+                        writer_metadata,
+                        equality_fields,
+                        &format!("{}.{}", self.key.instance_id.as_str(), request.table),
+                    )?)
                 }
                 _ => None,
             },
@@ -3090,9 +3162,10 @@ fn sign_input_shape(
 /// the manifest, and a reader applies the delete by id. Resolving them here,
 /// against the same metadata the session froze, is what makes a renamed or
 /// absent column a refusal instead of a delete that matches nothing.
-fn equality_delete_recipe(
+pub(crate) fn equality_delete_recipe(
     metadata: &TableMetadata,
     fields: &[ConnectorWriteFieldBinding],
+    target_fqn: &str,
 ) -> Result<crate::commit::write_stack::domain::IcebergEqualityDeleteRecipe, ConnectorError> {
     use crate::commit::write_stack::domain::{
         IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteRecipe,
@@ -3108,30 +3181,51 @@ fn equality_delete_recipe(
         ));
     }
     let schema = metadata.current_schema();
+    let mut projected = Vec::with_capacity(fields.len());
     let columns = fields
         .iter()
         .map(|binding| {
             let field = binding.field();
-            let iceberg_field = schema
+            let mut candidates = schema
                 .as_struct()
                 .fields()
                 .iter()
-                .find(|candidate| candidate.name.eq_ignore_ascii_case(field.name()))
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "Iceberg equality-delete field `{}` is absent from the frozen schema",
-                        field.name()
-                    ))
-                })?;
-            IcebergEqualityDeleteColumnFacts::try_new(
-                field.name().to_string(),
-                iceberg_field.id,
-                format!("{:?}", field.data_type()),
-                field.is_nullable(),
-            )
+                .filter(|candidate| candidate.name.eq_ignore_ascii_case(field.name()));
+            let iceberg_field = candidates.next().ok_or_else(|| {
+                invalid(format!(
+                    "Iceberg equality-delete field `{}` is absent from the frozen schema",
+                    field.name()
+                ))
+            })?;
+            if candidates.next().is_some() {
+                return Err(invalid(format!(
+                    "Iceberg equality-delete field `{}` is ambiguous in the frozen schema",
+                    field.name()
+                )));
+            }
+            crate::commit::frozen_write::validate_writer_type(&iceberg_field.field_type).map_err(
+                |message| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        format!(
+                            "{message}: table `{target_fqn}`, column `{}`",
+                            iceberg_field.name
+                        ),
+                    )
+                },
+            )?;
+            projected.push(iceberg_field.clone());
+            IcebergEqualityDeleteColumnFacts::try_new(field.name().to_string(), iceberg_field.id)
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    IcebergEqualityDeleteRecipe::try_new(columns)
+    let projection = crate::iceberg::spec::Schema::builder()
+        .with_schema_id(schema.schema_id())
+        .with_fields(projected)
+        .build()
+        .map_err(|error| invalid(format!("project Iceberg equality-delete schema: {error}")))?;
+    let field_schema_json = serde_json::to_string(&projection)
+        .map_err(|error| invalid(format!("freeze Iceberg equality-delete schema: {error}")))?;
+    IcebergEqualityDeleteRecipe::try_new(columns, field_schema_json)
 }
 
 /// Derive the data branch's partitioning and schema recipe from the frozen
@@ -3157,7 +3251,10 @@ fn data_branch_recipe(
         transforms.push(field.transform.to_string());
     }
     IcebergDataBranchRecipe::try_new(
-        Some(crate::schema_facts::iceberg_schema_def(schema)),
+        Some(
+            serde_json::to_string(schema.as_ref())
+                .map_err(|error| invalid(format!("freeze Iceberg target schema: {error}")))?,
+        ),
         sources,
         names,
         transforms,
@@ -3700,9 +3797,13 @@ mod eager_attempt_io_tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::catalog::CatalogTableName;
-    use crate::catalog::error::CatalogCommitEvidence;
-    use crate::catalog::transaction::{CatalogCommitDispatch, CommitProof, TransactionShape};
+    use crate::catalog::publication_dispatch::{
+        DispatchCompletion, PreparedCatalogDispatch, PreparedPublication,
+    };
+    use crate::catalog::transaction::CommitProof;
+    use crate::commit::attempt::observation::{
+        DispatchEvidence, ProtocolObservation, PublicationJournal,
+    };
     use crate::iceberg::io::{
         FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage,
         OutputFile, Storage, StorageConfig, StorageFactory,
@@ -4040,7 +4141,6 @@ mod eager_attempt_io_tests {
     struct CountingDispatch {
         behavior: DispatchBehavior,
         dispatches: AtomicUsize,
-        aborts: AtomicUsize,
     }
 
     impl CountingDispatch {
@@ -4048,44 +4148,100 @@ mod eager_attempt_io_tests {
             Arc::new(Self {
                 behavior,
                 dispatches: AtomicUsize::new(0),
-                aborts: AtomicUsize::new(0),
             })
         }
     }
 
+    struct CountingMechanism {
+        owner: Arc<CountingDispatch>,
+        snapshot_id: Option<i64>,
+    }
     #[async_trait]
-    impl CatalogCommitDispatch for CountingDispatch {
+    impl PreparedCatalogDispatch for CountingMechanism {
         async fn dispatch_once(
-            &self,
-            staged: Option<&crate::commit::model::FrozenRequest>,
-        ) -> crate::catalog::transaction::CommitDispatchResult {
-            assert!(
-                staged.is_some(),
-                "an eager attempt must dispatch its staged commit"
-            );
-            self.dispatches.fetch_add(1, Ordering::SeqCst);
-            crate::catalog::transaction::CommitDispatchResult::from_catalog_result(
-                match self.behavior {
-                    DispatchBehavior::Conflict => Err(IcebergError::new(
-                        ErrorKind::CatalogCommitConflicts,
-                        "injected OCC conflict",
-                    )),
-                    DispatchBehavior::Commit => Ok(CommitProof::applied(Some(1))),
-                    DispatchBehavior::LoseResponse => Err(IcebergError::new(
-                        ErrorKind::Unexpected,
-                        "injected lost response",
-                    )),
+            self: Box<Self>,
+            _: crate::catalog::publication::EvidenceContext,
+        ) -> DispatchCompletion {
+            self.owner.dispatches.fetch_add(1, Ordering::SeqCst);
+            let evidence = match self.owner.behavior {
+                DispatchBehavior::Conflict => DispatchEvidence::Rejected {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        "injected confirmed OCC rejection",
+                    ),
+                    observation: ProtocolObservation {
+                        adapter: "test-eager",
+                        stage: "rejected",
+                        ..Default::default()
+                    },
                 },
+                DispatchBehavior::Commit => DispatchEvidence::Applied {
+                    proof: CommitProof::applied(self.snapshot_id),
+                },
+                DispatchBehavior::LoseResponse => DispatchEvidence::Unknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "injected lost response",
+                    ),
+                    observation: ProtocolObservation {
+                        adapter: "test-eager",
+                        stage: "lost-response",
+                        ..Default::default()
+                    },
+                },
+            };
+            DispatchCompletion::evidence(evidence)
+        }
+    }
+
+    /// Owns the unissued capability, never a second mutation verdict. Repeated
+    /// observation reads the original journal without another dispatch.
+    struct JournalFixture {
+        journal: PublicationJournal<()>,
+        request: Option<crate::commit::model::FrozenRequest>,
+        dispatch: Arc<CountingDispatch>,
+    }
+    impl JournalFixture {
+        async fn commit(&mut self) -> CatalogOutcome<CommitProof> {
+            let context = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                64 * 1024,
+                1024 * 1024,
             )
+            .unwrap();
+            self.commit_with_context(&context).await
         }
-
-        async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
-            Ok(None)
-        }
-
-        async fn abort_before_dispatch(&self) -> Result<(), ConnectorError> {
-            self.aborts.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+        async fn commit_with_context(
+            &mut self,
+            context: &ConnectorRequestContext,
+        ) -> CatalogOutcome<CommitProof> {
+            let Some(request) = self.request.take() else {
+                return self
+                    .journal
+                    .commit_outcome(self.journal.current_entry().unwrap());
+            };
+            let dispatch = Arc::clone(&self.dispatch);
+            let entry = self
+                .journal
+                .publish_once(
+                    context.clone(),
+                    Default::default(),
+                    move |descriptor, _, _| async move {
+                        descriptor.validate_frozen(&request)?;
+                        let snapshot_id = request.ref_snapshot_after("main");
+                        Ok(PreparedPublication::Mutation {
+                            binding: None,
+                            dispatch: Box::new(CountingMechanism {
+                                owner: dispatch,
+                                snapshot_id,
+                            }),
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+            self.journal.commit_outcome(entry)
         }
     }
 
@@ -4268,7 +4424,7 @@ mod eager_attempt_io_tests {
     }
 
     struct StagedAttempt {
-        frontier: crate::catalog::transaction::Transaction,
+        frontier: JournalFixture,
         snapshot_id: i64,
         manifest_paths: Vec<String>,
         puffin_path: String,
@@ -4371,15 +4527,30 @@ mod eager_attempt_io_tests {
             .filter(|record| record.object.path().ends_with(".avro"))
             .map(|record| record.object.path().to_string())
             .collect();
-        let mut frontier = crate::catalog::transaction::Transaction::new(
-            TransactionIdentity::new("eager-I/O-test", [attempt; 16]),
-            CatalogTableName::new("db", "t"),
-            TransactionShape::Existing,
-            CatalogCommitEvidence::for_target("db.t")
-                .with_commit_uuid(format!("attempt-{attempt}")),
+        let token = commit.artifacts().attempt().operation();
+        let journal = PublicationJournal::new(token);
+        let evidence = ExternalMutationEvidence::try_new(
+            2,
+            ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                    "eager-io-fixture",
+                )
+                .unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([4; 16]),
+            ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "eager_io_fixture",
+            Bytes::from_static(b"{}"),
+        )
+        .unwrap();
+        journal.record(evidence, (), &commit).unwrap();
+        let frontier = JournalFixture {
+            journal,
+            request: Some(commit),
             dispatch,
-        );
-        frontier.stage(commit).expect("stage provider frontier");
+        };
         StagedAttempt {
             frontier,
             snapshot_id,
@@ -4450,12 +4621,20 @@ mod eager_attempt_io_tests {
         )
         .expect("expired context");
 
-        let error = commit_eager_frontier(&mut attempt.frontier, &context)
-            .await
-            .expect_err("elapsed deadline must veto catalog dispatch");
-        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        let outcome = attempt.frontier.commit_with_context(&context).await;
+        assert!(
+            matches!(outcome,CatalogOutcome::KnownUncommitted{ref failure}
+            if failure.kind()==ConnectorMutationFailureKind::DeadlineExceeded),
+            "{outcome:?}"
+        );
         assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
-        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            attempt
+                .frontier
+                .journal
+                .commit_outcome(attempt.frontier.journal.current_entry().unwrap()),
+            CatalogOutcome::KnownUncommitted { .. }
+        ));
 
         fixture
             .table
@@ -4463,6 +4642,18 @@ mod eager_attempt_io_tests {
             .delete(&attempt.puffin_path)
             .await
             .expect("clean test Puffin");
+        assert!(
+            !fixture
+                .table
+                .file_io()
+                .exists(&attempt.puffin_path)
+                .await
+                .unwrap()
+        );
+        for path in &attempt.manifest_paths {
+            fixture.table.file_io().delete(path).await.unwrap();
+            assert!(!fixture.table.file_io().exists(path).await.unwrap());
+        }
     }
 
     #[tokio::test]
@@ -4517,6 +4708,7 @@ mod eager_attempt_io_tests {
 #[cfg(test)]
 mod terminal_finalization_tests {
     use super::*;
+    use crate::catalog::transaction::CommitProof;
     fn handle() -> IcebergCommitHandle {
         use crate::commit::write_stack::planning::{
             IcebergWriteSessionPlanInput, plan_write_session,
@@ -4574,9 +4766,72 @@ mod terminal_finalization_tests {
             ConnectorMutationFailureKind::Unavailable,
             "old attempt cleanup failed",
         )));
+        use crate::commit::attempt::observation::{
+            DispatchEvidence, MemoryDispatchBarrier, PublicationJournal,
+        };
+        use crate::commit::model::OperationToken;
+        let token = OperationToken::from_write(
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
+                handle.session_id().to_bytes(),
+            ),
+        );
+        let journal = PublicationJournal::new(token);
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            65536,
+            262144,
+        )
+        .unwrap();
+        let evidence = ExternalMutationEvidence::try_new(
+            2,
+            ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("terminal-test")
+                    .unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([1; 16]),
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "write_session",
+            bytes::Bytes::from_static(b"independent fixture request"),
+        )
+        .unwrap();
+        let entry = journal
+            .prepare_catalog(
+                evidence,
+                crate::write_codec::connector_write_receipt_with_partitioning(77, None, None)
+                    .unwrap(),
+                vec!["db.table".into()],
+                b"frozen fixture publication".to_vec(),
+                crate::commit::publication_descriptor::AttributionPlan::ObserveOnly,
+                context.clone(),
+            )
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(
+                journal
+                    .claim_dispatch()
+                    .unwrap()
+                    .begin_dispatch(&context, &MemoryDispatchBarrier),
+            )
+            .unwrap();
+        journal.conclude_entry(
+            entry,
+            DispatchEvidence::Applied {
+                proof: CommitProof::applied(Some(77)),
+            },
+        );
+        journal.record_entry_finalization(entry, handle.terminal_finalization());
         let ExternalMutationOutcome::KnownCommitted { finalization, .. } =
             reconciled_known_committed_outcome(
                 &handle,
+                &journal,
+                entry,
                 77,
                 Err(internal("row count reload failed")),
             )
@@ -4625,3 +4880,27 @@ mod terminal_finalization_tests {
 
 #[cfg(test)]
 mod shared_cow_admission_metadata_tests;
+
+#[cfg(test)]
+mod variant_statistics_tests {
+    use super::*;
+    #[test]
+    fn variant_bounds_explain_unsupported_writer_statistics() {
+        let schema:crate::iceberg::spec::Schema=serde_json::from_value(serde_json::json!({"type":"struct","schema-id":42,"fields":[{"id":1,"name":"v","required":false,"type":"variant"}]})).unwrap();
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "file:///tmp/variant-statistics".into(),
+            crate::iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let error = decode_bounds(&BTreeMap::from([(1, vec![0])]), &metadata).unwrap_err();
+        assert!(error.message().contains("Variant statistics"));
+        assert!(error.message().contains("Variant writes are unsupported"));
+    }
+}

@@ -58,7 +58,9 @@ use novarocks_local_program::{
     ProgramNodeKind, SortTopNType,
 };
 
-use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances, root_value_type};
+use super::compiled_expression::{
+    RuntimeKernelControl, evaluate_chunk_all, instances, root_value_type,
+};
 use super::sort::creation::{CreatedSortColumns, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
@@ -519,7 +521,7 @@ impl ProcessorOperator for CompiledSortProcessor {
         let instances = self.instances.as_mut().expect("instances were created");
         let mut keys = creation.vector::<ArrayRef>(self.sites.len(), owner.as_ref())?;
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            let values = evaluate_all(instance, *site, chunk.record_batch(), &self.control)?;
+            let values = evaluate_chunk_all(instance, *site, &chunk, &self.control)?;
             let declared = root_value_type(&self.program, *site)?;
             type_storage = type_storage.retaining_observed::<ConstructionFailure>(
                 &declared

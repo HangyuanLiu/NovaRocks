@@ -104,6 +104,21 @@ impl IcebergLoadedTable {
         }
     }
 
+    /// Catalog control may inspect immutable identity without collecting any
+    /// storage delegation or constructing request-scoped FileIO.
+    pub(crate) fn metadata(&self) -> &crate::iceberg::spec::TableMetadata {
+        match &self.materialization {
+            IcebergLoadedTableMaterialization::Materialized(table) => table.metadata(),
+            IcebergLoadedTableMaterialization::DeferredRest(table) => table.metadata(),
+        }
+    }
+    pub(crate) fn metadata_location(&self) -> Option<&str> {
+        match &self.materialization {
+            IcebergLoadedTableMaterialization::Materialized(table) => table.metadata_location(),
+            IcebergLoadedTableMaterialization::DeferredRest(table) => table.metadata_location(),
+        }
+    }
+
     pub(crate) fn into_parts(self) -> (IcebergLoadedTableMaterialization, IcebergAccessDelegation) {
         (self.materialization, self.access_delegation)
     }
@@ -2175,7 +2190,6 @@ mod tests {
                 )
                 .await
                 .expect("REST generation")
-                .1
             })
         }
 

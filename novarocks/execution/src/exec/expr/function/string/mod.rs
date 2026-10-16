@@ -70,3 +70,9 @@ pub use dispatch::{eval_string_function, metadata, register};
 pub use split::eval_split;
 pub use substring::eval_substring;
 pub use upper::eval_upper;
+
+#[cfg(test)]
+mod concat_legacy_contract_tests;
+
+#[cfg(test)]
+mod substring_index_legacy_contract_tests;

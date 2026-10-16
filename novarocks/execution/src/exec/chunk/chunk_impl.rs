@@ -68,6 +68,7 @@ pub struct Chunk {
     // wrapper hold can then exit independently of the shared backing hold.
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
+    output_column_metadata: Option<super::OutputColumnMetadata>,
 }
 
 /// Owned Arrow access paired with its complete immutable execution binding
@@ -80,6 +81,7 @@ pub struct ChunkBatchProjection {
     connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
+    output_column_metadata: Option<super::OutputColumnMetadata>,
 }
 
 // Shared source custody contains only existing buffer charges, exact schema
@@ -91,6 +93,7 @@ struct ChunkSourceStorageHold {
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
     storage: ValueTypeStorageLifetime,
+    output_column_metadata: Option<super::OutputColumnMetadata>,
 }
 impl novarocks_type_contract::ValueTypeStorageHold for ChunkSourceStorageHold {}
 
@@ -134,11 +137,19 @@ impl ChunkBatchProjection {
             connector_output_memory: self.connector_output_memory,
             array_type_storage: self.array_type_storage,
             construction_storage: self.construction_storage,
+            output_column_metadata: self.output_column_metadata,
         }
     }
 }
 
 impl Chunk {
+    pub(crate) fn source_authority(&self) -> super::ChunkSourceAuthorityRef<'_> {
+        super::ChunkSourceAuthorityRef::from_attached(
+            self.accounting.as_ref(),
+            self.connector_output_memory.as_ref(),
+        )
+    }
+
     /// Transfer existing finite buffer/type responsibility into an independent
     /// neutral owner. The caller observes the real shared holder before it is
     /// allocated, and its lifetime covers that holder's own new construction.
@@ -147,7 +158,10 @@ impl Chunk {
         storage: ValueTypeStorageLifetime,
         mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
     ) -> Result<ValueTypeStorageLifetime, E> {
-        if self.accounting.is_none() && self.connector_output_memory.is_none() {
+        if self.accounting.is_none()
+            && self.connector_output_memory.is_none()
+            && self.output_column_metadata.is_none()
+        {
             let storage = storage.retaining_observed(&self.array_type_storage, &mut request)?;
             let storage = storage.retaining_observed(&self.construction_storage, &mut request)?;
             return storage.retaining_observed(&self.chunk_schema.storage_lifetime(), request);
@@ -164,6 +178,7 @@ impl Chunk {
                 connector_output_memory: self.connector_output_memory.clone(),
                 array_type_storage: self.array_type_storage.clone(),
                 construction_storage: self.construction_storage.clone(),
+                output_column_metadata: self.output_column_metadata.clone(),
                 storage,
             },
         )))
@@ -183,6 +198,7 @@ impl Chunk {
             connector_output_memory: self.connector_output_memory.clone(),
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: self.construction_storage.clone(),
+            output_column_metadata: self.output_column_metadata.clone(),
         }
     }
     pub fn into_batch_projection(self) -> ChunkBatchProjection {
@@ -193,6 +209,7 @@ impl Chunk {
             connector_output_memory: self.connector_output_memory,
             array_type_storage: self.array_type_storage,
             construction_storage: self.construction_storage,
+            output_column_metadata: self.output_column_metadata,
         }
     }
     #[cfg(test)]
@@ -205,6 +222,7 @@ impl Chunk {
     pub(super) fn retain_source_buffer_funding(&mut self, source: &Self) {
         self.accounting = source.accounting.clone();
         self.connector_output_memory = source.connector_output_memory.clone();
+        self.output_column_metadata = source.output_column_metadata.clone();
     }
 
     /// Pure expansion/test adapter for explicitly authored typed occurrences.
@@ -305,6 +323,7 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: source.storage.clone(),
             construction_storage: source.storage,
+            output_column_metadata: None,
         })
     }
 
@@ -404,12 +423,14 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            output_column_metadata: None,
         })
     }
 
     pub fn try_new_like(batch: RecordBatch, source: &Chunk) -> Result<Self, String> {
         let mut result = Self::try_new_with_chunk_schema(batch, source.chunk_schema_ref())?;
         result.array_type_storage = source.array_type_storage.clone();
+        result.output_column_metadata = source.output_column_metadata.clone();
         Ok(result)
     }
 
@@ -454,6 +475,7 @@ impl Chunk {
                 connector_output_memory: None,
                 array_type_storage: ValueTypeStorageLifetime::pure(),
                 construction_storage: ValueTypeStorageLifetime::pure(),
+                output_column_metadata: None,
             });
         }
         let row_count = batch.num_rows();
@@ -467,7 +489,53 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            output_column_metadata: None,
         })
+    }
+
+    /// Preserve the already paid original column Vec while the actual runtime
+    /// creator owns normalization and the new shared RecordBatch wrapper.
+    pub(crate) fn try_new_with_output_column_metadata(
+        batch: RecordBatch,
+        chunk_schema: ChunkSchemaRef,
+        metadata: super::OutputColumnMetadata,
+        owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+        struct UnpublishedColumns {
+            batch: RecordBatch,
+            metadata: super::OutputColumnMetadata,
+        }
+        let source = UnpublishedColumns { batch, metadata };
+        if source.batch.num_columns() != source.metadata.columns() {
+            return Err(novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "output column metadata requires the original frozen column container",
+                ),
+            )
+            .into());
+        }
+        let mut output = Self::try_new_typed_record_batch_owned_observed::<
+            crate::exec::pipeline::operator::ConstructionFailure,
+            _,
+            _,
+        >(
+            source.batch,
+            chunk_schema,
+            owner.storage_lifetime(),
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
+            |step| owner.observe(0, &[], step),
+        )?;
+        output.output_column_metadata = Some(source.metadata);
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_into_static_batch(self) -> Result<RecordBatch, String> {
+        if self.output_column_metadata.is_some() {
+            return Err("StaticValues cannot retain runtime output column metadata".to_string());
+        }
+        Arc::try_unwrap(self.batch).map_err(|_| "StaticValues batch is shared".to_string())
     }
 
     pub fn new_with_chunk_schema(batch: RecordBatch, chunk_schema: ChunkSchemaRef) -> Self {
@@ -499,6 +567,11 @@ impl Chunk {
         }
         if let Some(output_memory) = &self.connector_output_memory {
             inspection.charge_arc(output_memory.as_ref())?;
+        }
+        if let Some(metadata) = &self.output_column_metadata {
+            inspection.charge(metadata.holder_bytes().map_err(|_| {
+                super::root_schema_backing::RootSchemaBackingError::UnsupportedType
+            })?)?;
         }
         Ok(())
     }
@@ -548,6 +621,7 @@ impl Chunk {
             connector_output_memory: self.connector_output_memory.clone(),
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            output_column_metadata: self.output_column_metadata.clone(),
         };
         if let Some(accounting) = self.accounting.as_ref() {
             let tracker = accounting.tracker();
@@ -606,6 +680,7 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: storage,
+            output_column_metadata: self.output_column_metadata.clone(),
         };
         result.retain_source_buffer_funding(self);
         Ok(result)
@@ -783,6 +858,7 @@ impl Default for Chunk {
             connector_output_memory: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            output_column_metadata: None,
         }
     }
 }

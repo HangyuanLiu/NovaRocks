@@ -33,10 +33,13 @@ use sha2::{Digest, Sha256};
 mod aggregate_call;
 mod aggregate_erasure;
 pub mod aggregate_format;
+mod aggregate_helper_memory;
 mod aggregate_host_allocator;
 mod aggregate_invocation_backing;
 mod aggregate_kernel;
+mod aggregate_owned_state;
 pub mod aggregate_scalar;
+pub mod aggregate_scalar_debug;
 pub mod aggregate_scalar_fingerprint;
 mod aggregate_state_column;
 pub mod aggregate_types;
@@ -63,6 +66,7 @@ pub mod control_values;
 pub mod datasketches_hll;
 pub mod datasketches_hll_failure;
 pub mod datetime_value;
+pub mod decimal256_digits;
 pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
@@ -80,6 +84,9 @@ mod higher_order_call;
 mod higher_order_kernel;
 pub mod hll;
 pub mod invocation_arity;
+mod invocation_scalar_resources;
+pub mod json_object_core;
+mod json_object_resources;
 mod kernel_control;
 mod kernel_input;
 mod lambda_rows;
@@ -94,6 +101,7 @@ pub mod pattern_memo;
 pub mod percentile_hash_core;
 pub mod percentile_input;
 mod pure_catalogue;
+mod scalar_copy_geometry;
 #[cfg(test)]
 mod test_value_ingress;
 pub use frozen_writer_preparation::{
@@ -103,6 +111,7 @@ pub use frozen_writer_preparation::{
     prepare_frozen_writer_aggregate_with_empty_order_keys_and_creator_in,
 };
 mod scalar_kernel;
+mod scalar_resources;
 pub mod selected_copy;
 pub mod sketch_hash;
 mod specialization;
@@ -116,6 +125,7 @@ mod window_kernel;
 pub use aggregate_call::*;
 pub use aggregate_erasure::*;
 pub use aggregate_kernel::*;
+pub use aggregate_owned_state::OwnedAggregateState;
 pub use aggregate_state_column::*;
 pub use arithmetic::*;
 pub use binding::*;
@@ -127,6 +137,9 @@ pub use evaluation::*;
 pub use evaluation_failure::*;
 pub use higher_order_call::*;
 pub use higher_order_kernel::*;
+pub use invocation_scalar_resources::{
+    InvocationPreparationFailure, WholeInvocationRequestFacts, WholeInvocationResourceProfile,
+};
 pub use kernel_control::*;
 pub use kernel_input::validate_type_observed as validate_function_value_type_observed;
 pub use kernel_input::{
@@ -146,6 +159,9 @@ pub use novarocks_type_contract::{
 };
 pub use pure_catalogue::*;
 pub use scalar_kernel::*;
+pub use scalar_resources::{
+    ScalarInvocationRequestFacts, ScalarInvocationResourceProfile, ScalarResourceError,
+};
 pub use specialization::FunctionSpecializationFailure;
 pub use table_call::*;
 pub use table_kernel::*;
@@ -2796,8 +2812,18 @@ pub mod window_input_order;
 pub use window_invocation_data::WindowInvocationScope;
 
 mod array_backing_geometry;
+#[cfg(test)]
+mod source_custody_direct_tests;
+mod source_custody_resources;
+#[cfg(test)]
+mod source_custody_resources_tests;
 pub use arrow_result_custody::{
-    SourceBackingOwner, preflight_buffer_adoption_structure, retain_source_backing,
+    PreparedSourceCustody, SourceBackingOwner, preflight_buffer_adoption_structure,
+    retain_source_backing,
+};
+pub use source_custody_resources::{
+    SourceCustodyAllocationFacts, SourceCustodyPrefixFacts, SourceCustodyRequestFacts,
+    source_custody_prefix_facts,
 };
 
 pub mod string_repeat_pad_core;
@@ -2814,6 +2840,11 @@ pub mod approx_top_k_core;
 #[cfg(test)]
 mod common_type_m07_contract_tests;
 
+#[cfg(test)]
+mod parse_json_renderer_trace_tests;
+
+#[cfg(test)]
+mod aggregate_scalar_debug_legacy_contract_tests;
 pub mod arrow_ipc_construction;
 pub mod arrow_sort_construction;
 

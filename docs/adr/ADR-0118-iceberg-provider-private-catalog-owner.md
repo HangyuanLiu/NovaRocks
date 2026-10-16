@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0179
+    scope: "Unified Transaction and late SDK TableCommit carrier; private catalog ownership and operation admission remain active"
+    link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"
   - id: ADR-0171
     scope: "Internal reuse of vendored transaction/action preparation; catalog owner and late TableCommit carrier remain effective"
     link: "ADR-0171-commit-operation-model.md"
@@ -16,10 +19,12 @@ provenance:
 code-anchors:
   - "novarocks/connector/iceberg/src/catalog/mod.rs (NovaRocksCatalog)"
   - "novarocks/connector/iceberg/src/catalog/factory.rs (NovaRocksCatalogFactory)"
-  - "novarocks/connector/iceberg/src/catalog/transaction.rs (Transaction)"
+  - "novarocks/connector/iceberg/src/catalog/publication_dispatch.rs (PreparedPublication)"
 ---
 
 ## 问题
+
+> **当前适用范围：** [ADR-0179](ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 已用冻结请求、prepared catalog owner 与唯一 publication journal 替代本文的统一 `Transaction` 构造面、独立结果状态和 late SDK `TableCommit` carrier。私有 catalog 语义、按操作准入、HMS 只读与 Unknown 后不得重新派发的边界继续有效；下述旧构造方法为历史说明。
 
 「这个 Iceberg Catalog 支持这次操作吗」由谁回答、在哪一刻回答？是由一张脱离请求的能力表回答，
 还是由具体 Catalog 实现针对这一次具体 request 回答？

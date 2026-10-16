@@ -157,14 +157,19 @@ fn connector_ref_action(action: &IcebergReferenceSqlAction) -> Result<ConnectorR
             anchor,
             if_not_exists,
             or_replace,
-            has_uninterpreted_provider_options: _,
-        } => ConnectorRefAction::Create {
-            kind: connector_ref_kind(*kind),
-            name: Arc::from(name.as_str()),
-            snapshot_id: snapshot_anchor(anchor)?,
-            policy: policy(*or_replace, *if_not_exists),
-            expected_table_uuid: None,
-        },
+            has_uninterpreted_provider_options,
+        } => {
+            if *has_uninterpreted_provider_options {
+                return Err("Iceberg reference retention options are not supported".to_string());
+            }
+            ConnectorRefAction::Create {
+                kind: connector_ref_kind(*kind),
+                name: Arc::from(name.as_str()),
+                snapshot_id: snapshot_anchor(anchor)?,
+                policy: policy(*or_replace, *if_not_exists),
+                expected_table_uuid: None,
+            }
+        }
         IcebergReferenceSqlAction::Drop {
             kind,
             name,
@@ -219,7 +224,7 @@ mod tests {
             if_not_exists: true,
             or_replace: false,
             anchor: ReferenceAnchorSql::Version(CommandLiteral::Number("42".to_string())),
-            has_uninterpreted_provider_options: true,
+            has_uninterpreted_provider_options: false,
         };
 
         let ConnectorRefAction::Create {
@@ -252,6 +257,23 @@ mod tests {
             connector_ref_action(&action)
                 .expect_err("string snapshot ID must fail")
                 .contains("numeric literal")
+        );
+    }
+
+    #[test]
+    fn semantic_ref_rejects_uninterpreted_retention_options() {
+        let action = IcebergReferenceSqlAction::Create {
+            kind: IcebergReferenceKindSql::Branch,
+            name: "release".to_string(),
+            if_not_exists: false,
+            or_replace: false,
+            anchor: ReferenceAnchorSql::CurrentMain,
+            has_uninterpreted_provider_options: true,
+        };
+        assert!(
+            connector_ref_action(&action)
+                .unwrap_err()
+                .contains("retention options")
         );
     }
 }

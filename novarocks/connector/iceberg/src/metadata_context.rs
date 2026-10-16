@@ -133,9 +133,8 @@ impl AttemptMetadataTableCache {
 /// handle and no concrete-kind slot: a generation that held two clients would
 /// have two pieces of in-memory state that disagree about the same lake.
 ///
-/// Callers that need the vendored client -- the commit machinery, which submits
-/// through `Catalog::update_table` -- derive it from the owner rather than from
-/// a field of their own.
+/// Publication callers hand a complete frozen request to this owner; the
+/// journal retains its single dispatch conclusion and independent finalization.
 #[derive(Clone)]
 pub struct IcebergMetadataContext {
     control_state: IcebergCatalogControlState,
@@ -148,6 +147,7 @@ pub struct IcebergMetadataContext {
     /// Opaque per-generation cache identity. It is local-only and prevents
     /// two catalog generations in one query scope from sharing a table view.
     attempt_metadata_cache_owner: u64,
+    table_coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
 }
 
 #[allow(dead_code)]
@@ -195,6 +195,7 @@ impl IcebergMetadataContext {
         let binding = resources.planning_binding().clone();
         let build_control = control.clone();
         let iceberg_runtime = resources.catalog_runtime().iceberg_runtime().clone();
+        let activity = resources.catalog_runtime().activity().cloned();
         let catalog = resources
             .catalog_runtime()
             .block_on(async move {
@@ -208,6 +209,7 @@ impl IcebergMetadataContext {
                         binding,
                         rest_access_delegation,
                         iceberg_runtime,
+                        activity,
                     )
                     .await?;
                 if let Some(control) = &build_control {
@@ -233,6 +235,9 @@ impl IcebergMetadataContext {
             resources,
             novarocks_catalog,
             drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
+            table_coordination: Arc::new(
+                crate::catalog::table_coordination::IcebergTableCoordination::default(),
+            ),
             attempt_metadata_cache_owner: NEXT_ATTEMPT_METADATA_CACHE_OWNER
                 .fetch_add(1, Ordering::Relaxed),
         })
@@ -249,9 +254,26 @@ impl IcebergMetadataContext {
             resources,
             novarocks_catalog,
             drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
+            table_coordination: Arc::new(
+                crate::catalog::table_coordination::IcebergTableCoordination::default(),
+            ),
             attempt_metadata_cache_owner: NEXT_ATTEMPT_METADATA_CACHE_OWNER
                 .fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn with_table_coordination(
+        mut self,
+        coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
+    ) -> Self {
+        self.table_coordination = coordination;
+        self
+    }
+
+    pub(crate) fn table_coordination(
+        &self,
+    ) -> &Arc<crate::catalog::table_coordination::IcebergTableCoordination> {
+        &self.table_coordination
     }
 
     pub(crate) fn control_state(&self) -> &IcebergCatalogControlState {
@@ -339,6 +361,85 @@ impl IcebergMetadataContext {
         }
     }
 
+    /// Probe the UUID, wait in the logical catalog's domain, then establish a
+    /// fresh attempt base under the lock. Both observations retain the exact
+    /// request's original control and generation-specific credential binding.
+    pub(crate) fn coordinate_table_for_request(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            crate::catalog::table_coordination::IcebergTableCoordinationGuard,
+            IcebergPhysicalTable,
+        ),
+        novarocks_spi::connector::ConnectorError,
+    > {
+        self.coordinate_table_for_request_with_snapshots(
+            namespace,
+            table,
+            request,
+            crate::catalog::SnapshotLoading::All,
+        )
+    }
+
+    pub(crate) fn coordinate_table_for_request_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<
+        (
+            crate::catalog::table_coordination::IcebergTableCoordinationGuard,
+            IcebergPhysicalTable,
+        ),
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_spi::connector::ConnectorError;
+        let observed = self
+            .observe_table_classified_for_request_with_snapshots(
+                namespace, table, request, snapshots,
+            )
+            .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+        let uuid = observed.table.metadata().uuid();
+        let coordination = Arc::clone(self.table_coordination());
+        let wait_request = request.clone();
+        let activity = self.resources.catalog_runtime().activity().cloned();
+        let guard = self
+            .resources
+            .catalog_runtime()
+            .block_on(async move {
+                let _waiting = activity.as_ref().map(|owner| {
+                    owner.enter(novarocks_spi::connector::CatalogActivityPhase::TableCoordination)
+                });
+                coordination.acquire(uuid, &wait_request).await
+            })
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unavailable, message))??;
+        let fresh = self
+            .observe_table_classified_for_request_with_snapshots(
+                namespace, table, request, snapshots,
+            )
+            .map_err(|(kind, message)| {
+                if kind == ConnectorErrorKind::NotFound {
+                    ConnectorError::table_object_binding(
+                        novarocks_spi::connector::ConnectorTableObjectBindingFailure::Missing,
+                        message,
+                    )
+                } else {
+                    ConnectorError::new(kind, message)
+                }
+            })?;
+        if fresh.table.metadata().uuid() != uuid {
+            return Err(ConnectorError::table_object_binding(
+                novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                "Iceberg table UUID changed while waiting for catalog coordination",
+            ));
+        }
+        Ok((guard, fresh))
+    }
+
     /// Observe a mutation admission frontier without reusing planning caches.
     /// Keep the original deadline, stop view and credential collector for this attempt.
     pub(crate) fn observe_table_for_request(
@@ -369,6 +470,20 @@ impl IcebergMetadataContext {
             snapshots,
         )
         .map_err(|(_, message)| message)
+    }
+
+    pub(crate) fn observe_table_classified_for_request(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.observe_table_classified_for_request_with_snapshots(
+            namespace,
+            table,
+            request_context,
+            crate::catalog::SnapshotLoading::All,
+        )
     }
 
     pub(crate) fn observe_table_classified_for_request_with_snapshots(
@@ -1373,17 +1488,124 @@ mod tests {
 
         assert_eq!(generation.control_state().properties().len(), 2);
 
-        // Every vendored handle the generation hands out is the same
-        // allocation. Two clients built from one configuration would have
-        // separate in-memory state and disagree about the same lake -- a table
-        // dropped through one would still resolve through the other. That held
-        // once during development and cost a passing test to find, which is why
-        // the context now has no second handle to get wrong.
-        let first = generation.novarocks_catalog().vendored_client();
-        let second = generation.novarocks_catalog().vendored_client();
+        // Every operation reaches this generation's one semantic owner. The
+        // following real UUID/cache test independently checks its reads.
+        let first = Arc::clone(generation.novarocks_catalog());
+        let second = Arc::clone(generation.novarocks_catalog());
         assert!(
             Arc::ptr_eq(&first, &second),
-            "a generation must hold exactly one catalog client"
+            "a generation must hold exactly one catalog owner"
         );
+    }
+    // The oracle is a UUID returned by the real Hadoop create, independent of
+    // both cache implementations. The local warehouse/runtime belong to this
+    // test; every guard is dropped before the runtime and warehouse exit.
+    #[test]
+    fn coordinated_observation_bypasses_request_and_generation_caches() {
+        use novarocks_spi::connector::ConnectorStopOwner;
+        use std::time::{Duration, Instant};
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let context = IcebergMetadataContext::try_new(
+            IcebergCatalogControlState::new(configuration),
+            IcebergMetadataResources::new(binding, runtime.handle().clone()),
+        )
+        .expect("generation");
+        let created = runtime.block_on(
+            crate::catalog::admission_test_support::create_static_fixture_table(
+                &context,
+                novarocks_spi::connector::ProviderBindingEpoch::from_bytes([9; 16]),
+                crate::catalog::CatalogNamespaceName::new("analytics"),
+                crate::iceberg::TableCreation::builder()
+                    .name("frozen".to_string())
+                    .schema(
+                        Schema::builder()
+                            .with_fields(vec![Arc::new(NestedField::required(
+                                1,
+                                "id",
+                                Type::Primitive(PrimitiveType::Long),
+                            ))])
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            ),
+        );
+        let actual_uuid = created.metadata().uuid();
+        let stale = scope_retaining_table(
+            ConnectorRequestScope::new(),
+            Arc::new(AtomicUsize::new(0)),
+            context
+                .resources
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        );
+        assert_ne!(actual_uuid, stale.table.metadata().uuid());
+        context
+            .control_state
+            .physical_table_cache()
+            .insert("analytics", "frozen", stale.clone())
+            .expect("generation cache");
+        let stop = ConnectorStopOwner::new();
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            1024,
+            1024,
+        )
+        .unwrap();
+        let cache =
+            request.request_scope_extension_or_insert_with(AttemptMetadataTableCache::default);
+        cache
+            .get_or_load(
+                AttemptMetadataTableKey {
+                    owner: context.attempt_metadata_cache_owner,
+                    namespace: "analytics".to_string(),
+                    table: "frozen".to_string(),
+                },
+                || Ok(IcebergAttemptTableAccess::freeze(stale.clone())),
+            )
+            .unwrap();
+        let cached = context
+            .load_table_classified_for_request("analytics", "frozen", &request)
+            .unwrap();
+        assert_eq!(
+            cached.table.metadata().uuid(),
+            stale.table.metadata().uuid()
+        );
+        let (guard, fresh) = context
+            .coordinate_table_for_request("analytics", "frozen", &request)
+            .expect("fresh coordinated observation");
+        assert_eq!(fresh.table.metadata().uuid(), actual_uuid);
+        // A same-table caller cannot enter before the observation's holder
+        // releases, while a different UUID continues immediately.
+        runtime.block_on(async {
+            let pending = context.table_coordination().acquire(actual_uuid, &request);
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+            let other = context
+                .table_coordination()
+                .acquire(stale.table.metadata().uuid(), &request)
+                .await
+                .expect("different UUID progresses");
+            drop(other);
+        });
+        drop(guard);
     }
 }

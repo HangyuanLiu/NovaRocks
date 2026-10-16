@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use super::write_adaptation::adapt_batch;
 use crate as novarocks_connector_iceberg;
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
@@ -227,8 +228,7 @@ impl StagedWriteContext {
         let parquet_builder = ParquetWriterBuilder::new(
             parquet_writer_properties(self.metadata.properties())?,
             self.writer_schema.clone(),
-        )
-        .with_arrow_schema_override(Arc::clone(&self.annotated_schema));
+        );
         let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.file_io.clone(),
@@ -306,7 +306,7 @@ pub async fn write_record_batches(
             if batch.num_rows() == 0 {
                 continue;
             }
-            let annotated = annotate_batch(&batch, &ctx.annotated_schema)?;
+            let annotated = adapt_batch(&batch, &ctx.annotated_schema)?;
             for offset in
                 (0..annotated.num_rows()).step_by(write_batch_rows.min(annotated.num_rows()))
             {
@@ -346,7 +346,7 @@ pub async fn write_record_batches(
         if batch.num_rows() == 0 {
             continue;
         }
-        let annotated = annotate_batch(&batch, &ctx.annotated_schema)?;
+        let annotated = adapt_batch(&batch, &ctx.annotated_schema)?;
         let partitioned = splitter
             .split(&annotated)
             .map_err(|e| format!("split iceberg batch by partition spec failed: {e}"))?;
@@ -858,359 +858,6 @@ pub fn append_row_lineage_columns(
     columns.push(Arc::new(lineage.last_updated_sequence_numbers) as ArrayRef);
     arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("build row-lineage record batch failed: {e}"))
-}
-
-fn annotate_batch(
-    batch: &RecordBatch,
-    annotated_schema: &arrow::datatypes::SchemaRef,
-) -> Result<RecordBatch, String> {
-    use arrow::array::ArrayRef;
-
-    if batch_has_iceberg_field_ids(batch)
-        || batch_has_reordered_target_names(batch, annotated_schema)
-    {
-        return annotate_batch_by_identity(batch, annotated_schema);
-    }
-
-    if batch.num_columns() != annotated_schema.fields().len() {
-        return Err(format!(
-            "annotate_batch column count mismatch: batch={} schema={}",
-            batch.num_columns(),
-            annotated_schema.fields().len()
-        ));
-    }
-    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    for (idx, (col, target_field)) in batch
-        .columns()
-        .iter()
-        .zip(annotated_schema.fields().iter())
-        .enumerate()
-    {
-        let new_col = reannotate_array(col, target_field.data_type())
-            .map_err(|e| format!("annotate_batch column {idx} ({}): {e}", target_field.name()))?;
-        new_columns.push(new_col);
-    }
-    RecordBatch::try_new(Arc::clone(annotated_schema), new_columns)
-        .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))
-}
-
-fn batch_has_iceberg_field_ids(batch: &RecordBatch) -> bool {
-    batch
-        .schema()
-        .fields()
-        .iter()
-        .any(|field| iceberg_field_id(field).is_some())
-}
-
-fn iceberg_field_id(field: &arrow::datatypes::Field) -> Option<&str> {
-    field
-        .metadata()
-        .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
-        .map(String::as_str)
-}
-
-fn batch_has_reordered_target_names(
-    batch: &RecordBatch,
-    annotated_schema: &arrow::datatypes::SchemaRef,
-) -> bool {
-    if batch.num_columns() != annotated_schema.fields().len() {
-        return false;
-    }
-
-    let batch_fields = batch.schema();
-    let batch_fields = batch_fields.fields();
-    let target_fields = annotated_schema.fields();
-    let names_match_positionally = batch_fields
-        .iter()
-        .zip(target_fields.iter())
-        .all(|(source, target)| source.name().eq_ignore_ascii_case(target.name()));
-    if names_match_positionally {
-        return false;
-    }
-
-    let mut source_names = batch_fields
-        .iter()
-        .map(|field| field.name().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let mut target_names = target_fields
-        .iter()
-        .map(|field| field.name().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    source_names.sort();
-    target_names.sort();
-    source_names == target_names
-}
-
-fn annotate_batch_by_identity(
-    batch: &RecordBatch,
-    annotated_schema: &arrow::datatypes::SchemaRef,
-) -> Result<RecordBatch, String> {
-    use arrow::array::ArrayRef;
-
-    let source_schema = batch.schema();
-    let mut source_by_field_id: HashMap<String, usize> = HashMap::new();
-    let mut source_by_name: HashMap<String, usize> = HashMap::new();
-    for (idx, field) in source_schema.fields().iter().enumerate() {
-        if let Some(field_id) = iceberg_field_id(field)
-            && source_by_field_id
-                .insert(field_id.to_string(), idx)
-                .is_some()
-        {
-            return Err(format!(
-                "annotate_batch duplicate iceberg field id {field_id} in source batch"
-            ));
-        }
-        let name_key = field.name().to_ascii_lowercase();
-        if source_by_name.insert(name_key.clone(), idx).is_some() {
-            return Err(format!(
-                "annotate_batch duplicate source column name `{}`",
-                field.name()
-            ));
-        }
-    }
-
-    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(annotated_schema.fields().len());
-    for (target_idx, target_field) in annotated_schema.fields().iter().enumerate() {
-        let source_idx = iceberg_field_id(target_field)
-            .and_then(|field_id| source_by_field_id.get(field_id).copied())
-            .or_else(|| {
-                source_by_name
-                    .get(&target_field.name().to_ascii_lowercase())
-                    .copied()
-            });
-
-        let new_col = if let Some(source_idx) = source_idx {
-            let col = batch.column(source_idx);
-            reannotate_array(col, target_field.data_type()).map_err(|e| {
-                format!(
-                    "annotate_batch column {target_idx} ({}): {e}",
-                    target_field.name()
-                )
-            })?
-        } else {
-            if !target_field.is_nullable() {
-                return Err(format!(
-                    "annotate_batch missing required target column `{}`",
-                    target_field.name()
-                ));
-            }
-            arrow::array::new_null_array(target_field.data_type(), batch.num_rows())
-        };
-        new_columns.push(new_col);
-    }
-
-    RecordBatch::try_new(Arc::clone(annotated_schema), new_columns)
-        .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))
-}
-
-/// Whether `dtype` is a nested / composite Arrow type whose inner `Field`
-/// definitions are part of the `DataType` itself (so structural identity is
-/// load-bearing). `reannotate_array` rebuilds the supported nested types
-/// (Struct / List / Map) through dedicated arms and must NEVER hand a nested
-/// type to the general scalar cast: a nested-vs-scalar pair (e.g. List -> Int)
-/// or an unsupported nested-vs-nested pair (e.g. List -> Struct) must fail
-/// fast via the catch-all. This guard gates the general scalar coercion arm so
-/// only genuine scalar <-> scalar pairs are delegated to the neutral scalar cast.
-fn is_nested_dtype(dtype: &arrow::datatypes::DataType) -> bool {
-    use arrow::datatypes::DataType;
-    matches!(
-        dtype,
-        DataType::Struct(_)
-            | DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::ListView(_)
-            | DataType::LargeListView(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Map(_, _)
-            | DataType::Union(_, _)
-            | DataType::Dictionary(_, _)
-            | DataType::RunEndEncoded(_, _)
-    )
-}
-
-/// Rebuild `array` so its `data_type()` matches `target_dtype` exactly,
-/// preserving the underlying data buffers.
-///
-/// Arrow's `RecordBatch::try_new` performs a strict recursive `PartialEq`
-/// on data types. For scalar / primitive columns the comparison succeeds
-/// because the field-level metadata (e.g. `PARQUET:field_id`) lives on the
-/// `Schema`'s top-level `Field`, not inside the `DataType`. But for
-/// `DataType::Map(entries_field, _)`, `DataType::List(child_field)`, and
-/// `DataType::Struct(fields)`, the inner `Field` definitions are part of
-/// the `DataType` itself, so any difference in their metadata or
-/// nullability fails the comparison.
-///
-/// The Iceberg sink produces an annotated schema whose inner fields carry
-/// `PARQUET:field_id`; the runtime chunk does not. This helper deep-rebuilds
-/// the array so its inner field layout matches the target, while keeping the
-/// original buffers.
-///
-/// Beyond field-id reannotation, this is also the single place that reconciles
-/// an INSERT's source Arrow type to the sink column's target type, matching the
-/// native Iceberg write path. The arms are tried in order:
-///   1. exact type equality -> passthrough;
-///   2. supported nested rebuilds (Map / Struct / List -> same kind), recursing
-///      into children;
-///   3. Arrow `Null` source (bare NULL literal insert) -> all-null target array;
-///   4. general scalar <-> scalar coercion via the neutral scalar cast,
-///      GUARDED so neither side is a nested/composite type;
-///   5. catch-all fail-fast `Err` for everything else (structural mismatches
-///      such as List -> Int, scalar -> nested, or unsupported nested pairs),
-///      per CLAUDE.md rule #2.
-fn reannotate_array(
-    array: &arrow::array::ArrayRef,
-    target_dtype: &arrow::datatypes::DataType,
-) -> Result<arrow::array::ArrayRef, String> {
-    use arrow::array::{ArrayRef, ListArray, MapArray, StructArray};
-    use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::DataType;
-
-    if array.data_type() == target_dtype {
-        return Ok(array.clone());
-    }
-
-    match (array.data_type(), target_dtype) {
-        (DataType::Map(_, _), DataType::Map(target_entries_field, target_sorted)) => {
-            let map = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
-                "reannotate_array: Map data_type but array is not MapArray".to_string()
-            })?;
-            let target_entries_struct_fields = match target_entries_field.data_type() {
-                DataType::Struct(fields) => fields,
-                other => {
-                    return Err(format!(
-                        "reannotate_array: target Map entries must be Struct, got {other:?}"
-                    ));
-                }
-            };
-            if target_entries_struct_fields.len() != 2 {
-                return Err(format!(
-                    "reannotate_array: target Map entries Struct must have 2 fields, got {}",
-                    target_entries_struct_fields.len()
-                ));
-            }
-            let target_key_field = &target_entries_struct_fields[0];
-            let target_value_field = &target_entries_struct_fields[1];
-
-            let keys_in: ArrayRef = Arc::new(map.keys().clone());
-            let values_in: ArrayRef = Arc::new(map.values().clone());
-            let new_keys = reannotate_array(&keys_in, target_key_field.data_type())?;
-            let new_values = reannotate_array(&values_in, target_value_field.data_type())?;
-
-            // The Iceberg MAP key field is `required` per the Iceberg spec, so
-            // its Arrow representation is a non-nullable Struct field. A NULL map
-            // key is not representable in an Iceberg table. Building a
-            // StructArray with unmasked nulls on a non-nullable field panics
-            // inside Arrow's `StructArray::new`; fail fast with a clear error on
-            // user input instead (CLAUDE.md rule #2).
-            if !target_key_field.is_nullable() && new_keys.null_count() > 0 {
-                return Err(format!(
-                    "Iceberg MAP keys must be non-null (column key field `{}`); cannot insert a NULL map key",
-                    target_key_field.name()
-                ));
-            }
-            let new_entries = StructArray::try_new(
-                target_entries_struct_fields.clone(),
-                vec![new_keys, new_values],
-                map.entries().nulls().cloned(),
-            )
-            .map_err(|e| {
-                format!("reannotate_array: rebuild Map entries StructArray failed: {e}")
-            })?;
-            let new_map = MapArray::try_new(
-                target_entries_field.clone(),
-                OffsetBuffer::new(map.value_offsets().to_vec().into()),
-                new_entries,
-                map.nulls().cloned(),
-                *target_sorted,
-            )
-            .map_err(|e| format!("reannotate_array: rebuild MapArray failed: {e}"))?;
-            Ok(Arc::new(new_map) as ArrayRef)
-        }
-        (DataType::Struct(_), DataType::Struct(target_fields)) => {
-            let struct_arr = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    "reannotate_array: Struct data_type but array is not StructArray".to_string()
-                })?;
-            if struct_arr.num_columns() != target_fields.len() {
-                return Err(format!(
-                    "reannotate_array: Struct child count mismatch: array={} target={}",
-                    struct_arr.num_columns(),
-                    target_fields.len()
-                ));
-            }
-            let mut new_children: Vec<ArrayRef> = Vec::with_capacity(target_fields.len());
-            for (i, target_child_field) in target_fields.iter().enumerate() {
-                let child = struct_arr.column(i).clone();
-                let new_child = reannotate_array(&child, target_child_field.data_type())?;
-                new_children.push(new_child);
-            }
-            let new_struct = StructArray::try_new(
-                target_fields.clone(),
-                new_children,
-                struct_arr.nulls().cloned(),
-            )
-            .map_err(|e| format!("reannotate_array: rebuild StructArray failed: {e}"))?;
-            Ok(Arc::new(new_struct) as ArrayRef)
-        }
-        (DataType::List(_), DataType::List(target_child_field)) => {
-            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                "reannotate_array: List data_type but array is not ListArray".to_string()
-            })?;
-            let values_in: ArrayRef = list.values().clone();
-            let new_values = reannotate_array(&values_in, target_child_field.data_type())?;
-            let new_list = ListArray::try_new(
-                target_child_field.clone(),
-                OffsetBuffer::new(list.value_offsets().to_vec().into()),
-                new_values,
-                list.nulls().cloned(),
-            )
-            .map_err(|e| format!("reannotate_array: rebuild ListArray failed: {e}"))?;
-            Ok(Arc::new(new_list) as ArrayRef)
-        }
-        (a, b) if a == b => Ok(array.clone()),
-        // Arrow `Null` source -> any target type. A `Null` array is produced
-        // when an INSERT supplies a bare NULL literal (no type information):
-        // every row is NULL. Build an all-null array of the target type
-        // directly rather than routing through a cast kernel; this is always
-        // valid for a nullable insert and avoids the kernel-specific holes
-        // around `Null -> <T>`. Length is preserved.
-        (DataType::Null, _) => Ok(arrow::array::new_null_array(target_dtype, array.len())),
-        // General scalar <-> scalar coercion. INSERT-SELECT may feed a source
-        // scalar column into a different-typed scalar sink column, e.g.
-        //   * numeric <-> numeric (integer narrowing, integer -> Decimal128,
-        //     Decimal128 -> Decimal128 narrowing with half-up rounding,
-        //     integer -> float widening, float narrowing/float -> integer);
-        //   * scalar -> STRING (numeric/boolean/temporal -> Utf8);
-        //   * STRING -> scalar and temporal <-> string, etc.
-        // The native Iceberg write path accepts these coercions. We delegate to
-        // the canonical relaxed scalar cast, which applies safe=true
-        // semantics (out-of-range values become NULL, matching the DECIMAL
-        // overflow convention) and identical textual formatting for ->STRING.
-        //
-        // This arm is GUARDED to scalar pairs only: if either side is a nested
-        // / composite type (`is_nested_dtype`), we fall through to the
-        // fail-fast catch-all below. Supported nested rebuilds (Struct/List/Map
-        // -> same kind) are handled by the dedicated arms ABOVE; a nested ->
-        // scalar pair (e.g. List -> Int), a scalar -> nested pair, or an
-        // unsupported nested -> nested pair MUST NOT reach the cast and instead
-        // errors out, preserving CLAUDE.md rule #2 (fail fast on structural
-        // mismatches).
-        (a, b) if !is_nested_dtype(a) && !is_nested_dtype(b) => {
-            novarocks_types::arrow_cast::cast_scalar_with_special_rules(array, target_dtype)
-                .map_err(|e| {
-                    format!(
-                        "reannotate_array: coerce scalar {:?} to {:?} failed: {e}",
-                        array.data_type(),
-                        target_dtype
-                    )
-                })
-        }
-        (a, b) => Err(format!(
-            "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
-        )),
-    }
 }
 
 fn unique_file_suffix() -> String {
@@ -1979,7 +1626,7 @@ mod tests {
         .expect("append");
         let extended_schema = build_row_lineage_writer_schema(&iceberg_schema).expect("schema");
         let annotated_schema = Arc::new(schema_to_arrow_schema(&extended_schema).expect("arrow"));
-        let annotated = annotate_batch(&enriched, &annotated_schema).expect("annotate");
+        let annotated = adapt_batch(&enriched, &annotated_schema).expect("annotate");
 
         assert_eq!(annotated.num_columns(), 3);
         assert_eq!(annotated.schema().field(1).name(), "_row_id");
@@ -1990,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn annotate_batch_aligns_by_iceberg_field_id_and_fills_nullable_added_columns() {
+    fn adaptation_rejects_missing_projected_columns() {
         use arrow::array::{Int32Array, Int64Array};
         use arrow::datatypes::{DataType, Schema};
         use std::sync::Arc;
@@ -2013,16 +1660,12 @@ mod tests {
             arrow_field_with_iceberg_id("category", DataType::Utf8, true, 3),
         ]));
 
-        let annotated = annotate_batch(&source, &annotated_schema).expect("annotate");
-
-        assert_eq!(annotated.num_columns(), 3);
-        assert_eq!(annotated.schema().field(2).name(), "category");
-        assert_eq!(annotated.column(2).data_type(), &DataType::Utf8);
-        assert!(annotated.column(2).is_null(0));
+        let error = adapt_batch(&source, &annotated_schema).expect_err("missing projected column");
+        assert!(error.contains("column count mismatch"), "{error}");
     }
 
     #[test]
-    fn annotate_batch_aligns_by_iceberg_field_id_and_ignores_dropped_columns() {
+    fn adaptation_rejects_unprojected_dropped_columns() {
         use arrow::array::{Int32Array, Int64Array, StringArray};
         use arrow::datatypes::{DataType, Schema};
         use std::sync::Arc;
@@ -2046,21 +1689,9 @@ mod tests {
             arrow_field_with_iceberg_id("id", DataType::Int32, false, 1),
         ]));
 
-        let annotated = annotate_batch(&source, &annotated_schema).expect("annotate");
-
-        assert_eq!(annotated.num_columns(), 2);
-        let amount = annotated
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("amount");
-        let id = annotated
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("id");
-        assert_eq!(amount.value(0), 400);
-        assert_eq!(id.value(0), 4);
+        let error =
+            adapt_batch(&source, &annotated_schema).expect_err("unprojected dropped column");
+        assert!(error.contains("column count mismatch"), "{error}");
     }
 
     #[test]
@@ -2079,11 +1710,11 @@ mod tests {
             Field::new("amount", DataType::Int64, true),
         ]));
 
-        let err = annotate_batch(&source, &annotated_schema).expect_err("count mismatch");
+        let err = adapt_batch(&source, &annotated_schema).expect_err("count mismatch");
 
         assert_eq!(
             err,
-            "annotate_batch column count mismatch: batch=1 schema=2"
+            "Iceberg write adaptation column count mismatch: input=1 target=2"
         );
     }
 
@@ -2171,7 +1802,7 @@ mod tests {
         );
 
         let annotated =
-            annotate_batch(&runtime_batch, &annotated_schema).expect("annotate map column");
+            adapt_batch(&runtime_batch, &annotated_schema).expect("annotate map column");
         assert_eq!(annotated.num_columns(), 1);
         let out_map = annotated
             .column(0)
@@ -2203,800 +1834,186 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
-    async fn write_variant_column_round_trips_through_local_parquet() {
-        use arrow::array::{Int32Array, LargeBinaryArray};
-        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        use std::fs::File;
-        use std::sync::Arc;
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let location = format!("file://{}", dir.path().display());
-
-        let iceberg_schema = Arc::new(
-            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::optional(2, "v", Type::Variant(crate::iceberg::spec::VariantType))
-                        .into(),
-                ])
-                .build()
-                .expect("schema"),
-        );
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
-            iceberg_schema.as_ref().clone(),
-            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
-            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
-            location.clone(),
-            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
-            std::collections::HashMap::new(),
-        )
-        .expect("builder")
-        .build()
-        .expect("metadata")
-        .metadata;
-        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(
-                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
-            )
-            .file_io(
-                novarocks_connector_iceberg::fs_io::build_file_io_for_location(
-                    &location,
-                    local_test_binding(),
-                ),
-            )
-            .metadata(metadata)
-            .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
-            .build()
-            .expect("table");
-
-        // Build a 1-row record batch where `v` holds a serialized variant
-        // (short string "hello").
-        let payload = {
-            let metadata = vec![0x01u8, 0x00, 0x00];
-            let mut value = Vec::new();
-            let s = b"hello";
-            value.push(((s.len() as u8) << 2) | 0b01);
-            value.extend_from_slice(s);
-            let total = (metadata.len() + value.len()) as u32;
-            let mut out = Vec::new();
-            out.extend_from_slice(&total.to_le_bytes());
-            out.extend_from_slice(&metadata);
-            out.extend_from_slice(&value);
-            out
+    async fn sdk_writer_preserves_values_and_writes_target_timezone_and_nested_ids() {
+        use crate::iceberg::spec::{
+            FormatVersion, ListType, MapType, PartitionSpec, SortOrder, TableMetadataBuilder,
         };
-        let input_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("v", DataType::LargeBinary, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            input_schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(LargeBinaryArray::from_iter_values([payload.as_slice()])),
-            ],
-        )
-        .expect("batch");
+        use arrow::array::{
+            ArrayRef, BinaryArray, Int32Array, ListArray, MapArray, StringArray, StructArray,
+            TimestampMicrosecondArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::basic::LogicalType;
 
-        let data_files = write_record_batches_as_data_files(&table, vec![batch])
-            .await
-            .expect("write");
-        assert_eq!(data_files.len(), 1);
-        let path = data_files[0].file_path().to_string();
-        let on_disk = path.strip_prefix("file://").unwrap_or(&path);
-
-        // Re-open the parquet file with the standard parquet-rs reader and
-        // assert the physical layout matches the spec.
-        let f = File::open(on_disk).expect("open parquet");
-        let builder = ParquetRecordBatchReaderBuilder::try_new(f).expect("builder");
-        let parquet_schema = builder.parquet_schema();
-        let v_node = parquet_schema
-            .columns()
-            .iter()
-            .find(|c| c.path().string().starts_with("v"))
-            .expect("v column");
-        assert!(
-            v_node.path().string() == "v.metadata" || v_node.path().string() == "v.value",
-            "expected leaf path under v.*; got {}",
-            v_node.path().string()
-        );
-        // Look at the parent group's logical type via the parquet schema descr.
-        let root = builder.parquet_schema().root_schema();
-        let v_field = root
-            .get_fields()
-            .iter()
-            .find(|f| f.name() == "v")
-            .expect("v");
-        assert!(
-            format!("{:?}", v_field.get_basic_info().logical_type_ref())
-                .to_lowercase()
-                .contains("variant"),
-            "v parent group must carry LogicalType::Variant; got {:?}",
-            v_field.get_basic_info().logical_type_ref()
-        );
-    }
-
-    /// reannotate_array must narrow Decimal128(src_p, src_s) → Decimal128(tgt_p, tgt_s)
-    /// with half-up rounding rather than returning an error.
-    #[test]
-    fn reannotate_decimal128_narrows_scale_with_rounding() {
-        use arrow::array::{ArrayRef, Decimal128Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        // Source: DECIMAL(13, 4) — values as returned by CAST(x AS DECIMAL(13,4)).
-        let src = Arc::new(
-            Decimal128Array::from(vec![
-                Some(12344_i128),  // 1.2344 -> rounds DOWN to 1.23
-                Some(12356_i128),  // 1.2356 -> rounds UP to 1.24
-                Some(-23444_i128), // -2.3444 -> rounds DOWN (toward 0) to -2.34
-                Some(-23456_i128), // -2.3456 -> rounds away from 0 to -2.35
-                None,              // NULL preserves NULL
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_schema_id(17)
+            .with_fields(vec![
+                NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+                NestedField::optional(
+                    2,
+                    "l",
+                    Type::List(ListType::new(
+                        NestedField::optional(3, "element", Type::Primitive(PrimitiveType::Binary))
+                            .into(),
+                    )),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "m",
+                    Type::Map(MapType::new(
+                        NestedField::required(5, "key", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                        NestedField::optional(6, "value", Type::Primitive(PrimitiveType::Int))
+                            .into(),
+                    )),
+                )
+                .into(),
             ])
-            .with_precision_and_scale(13, 4)
-            .expect("src decimal"),
-        ) as ArrayRef;
-
-        let target_dtype = DataType::Decimal128(10, 2);
-        let result = reannotate_array(&src, &target_dtype).expect("reannotate must succeed");
-
-        let out = result
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .expect("Decimal128Array");
-
-        assert_eq!(out.precision(), 10);
-        assert_eq!(out.scale(), 2);
-        assert_eq!(out.len(), 5);
-
-        // 1.2344 -> 1.23
-        assert_eq!(out.value(0), 123_i128);
-        // 1.2356 -> 1.24
-        assert_eq!(out.value(1), 124_i128);
-        // -2.3444 -> -2.34
-        assert_eq!(out.value(2), -234_i128);
-        // -2.3456 -> -2.35
-        assert_eq!(out.value(3), -235_i128);
-        // NULL
-        assert!(out.is_null(4));
-    }
-
-    /// reannotate_array: same Decimal128 precision and scale is a no-op (fast path).
-    #[test]
-    fn reannotate_decimal128_same_type_is_passthrough() {
-        use arrow::array::{ArrayRef, Decimal128Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src = Arc::new(
-            Decimal128Array::from(vec![Some(100_i128), None])
-                .with_precision_and_scale(10, 2)
-                .expect("src"),
-        ) as ArrayRef;
-
-        let target_dtype = DataType::Decimal128(10, 2);
-        let result = reannotate_array(&src, &target_dtype).expect("same-type must succeed");
-        // The early equality check returns the original Arc.
-        assert!(Arc::ptr_eq(&src, &result));
-    }
-
-    /// reannotate_array must narrow Int64 → Int32 losslessly when every value fits.
-    #[test]
-    fn reannotate_int64_narrows_to_int32_lossless() {
-        use arrow::array::{ArrayRef, Int32Array, Int64Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Int64Array::from(vec![
-            Some(1_i64),
-            Some(20_i64),
-            Some(99999_i64),
-            None,
-        ]));
-
-        let result =
-            reannotate_array(&src, &DataType::Int32).expect("lossless narrow must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("Int32Array");
-
-        assert_eq!(out.len(), 4);
-        assert_eq!(out.value(0), 1_i32);
-        assert_eq!(out.value(1), 20_i32);
-        assert_eq!(out.value(2), 99999_i32);
-        assert!(out.is_null(3));
-    }
-
-    /// reannotate_array must produce NULL (not error) when Int64 → Int32 overflows.
-    #[test]
-    fn reannotate_int64_to_int32_overflow_returns_null() {
-        use arrow::array::{ArrayRef, Int32Array, Int64Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        // i32::MAX is 2_147_483_647; values beyond that should become NULL.
-        let src: ArrayRef = Arc::new(Int64Array::from(vec![
-            Some(42_i64),
-            Some(i64::from(i32::MAX) + 1), // overflows
-            Some(-1_i64),
-            None,
-        ]));
-
-        let result =
-            reannotate_array(&src, &DataType::Int32).expect("overflow arm must not return Err");
-        let out = result
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("Int32Array");
-
-        assert_eq!(out.len(), 4);
-        assert_eq!(out.value(0), 42_i32);
-        assert!(out.is_null(1), "overflowing value must become NULL");
-        assert_eq!(out.value(2), -1_i32);
-        assert!(out.is_null(3));
-    }
-
-    /// reannotate_array must narrow Int32 → Int16 losslessly.
-    #[test]
-    fn reannotate_int32_narrows_to_int16() {
-        use arrow::array::{ArrayRef, Int16Array, Int32Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Int32Array::from(vec![
-            Some(100_i32),
-            Some(-200_i32),
-            None,
-            Some(i32::from(i16::MAX) + 1), // overflows i16
-        ]));
-
-        let result =
-            reannotate_array(&src, &DataType::Int16).expect("Int32->Int16 must not return Err");
-        let out = result
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .expect("Int16Array");
-
-        assert_eq!(out.len(), 4);
-        assert_eq!(out.value(0), 100_i16);
-        assert_eq!(out.value(1), -200_i16);
-        assert!(out.is_null(2));
-        assert!(out.is_null(3), "overflow must become NULL");
-    }
-
-    /// reannotate_array: same Int32 type is a passthrough (regression guard).
-    #[test]
-    fn reannotate_int32_same_type_is_passthrough() {
-        use arrow::array::{ArrayRef, Int32Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Int32Array::from(vec![Some(7_i32), None]));
-        let result = reannotate_array(&src, &DataType::Int32).expect("same Int32 must succeed");
-        assert!(Arc::ptr_eq(&src, &result));
-    }
-
-    /// reannotate_array must implicitly coerce an integer column to Utf8 when the
-    /// iceberg sink column is STRING/VARCHAR, matching the native write path.
-    #[test]
-    fn reannotate_int64_coerces_to_utf8() {
-        use arrow::array::{ArrayRef, Int64Array, StringArray};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Int64Array::from(vec![
-            Some(1_i64),
-            Some(2_i64),
-            Some(3_i64),
-            None,
-        ]));
-
-        let result = reannotate_array(&src, &DataType::Utf8).expect("Int64->Utf8 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-
-        assert_eq!(out.len(), 4);
-        assert_eq!(out.value(0), "1");
-        assert_eq!(out.value(1), "2");
-        assert_eq!(out.value(2), "3");
-        assert!(out.is_null(3));
-    }
-
-    /// reannotate_array must coerce a DECIMAL column to Utf8 using the same
-    /// formatting the engine uses for CAST(... AS STRING) (value 150, scale 2 -> "1.50").
-    #[test]
-    fn reannotate_decimal128_coerces_to_utf8() {
-        use arrow::array::{ArrayRef, Decimal128Array, StringArray};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(
-            Decimal128Array::from(vec![Some(150_i128), Some(-25_i128), None])
-                .with_precision_and_scale(10, 2)
-                .expect("src decimal"),
-        );
-
-        let result =
-            reannotate_array(&src, &DataType::Utf8).expect("Decimal128->Utf8 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.value(0), "1.50");
-        assert_eq!(out.value(1), "-0.25");
-        assert!(out.is_null(2));
-    }
-
-    /// reannotate_array must coerce a BOOLEAN column to Utf8 ("true"/"false").
-    #[test]
-    fn reannotate_boolean_coerces_to_utf8() {
-        use arrow::array::{ArrayRef, BooleanArray, StringArray};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(false), None]));
-
-        let result = reannotate_array(&src, &DataType::Utf8).expect("Boolean->Utf8 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.value(0), "true");
-        assert_eq!(out.value(1), "false");
-        assert!(out.is_null(2));
-    }
-
-    /// reannotate_array must implicitly coerce an integer column to Decimal128
-    /// when the iceberg sink column is DECIMAL, matching the native write path
-    /// (e.g. INSERT of a BIGINT expression into a DECIMAL(18,0) column).
-    #[test]
-    fn reannotate_int64_coerces_to_decimal128_scale0() {
-        use arrow::array::{ArrayRef, Decimal128Array, Int64Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Int64Array::from(vec![
-            Some(1_i64),
-            Some(2_i64),
-            Some(3_i64),
-            None,
-        ]));
-
-        let target_dtype = DataType::Decimal128(18, 0);
-        let result = reannotate_array(&src, &target_dtype).expect("Int64->Decimal128 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .expect("Decimal128Array");
-
-        assert_eq!(out.precision(), 18);
-        assert_eq!(out.scale(), 0);
-        assert_eq!(out.len(), 4);
-        assert_eq!(out.value(0), 1_i128);
-        assert_eq!(out.value(1), 2_i128);
-        assert_eq!(out.value(2), 3_i128);
-        assert!(out.is_null(3));
-    }
-
-    /// reannotate_array must scale integer values when coercing to a DECIMAL with
-    /// non-zero scale (1 -> 1.00 under DECIMAL(10,2), i.e. raw value 100).
-    #[test]
-    fn reannotate_int64_coerces_to_decimal128_scaled() {
-        use arrow::array::{ArrayRef, Decimal128Array, Int64Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Int64Array::from(vec![Some(1_i64), Some(25_i64), None]));
-
-        let target_dtype = DataType::Decimal128(10, 2);
-        let result =
-            reannotate_array(&src, &target_dtype).expect("Int64->Decimal128 scaled must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .expect("Decimal128Array");
-
-        assert_eq!(out.precision(), 10);
-        assert_eq!(out.scale(), 2);
-        assert_eq!(out.len(), 3);
-        // 1 -> 1.00 (raw 100), 25 -> 25.00 (raw 2500).
-        assert_eq!(out.value(0), 100_i128);
-        assert_eq!(out.value(1), 2500_i128);
-        assert!(out.is_null(2));
-    }
-
-    /// reannotate_array must implicitly widen an integer column to Float64 when
-    /// the iceberg sink column is DOUBLE.
-    #[test]
-    fn reannotate_int32_coerces_to_float64() {
-        use arrow::array::{ArrayRef, Float64Array, Int32Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Int32Array::from(vec![
-            Some(1_i32),
-            Some(-2_i32),
-            Some(300_i32),
-            None,
-        ]));
-
-        let result =
-            reannotate_array(&src, &DataType::Float64).expect("Int32->Float64 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Float64Array");
-
-        assert_eq!(out.len(), 4);
-        assert_eq!(out.value(0), 1.0_f64);
-        assert_eq!(out.value(1), -2.0_f64);
-        assert_eq!(out.value(2), 300.0_f64);
-        assert!(out.is_null(3));
-    }
-
-    /// reannotate_array must narrow Float64 -> Float32 (clean numeric->numeric).
-    #[test]
-    fn reannotate_float64_narrows_to_float32() {
-        use arrow::array::{ArrayRef, Float32Array, Float64Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-
-        let src: ArrayRef = Arc::new(Float64Array::from(vec![
-            Some(1.5_f64),
-            Some(-2.25_f64),
-            None,
-        ]));
-
-        let result =
-            reannotate_array(&src, &DataType::Float32).expect("Float64->Float32 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("Float32Array");
-
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.value(0), 1.5_f32);
-        assert_eq!(out.value(1), -2.25_f32);
-        assert!(out.is_null(2));
-    }
-
-    /// reannotate_array must keep failing fast for genuinely incompatible pairs
-    /// (e.g. Struct -> Int32). The fix only adds the `-> Utf8` coercion arm; it
-    /// must not broaden the catch-all into arbitrary scalar/composite casts.
-    #[test]
-    fn reannotate_struct_to_int32_still_errors() {
-        use arrow::array::{ArrayRef, Int64Array, StructArray};
-        use arrow::datatypes::{DataType, Field, Fields};
-        use std::sync::Arc;
-
-        let child = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
-        let fields: Fields = vec![Arc::new(Field::new("a", DataType::Int64, true))].into();
-        let src: ArrayRef = Arc::new(StructArray::new(fields, vec![child], None));
-
-        let err = reannotate_array(&src, &DataType::Int32)
-            .expect_err("Struct -> Int32 must remain a fail-fast error");
-        assert!(
-            err.contains("incompatible data types"),
-            "expected the fail-fast catch-all error, got: {err}"
-        );
-    }
-
-    /// reannotate_array must coerce an Arrow `Null` source array (all nulls,
-    /// e.g. an INSERT of a bare NULL literal) into an all-null array of the
-    /// sink column's BOOLEAN type. The native write path accepts NULL inserts
-    /// into any nullable column, so the iceberg path must too.
-    #[test]
-    fn reannotate_null_array_coerces_to_boolean() {
-        use arrow::array::{ArrayRef, BooleanArray};
-        use arrow::datatypes::DataType;
-
-        let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
-        let result =
-            reannotate_array(&src, &DataType::Boolean).expect("Null->Boolean must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("BooleanArray");
-
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.null_count(), 3);
-    }
-
-    /// reannotate_array must coerce an Arrow `Null` source array into an
-    /// all-null Int64 array.
-    #[test]
-    fn reannotate_null_array_coerces_to_int64() {
-        use arrow::array::{ArrayRef, Int64Array};
-        use arrow::datatypes::DataType;
-
-        let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
-        let result = reannotate_array(&src, &DataType::Int64).expect("Null->Int64 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.null_count(), 3);
-    }
-
-    /// reannotate_array must coerce an Arrow `Null` source array into an
-    /// all-null Utf8 array.
-    #[test]
-    fn reannotate_null_array_coerces_to_utf8() {
-        use arrow::array::{ArrayRef, StringArray};
-        use arrow::datatypes::DataType;
-
-        let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
-        let result = reannotate_array(&src, &DataType::Utf8).expect("Null->Utf8 must succeed");
-        let out = result
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.null_count(), 3);
-    }
-
-    /// reannotate_array must keep failing fast when a NESTED source (List) is
-    /// fed into a scalar sink column (Int32). Generalizing scalar->scalar
-    /// coercion must NOT open a path that casts nested arrays to scalars; such
-    /// structural mismatches must still hit the fail-fast catch-all.
-    #[test]
-    fn reannotate_list_to_int32_still_errors() {
-        use arrow::array::{ArrayRef, Int32Array, ListArray};
-        use arrow::buffer::OffsetBuffer;
-        use arrow::datatypes::{DataType, Field};
-        use std::sync::Arc;
-
-        // List<Int32> with 2 lists: [1,2] and [3].
-        let values = Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef;
-        let child_field = Arc::new(Field::new("item", DataType::Int32, true));
-        let offsets = OffsetBuffer::new(vec![0_i32, 2, 3].into());
-        let list = ListArray::try_new(child_field, offsets, values, None).expect("list");
-        let src: ArrayRef = Arc::new(list);
-
-        let err = reannotate_array(&src, &DataType::Int32)
-            .expect_err("List<Int32> -> Int32 must remain a fail-fast error");
-        assert!(
-            err.contains("incompatible data types"),
-            "expected the fail-fast catch-all error, got: {err}"
-        );
-    }
-
-    /// reannotate_array must return a clean Err (not panic) when a runtime Map
-    /// column carrying a NULL key is reannotated to the Iceberg target Map type
-    /// whose key field is non-nullable (the spec marks map keys `required`).
-    /// Without the guard, Arrow's `StructArray::new` panics with
-    /// "Found unmasked nulls for non-nullable StructArray field \"key\"".
-    #[test]
-    fn reannotate_map_with_null_key_to_required_key_target_errors() {
-        use arrow::array::{ArrayRef, Int32Array, MapArray, StringArray, StructArray};
-        use arrow::buffer::OffsetBuffer;
-        use arrow::datatypes::{DataType, Field, Fields};
-        use std::sync::Arc;
-
-        // Runtime source MapArray: key field nullable (as execution produces),
-        // with a NULL key in the single entry [{null: "x"}].
-        let src_key_field = Arc::new(Field::new("key", DataType::Int32, true));
-        let src_value_field = Arc::new(Field::new("value", DataType::Utf8, true));
-        let src_entries_fields: Fields =
-            vec![src_key_field.clone(), src_value_field.clone()].into();
-        let src_entries_field = Arc::new(Field::new(
-            "key_value",
-            DataType::Struct(src_entries_fields.clone()),
-            false,
-        ));
-        let keys = Arc::new(Int32Array::from(vec![None])) as ArrayRef;
-        let values = Arc::new(StringArray::from(vec![Some("x")])) as ArrayRef;
-        let src_entries = StructArray::new(src_entries_fields, vec![keys, values], None);
-        let src_map = MapArray::try_new(
-            src_entries_field,
-            OffsetBuffer::new(vec![0_i32, 1].into()),
-            src_entries,
-            None,
-            false,
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            location.clone(),
+            FormatVersion::V3,
+            HashMap::new(),
         )
-        .expect("src map");
-        let src: ArrayRef = Arc::new(src_map);
-
-        // Target Iceberg Map type: key field NON-nullable (required).
-        let target_key_field = Arc::new(Field::new("key", DataType::Int32, false));
-        let target_value_field = Arc::new(Field::new("value", DataType::Utf8, true));
-        let target_entries_field = Arc::new(Field::new(
-            "key_value",
-            DataType::Struct(vec![target_key_field, target_value_field].into()),
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "sdk_layout"]).unwrap())
+            .file_io(crate::fs_io::build_file_io_for_location(
+                &location,
+                local_test_binding(),
+            ))
+            .metadata(metadata)
+            .runtime(crate::iceberg::Runtime::try_current().unwrap())
+            .build()
+            .unwrap();
+        let list: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Binary, true)),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            Arc::new(BinaryArray::from(vec![Some(&[0xff, 0][..]), None])),
+            None,
+        ));
+        let fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new("value", DataType::Int32, true)),
+        ]
+        .into();
+        let entries = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+            ],
+            None,
+        );
+        let map: ArrayRef = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            entries,
+            None,
             false,
         ));
-        let target_dtype = DataType::Map(target_entries_field, false);
-
-        let err = reannotate_array(&src, &target_dtype)
-            .expect_err("null map key into a required key field must be a clean Err, not a panic");
-        assert!(
-            err.contains("Iceberg MAP keys must be non-null"),
-            "expected the null-map-key fail-fast error, got: {err}"
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(-1234567), None]));
+        let arrays = vec![ts, list, map];
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(
+                arrays
+                    .iter()
+                    .zip(["ts", "l", "m"])
+                    .map(|(array, name)| Field::new(name, array.data_type().clone(), true))
+                    .collect::<Vec<_>>(),
+            )),
+            arrays,
+        )
+        .unwrap();
+        let files = write_record_batches_as_data_files(&table, vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let path = files[0]
+            .file_path()
+            .strip_prefix("file://")
+            .unwrap_or(files[0].file_path());
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
+        let columns = reader.parquet_schema().columns();
+        assert!(matches!(
+            columns[0].logical_type_ref(),
+            Some(LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: true,
+                ..
+            })
+        ));
+        let paths = columns
+            .iter()
+            .map(|column| column.path().string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "ts",
+                "l.list.element",
+                "m.key_value.key",
+                "m.key_value.value"
+            ]
         );
-    }
-
-    #[test]
-    fn reannotate_nested_list_coerces_int64_children_to_largeint() {
-        use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array, ListArray};
-        use arrow::buffer::OffsetBuffer;
-        use arrow::datatypes::{DataType, Field};
-
-        let values = Arc::new(Int64Array::from(vec![Some(7_i64), Some(-9_i64)])) as ArrayRef;
-        let source = Arc::new(
-            ListArray::try_new(
-                Arc::new(Field::new("item", DataType::Int64, true)),
-                OffsetBuffer::new(vec![0_i32, 2].into()),
-                values,
-                None,
-            )
-            .expect("source list"),
-        ) as ArrayRef;
-        let target = DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::FixedSizeBinary(16),
-            true,
-        )));
-
-        let output = reannotate_array(&source, &target).expect("List<Int64> -> List<LARGEINT>");
-        let output = output
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("list output");
-        let values = output
-            .values()
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("LARGEINT values");
-        assert_eq!(novarocks_types::largeint::value_at(values, 0).unwrap(), 7);
-        assert_eq!(novarocks_types::largeint::value_at(values, 1).unwrap(), -9);
-    }
-
-    #[test]
-    fn reannotate_nested_struct_coerces_int64_child_to_largeint() {
-        use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array, StructArray};
-        use arrow::datatypes::{DataType, Field, Fields};
-
-        let source_fields: Fields = vec![Arc::new(Field::new("id", DataType::Int64, true))].into();
-        let source = Arc::new(
-            StructArray::try_new(
-                source_fields,
-                vec![Arc::new(Int64Array::from(vec![Some(11_i64), Some(-13_i64)])) as ArrayRef],
-                None,
-            )
-            .expect("source struct"),
-        ) as ArrayRef;
-        let target = DataType::Struct(
-            vec![Arc::new(Field::new(
-                "id",
-                DataType::FixedSizeBinary(16),
-                true,
-            ))]
-            .into(),
+        // TableMetadataBuilder assigns fresh IDs: all top-level fields precede children.
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.self_type().get_basic_info().id())
+                .collect::<Vec<_>>(),
+            vec![1, 4, 5, 6]
         );
-
-        let output = reannotate_array(&source, &target).expect("Struct<Int64> -> Struct<LARGEINT>");
-        let output = output
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("struct output");
-        let value = output
+        let batches = reader
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let output = &batches[0];
+        let ts = output
             .column(0)
             .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("LARGEINT child");
-        assert_eq!(novarocks_types::largeint::value_at(value, 0).unwrap(), 11);
-        assert_eq!(novarocks_types::largeint::value_at(value, 1).unwrap(), -13);
-    }
-
-    #[test]
-    fn reannotate_nested_map_coerces_int64_entries_to_largeint() {
-        use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array, MapArray, StructArray};
-        use arrow::buffer::OffsetBuffer;
-        use arrow::datatypes::{DataType, Field, Fields};
-
-        let source_fields: Fields = vec![
-            Arc::new(Field::new("key", DataType::Int64, false)),
-            Arc::new(Field::new("value", DataType::Int64, true)),
-        ]
-        .into();
-        let source_entries_field = Arc::new(Field::new(
-            "key_value",
-            DataType::Struct(source_fields.clone()),
-            false,
-        ));
-        let source_entries = StructArray::try_new(
-            source_fields,
-            vec![
-                Arc::new(Int64Array::from(vec![3_i64])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![Some(-5_i64)])) as ArrayRef,
-            ],
-            None,
-        )
-        .expect("source map entries");
-        let source = Arc::new(
-            MapArray::try_new(
-                source_entries_field,
-                OffsetBuffer::new(vec![0_i32, 1].into()),
-                source_entries,
-                None,
-                false,
-            )
-            .expect("source map"),
-        ) as ArrayRef;
-        let target_fields: Fields = vec![
-            Arc::new(Field::new("key", DataType::FixedSizeBinary(16), false)),
-            Arc::new(Field::new("value", DataType::FixedSizeBinary(16), true)),
-        ]
-        .into();
-        let target = DataType::Map(
-            Arc::new(Field::new(
-                "key_value",
-                DataType::Struct(target_fields),
-                false,
-            )),
-            false,
-        );
-
-        let output = reannotate_array(&source, &target)
-            .expect("Map<Int64, Int64> -> Map<LARGEINT, LARGEINT>");
-        let output = output
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), -1234567);
+        assert!(ts.is_null(1));
+        let list = output
+            .column(1)
             .as_any()
-            .downcast_ref::<MapArray>()
-            .expect("map output");
-        let keys = output
-            .keys()
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("LARGEINT keys");
-        let values = output
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let values = list
             .values()
             .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("LARGEINT values");
-        assert_eq!(novarocks_types::largeint::value_at(keys, 0).unwrap(), 3);
-        assert_eq!(novarocks_types::largeint::value_at(values, 0).unwrap(), -5);
-    }
-    #[test]
-    fn scalar_integer_writer_widens_logical_values_to_iceberg_int_without_null_loss() {
-        use arrow::array::{ArrayRef, Int8Array, Int16Array, Int32Array};
-        use arrow::datatypes::DataType;
-        use std::sync::Arc;
-        for (source, expected) in [
-            (
-                Arc::new(Int8Array::from(vec![Some(-128), None, Some(127)])) as ArrayRef,
-                vec![Some(-128), None, Some(127)],
-            ),
-            (
-                Arc::new(Int16Array::from(vec![Some(-32768), None, Some(32767)])) as ArrayRef,
-                vec![Some(-32768), None, Some(32767)],
-            ),
-        ] {
-            let storage = reannotate_array(&source, &DataType::Int32).unwrap();
-            assert_eq!(storage.data_type(), &DataType::Int32);
-            assert_eq!(storage.null_count(), source.null_count());
-            assert_eq!(
-                storage
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>(),
-                expected
-            );
-        }
+            .downcast_ref::<arrow::array::LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), &[0xff, 0]);
+        assert!(values.is_null(1));
+        let map = output
+            .column(2)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(
+            map.keys()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "a"
+        );
+        assert!(map.values().is_null(1));
     }
 }

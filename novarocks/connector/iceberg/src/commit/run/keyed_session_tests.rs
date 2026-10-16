@@ -350,7 +350,7 @@ async fn real_keyed_empty_full_begin_finish_reasserts_closure_with_v4_evidence()
 async fn keyed_full_zero_output_that_removes_live_files_is_delete() {
     let fixture = keyed_fixture().await;
     append_snapshot_for_test(
-        Arc::clone(fixture.provider.runtime()),
+        fixture.provider.clone(),
         fixture.table.clone(),
         vec![written_file(&fixture.table, "keyed-old-data")],
         "main".into(),
@@ -845,12 +845,14 @@ async fn real_keyed_eager_repartition_prepares_begins_and_finishes_one_exact_pub
         expected.spec_id()
     );
     let data = writer.data().unwrap();
-    assert_eq!(
-        data.input_schema(),
-        Some(&crate::schema_facts::iceberg_schema_def(
-            before.metadata().current_schema()
-        ))
-    );
+    // The recipe freezes the provider's authoritative SDK schema, while the
+    // execution input schema is admitted separately by write adaptation.
+    let target_schema: crate::iceberg::spec::Schema = serde_json::from_str(
+        data.target_schema_json()
+            .expect("eager repartition must retain its frozen target schema"),
+    )
+    .unwrap();
+    assert_eq!(&target_schema, before.metadata().current_schema().as_ref());
     assert_eq!(data.partition_source_column_names(), &["id".to_string()]);
     assert_eq!(data.transform_exprs(), &["identity".to_string()]);
     assert_eq!(

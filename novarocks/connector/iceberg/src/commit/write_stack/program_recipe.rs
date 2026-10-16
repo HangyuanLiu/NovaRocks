@@ -35,7 +35,6 @@ use super::domain::{IcebergWriteBranch, IcebergWriterHandle};
 use crate::commit::frozen_write::{
     FrozenDataWriteFacts, FrozenWriteSchemaError, prepare_frozen_write_schema,
 };
-use crate::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
 type Failure = PureProviderCompileError<ConnectorCodecError>;
 const COPY_BYTES: usize = 1024;
@@ -115,7 +114,7 @@ fn compile(
             | ConnectorWriteInputShape::PositionDelete { .. }
             | ConnectorWriteInputShape::DeletionVector { .. },
         ) => {
-            let schema = input_schema(draft.input(), work)?;
+            let schema = data_input_schema(draft.input(), work)?;
             validate_data(&value, &schema, control, work)?;
         }
         (IcebergWriteBranch::EqualityDelete, ConnectorWriteInputShape::EqualityDelete { .. }) => {
@@ -127,17 +126,15 @@ fn compile(
                 )
             })?;
             work.flush()?;
-            super::equality_schema::resolve_equality_columns_for_compile(
-                equality, &schema, control,
-            )
-            .map_err(|error| match error {
-                super::equality_schema::EqualitySchemaError::Control(error) => {
-                    Failure::Control(error)
-                }
-                super::equality_schema::EqualitySchemaError::Source(error) => {
-                    invalid("equality", error.to_string())
-                }
-            })?;
+            super::equality_schema::equality_delete_target_for_compile(equality, &schema, control)
+                .map_err(|error| match error {
+                    super::equality_schema::EqualitySchemaError::Control(error) => {
+                        Failure::Control(error)
+                    }
+                    super::equality_schema::EqualitySchemaError::Source(error) => {
+                        invalid("equality", error.to_string())
+                    }
+                })?;
             work.step()?;
         }
         (IcebergWriteBranch::PositionDelete, ConnectorWriteInputShape::PositionDelete { .. })
@@ -201,6 +198,55 @@ fn input_schema(
     Ok(schema)
 }
 
+/// Freeze only the columns this flavor sends to a physical DATA writer.
+/// File/position identities belong to delete and row-rewrite control, while
+/// reserved lineage columns are real DATA fields with reserved definitions.
+fn data_input_schema(
+    input: &ConnectorWriteInputShape,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaRef, Failure> {
+    let mut selected = Vec::new();
+    match input {
+        ConnectorWriteInputShape::Data { fields } => selected.extend(fields.iter()),
+        ConnectorWriteInputShape::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } => {
+            selected.extend(data_fields.iter());
+            for field in row_identity_fields {
+                let name = field.field().name();
+                if name.eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_ROW_ID_COL)
+                    || name.eq_ignore_ascii_case(
+                        crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    )
+                {
+                    selected.push(field);
+                }
+                work.step()?;
+            }
+        }
+        ConnectorWriteInputShape::PositionDelete {
+            partition_source_fields,
+            ..
+        }
+        | ConnectorWriteInputShape::DeletionVector {
+            partition_source_fields,
+            ..
+        } => selected.extend(partition_source_fields.iter()),
+        ConnectorWriteInputShape::EqualityDelete { .. } => {
+            unreachable!("equality branch uses its own target")
+        }
+    }
+    let mut fields = Vec::with_capacity(selected.len());
+    for binding in selected {
+        work.flush()?;
+        fields.push(binding.field().clone());
+        work.flush()?;
+        work.step()?;
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 fn validate_data(
     handle: &IcebergWriterHandle,
     schema: &SchemaRef,
@@ -213,7 +259,7 @@ fn validate_data(
             "Iceberg data writer handle carries no data branch recipe",
         )
     })?;
-    let source = recipe.input_schema().ok_or_else(|| {
+    let source = recipe.target_schema_json().ok_or_else(|| {
         invalid(
             "data",
             "Iceberg data writer handle carries no frozen input schema",
@@ -227,9 +273,7 @@ fn validate_data(
         partition_source_column_names: copy_texts(recipe.partition_source_column_names(), work)?,
         partition_column_names: copy_texts(recipe.partition_column_names(), work)?,
         transform_exprs: copy_texts(recipe.transform_exprs(), work)?,
-        data_input_schema: IcebergSchemaDef {
-            fields: copy_source_fields(&source.fields, work)?,
-        },
+        target_schema_json: copy_text(source, work)?,
         parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
     };
     work.step()?;
@@ -242,46 +286,6 @@ fn validate_data(
     })?;
     work.step()?;
     Ok(())
-}
-
-fn copy_source_fields(
-    fields: &[IcebergSchemaFieldDef],
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<IcebergSchemaFieldDef>, Failure> {
-    // This is the already-decoded serde tree within the original JSON envelope,
-    // including unprojected source fields; do not apply public projection caps.
-    let mut copied = Vec::with_capacity(fields.len());
-    for field in fields {
-        let name = copy_text(&field.name, work)?;
-        let initial_default_json = field
-            .initial_default_json
-            .as_deref()
-            .map(|value| copy_text(value, work))
-            .transpose()?;
-        let write_default_json = field
-            .write_default_json
-            .as_deref()
-            .map(|value| copy_text(value, work))
-            .transpose()?;
-        let children = copy_source_fields(&field.children, work)?;
-        work.flush()?;
-        // serde skips these legacy literal fields. Bracket their clone without
-        // pretending their library internals are cooperative byte copies.
-        let initial_default = field.initial_default.clone();
-        let write_default = field.write_default.clone();
-        work.flush()?;
-        copied.push(IcebergSchemaFieldDef {
-            field_id: field.field_id,
-            name,
-            initial_default,
-            write_default,
-            initial_default_json,
-            write_default_json,
-            children,
-        });
-        work.step()?;
-    }
-    Ok(copied)
 }
 
 fn copy_texts(

@@ -189,12 +189,14 @@ fn binding(
 /// same-name recreate. `poisoned` names the one catalog whose materialization
 /// fails, so a single-catalog failure scope can be observed alongside healthy
 /// catalogs in one frontend.
+#[derive(Clone)]
 struct SelectivelyFailingFactory {
-    incarnations: AtomicU64,
+    incarnations: Arc<AtomicU64>,
     poisoned: Option<&'static str>,
     hanging: Option<HangingCatalog>,
 }
 
+#[derive(Clone)]
 struct HangingCatalog {
     name: &'static str,
     entered: Arc<Notify>,
@@ -204,7 +206,7 @@ struct HangingCatalog {
 impl SelectivelyFailingFactory {
     fn ready() -> Self {
         Self {
-            incarnations: AtomicU64::new(0),
+            incarnations: Arc::new(AtomicU64::new(0)),
             poisoned: None,
             hanging: None,
         }
@@ -212,7 +214,7 @@ impl SelectivelyFailingFactory {
 
     fn failing_for(catalog: &'static str) -> Self {
         Self {
-            incarnations: AtomicU64::new(0),
+            incarnations: Arc::new(AtomicU64::new(0)),
             poisoned: Some(catalog),
             hanging: None,
         }
@@ -220,7 +222,7 @@ impl SelectivelyFailingFactory {
 
     fn hanging_for(catalog: &'static str, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
         Self {
-            incarnations: AtomicU64::new(0),
+            incarnations: Arc::new(AtomicU64::new(0)),
             poisoned: None,
             hanging: Some(HangingCatalog {
                 name: catalog,
@@ -250,6 +252,23 @@ impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for Selectivel
         ))
     }
 
+    fn open_catalog(
+        &self,
+        identity: novarocks_spi::connector::CatalogScopeIdentity,
+    ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+        Arc::new(SelectivelyFailingCatalogFactory {
+            factory: self.clone(),
+            identity,
+        })
+    }
+}
+
+struct SelectivelyFailingCatalogFactory {
+    factory: SelectivelyFailingFactory,
+    identity: novarocks_spi::connector::CatalogScopeIdentity,
+}
+
+impl novarocks_spi::connector::ProviderCatalogControlFactory for SelectivelyFailingCatalogFactory {
     fn materialize(
         &self,
         properties: novarocks_spi::connector::NormalizedCatalogProperties,
@@ -263,12 +282,21 @@ impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for Selectivel
     > {
         use futures::FutureExt;
 
-        let poisoned = self.poisoned;
-        let hanging = self.hanging.as_ref().and_then(|hanging| {
+        assert_eq!(
+            properties.as_catalog_properties().provider_id(),
+            self.identity.provider_id(),
+        );
+        assert_eq!(
+            properties.handle().catalog_name(),
+            self.identity.instance_id(),
+        );
+
+        let poisoned = self.factory.poisoned;
+        let hanging = self.factory.hanging.as_ref().and_then(|hanging| {
             (hanging.name == properties.handle().catalog_name().as_str())
                 .then(|| (Arc::clone(&hanging.entered), Arc::clone(&hanging.release)))
         });
-        let sequence = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
+        let sequence = self.factory.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
         let mut incarnation = [0_u8; 16];
         incarnation[8..].copy_from_slice(&sequence.to_be_bytes());
         async move {

@@ -34,6 +34,9 @@ pub mod loopback_s3;
 pub mod native_fault_proxy;
 pub mod native_root_reply_fault;
 pub mod process_resources;
+pub mod publication;
+pub mod publication_catalog;
+pub mod publication_service;
 pub mod recording_rest_catalog;
 pub mod vended_rest_catalog;
 

@@ -108,12 +108,14 @@ pub(crate) fn prepare_row_mutation(
     // The strategy rule, the fail-fast write guards it runs first, and the
     // merge-on-read override for a MERGE that can delete all live in the
     // provider. A policy rejection here is a denial, not an internal fault.
-    let strategy = match row_mutation_strategy_from_metadata(&metadata, &request.intent) {
+    let strategy = match row_mutation_strategy_from_metadata(
+        &metadata,
+        &request.intent,
+        &format!("{}.{}.{}", table.catalog, table.namespace, table.table),
+    ) {
         Ok(strategy) => strategy,
         Err(error) => {
-            return Ok(ConnectorRowMutationPreparationOutcome::Denied(
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error),
-            ));
+            return Ok(ConnectorRowMutationPreparationOutcome::Denied(error));
         }
     };
     // A MERGE that can append has no target identity or before-image for its

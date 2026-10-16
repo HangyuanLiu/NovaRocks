@@ -15,23 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! NovaRocks extension of the upstream Iceberg REST client.
-//!
-//! The upstream `RestCatalog` owns the `/v1/config` handshake, config merge
-//! and its session cache, plus the few read requests that need no NovaRocks
-//! semantics. Everything that needs NovaRocks semantics -- every mutation and
-//! its evidence, single-page listing, access delegation, credentials, views and
-//! the backend acquisition -- is issued here from the one session binding the
-//! injected auth owner captures while upstream establishes its session.
-//!
-//! Dependency direction: `evidence`, `json` and `minimal_view` are pure;
-//! `http` depends only on the observation types in `evidence`; endpoint and
-//! mutation modules compose the rest. The upstream REST crate appears only in
-//! the auth owner, the upstream boundary and the transitional adapter.
+//! Provider-owned Iceberg REST session, transport, wire models and endpoints.
+//! One configuration handshake establishes the generation's immutable route,
+//! authentication provenance and capabilities. Every frontend request shares
+//! that session; backend credential acquisition uses its frozen routing facts.
 //!
 //! Design: ADR-0175 (docs/adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)
 
-pub(crate) mod adapter;
 pub(crate) mod attempt;
 pub(crate) mod auth;
 pub(crate) mod binding;
@@ -46,3 +36,12 @@ pub(crate) mod mutation;
 pub(crate) mod routing;
 #[cfg(test)]
 pub(crate) mod test_server;
+
+pub(crate) mod configuration;
+pub(crate) mod wire;
+
+#[cfg(test)]
+mod activity_tests;
+
+#[cfg(test)]
+mod publication_owner_tests;

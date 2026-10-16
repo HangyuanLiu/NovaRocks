@@ -58,7 +58,6 @@ pub(super) fn definition(
     )
 }
 struct ByOwner {
-    preparation_domain: ByPreparationDomain,
     resolver: Arc<BuiltinAggregateResolver>,
     declaration: FunctionBindingDeclaration,
     direction: super::aggregate_by_core::ByDirection,
@@ -100,7 +99,6 @@ impl ByOwner {
             })
             .collect();
         Ok(Self {
-            preparation_domain: ByPreparationDomain::InstalledAggregate,
             resolver,
             declaration,
             direction: if name == "max_by" {
@@ -243,9 +241,13 @@ impl PureAggregateImplementation for ByOwner {
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<ByKernel>, KernelFailure> {
-        self.prepare_core(input, contract, control, || {
-            self.validate_selected(input.selected, input.request, control)
-        })
+        self.prepare_core(
+            input,
+            contract,
+            control,
+            ByPreparationDomain::InstalledAggregate,
+            || self.validate_selected(input.selected, input.request, control),
+        )
     }
     fn prepare_aggregate_checked(
         &self,
@@ -254,9 +256,13 @@ impl PureAggregateImplementation for ByOwner {
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<Self::Kernel>, crate::CheckedOwnerFailure<KernelFailure>> {
-        self.prepare_core(input, contract, control, || {
-            checked.require_binding_author(self.resolver.as_ref(), input)
-        })
+        self.prepare_core(
+            input,
+            contract,
+            control,
+            ByPreparationDomain::InstalledAggregate,
+            || checked.require_binding_author(self.resolver.as_ref(), input),
+        )
         .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
@@ -268,7 +274,6 @@ pub(super) fn private_window_definition_for_test(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let mut owner = ByOwner::new(name, declaration, resolver)?;
-    owner.preparation_domain = ByPreparationDomain::OriginalWindow;
     for implementation in &mut owner.implementations {
         implementation.abi = PureKernelAbi::AggregateWindowV1;
     }
@@ -283,6 +288,38 @@ pub(super) fn private_window_definition_for_test(
     })
 }
 impl PureAggregateWindowImplementation for ByOwner {
+    fn prepare_aggregate_for_window(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<ByKernel>, KernelFailure> {
+        self.prepare_core(
+            input,
+            contract,
+            control,
+            ByPreparationDomain::OriginalWindow,
+            || self.validate_selected(input.selected, input.request, control),
+        )
+    }
+
+    fn prepare_aggregate_for_window_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<ByKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_core(
+            input,
+            contract,
+            control,
+            ByPreparationDomain::OriginalWindow,
+            || checked.require_binding_author(self.resolver.as_ref(), input),
+        )
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+
     fn prepare_aggregate_window(
         &self,
         aggregate: Arc<ByKernel>,
@@ -337,6 +374,7 @@ impl ByOwner {
         input: CallEffectInput<'_>,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
+        preparation_domain: ByPreparationDomain,
         validate: impl FnOnce() -> Result<(), FunctionBindingError>,
     ) -> Result<Arc<ByKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
@@ -397,7 +435,7 @@ impl ByOwner {
                     ));
                 }
             }
-            validate_contract(&contract, self.preparation_domain, &mut work)?;
+            validate_contract(&contract, preparation_domain, &mut work)?;
             work.flush().map_err(compile_failure)?;
             let prepared = Arc::new(ByKernel {
                 contract,

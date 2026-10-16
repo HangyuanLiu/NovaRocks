@@ -355,7 +355,12 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         }
         let manifest = crate::manifest::load_manifest(&manifest_file, table.file_io())
             .await
-            .map_err(|e| format!("load manifest: {e}"))?;
+            .map_err(|e| {
+                crate::manifest::with_variant_statistics_hint(
+                    format!("load manifest: {e}"),
+                    metadata,
+                )
+            })?;
         check_read_control(control)?;
         check_cow_active(budget)?;
         let spec = metadata

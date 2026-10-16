@@ -894,6 +894,15 @@ impl ConnectorControlRoleBindingFactory for PaimonControlRoleBindingFactory {
         NormalizedCatalogProperties::try_new(properties).map_err(invalid_definition)
     }
 
+    fn open_catalog(
+        &self,
+        _identity: novarocks_spi::connector::CatalogScopeIdentity,
+    ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+        Arc::new(self.clone())
+    }
+}
+
+impl novarocks_spi::connector::ProviderCatalogControlFactory for PaimonControlRoleBindingFactory {
     fn materialize(
         &self,
         properties: NormalizedCatalogProperties,
@@ -2388,5 +2397,96 @@ mod tests {
             .expect("closing the stream");
         assert_eq!(task_operations.live_operations(), 0);
         assert!(!task_operations.is_sealed(), "the task source stays open");
+    }
+}
+
+// Factory lifecycle coverage is independent of the suspended Paimon data-read
+// design tests above. It protects the neutral SPI handoff and opens no files.
+#[cfg(test)]
+mod catalog_materialization_tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        CatalogProperty, CatalogScopeIdentity, CatalogVersion, ConnectorInstanceId,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct ObserveFileIoBindings(Arc<AtomicUsize>);
+
+    impl PaimonRoleFileIoFactory for ObserveFileIoBindings {
+        fn bind_file_io(
+            &self,
+            _properties: &CatalogProperties,
+            _warehouse: &str,
+            _request: &ConnectorRequestContext,
+        ) -> Result<PaimonHostFileIo, ConnectorError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(internal(
+                "catalog materialization must not bind request FileIO",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_scope_materializes_independent_read_only_generations_without_io() {
+        let io_calls = Arc::new(AtomicUsize::new(0));
+        let factory = PaimonControlRoleBindingFactory::new(
+            Arc::new(ObserveFileIoBindings(Arc::clone(&io_calls))),
+            tokio::runtime::Handle::current(),
+        );
+        let instance = ConnectorInstanceId::parse("paimon.lifecycle").unwrap();
+        let owner = factory.open_catalog(CatalogScopeIdentity::new(
+            provider_id(),
+            instance.clone(),
+            Default::default(),
+        ));
+        let properties = |version| {
+            factory
+                .normalize_and_validate(
+                    CatalogProperties::new(
+                        CatalogHandle::new(
+                            instance.clone(),
+                            CatalogVersion::from_bytes([version; 32]),
+                        ),
+                        provider_id(),
+                        1,
+                        vec![
+                            CatalogProperty::new(
+                                PAIMON_CATALOG_TYPE_KEY,
+                                PAIMON_FILESYSTEM_BINDING,
+                            )
+                            .unwrap(),
+                            CatalogProperty::new(PAIMON_WAREHOUSE_KEY, "file:///factory-lifecycle")
+                                .unwrap(),
+                        ],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let first_properties = properties(1);
+        let second_properties = properties(2);
+        let materialization =
+            || MaterializationContext::new(Instant::now() + Duration::from_secs(5));
+        let first = owner
+            .materialize(first_properties.clone(), materialization())
+            .await
+            .unwrap();
+        let second = owner
+            .materialize(second_properties.clone(), materialization())
+            .await
+            .unwrap();
+        assert_eq!(first.properties(), &first_properties);
+        assert_eq!(second.properties(), &second_properties);
+        assert_ne!(
+            first.control().control_runtime_id(),
+            second.control().control_runtime_id()
+        );
+        for binding in [&first, &second] {
+            assert!(binding.read().is_some());
+            assert!(binding.write().is_none());
+        }
+        assert_eq!(io_calls.load(Ordering::SeqCst), 0);
     }
 }

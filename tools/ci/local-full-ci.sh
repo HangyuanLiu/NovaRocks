@@ -500,6 +500,10 @@ run_cargo_gates() {
     cargo deny --locked check advisories bans licenses sources
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
+  run_fail_fast_stage "JSONObject resource profiles" "json-object-resource-profile.log" \
+    python3 tools/ci/check-json-object-resource-profile.py
+  run_fail_fast_stage "JSONObject resource profile mutations" "json-object-resource-profile-test.log" \
+    python3 tools/ci/tests/json-object-resource-profile-test.py
   run_fail_fast_stage "DataSketches resolved source" "datasketches-source.log" \
     python3 tools/ci/check-datasketches-source.py
   run_fail_fast_stage "DataSketches source mutations" "datasketches-source-test.log" \
@@ -520,6 +524,10 @@ run_cargo_gates() {
     tools/ci/check-connector-role-binding-boundary.py
   run_fail_fast_stage "connector role binding boundary mutations" "connector-role-binding-boundary-test.log" \
     tools/ci/tests/connector-role-binding-boundary-test.sh
+  run_fail_fast_stage "Iceberg provider dependency boundary" "iceberg-provider-dependency-boundary.log" \
+    python3 tools/ci/check-iceberg-provider-dependency-boundary.py --manifest-path Cargo.toml
+  run_fail_fast_stage "Iceberg provider dependency boundary mutations" "iceberg-provider-dependency-boundary-test.log" \
+    tools/ci/tests/iceberg-provider-dependency-boundary-test.sh
   run_fail_fast_stage "StateStore dependency boundary" "state-store-dependency-boundary.log" \
     python3 tools/ci/check-state-store-dependency-boundary.py --manifest-path Cargo.toml
   run_fail_fast_stage "StateStore dependency boundary mutations" "state-store-dependency-boundary-test.log" \
@@ -1103,28 +1111,11 @@ run_sql_suites() {
     if ! ci_should_use_runner_suite_timeout "$suite"; then
       suite_query_timeout_args=(--query-timeout "$query_timeout")
     fi
-    # IRU-9 restores Variant execution after the compile-only SDK cutover.
-    # Keep case files intact; the numeric-input case also loses its non-Variant
-    # coverage temporarily and is included in the restoration handoff.
-    case "$suite" in
-      iceberg-dml)
-        suite_extra_args=(--skip "variant_get,variant_insert,variant_mutations,insert_exact_numeric_input")
-        ;;
-      optimizer)
-        suite_extra_args=(--skip "variant_path_pushdown")
-        ;;
-      analytic)
-        suite_extra_args=(--skip "window_result_domain_handoff")
-        if [ "$RUN_MODE" != "explicit" ]; then
-          # Keep the default stable run focused. These migrated window matrices
-          # remain available in direct analytic suite runs.
-          suite_extra_args=(
-            --skip
-            "analytic_test_basic_window_function,analytic_test_basic_window_function_2,window_result_domain_handoff"
-          )
-        fi
-        ;;
-    esac
+    if [ "$suite" = "analytic" ] && [ "$RUN_MODE" != "explicit" ]; then
+      # Keep the default stable run focused. These migrated window matrices
+      # remain available in direct analytic suite runs.
+      suite_extra_args=(--skip "analytic_test_basic_window_function,analytic_test_basic_window_function_2")
+    fi
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \

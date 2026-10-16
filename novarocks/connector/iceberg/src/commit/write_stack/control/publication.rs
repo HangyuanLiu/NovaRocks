@@ -20,19 +20,31 @@
 mod lineage;
 
 use super::*;
+#[cfg(test)]
 use crate::catalog::error::CatalogCommitEvidence;
+#[cfg(test)]
 use crate::catalog::transaction::CommitProof;
-use crate::commit::attempt::{self, OwnerPublisher, Publisher, RetryPolicy, TransitionalPublisher};
+#[cfg(test)]
+use crate::commit::attempt::Publisher;
+use crate::commit::attempt::observation::PublicationJournal;
+use crate::commit::attempt::prepared::CatalogPublisher;
+use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::dependency::ValidationInputs;
 use crate::commit::model::{
-    AddedContent, ArtifactClass, ArtifactRecord, ArtifactWriter, BaseIdentity, CleanupScope,
-    FileChanges, FrozenRequest, IcebergCleanupReport, IsolationLevel, ObjectIdentity,
-    OperationIntent, OperationIntentParts, OperationToken, PublicationOutcome, RequestShape,
-    StartSnapshot, TableTarget,
+    AddedContent, ArtifactClass, BaseIdentity, CleanupScope, FileChanges, FrozenRequest,
+    IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken,
+    RequestShape, StartSnapshot, TableTarget,
 };
-use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
-use crate::commit::staging::{PreparedChange, Preparer, StagedView, StagingBase};
+#[cfg(test)]
+use crate::commit::model::{ArtifactWriter, IcebergCleanupReport, PublicationOutcome};
+#[cfg(test)]
+use crate::commit::operation::IcebergCommitAttempt;
+use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
+#[cfg(test)]
+use crate::commit::staging::StagingBase;
+use crate::commit::staging::{PreparedChange, Preparer, StagedView};
 use async_trait::async_trait;
+#[cfg(test)]
 use std::sync::Mutex;
 
 fn format_error(error: ConnectorError) -> crate::iceberg::Error {
@@ -470,83 +482,6 @@ impl Preparer for WriteStatisticsPreparer {
     }
 }
 
-#[derive(Clone)]
-enum DispatchFact {
-    Undispatched,
-    Ready(ExternalMutationEvidence),
-    Issued(ExternalMutationEvidence),
-    Committed(CommitProof, ExternalMutationFinalization),
-    Rejected(ConnectorMutationFailure),
-}
-
-struct ObservedPublisher {
-    inner: Box<dyn Publisher>,
-    state: Arc<Mutex<DispatchFact>>,
-}
-
-#[async_trait]
-impl Publisher for ObservedPublisher {
-    async fn load_target_with_snapshots(
-        &self,
-        attempt: &IcebergCommitAttempt,
-        mode: crate::catalog::SnapshotLoading,
-    ) -> crate::iceberg::Result<StagingBase> {
-        self.inner.load_target_with_snapshots(attempt, mode).await
-    }
-
-    async fn load_target(
-        &self,
-        attempt: &IcebergCommitAttempt,
-    ) -> crate::iceberg::Result<StagingBase> {
-        self.inner.load_target(attempt).await
-    }
-    fn preflight_recovery(
-        &self,
-        request: &FrozenRequest,
-        operation: &IcebergCommitOperation,
-    ) -> crate::iceberg::Result<()> {
-        self.inner.preflight_recovery(request, operation)
-    }
-    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let DispatchFact::Ready(evidence) = &*state else {
-                return CatalogOutcome::uncommitted(
-                    ConnectorMutationFailureKind::Internal,
-                    "Iceberg dispatch has no complete bounded recovery evidence",
-                );
-            };
-            *state = DispatchFact::Issued(evidence.clone());
-        }
-        let outcome = self.inner.dispatch_once(request).await;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &outcome {
-            CatalogOutcome::KnownCommitted {
-                receipt,
-                finalization,
-                ..
-            } => *state = DispatchFact::Committed(receipt.clone(), finalization.clone()),
-            CatalogOutcome::KnownUncommitted { failure } => {
-                *state = DispatchFact::Rejected(failure.clone())
-            }
-            CatalogOutcome::Unsupported(error) => {
-                *state = DispatchFact::Rejected(failure(
-                    ConnectorMutationFailureKind::Unsupported,
-                    error.message(),
-                ))
-            }
-            CatalogOutcome::CommitUnknown { .. } => {}
-        }
-        outcome
-    }
-}
-
 impl IcebergWriteSessionControl {
     pub(super) fn dispatch_operation(
         &self,
@@ -603,13 +538,18 @@ impl IcebergWriteSessionControl {
                 return Ok(self.reject_operation(&operation, format_error_to_connector(error)));
             }
         };
-        let state = Arc::new(Mutex::new(DispatchFact::Undispatched));
+        let journal = PublicationJournal::for_runtime(
+            operation.token(),
+            self.runtime.resources().catalog_runtime(),
+        );
         let template =
             match RecoveryTemplate::from_handle(&self.descriptor, self.key.incarnation, handle) {
                 Ok(template) => template,
                 Err(error) => return Ok(self.reject_operation(&operation, error)),
             };
-        let preflight_state = Arc::clone(&state);
+        let preflight_journal = journal.clone();
+        let receipt_partitioning = handle.repartition().map(|r| r.committed().clone());
+        let receipt_output_facts = recipe.output_facts.clone();
         let retained_evidence = handle.recovery_evidence_slot();
         let preflight = Arc::new(
             move |request: &FrozenRequest, operation: &IcebergCommitOperation| {
@@ -617,46 +557,26 @@ impl IcebergWriteSessionControl {
                 *retained_evidence.lock().map_err(|_| {
                     format_error(internal("Iceberg retained evidence state poisoned"))
                 })? = Some(evidence.clone());
-                *preflight_state.lock().map_err(|_| {
-                    format_error(internal("Iceberg dispatch evidence state poisoned"))
-                })? = DispatchFact::Ready(evidence);
-                Ok(())
+                // Mandatory receipt facts are frozen before mutation becomes
+                // possible. Catalog reload and row-count enrichment are optional.
+                let receipt = match request.ref_snapshot_after(request.target_ref()) {
+                    Some(snapshot) => crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
+                        snapshot, None, receipt_partitioning.clone(), Some(receipt_output_facts.clone()),
+                    ).map_err(|error| format_error(corrupt(error)))?,
+                    None => unprojected_committed_receipt(),
+                };
+                preflight_journal.record(evidence, receipt, request)
             },
         );
         let catalog = Arc::clone(self.runtime.novarocks_catalog());
-        let evidence = CatalogCommitEvidence::for_target(format!(
-            "{}.{}",
-            handle.table().namespace(),
-            handle.table().table_name()
-        ))
-        .with_target_uuid(handle.table().table_uuid().to_string())
-        .with_commit_uuid(handle.session_id().to_string());
-        let direct = TransitionalPublisher {
+        let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
+            catalog_operation: handle.flavor().catalog_operation(),
             catalog,
             ident: recipe.target.ident.clone(),
             target_ref: recipe.target_ref.clone(),
-            evidence,
+            operation: operation.token(),
             recovery_preflight: preflight,
-        };
-        let inner: Box<dyn Publisher> = if matches!(
-            recipe.op_kind,
-            CommitOpKind::FastAppend | CommitOpKind::Overwrite
-        ) {
-            Box::new(OwnerPublisher {
-                target: direct,
-                operation: operation.token(),
-                marker: Some((
-                    Arc::from(ICEBERG_WRITE_SESSION_MARKER_PROPERTY),
-                    Arc::from(handle.session_id().to_string()),
-                )),
-            })
-        } else {
-            Box::new(direct)
-        };
-        let publisher = ObservedPublisher {
-            inner,
-            state: Arc::clone(&state),
-        };
+        }));
         let stats = WriteStatisticsPreparer {
             op_kind: recipe.op_kind,
             drafts: statistics,
@@ -668,7 +588,14 @@ impl IcebergWriteSessionControl {
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                let intent = match recipe.intent(&run_operation).await {
+                let intent = match run_operation
+                    .runtime()
+                    .observe_preparation_async(
+                        recipe.intent(&run_operation),
+                        attempt::before_dispatch_failure,
+                    )
+                    .await
+                {
                     Ok(intent) => intent,
                     Err(error) => {
                         return attempt::rejected(
@@ -694,122 +621,98 @@ impl IcebergWriteSessionControl {
                 )
                 .await
             });
-        let report = match result {
-            Ok(report) => report,
+        let outcome = match result {
+            Ok(report) => journal.project(report),
             Err(error) => {
-                let observed = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                match observed {
-                    DispatchFact::Issued(evidence) => {
-                        return Ok(ExternalMutationOutcome::CommitUnknown {
-                            failure: failure(ConnectorMutationFailureKind::Unavailable, error),
-                            evidence,
-                        });
-                    }
-                    DispatchFact::Committed(proof, finalization) => {
-                        *state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            DispatchFact::Committed(
-                                proof.clone(),
-                                add_finalization_failure(finalization, &error),
-                            );
-                        attempt::Report {
-                            publication: PublicationOutcome::Committed(proof),
-                            cleanup: IcebergCleanupReport::Partial {
-                                deleted: 0,
-                                remaining: operation
-                                    .recovery_artifacts()
-                                    .into_iter()
-                                    .map(|r| {
-                                        crate::commit::model::RemainingArtifact {
-                                    object: r.object,
-                                    reason:
-                                        crate::commit::model::CleanupRemainingReason::DeleteFailed(
-                                            error.clone(),
-                                        ),
-                                }
-                                    })
-                                    .collect(),
-                            },
-                        }
-                    }
-                    DispatchFact::Rejected(failure) => {
-                        return Ok(self.reject_operation_failure(&operation, failure));
-                    }
-                    DispatchFact::Undispatched | DispatchFact::Ready(_) => {
-                        return Ok(self.reject_operation(&operation, internal(error)));
-                    }
+                let recovery = journal.clone();
+                let recovery_operation = operation.clone();
+                match operation.runtime().block_on(async move {
+                    recovery
+                        .recover_bridge(
+                            &recovery_operation,
+                            format!("Write publication bridge failed: {error}"),
+                        )
+                        .await
+                }) {
+                    Ok(outcome) => outcome,
+                    Err(error) => journal.bridge_failure(
+                        &operation,
+                        format!("Write publication recovery bridge failed: {error}"),
+                    ),
                 }
             }
         };
-        match report.publication {
-            PublicationOutcome::KnownUncommitted(failure) => {
-                Ok(ExternalMutationOutcome::KnownUncommitted {
-                    failure,
-                    cleanup: report.cleanup.finalization(),
-                })
-            }
-            PublicationOutcome::Unknown { failure, .. } => {
-                let observed = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match &*observed {
-                    DispatchFact::Issued(evidence) => Ok(ExternalMutationOutcome::CommitUnknown {
-                        failure,
-                        evidence: evidence.clone(),
-                    }),
-                    _ => Err(internal(
-                        "Unknown Iceberg dispatch lacks its checked recovery envelope",
-                    )),
-                }
-            }
-            PublicationOutcome::Committed(proof) => {
-                let mut finalization = report.cleanup.finalization();
-                if let DispatchFact::Committed(
-                    _,
-                    ExternalMutationFinalization::Failed(owner_failure),
-                ) = &*state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                {
-                    finalization = add_finalization_failure(finalization, owner_failure.message());
-                }
-                let rows = match proof.snapshot_id {
-                    Some(id) => match self.publication_row_count(handle, id, context) {
-                        Ok(rows) => rows,
-                        Err(e) => {
-                            finalization = add_finalization_failure(finalization, e.message());
-                            None
-                        }
-                    },
-                    None => None,
-                };
-                let (receipt, finalization) = match proof.snapshot_id {
-                    Some(id) => committed_write_receipt(
-                        id,
-                        rows,
-                        handle.repartition().map(|r| r.committed().clone()),
-                        Some(output_facts),
-                        finalization,
-                    ),
-                    None => (
-                        unprojected_committed_receipt(),
-                        add_finalization_failure(
-                            finalization,
-                            "Committed Iceberg write has no published snapshot projection",
-                        ),
-                    ),
-                };
-                Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: proof.effect,
-                    receipt,
-                    finalization,
-                })
-            }
+        if let Some(evidence) = journal
+            .current_entry()
+            .and_then(|entry| journal.entry_evidence(entry))
+        {
+            handle.retain_recovery_evidence(evidence)?;
         }
+        let ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            mut finalization,
+        } = outcome
+        else {
+            return Ok(outcome);
+        };
+        let snapshot_id =
+            journal
+                .current_entry()
+                .and_then(|entry| match journal.commit_outcome(entry) {
+                    CatalogOutcome::KnownCommitted { receipt, .. } => receipt.snapshot_id,
+                    _ => None,
+                });
+        let enriched = match snapshot_id {
+            Some(snapshot_id) => {
+                let rows = match journal
+                    .finalization_context(
+                        journal
+                            .current_entry()
+                            .expect("committed write has a publication entry"),
+                        self.runtime.novarocks_catalog().evidence_policy(),
+                    )
+                    .and_then(|grant| grant.for_io(context))
+                {
+                    Ok(finalization_context) => {
+                        let _finalizing = journal
+                            .current_entry()
+                            .and_then(|entry| journal.finalization_activity(entry));
+                        match self.publication_row_count(handle, snapshot_id, &finalization_context)
+                        {
+                            Ok(rows) => rows,
+                            Err(error) => {
+                                finalization =
+                                    add_finalization_failure(finalization, error.message());
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        finalization = add_finalization_failure(finalization, error.message());
+                        None
+                    }
+                };
+                let (enriched, projection) = committed_write_receipt(
+                    snapshot_id,
+                    rows,
+                    handle.repartition().map(|r| r.committed().clone()),
+                    Some(output_facts),
+                    finalization,
+                );
+                finalization = projection;
+                enriched
+            }
+            None => receipt,
+        };
+        if let Some(entry) = journal.current_entry() {
+            journal.record_entry_finalization(entry, finalization.clone());
+        }
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt: enriched,
+            finalization,
+        })
     }
 
     fn reject_operation(

@@ -49,7 +49,6 @@ use crate::commit::report::IcebergColumnStats;
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::delete_file::IcebergFileFormat;
-use crate::scan_model::IcebergSchemaDef;
 use crate::write_descriptor::IcebergPartitionDescriptor;
 
 pub(crate) fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -176,6 +175,27 @@ pub enum IcebergWriteFlavor {
 }
 
 impl IcebergWriteFlavor {
+    /// Preserve the admitted operation family through catalog publication.
+    pub(crate) const fn catalog_operation(self) -> crate::catalog::admission::CatalogOperation {
+        use crate::catalog::admission::CatalogOperation;
+        match self {
+            Self::Append => CatalogOperation::Append,
+            Self::Overwrite | Self::PartitionOverwrite => CatalogOperation::Overwrite,
+            Self::RowMutationPositionDelete | Self::RowMutationDeletionVector => {
+                CatalogOperation::RowMutation
+            }
+            Self::EqualityDelete => CatalogOperation::RowDelta,
+            Self::RowMutationCopyOnWrite => CatalogOperation::CopyOnWrite,
+            Self::StagedCreate => CatalogOperation::CreateTable(
+                crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+            ),
+            Self::ManagedPublication => CatalogOperation::PublishDocuments,
+            Self::DistributedRewrite => CatalogOperation::RewriteDataFiles,
+            Self::DistributedRewritePositionDeletes => CatalogOperation::RewritePositionDeletes,
+            Self::TableMaintenance => CatalogOperation::Truncate,
+        }
+    }
+
     /// The single external commit op this flavor performs.
     ///
     /// The mapping is the one the provider already commits today: a
@@ -687,16 +707,20 @@ impl IcebergWriterOutput {
     }
 }
 
-/// COW-only backing minted by the checked schema constructor. No activity lease.
-/// The guard is last so the actual owned schema graph exits before its holder.
+/// Complete provider schema JSON; its allocation retains the original COW holder.
+#[derive(Clone, Debug)]
+pub(crate) enum IcebergDataSchema {
+    Owned(String),
+    CowShared(Arc<IcebergCowTargetSchemaBacking>),
+}
 #[derive(Debug)]
-pub(crate) struct IcebergCowSchemaBacking {
-    schema: IcebergSchemaDef,
+pub(crate) struct IcebergCowTargetSchemaBacking {
+    schema: String,
     _original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
-impl IcebergCowSchemaBacking {
+impl IcebergCowTargetSchemaBacking {
     pub(crate) fn from_checked(
-        schema: IcebergSchemaDef,
+        schema: String,
         original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -704,96 +728,60 @@ impl IcebergCowSchemaBacking {
             _original: original,
         })
     }
-    pub(crate) fn schema(&self) -> &IcebergSchemaDef {
-        &self.schema
-    }
-    pub(crate) fn original(&self) -> &novarocks_spi::connector::ConnectorPayloadRetentionGuard {
-        &self._original
-    }
-}
-
-/// Private ownership specialization; its serialized shape is exactly SchemaDef.
-#[derive(Clone, Debug)]
-pub(crate) enum IcebergDataSchema {
-    Owned(IcebergSchemaDef),
-    CowShared(Arc<IcebergCowSchemaBacking>),
 }
 impl IcebergDataSchema {
-    pub(crate) fn schema(&self) -> &IcebergSchemaDef {
+    pub(crate) fn schema(&self) -> &str {
         match self {
             Self::Owned(schema) => schema,
-            Self::CowShared(owner) => owner.schema(),
+            Self::CowShared(owner) => &owner.schema,
         }
     }
 }
-impl serde::Serialize for IcebergDataSchema {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(self.schema(), serializer)
-    }
-}
-impl<'de> serde::Deserialize<'de> for IcebergDataSchema {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        <IcebergSchemaDef as serde::Deserialize>::deserialize(deserializer).map(Self::Owned)
-    }
-}
 
-/// The data-branch recipe: the frozen input schema and the partitioning every
-/// data writer writes through.
+/// Complete frozen target schema and partition facts for the data branch.
 #[derive(Clone, Debug)]
 pub struct IcebergDataBranchRecipe {
-    input_schema: Option<IcebergDataSchema>,
+    target_schema: Option<IcebergDataSchema>,
     partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
-    /// Whether the branch this recipe drives was cut from a row-lineage input.
-    ///
-    /// It is descriptive only, and deliberately recorded as such: **no writer
-    /// consults it**. Row lineage is preserved by the columns themselves --
-    /// `annotate_schema_from_scan_model` (`crate::schema_mapping`) recognises an
-    /// incoming `_row_id` / `_last_updated_sequence_number` column by name and
-    /// stamps Iceberg's reserved field id straight onto it, without consulting
-    /// the frozen table schema at all. So an updated row keeps its identity
-    /// because SQL sends those columns, not because this flag is set, and
-    /// clearing it would not stop lineage being written.
+    /// Descriptive only. Input lineage columns select the reserved definitions.
     row_lineage: bool,
     _cow_original: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
-
 impl IcebergDataBranchRecipe {
     pub fn try_new(
-        input_schema: Option<IcebergSchemaDef>,
+        target_schema: Option<String>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
         row_lineage: bool,
     ) -> Result<Self, ConnectorError> {
         Self::try_new_schema_backing(
-            input_schema.map(IcebergDataSchema::Owned),
+            target_schema.map(IcebergDataSchema::Owned),
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
             row_lineage,
         )
     }
-
     pub(crate) fn try_new_cow(
-        input_schema: Arc<IcebergCowSchemaBacking>,
+        target_schema: Arc<IcebergCowTargetSchemaBacking>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
         row_lineage: bool,
     ) -> Result<Self, ConnectorError> {
         Self::try_new_schema_backing(
-            Some(IcebergDataSchema::CowShared(input_schema)),
+            Some(IcebergDataSchema::CowShared(target_schema)),
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
             row_lineage,
         )
     }
-
     fn try_new_schema_backing(
-        input_schema: Option<IcebergDataSchema>,
+        target_schema: Option<IcebergDataSchema>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
@@ -815,12 +803,12 @@ impl IcebergDataBranchRecipe {
                 "Iceberg data writer repeats a partition column name",
             ));
         }
-        let original = match &input_schema {
-            Some(IcebergDataSchema::CowShared(owner)) => Some(owner.original().clone()),
+        let original = match &target_schema {
+            Some(IcebergDataSchema::CowShared(owner)) => Some(owner._original.clone()),
             _ => None,
         };
         Ok(Self {
-            input_schema,
+            target_schema,
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
@@ -828,9 +816,8 @@ impl IcebergDataBranchRecipe {
             _cow_original: original,
         })
     }
-
-    pub fn input_schema(&self) -> Option<&IcebergSchemaDef> {
-        self.input_schema.as_ref().map(IcebergDataSchema::schema)
+    pub fn target_schema_json(&self) -> Option<&str> {
+        self.target_schema.as_ref().map(IcebergDataSchema::schema)
     }
     pub fn partition_source_column_names(&self) -> &[String] {
         &self.partition_source_column_names
@@ -841,11 +828,6 @@ impl IcebergDataBranchRecipe {
     pub fn transform_exprs(&self) -> &[String] {
         &self.transform_exprs
     }
-    /// Whether this branch was cut from a row-lineage input.
-    ///
-    /// Descriptive metadata: it round-trips through the writer-handle codec and
-    /// is read by nothing that writes. See the field's own note for what
-    /// actually carries row lineage.
     pub const fn row_lineage(&self) -> bool {
         self.row_lineage
     }
@@ -1282,74 +1264,43 @@ impl IcebergPositionDeleteFileArtifact {
 
 /// One column an equality-delete file matches rows on.
 ///
-/// `data_type` is the caller's Arrow type *rendering*, not a type. The backend
-/// takes the real Arrow type from the fragment's own frozen input schema and
-/// uses this only to prove the two agree, which is what keeps an Arrow value off
-/// the FE/BE boundary while still making a mismatch a refusal.
+/// The name and field identity of one equality key; types belong to field_schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergEqualityDeleteColumnFacts {
     name: String,
     field_id: i32,
-    data_type: String,
-    nullable: bool,
 }
-
 impl IcebergEqualityDeleteColumnFacts {
-    pub fn try_new(
-        name: String,
-        field_id: i32,
-        data_type: String,
-        nullable: bool,
-    ) -> Result<Self, ConnectorError> {
+    pub fn try_new(name: String, field_id: i32) -> Result<Self, ConnectorError> {
         if name.is_empty() {
             return Err(invalid("Iceberg equality-delete column requires a name"));
-        }
-        if data_type.is_empty() {
-            return Err(invalid(format!(
-                "Iceberg equality-delete column `{name}` requires its frozen type rendering"
-            )));
         }
         if field_id < 0 {
             return Err(invalid(format!(
                 "Iceberg equality-delete column `{name}` requires a nonnegative field id"
             )));
         }
-        Ok(Self {
-            name,
-            field_id,
-            data_type,
-            nullable,
-        })
+        Ok(Self { name, field_id })
     }
-
     pub fn name(&self) -> &str {
         &self.name
     }
     pub const fn field_id(&self) -> i32 {
         self.field_id
     }
-    pub fn data_type(&self) -> &str {
-        &self.data_type
-    }
-    pub const fn nullable(&self) -> bool {
-        self.nullable
-    }
 }
 
-/// How an equality-delete branch writer builds its delete file.
-///
-/// It carries no old-delete reference by construction: an equality delete
-/// appends a file that names no data file and retires no existing artifact.
+/// Complete provider schema projection in equality-key input order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergEqualityDeleteRecipe {
     columns: Vec<IcebergEqualityDeleteColumnFacts>,
+    field_schema_json: String,
 }
-
 impl IcebergEqualityDeleteRecipe {
-    pub fn try_new(columns: Vec<IcebergEqualityDeleteColumnFacts>) -> Result<Self, ConnectorError> {
-        // A file that matches on nothing would delete every row it is applied
-        // to, so an empty match key is refused rather than treated as "match
-        // all".
+    pub fn try_new(
+        columns: Vec<IcebergEqualityDeleteColumnFacts>,
+        field_schema_json: String,
+    ) -> Result<Self, ConnectorError> {
         if columns.is_empty() {
             return Err(invalid(
                 "Iceberg equality delete matches on at least one column",
@@ -1364,14 +1315,17 @@ impl IcebergEqualityDeleteRecipe {
                 )));
             }
         }
-        Ok(Self { columns })
+        Ok(Self {
+            columns,
+            field_schema_json,
+        })
     }
-
     pub fn columns(&self) -> &[IcebergEqualityDeleteColumnFacts] {
         &self.columns
     }
-
-    /// The match key as Iceberg records it on the manifest: sorted and unique.
+    pub fn field_schema_json(&self) -> &str {
+        &self.field_schema_json
+    }
     pub fn field_ids(&self) -> Vec<i32> {
         self.columns
             .iter()

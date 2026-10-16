@@ -74,6 +74,17 @@ fn strict_source_domain(
     ))
 }
 
+fn legacy_projection(domain: Option<ValueLogicalType>) -> Option<&'static str> {
+    domain
+        .filter(|domain| {
+            !matches!(
+                domain,
+                ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
+            )
+        })
+        .and_then(ValueLogicalType::metadata_value)
+}
+
 use crate::fragment_error::NativeFragmentDecodeError;
 
 use crate::fragment_plan_node::NativeLoweredPlanNode;

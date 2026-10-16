@@ -906,6 +906,7 @@ pub fn start_frontend_management_server(
         management_island_reader,
         Some(management_convergence_reader),
         Arc::clone(&config.memory_authority),
+        Some(host.catalog_activity_observer()),
         #[cfg(feature = "test-controls")]
         statement_observation,
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
@@ -1595,6 +1596,19 @@ mod tests {
             )
         }
 
+        fn open_catalog(
+            &self,
+            identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(EchoingCatalogFactory { identity })
+        }
+    }
+
+    struct EchoingCatalogFactory {
+        identity: novarocks_spi::connector::CatalogScopeIdentity,
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for EchoingCatalogFactory {
         fn materialize(
             &self,
             properties: novarocks_spi::connector::NormalizedCatalogProperties,
@@ -1607,6 +1621,15 @@ mod tests {
             >,
         > {
             use futures::FutureExt;
+
+            assert_eq!(
+                properties.as_catalog_properties().provider_id(),
+                self.identity.provider_id(),
+            );
+            assert_eq!(
+                properties.handle().catalog_name(),
+                self.identity.instance_id(),
+            );
 
             async move {
                 let control =

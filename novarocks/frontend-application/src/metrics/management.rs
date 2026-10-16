@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use novarocks_memory::MemoryAuthority;
 
@@ -45,6 +45,7 @@ struct FrontendManagementState {
     serving_reader: Arc<dyn FrontendServingSnapshotReader>,
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
     memory_authority: Arc<MemoryAuthority>,
+    catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
     #[cfg(feature = "test-controls")]
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
 }
@@ -220,6 +221,95 @@ async fn memory_authority_snapshot(
     .into_response()
 }
 
+#[derive(serde::Serialize)]
+struct CatalogActivityManagementRow {
+    provider_id: String,
+    catalog: String,
+    source_entry_id: uuid::Uuid,
+    current: bool,
+    /// Null means this provider has no activity reader.
+    observation: Option<novarocks_spi::connector::CatalogActivitySnapshot>,
+}
+#[derive(serde::Serialize)]
+struct CatalogActivityManagementSnapshot {
+    schema_version: u8,
+    catalogs: Vec<CatalogActivityManagementRow>,
+    /// Sum of the observed scopes; unsupported scopes are listed separately.
+    phases: Vec<novarocks_spi::connector::CatalogPhaseActivity>,
+    unsupported_catalogs: usize,
+}
+async fn catalog_activity_snapshot(
+    State(state): State<FrontendManagementState>,
+) -> axum::response::Response {
+    let sources = {
+        let Some(reader) = state.catalog_activity.as_ref().and_then(Weak::upgrade) else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Catalog activity observation is unavailable",
+            )
+                .into_response();
+        };
+        match reader.catalog_activity_sources() {
+            Ok(sources) => sources,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Catalog activity observation is unavailable",
+                )
+                    .into_response();
+            }
+        }
+    };
+    let mut phases = novarocks_spi::connector::CatalogActivityPhase::ALL
+        .into_iter()
+        .map(|phase| novarocks_spi::connector::CatalogPhaseActivity {
+            phase,
+            inflight: 0,
+            started: 0,
+            exited: 0,
+            elapsed_count: 0,
+            elapsed_sum_ns: 0,
+            elapsed_max_ns: 0,
+        })
+        .collect::<Vec<_>>();
+    let mut unsupported_catalogs = 0;
+    // Provider snapshots run after the Catalog Application owner lock is released.
+    let catalogs = sources
+        .into_iter()
+        .map(|source| {
+            let observation = source.reader.map(|reader| reader.snapshot());
+            if let Some(observation) = &observation {
+                for phase in &observation.phases {
+                    let total = &mut phases[phase.phase as usize];
+                    total.inflight = total.inflight.saturating_add(phase.inflight);
+                    total.started = total.started.saturating_add(phase.started);
+                    total.exited = total.exited.saturating_add(phase.exited);
+                    total.elapsed_count = total.elapsed_count.saturating_add(phase.elapsed_count);
+                    total.elapsed_sum_ns =
+                        total.elapsed_sum_ns.saturating_add(phase.elapsed_sum_ns);
+                    total.elapsed_max_ns = total.elapsed_max_ns.max(phase.elapsed_max_ns);
+                }
+            } else {
+                unsupported_catalogs += 1;
+            }
+            CatalogActivityManagementRow {
+                provider_id: source.identity.provider_id().as_str().into(),
+                catalog: source.identity.instance_id().as_str().into(),
+                source_entry_id: source.identity.source_entry_id(),
+                current: source.current,
+                observation,
+            }
+        })
+        .collect();
+    Json(CatalogActivityManagementSnapshot {
+        schema_version: 1,
+        catalogs,
+        phases,
+        unsupported_catalogs,
+    })
+    .into_response()
+}
+
 /// Builds the management surface from late-bindable, read-only capabilities.
 /// No route in this router can mutate the serving lifecycle.
 pub(crate) fn frontend_management_router_with_readers(
@@ -228,6 +318,7 @@ pub(crate) fn frontend_management_router_with_readers(
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
     convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
     memory_authority: Arc<MemoryAuthority>,
+    catalog_activity: Option<Weak<dyn novarocks_catalog_application::CatalogApplicationPort>>,
     debug_enabled: bool,
     #[cfg(feature = "test-controls")] statement_observation: Option<
         Arc<crate::preparation_diagnostics::StatementObservationOwner>,
@@ -238,6 +329,7 @@ pub(crate) fn frontend_management_router_with_readers(
         serving_reader,
         island_reader,
         memory_authority,
+        catalog_activity,
         #[cfg(feature = "test-controls")]
         statement_observation: statement_observation.clone(),
     };
@@ -247,7 +339,8 @@ pub(crate) fn frontend_management_router_with_readers(
         .route("/readyz", get(readyz))
         .route("/island-readyz", get(island_readyz))
         .route("/v1/frontend/state", get(frontend_state))
-        .route("/v1/memory/authority", get(memory_authority_snapshot));
+        .route("/v1/memory/authority", get(memory_authority_snapshot))
+        .route("/v1/catalogs/activity", get(catalog_activity_snapshot));
     #[cfg(feature = "test-controls")]
     let router = if debug_enabled && statement_observation.is_some() && convergence_reader.is_some()
     {
@@ -537,10 +630,220 @@ mod tests {
             island,
             Some(Arc::new(EmptyConvergenceReader)),
             test_memory_authority(),
+            None,
             debug_enabled,
             #[cfg(feature = "test-controls")]
             None,
         )
+    }
+
+    struct ActivityCatalogPort {
+        sources: Vec<novarocks_spi::connector::CatalogActivitySource>,
+    }
+    impl novarocks_catalog_application::CatalogApplicationPort for ActivityCatalogPort {
+        fn create_catalog(
+            &self,
+            _: novarocks_catalog_application::CatalogCreateCommand,
+        ) -> Result<
+            novarocks_catalog_application::CatalogRuntimeObservation,
+            novarocks_catalog_application::CatalogApplicationError,
+        > {
+            panic!("management may not mutate catalogs")
+        }
+        fn drop_catalog(
+            &self,
+            _: novarocks_catalog_application::CatalogDropCommand,
+        ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
+            panic!("management may not mutate catalogs")
+        }
+        fn admit_catalog(
+            &self,
+            _: &novarocks_spi::connector::ConnectorInstanceId,
+        ) -> novarocks_catalog_application::CatalogAdmission {
+            panic!("activity may not admit catalogs")
+        }
+        fn catalog_activity_sources(
+            &self,
+        ) -> Result<
+            Vec<novarocks_spi::connector::CatalogActivitySource>,
+            novarocks_catalog_application::CatalogApplicationError,
+        > {
+            Ok(self.sources.clone())
+        }
+    }
+    struct FixedActivity(novarocks_spi::connector::CatalogActivitySnapshot);
+    impl novarocks_spi::connector::CatalogActivityReader for FixedActivity {
+        fn snapshot(&self) -> novarocks_spi::connector::CatalogActivitySnapshot {
+            self.0.clone()
+        }
+    }
+    #[tokio::test]
+    async fn catalog_activity_management_distinguishes_blocked_scopes_and_unsupported_observation()
+    {
+        use novarocks_spi::connector::{
+            CatalogActivityEvents, CatalogActivityPhase as P, CatalogActivitySnapshot,
+            CatalogActivitySource, CatalogPhaseActivity, CatalogScopeIdentity, ConnectorInstanceId,
+            ConnectorProviderId,
+        };
+        let mut sources = Vec::new();
+        for (name, current, inflight, supported) in [
+            ("blocked", false, 2, true),
+            ("normal", true, 0, true),
+            ("unsupported", true, 0, false),
+        ] {
+            let identity = CatalogScopeIdentity::new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                ConnectorInstanceId::parse(name).unwrap(),
+                uuid::Uuid::now_v7(),
+            );
+            let snapshot = CatalogActivitySnapshot {
+                provider_id: "iceberg".into(),
+                catalog: name.into(),
+                source_entry_id: identity.source_entry_id(),
+                phases: vec![CatalogPhaseActivity {
+                    phase: P::Bridge,
+                    inflight,
+                    started: inflight,
+                    exited: 0,
+                    elapsed_count: 0,
+                    elapsed_sum_ns: 0,
+                    elapsed_max_ns: 0,
+                }],
+                events: CatalogActivityEvents::default(),
+                generations: Vec::new(),
+            };
+            sources.push(CatalogActivitySource {
+                identity,
+                current,
+                reader: supported.then(|| {
+                    Arc::new(FixedActivity(snapshot))
+                        as Arc<dyn novarocks_spi::connector::CatalogActivityReader>
+                }),
+            });
+        }
+        let lifecycle = Arc::new(FrontendServingLifecycle::new());
+        let island = Arc::new(TestIslandReader::new(island_snapshot(0, 0, 0, 0)));
+        let owner: Arc<dyn novarocks_catalog_application::CatalogApplicationPort> =
+            Arc::new(ActivityCatalogPort { sources });
+        let app = frontend_management_router_with_readers(
+            FrontendMetricsRegistry::new().unwrap(),
+            lifecycle,
+            island,
+            None,
+            test_memory_authority(),
+            Some(Arc::downgrade(&owner)),
+            false,
+            #[cfg(feature = "test-controls")]
+            None,
+        );
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the router must not retain the catalog service"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/catalogs/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["catalogs"].as_array().unwrap().len(), 3);
+        assert_eq!(document["unsupported_catalogs"], 1);
+        assert_eq!(document["phases"][P::Bridge as usize]["inflight"], 2);
+        assert_eq!(document["catalogs"][0]["current"], false);
+        assert_eq!(
+            document["catalogs"][1]["observation"]["phases"][0]["inflight"],
+            0
+        );
+        assert!(document["catalogs"][2]["observation"].is_null());
+        fn assert_no_sensitive_fields(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (key, value) in fields {
+                        for forbidden in [
+                            "request_key",
+                            "table_path",
+                            "warehouse",
+                            "authorization",
+                            "endpoint",
+                            "marker",
+                            "secret",
+                        ] {
+                            assert!(
+                                !key.contains(forbidden),
+                                "unexpected diagnostic field: {key}"
+                            );
+                        }
+                        assert_no_sensitive_fields(value);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        assert_no_sensitive_fields(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_sensitive_fields(&document);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the completed snapshot must release its service upgrade"
+        );
+        let ready = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "activity does not make a booting FE ready"
+        );
+        drop(owner);
+        let retired = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/catalogs/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retired.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a retired owner must not be reported as an empty activity snapshot"
+        );
+        let unavailable = router(
+            false,
+            Arc::new(FrontendServingLifecycle::new()),
+            Arc::new(TestIslandReader::new(island_snapshot(0, 0, 0, 0))),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/v1/catalogs/activity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

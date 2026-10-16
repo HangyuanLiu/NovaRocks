@@ -272,22 +272,16 @@ fn aggregate_output_columns(
                 // built, not the result the statement asked for. Reading the
                 // parent's type for it would name the type of a value this
                 // phase never produces.
-                value_type: {
-                    let mut value_type = match publishes {
-                        PhaseOutput::State => {
-                            crate::functions::aggregate_selection(call.source.binding())
-                                .intermediate_type
-                                .clone()
-                        }
-                        PhaseOutput::Result => {
-                            crate::functions::aggregate_result_type(call.source.binding()).clone()
-                        }
-                    };
-                    // Widen only the phase-output root, preserving its full domain.
-                    value_type = value_type
-                        .with_nullable(true)
-                        .expect("validated root NULL contract");
-                    value_type
+                value_type: match publishes {
+                    PhaseOutput::State => {
+                        crate::functions::aggregate_selection(call.source.binding())
+                            .intermediate_type
+                            .with_nullable(true)
+                            .expect("validated root NULL contract")
+                    }
+                    PhaseOutput::Result => {
+                        crate::functions::aggregate_result_type(call.source.binding()).clone()
+                    }
                 },
 
                 is_internal: true,
@@ -1303,7 +1297,7 @@ mod tests {
                         name: "count(distinct x)".into(),
                         value_type: novarocks_type_contract::FunctionValueType::new(
                             DataType::Int64,
-                            true,
+                            false,
                         ),
 
                         is_internal: false,
@@ -1343,6 +1337,29 @@ mod tests {
         // distinct=true is preserved so the display name matches what PROJECT looks up.
         assert!(top.aggregates[0].distinct);
         assert_eq!(top.is_merge, vec![false, true]);
+
+        let Operator::LogicalAggregate(original) = &mexpr.op else {
+            unreachable!();
+        };
+        // Final phases publish the statement's complete bound results. COUNT
+        // remains required even when its input is empty; SUM remains nullable.
+        assert_eq!(
+            top.output_layout.aggregate_columns[0].value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
+        assert_eq!(
+            top.output_layout.aggregate_columns[1].value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        for (actual, declared) in top
+            .output_layout
+            .aggregate_columns
+            .iter()
+            .zip(&original.output_layout.aggregate_columns)
+        {
+            assert_eq!(actual.value_type, declared.value_type);
+            assert_eq!(actual.column_id, declared.column_id);
+        }
 
         // Follow chain: GLOBAL -> DISTINCT_GLOBAL -> LOCAL -> scan
         assert_eq!(out[0].children.len(), 1);
@@ -1912,7 +1929,7 @@ mod tests {
                         name: "count(distinct x)".into(),
                         value_type: novarocks_type_contract::FunctionValueType::new(
                             DataType::Int64,
-                            true,
+                            false,
                         ),
 
                         is_internal: false,
@@ -1949,6 +1966,29 @@ mod tests {
         assert_eq!(top.group_by.len(), 0);
         assert_eq!(top.aggregates.len(), 2);
         assert_eq!(top.is_merge, vec![true, true]);
+
+        let Operator::LogicalAggregate(original) = &mexpr.op else {
+            unreachable!();
+        };
+        // Final phases publish the statement's complete bound results. COUNT
+        // remains required even when its input is empty; SUM remains nullable.
+        assert_eq!(
+            top.output_layout.aggregate_columns[0].value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
+        assert_eq!(
+            top.output_layout.aggregate_columns[1].value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        for (actual, declared) in top
+            .output_layout
+            .aggregate_columns
+            .iter()
+            .zip(&original.output_layout.aggregate_columns)
+        {
+            assert_eq!(actual.value_type, declared.value_type);
+            assert_eq!(actual.column_id, declared.column_id);
+        }
 
         // DISTINCT_LOCAL: scalar, [count(x) update, sum(a) merge]
         let dl_group = &memo.groups[out[0].children[0]];

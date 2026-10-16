@@ -104,6 +104,18 @@ pub trait ValueSchemaCreationFactory<H> {
 
     fn begin_scope(&self) -> Result<Self::Scope<'_>, H>;
 
+    /// Visit this factory's real scope-holder requests without creating a
+    /// scope or granting capacity. An unqualified factory refuses explicitly.
+    fn visit_scope_allocation_layouts<E>(
+        &self,
+        _visit: &mut dyn FnMut(Layout) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<crate::owned_resources::layout::LayoutResourceError>,
+    {
+        Err(crate::owned_resources::layout::LayoutResourceError::SourceModel.into())
+    }
+
     /// Observe the actual scope author's private-holder geometry before its
     /// allocation. This callback is a pure model/check gate, never a grant.
     fn begin_scope_observed<O>(

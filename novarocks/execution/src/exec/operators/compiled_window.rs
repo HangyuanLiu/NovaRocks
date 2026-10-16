@@ -1291,6 +1291,23 @@ fn validate_complete_output(
 }
 
 impl Operator for CompiledWindowProcessor {
+    #[cfg(any(test, feature = "test-support"))]
+    fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> {
+        self.output.clone()
+    }
+    fn compiled_schema_preparation_site(
+        &self,
+    ) -> Option<(
+        &Arc<LocalProgram>,
+        crate::runtime::preparation_metadata::CompiledSchemaSite,
+    )> {
+        Some((
+            &self.program,
+            crate::runtime::preparation_metadata::CompiledSchemaSite::AnalyticOutput(
+                self.output_node,
+            ),
+        ))
+    }
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -1528,4 +1545,16 @@ mod tests {
             ranges(&[(0, 2), (2, 3), (3, 5)])
         );
     }
+}
+
+/// The real factory retains frozen declarations; prepare owns runtime creation.
+#[cfg(feature = "test-support")]
+pub fn prepare_window_factory_for_test(
+    program: Arc<LocalProgram>,
+    node: ProgramNodeId,
+    error: Arc<RuntimeErrorState>,
+) -> ExecutionResult<CompiledWindowProcessorFactory> {
+    Ok(CompiledWindowProcessorFactory::try_new(
+        program, node, error,
+    )?)
 }

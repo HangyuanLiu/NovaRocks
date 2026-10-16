@@ -312,18 +312,19 @@ async fn every_stage_equals_canonical_prefix_and_whole_request() {
             .requirements()
             .contains(&TableRequirement::DefaultSpecIdMatch { default_spec_id: 0 })
     );
-    let table = crate::iceberg::table::Table::builder()
-        .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
-        .identifier(intent.target().ident.clone())
-        .metadata(base.clone())
-        .file_io(writer.io.clone())
-        .metadata_location(
-            "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json",
-        )
-        .build()
-        .unwrap();
-    let applied = request.into_table_commit().apply(table).unwrap();
-    assert_eq!(staged, facts(applied.metadata()));
+    // Independently replay SDK format primitives, without the staging replay
+    // helper or a terminal SDK Catalog publication object.
+    for requirement in request.requirements() {
+        requirement.check(Some(&base)).unwrap();
+    }
+    let mut applied = base.into_builder(Some(
+        "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json"
+            .into(),
+    ));
+    for update in request.updates() {
+        applied = update.clone().apply(applied).unwrap();
+    }
+    assert_eq!(staged, facts(&applied.build().unwrap().metadata));
 }
 
 struct AppendObserver {
@@ -855,11 +856,12 @@ async fn create_initialization_is_complete_and_only_asserts_create() {
     );
 }
 #[tokio::test]
-async fn frozen_requests_match_three_stable_rest_goldens() {
+async fn frozen_requests_match_stable_rest_goldens() {
     for shape in [
         RequestShape::SnapshotProducing,
         RequestShape::MetadataOnly,
         RequestShape::Create,
+        RequestShape::RefRetention,
     ] {
         let base = fixture(FormatVersion::V2);
         let intent = intent(shape);
@@ -891,6 +893,18 @@ async fn frozen_requests_match_three_stable_rest_goldens() {
                     updates: HashMap::from([("analyzed".into(), "true".into())]),
                 }]))
                 .unwrap();
+        } else if shape == RequestShape::RefRetention {
+            engine
+                .stage_change(PreparedChange {
+                    updates: vec![TableUpdate::RemoveSnapshotRef {
+                        ref_name: "old".into(),
+                    }],
+                    requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                        r#ref: "old".into(),
+                        snapshot_id: None,
+                    }],
+                })
+                .unwrap();
         } else {
             engine
                 .stage_change(change(append(engine.metadata(), 11)))
@@ -903,6 +917,9 @@ async fn frozen_requests_match_three_stable_rest_goldens() {
             RequestShape::MetadataOnly => ("metadata", include_str!("golden/metadata.json")),
             RequestShape::Create => ("create", include_str!("golden/create.json")),
             RequestShape::DocumentExpiry => unreachable!("expiry has a separate golden"),
+            RequestShape::RefRetention => {
+                ("ref-retention", include_str!("golden/ref-retention.json"))
+            }
         };
         let expected: serde_json::Value = serde_json::from_str(golden).unwrap();
         assert_eq!(
@@ -1044,6 +1061,243 @@ async fn new_spec_binds_missing_field_ids_before_rest_freeze() {
 }
 
 #[tokio::test]
+async fn ref_retention_staging_generates_set_ref_assertion_but_requires_explicit_remove_assertion()
+{
+    let metadata = fixture(FormatVersion::V2);
+    let writer = TestWriter::new();
+    let operation = intent(RequestShape::RefRetention);
+    let mut engine = StagingEngine::begin(
+        StagingBase::Existing {
+            metadata,
+            metadata_location: "s3://bucket/metadata/v1.json".into(),
+        },
+        &operation,
+        &writer,
+    )
+    .unwrap();
+    // An unborn main has no existing snapshot. Removing an absent ref remains
+    // a legitimate metadata operation when its exact absence is asserted.
+    engine
+        .stage_change(PreparedChange {
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None,
+            }],
+            updates: vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: "old".into(),
+            }],
+        })
+        .unwrap();
+    let request = engine.freeze(&[]).unwrap();
+    assert_eq!(request.shape(), RequestShape::RefRetention);
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None
+            })
+    );
+}
+
+fn artifactless_context(
+    stop: &novarocks_spi::connector::ConnectorStopOwner,
+) -> novarocks_spi::connector::ConnectorRequestContext {
+    novarocks_spi::connector::ConnectorRequestContext::try_new(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        stop.view(),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .unwrap()
+}
+
+#[test]
+fn artifactless_existing_schema_stages_canonical_ids_and_parent_requirements_without_io() {
+    let base = fixture(FormatVersion::V2);
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let attempt = AttemptToken::new(token(), 9);
+    let schema = Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "label",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let request = freeze_existing_change(
+        intent(RequestShape::MetadataOnly).target().ident.clone(),
+        "main",
+        &base,
+        "s3://bucket/table/metadata/base.json",
+        RequestShape::MetadataOnly,
+        attempt,
+        change(vec![
+            TableUpdate::AddSchema { schema },
+            TableUpdate::SetCurrentSchema { schema_id: -1 },
+        ]),
+        &artifactless_context(&stop),
+    )
+    .unwrap();
+    assert_eq!(request.artifacts().attempt(), attempt);
+    assert!(request.artifacts().attempt_owned().is_empty());
+    assert!(request.artifacts().operation_references().is_empty());
+    assert!(request.artifacts().session_references().is_empty());
+    assert_eq!(
+        request.requirements(),
+        &[
+            TableRequirement::UuidMatch { uuid: uuid() },
+            TableRequirement::LastAssignedFieldIdMatch {
+                last_assigned_field_id: 1
+            },
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: 0
+            },
+        ]
+    );
+    let json = request.to_rest_json().unwrap();
+    assert_eq!(json["updates"][0]["schema"]["schema-id"], 1);
+    assert_eq!(json["updates"][1]["schema-id"], 1);
+    assert_eq!(
+        request.base_facts().unwrap().last_sequence_number,
+        base.last_sequence_number()
+    );
+}
+
+#[test]
+fn artifactless_ref_retention_requires_exact_remove_assertion_and_rejects_artifact_shapes() {
+    let base = fixture(FormatVersion::V2);
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let context = artifactless_context(&stop);
+    let freeze = |shape, change| {
+        freeze_existing_change(
+            intent(RequestShape::MetadataOnly).target().ident.clone(),
+            "main",
+            &base,
+            "s3://bucket/table/metadata/base.json",
+            shape,
+            AttemptToken::new(token(), 3),
+            change,
+            &context,
+        )
+    };
+    let update = TableUpdate::RemoveSnapshotRef {
+        ref_name: "old".into(),
+    };
+    assert!(freeze(RequestShape::RefRetention, change(vec![update.clone()])).is_err());
+    let request = freeze(
+        RequestShape::RefRetention,
+        PreparedChange {
+            updates: vec![update],
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None,
+            }],
+        },
+    )
+    .unwrap();
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None
+            })
+    );
+    for shape in [RequestShape::Create, RequestShape::SnapshotProducing] {
+        assert!(freeze(shape, PreparedChange::default()).is_err());
+    }
+}
+
+#[test]
+fn artifactless_preparation_stop_preserves_original_typed_reason() {
+    use novarocks_spi::connector::{ConnectorMutationFailureKind, ConnectorStopOwner};
+    let base = fixture(FormatVersion::V2);
+    let stop = ConnectorStopOwner::new();
+    let context = artifactless_context(&stop);
+    stop.request_stop();
+    let error = freeze_existing_change(
+        intent(RequestShape::MetadataOnly).target().ident.clone(),
+        "main",
+        &base,
+        "s3://bucket/table/metadata/base.json",
+        RequestShape::MetadataOnly,
+        AttemptToken::new(token(), 0),
+        PreparedChange::default(),
+        &context,
+    )
+    .unwrap_err();
+    assert_eq!(
+        crate::commit::attempt::before_dispatch_failure(&error).kind(),
+        ConnectorMutationFailureKind::Cancelled
+    );
+}
+
+fn freeze_uuid_fixture(
+    requirements: Vec<TableRequirement>,
+) -> crate::iceberg::Result<FrozenRequest> {
+    let base = fixture(FormatVersion::V2);
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    freeze_existing_change(
+        TableIdent::from_strs(["db", "t"]).unwrap(),
+        "main",
+        &base,
+        "s3://bucket/table/metadata/base.json",
+        RequestShape::MetadataOnly,
+        AttemptToken::new(token(), 0),
+        PreparedChange {
+            requirements,
+            updates: vec![TableUpdate::RemoveProperties {
+                removals: vec!["k".into()],
+            }],
+        },
+        &artifactless_context(&stop),
+    )
+}
+
+#[test]
+fn artifactless_freeze_keeps_exactly_one_equal_caller_uuid() {
+    let request = freeze_uuid_fixture(vec![TableRequirement::UuidMatch { uuid: uuid() }]).unwrap();
+    assert_eq!(
+        request.identifier(),
+        &TableIdent::from_strs(["db", "t"]).unwrap()
+    );
+    assert_eq!(
+        request.requirements(),
+        &[TableRequirement::UuidMatch { uuid: uuid() }]
+    );
+    assert!(request.artifacts().attempt_owned().is_empty());
+}
+
+#[test]
+fn artifactless_freeze_rejects_a_foreign_caller_uuid_before_publication() {
+    let error = freeze_uuid_fixture(vec![TableRequirement::UuidMatch {
+        uuid: Uuid::from_bytes([2; 16]),
+    }])
+    .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::iceberg::ErrorKind::CatalogCommitConflicts
+    );
+}
+
+#[test]
+fn artifactless_freeze_rejects_create_requirements_for_an_existing_table() {
+    let error = freeze_uuid_fixture(vec![TableRequirement::NotExist]).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::iceberg::ErrorKind::CatalogCommitConflicts
+    );
+}
+
+#[tokio::test]
 async fn document_expiry_asserts_all_observed_refs_and_matches_rest_golden() {
     let writer = TestWriter::new();
     let setup = intent(RequestShape::SnapshotProducing);
@@ -1124,28 +1378,4 @@ async fn document_expiry_rejects_every_effect_outside_its_channel() {
         let mut engine = StagingEngine::begin(existing(base.clone()), &expiry, &writer).unwrap();
         assert!(engine.stage_change(change(vec![update])).is_err());
     }
-}
-
-#[tokio::test]
-async fn empty_table_property_expiry_is_fenced_against_first_publication() {
-    let writer = TestWriter::new();
-    let base = fixture(FormatVersion::V2);
-    let expiry = intent(RequestShape::DocumentExpiry);
-    let mut engine = StagingEngine::begin(existing(base.clone()), &expiry, &writer).unwrap();
-    engine
-        .stage_change(change(vec![TableUpdate::RemoveProperties {
-            removals: vec![format!("novarocks.doc.v2.rev.{}", "0".repeat(64))],
-        }]))
-        .unwrap();
-    let request = engine.freeze(&[]).unwrap();
-    let absent = TableRequirement::RefSnapshotIdMatch {
-        r#ref: "main".into(),
-        snapshot_id: None,
-    };
-    assert!(request.requirements().contains(&absent));
-    absent.check(Some(&base)).unwrap();
-    let publish = intent(RequestShape::SnapshotProducing);
-    let mut concurrent = StagingEngine::begin(existing(base.clone()), &publish, &writer).unwrap();
-    concurrent.stage_change(change(append(&base, 11))).unwrap();
-    assert!(absent.check(Some(concurrent.metadata())).is_err());
 }

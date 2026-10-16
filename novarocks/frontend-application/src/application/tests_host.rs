@@ -346,6 +346,37 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_activity_observer_tracks_the_original_service_without_retaining_host_resources() {
+    let mut host = open_host(Some(state_store_input()))
+        .await
+        .expect("catalog activity Host must open");
+    let observer = host.catalog_activity_observer();
+    {
+        let observed = observer
+            .upgrade()
+            .expect("the role-owned catalog service remains alive");
+        let original = host.catalog_role_runtime().catalog_application_port();
+        assert!(
+            Arc::ptr_eq(&observed, &original),
+            "the observer must point to the original service, not a temporary published wrapper"
+        );
+        assert!(
+            observed
+                .catalog_activity_sources()
+                .expect("the actual service supports activity observation")
+                .is_empty()
+        );
+    }
+    host.shutdown()
+        .await
+        .expect("the weak observer must not retain Host StateStore resources");
+    assert!(
+        observer.upgrade().is_none(),
+        "Host shutdown must release the original catalog service"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unregistered_provider_fails_before_store_open() {
     let input = state_store_input();
     let error = match FrontendApplicationHost::open(

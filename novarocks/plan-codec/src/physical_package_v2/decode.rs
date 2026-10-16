@@ -507,7 +507,7 @@ pub(crate) fn decode_fragment_package_core<H>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     decode_fragment_package_factory_core::<H, crate::value_type_table::resources::NoFactory>(
-        raw, model, limits, creation, None, work,
+        raw, model, limits, creation, None, work, &mut None,
     )
 }
 
@@ -532,11 +532,70 @@ pub fn decode_fragment_package_with_factory<
         Some(creation),
         Some(factory),
         &mut work,
+        &mut None,
     );
     if matches!(
         &result,
         Err(ProjectionFailure::Host(_))
             | Err(ProjectionFailure::Codec(PackageDecodeError::Control(_)))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+/// The existing receiver with the caller's actual creator and narrow original
+/// Arrow/source tail funding. Other namespaces retain their existing responsibility.
+pub fn decode_fragment_package_with_factory_and_funding<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    creation: &mut ValueSchemaCreation<'_, H>,
+    factory: &F,
+    control: &dyn PureCompileControl,
+    funding: &mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_fragment_package_factory_core(
+        raw,
+        model,
+        limits,
+        Some(creation),
+        Some(factory),
+        &mut work,
+        &mut Some(funding),
+    );
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+pub fn decode_fragment_package_with_type_host<
+    G: crate::physical_type_v2::PackageTypeMaterializationScope,
+>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    control: &dyn PureCompileControl,
+    host: &mut G,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, G::HostError>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_fragment_package_factory_core::<
+        G::HostError,
+        crate::value_type_table::resources::NoFactory,
+    >(raw, model, limits, None, None, &mut work, &mut Some(host));
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
     ) {
         return result;
     }
@@ -554,6 +613,7 @@ fn decode_fragment_package_factory_core<
     mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
+    funding: &mut Option<&mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>>,
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     let plan_limits = limits.admission.plan_limits;
 
@@ -612,8 +672,19 @@ fn decode_fragment_package_factory_core<
     // header join the invoice once.
     let mut type_requests = 0usize;
     let types = if let Some(creator) = creation.as_deref_mut() {
-        let types = match factory {
-            Some(factory) => decode_package_type_table_with_factory_in(
+        let types = match (factory, funding.as_deref_mut()) {
+            (Some(factory), Some(funding)) => {
+                crate::physical_type_v2::decode_package_type_table_with_factory_and_funding_in(
+                    &wire_package,
+                    invoice,
+                    limits.types,
+                    creator,
+                    factory,
+                    work,
+                    funding,
+                )?
+            }
+            (Some(factory), None) => decode_package_type_table_with_factory_in(
                 &wire_package,
                 invoice,
                 limits.types,
@@ -621,7 +692,7 @@ fn decode_fragment_package_factory_core<
                 factory,
                 work,
             )?,
-            None => decode_package_type_table_with_creator_in(
+            (None, _) => decode_package_type_table_with_creator_in(
                 &wire_package,
                 invoice,
                 limits.types,
@@ -636,6 +707,18 @@ fn decode_fragment_package_factory_core<
                     "package type creator omitted its original request receipt",
                 ))?;
         types
+    } else if let Some(funding) = funding.as_deref_mut() {
+        crate::physical_type_v2::decode_package_type_table_with_funding_in(
+            &wire_package,
+            invoice,
+            limits.types,
+            &mut |facts: &PackageTypeProjectionFacts| {
+                type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
+                Ok(())
+            },
+            work,
+            funding,
+        )?
     } else {
         decode_package_type_table_observed(
             &wire_package,

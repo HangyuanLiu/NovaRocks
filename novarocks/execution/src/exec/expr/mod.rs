@@ -427,6 +427,7 @@ impl ExprArena {
                     FunctionKind::Abs => function::eval_abs(self, id, args[0], chunk),
                     FunctionKind::ArrayMap => function::eval_array_map(self, id, args, chunk),
                     FunctionKind::Year => function::eval_year(self, id, chunk),
+                    FunctionKind::HourFromUnixtime => function::eval_hour_from_unixtime(self, id, args, chunk),
                     FunctionKind::AssertTrue => function::eval_assert_true(self, args, chunk),
                     FunctionKind::Substring => {
                         let length_expr = if args.len() == 3 { Some(args[2]) } else { None };
@@ -1818,3 +1819,12 @@ mod approx_top_k_actual_sql_source_tests;
 mod parse_json_actual_sql_source_tests;
 #[cfg(test)]
 mod parse_json_original_runtime_baseline_tests;
+
+#[cfg(test)]
+pub(crate) mod runtime_scalar_memory_actual_sql_tests;
+
+#[cfg(test)]
+mod runtime_scalar_memory_actual_sql_bitwise_tests;
+
+#[cfg(test)]
+mod signed_cast_nullability_sql_tests;

@@ -26,7 +26,6 @@ mod data_file;
 pub mod data_writer;
 pub(crate) mod dependency;
 pub mod equality_delete_writer;
-pub(crate) mod existing_commit;
 pub(crate) mod fast_append;
 pub mod frozen_write;
 pub(crate) mod helpers;
@@ -38,11 +37,11 @@ pub(crate) mod operation;
 pub(crate) mod overwrite;
 mod overwrite_partitions;
 pub mod position_delete_writer;
+pub(crate) mod publication_descriptor;
 pub mod puffin_dv;
 pub(crate) mod recovery;
 pub mod ref_action;
 pub mod report;
-pub mod retry;
 mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv_from_files;
@@ -59,6 +58,7 @@ pub(crate) mod truncate;
 pub mod types;
 mod update_cow;
 pub mod validation;
+mod write_adaptation;
 pub mod write_control;
 pub mod write_fence;
 pub mod write_io;
@@ -66,15 +66,14 @@ mod write_preparation;
 mod write_shared;
 pub mod write_stack;
 
-pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
+pub(crate) use equality_delete_writer::write_equality_delete_file;
 pub use mv_provenance::{
     MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MvPublicationProvenanceV2,
     ProvenanceBase, RefreshTechnique,
 };
 pub use mv_refresh_ref::{
     MV_PUBLICATION_ID_PROP, MV_PUBLICATION_STAGING_REF_PREFIX, MvPublicationSnapshotMarker,
-    MvRefreshPublishOutcome, MvRefreshPublishPlan, publish_staging_branch_to_main,
-    snapshot_matches_publication_marker,
+    MvRefreshPublishPlan, snapshot_matches_publication_marker,
 };
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
 pub use puffin_dv::{
@@ -82,14 +81,7 @@ pub use puffin_dv::{
     read_deletion_vector_puffin_with_range_reader, write_multi_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
-pub use ref_action::{
-    ExactBranchDropOutcome, RefAction, RefActionOutcome, RefActionPlan, drop_branch_if_exact,
-    execute_ref_action, lower_ref_action,
-};
-pub use retry::{
-    COMMIT_RETRY_BACKOFF_MS, COMMIT_RETRY_MAX_ATTEMPTS, commit_with_retry,
-    is_retryable_commit_conflict,
-};
+pub use ref_action::{RefAction, RefActionPlan, lower_ref_action};
 pub use rewrite_data_files::{
     LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
 };

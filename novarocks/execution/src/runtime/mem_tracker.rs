@@ -104,6 +104,17 @@ pub struct MemTracker {
     children: Mutex<Vec<Weak<MemTracker>>>,
 }
 
+/// Requests of one original limit-failure String, even when its host discards
+/// it. These numerical facts neither reserve bytes nor select a failing limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrackerLimitFailureRequestFacts {
+    pub(crate) requested_bytes: usize,
+    pub(crate) requests: usize,
+    pub(crate) peak_bytes: usize,
+    pub(crate) retained_bytes: usize,
+    pub(crate) output_bytes: usize,
+}
+
 impl MemTracker {
     /// Create a root tracker with no parent.
     pub fn new_root(label: impl Into<String>) -> Arc<Self> {
@@ -227,6 +238,23 @@ impl MemTracker {
     /// Failed post-mutation accounting remains until the owner releases it;
     /// prospective construction callers balance their unconstructed request.
     pub fn consume_and_check_limit_typed(&self, bytes: i64) -> Result<(), MemTrackerLimitExceeded> {
+        self.consume_with_limit_projection(bytes, |tracker, current, limit| {
+            MemTrackerLimitExceeded {
+                detail: tracker.limit_exceeded_detail(current, limit),
+            }
+        })
+    }
+
+    /// The original accounting verdict without constructing an unadmitted diagnostic.
+    pub(crate) fn consume_and_check_limit_nominal(&self, bytes: i64) -> Result<(), ()> {
+        self.consume_with_limit_projection(bytes, |_, _, _| ())
+    }
+
+    fn consume_with_limit_projection<E>(
+        &self,
+        bytes: i64,
+        project: impl Fn(&MemTracker, i64, i64) -> E,
+    ) -> Result<(), E> {
         if bytes <= 0 {
             return Ok(());
         }
@@ -238,9 +266,7 @@ impl MemTracker {
             current.update_peak(new_value);
             let limit = current.limit();
             if exceeded.is_none() && limit > 0 && new_value > limit {
-                exceeded = Some(MemTrackerLimitExceeded {
-                    detail: current.limit_exceeded_detail(new_value, limit),
-                });
+                exceeded = Some(project(current, new_value, limit));
             }
             tracker = current.parent.as_deref();
         }
@@ -383,6 +409,52 @@ impl MemTracker {
             self.label
         )
     }
+
+    /// Borrow the same immutable ancestry as consume_and_check_limit. Only
+    /// its first crossed limit formats, while accounting still visits all
+    /// ancestors. Do not build tracker_path or clone labels here.
+    pub(crate) fn limit_failure_request_facts(
+        &self,
+    ) -> Result<TrackerLimitFailureRequestFacts, novarocks_type_contract::ControlResourceError>
+    {
+        let mut maximum_label = 0;
+        let mut tracker = Some(self);
+        while let Some(current) = tracker {
+            maximum_label = maximum_label.max(current.label.len());
+            tracker = current.parent.as_deref();
+        }
+        let output_bytes = maximum_label
+            .checked_add(121)
+            .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+        // The original template has 83 literal bytes and a leading literal;
+        // its pinned estimated_capacity is 166. Both actual i64 operands are
+        // positive at this call site and have at most 19 decimal digits.
+        let original = novarocks_type_contract::owned_resources::formatting::original_format_string_request_bound(
+            166,
+            output_bytes,
+        )?;
+        // The SAME formatter author returns initial C=166 for one request,
+        // otherwise C=2*G for its maximum successful destination capacity G.
+        let retained_bytes = if original.allocation_requests_upper_bound == 1 {
+            original.request_bytes_upper_bound
+        } else {
+            original.request_bytes_upper_bound / 2
+        };
+        let peak_bytes = if original.allocation_requests_upper_bound == 1 {
+            retained_bytes
+        } else {
+            retained_bytes
+                .checked_add(retained_bytes / 2)
+                .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?
+        };
+        Ok(TrackerLimitFailureRequestFacts {
+            requested_bytes: original.request_bytes_upper_bound,
+            requests: original.allocation_requests_upper_bound,
+            peak_bytes,
+            retained_bytes,
+            output_bytes,
+        })
+    }
 }
 
 fn tracker_path(tracker: &Arc<MemTracker>) -> Vec<Arc<MemTracker>> {
@@ -428,6 +500,137 @@ pub fn query_tracker_label(high: i64, low: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::MemTracker;
+
+    #[test]
+    fn nominal_limit_projection_preserves_every_ancestor_counter() {
+        let original_root = MemTracker::new_root("root".repeat(4096));
+        let original_middle = MemTracker::new_child("middle", &original_root);
+        let original_leaf = MemTracker::new_child("leaf", &original_middle);
+        let nominal_root = MemTracker::new_root("root".repeat(4096));
+        let nominal_middle = MemTracker::new_child("middle", &nominal_root);
+        let nominal_leaf = MemTracker::new_child("leaf", &nominal_middle);
+        for tracker in [&original_root, &nominal_root] {
+            tracker.install_limit_once(1).unwrap();
+        }
+        for tracker in [&original_middle, &nominal_middle] {
+            tracker.install_limit_once(2).unwrap();
+        }
+        for bytes in [-1, 0, 1, 2, 4] {
+            assert_eq!(
+                original_leaf.consume_and_check_limit(bytes).is_err(),
+                nominal_leaf.consume_and_check_limit_nominal(bytes).is_err()
+            );
+            for (original, nominal) in [
+                (&original_root, &nominal_root),
+                (&original_middle, &nominal_middle),
+                (&original_leaf, &nominal_leaf),
+            ] {
+                assert_eq!(nominal.current(), original.current());
+                assert_eq!(nominal.allocated(), original.allocated());
+                assert_eq!(nominal.peak(), original.peak());
+            }
+        }
+        original_leaf.release(7);
+        nominal_leaf.release(7);
+        for (original, nominal) in [
+            (&original_root, &nominal_root),
+            (&original_middle, &nominal_middle),
+            (&original_leaf, &nominal_leaf),
+        ] {
+            assert_eq!(nominal.current(), 0);
+            assert_eq!(nominal.deallocated(), original.deallocated());
+        }
+    }
+
+    #[test]
+    fn first_limit_projection_runs_once_at_original_ancestor_position() {
+        let root = MemTracker::new_root("root");
+        let middle = MemTracker::new_child("middle", &root);
+        let leaf = MemTracker::new_child("leaf", &middle);
+        middle.install_limit_once(1).unwrap();
+        root.install_limit_once(1).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = leaf.consume_with_limit_projection(2, |tracker, current, limit| {
+            calls.set(calls.get() + 1);
+            assert!(std::ptr::eq(tracker, middle.as_ref()));
+            assert_eq!((current, limit), (2, 1));
+            assert_eq!(leaf.current(), 2);
+            assert_eq!(root.current(), 0);
+            tracker.limit_exceeded_detail(current, limit)
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            result.unwrap_err(),
+            "ResourceExhausted: memory limit exceeded for tracker middle: current 2 bytes, limit 1 bytes"
+        );
+        assert_eq!(root.current(), 2);
+        assert_eq!(root.allocated(), 2);
+        assert_eq!(root.peak(), 2);
+        leaf.release(2);
+        let result = leaf.consume_with_limit_projection(0, |_, _, _| {
+            calls.set(calls.get() + 1);
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn tracker_limit_failure_requests_cover_actual_ancestry_and_preserve_original_text() {
+        for count in [0, 16, 128, 4096] {
+            let label = "root\0µ\n".repeat(count);
+            let root = MemTracker::new_root(label.clone());
+            let middle = MemTracker::new_child("middle", &root);
+            let leaf = MemTracker::new_child("leaf", &middle);
+            root.install_limit_once(1).unwrap();
+            let facts = leaf.limit_failure_request_facts().unwrap();
+            for tracker in [&root, &middle, &leaf] {
+                assert_eq!(tracker.current(), 0);
+                assert_eq!(tracker.allocated(), 0);
+            }
+            let original = leaf.consume_and_check_limit(2).unwrap_err();
+            assert_eq!(
+                original,
+                format!(
+                    "ResourceExhausted: memory limit exceeded for tracker {label}: current 2 bytes, limit 1 bytes"
+                )
+            );
+            assert!(original.len() <= facts.output_bytes);
+            assert!(original.capacity() <= facts.retained_bytes);
+            assert!(facts.retained_bytes <= facts.peak_bytes);
+            assert!(facts.peak_bytes <= facts.requested_bytes);
+            assert!(facts.requests > 0);
+            for tracker in [&root, &middle, &leaf] {
+                assert_eq!(tracker.current(), 2);
+                assert_eq!(tracker.allocated(), 2);
+                assert_eq!(tracker.peak(), 2);
+            }
+            leaf.release(2);
+            for tracker in [&root, &middle, &leaf] {
+                assert_eq!(tracker.current(), 0);
+                assert_eq!(tracker.allocated(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn tracker_limit_failure_requests_do_not_change_first_failure_or_ancestor_accounting() {
+        let root = MemTracker::new_root("long root label".repeat(1024));
+        let leaf = MemTracker::new_child("leaf", &root);
+        root.install_limit_once(1).unwrap();
+        leaf.install_limit_once(1).unwrap();
+        let facts = leaf.limit_failure_request_facts().unwrap();
+        assert!(facts.output_bytes >= root.label().len() + 121);
+        assert_eq!(
+            leaf.consume_and_check_limit(2).unwrap_err(),
+            "ResourceExhausted: memory limit exceeded for tracker leaf: current 2 bytes, limit 1 bytes"
+        );
+        assert_eq!(root.current(), 2);
+        assert_eq!(root.allocated(), 2);
+        assert_eq!(leaf.allocated(), 2);
+        leaf.release(2);
+        assert_eq!(root.current(), 0);
+        assert_eq!(leaf.current(), 0);
+    }
 
     #[test]
     fn immutable_limit_is_idempotent_and_rejects_drift() {

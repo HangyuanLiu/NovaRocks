@@ -214,18 +214,9 @@ fn pure_differential_n_nan_signed_zero_at_original_stable_sort_size_boundaries()
 }
 
 #[test]
-fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift_and_named_refusal() {
+fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift() {
+    use super::DifferentialFailure;
     use super::aggregate::run_aggregate_differential;
-    use super::{DifferentialFailure, HarnessControl};
-    use novarocks_functions::builtin::catalogue::builtin_engine_function_catalog;
-    use novarocks_functions::{
-        AggregateKernelPhase, AggregatePreparationOptions, CallArgumentUses, CallEffectInput,
-        FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionSpecializationFailure,
-        KernelFailure, PureCallPreparation, ScopedExpressionEffects,
-    };
-    use novarocks_type_contract::{
-        CallProofScope, DecimalOverflowPolicy, ExpressionUseId, SemanticParameters,
-    };
     for name in ["min_n", "max_n"] {
         for nullable in [false, true] {
             let source = FunctionValueType::try_with_logical_type(
@@ -243,7 +234,7 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift_and_n
                 for limit_nullable in [false, true] {
                     for rows in [0usize, 8] {
                         let values = if rows == 0 {
-                            new_empty_array(&source.data_type())
+                            new_empty_array(source.data_type())
                         } else {
                             InputGenerator::new(1821).column(
                                 &source,
@@ -256,86 +247,21 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift_and_n
                             .typed_column(source.clone(), values)
                             .typed_column(limit.clone(), limits(&n, rows, 3));
                         let failure = run_aggregate_differential(&spec).unwrap_err();
-                        // Complete semantics now reach the actual selected owner
-                        // before the legacy emitter can import nominal metadata.
-                        // Keep the explicit unsupported profile, not retired
-                        // planned-vs-imported Field annotation drift as authority.
                         match failure {
-                            DifferentialFailure::Specialization(reason) => {
-                                assert_eq!(
-                                    reason,
-                                    format!(
-                                        "invalid kernel program: builtin.aggregate/{name}/v1 has no installed min_n/max_n logical input profile for LargeInt"
-                                    )
+                            DifferentialFailure::LegacyUnavailable {
+                                name: actual,
+                                reason,
+                            } => {
+                                assert_eq!(actual, name);
+                                let expected = format!(
+                                    "bind aggregate `{name}`: aggregate `{name}` resolved signature drift: planned=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true, metadata: {{\"nr_logical_type\": \"largeint\"}} }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}, local=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}"
                                 );
+                                assert_eq!(reason, expected);
                             }
                             other => panic!(
-                                "expected original selected LARGEINT profile refusal: {other}"
+                                "expected frozen logical LARGEINT legacy metadata drift: {other}"
                             ),
                         }
-                        let catalog = builtin_engine_function_catalog();
-                        let arguments = [
-                            FunctionArgument::Value {
-                                value_type: source.clone(),
-                                constant: None,
-                            },
-                            FunctionArgument::Value {
-                                value_type: limit.clone(),
-                                constant: None,
-                            },
-                        ];
-                        let request = FunctionBindingRequest {
-                            arguments: &arguments,
-                            logical_argument_count: 2,
-                            expected_result_type: None,
-                        };
-                        let bound = catalog
-                            .resolve_bound_user(
-                                name,
-                                FunctionKind::Aggregate,
-                                request,
-                                &HarnessControl,
-                            )
-                            .unwrap();
-                        let selected = Arc::new(bound.selected);
-                        let context = super::harness_context();
-                        let uses = [Some(ExpressionUseId::new(1)), Some(ExpressionUseId::new(2))];
-                        let parameters = SemanticParameters::try_new([]).unwrap();
-                        let result = catalog.prepare_fresh_selected(
-                            CallEffectInput {
-                                function_id: &bound.function_id,
-                                kind: FunctionKind::Aggregate,
-                                selected: &selected,
-                                request,
-                                argument_uses: CallArgumentUses::SelectedChannels(&uses),
-                                context,
-                                parameters: &parameters,
-                                environment: &[],
-                                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                                proof_scope: CallProofScope::Domain(context.domain),
-                            },
-                            selected.clone(),
-                            PureCallPreparation::Aggregate {
-                                arguments: ScopedExpressionEffects::pure_value(context),
-                                options: AggregatePreparationOptions {
-                                    state_interpretation: None,
-                                    phase: AggregateKernelPhase::Single,
-                                    distinct: false,
-                                    order_keys: Arc::from([]),
-                                    state_input_type: None,
-                                },
-                            },
-                            &HarnessControl,
-                        );
-                        let failure = match result {
-                            Err(error) => error,
-                            Ok(_) => panic!(
-                                "logical LARGEINT must explicitly reject its unsupported installed profile"
-                            ),
-                        };
-                        assert!(
-                            matches!(failure,FunctionSpecializationFailure::Kernel(KernelFailure::InvalidProgram(diagnostic)) if diagnostic.message()==format!("builtin.aggregate/{name}/v1 has no installed min_n/max_n logical input profile for LargeInt"))
-                        );
                     }
                 }
             }

@@ -25,8 +25,8 @@ use std::sync::Arc;
 use crate::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
 use crate::connector::{
     CatalogProperties, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorFieldPath,
-    ConnectorMaterializationError, ConnectorProviderId, MaterializationContext,
-    NormalizedCatalogProperties,
+    ConnectorInstanceId, ConnectorMaterializationError, ConnectorProviderId,
+    MaterializationContext, NormalizedCatalogProperties,
 };
 
 use crate::connector::{ConnectorControlRoleBinding, ConnectorExecutionRoleBinding};
@@ -39,6 +39,56 @@ pub trait ProviderControlRoleFactory: Send + Sync {
         &self,
         properties: CatalogProperties,
     ) -> Result<NormalizedCatalogProperties, ConnectorMaterializationError>;
+
+    /// Open the local owner of one logical catalog. This must perform no I/O.
+    /// Its lifetime spans credential/configuration generations of this entry.
+    fn open_catalog(
+        &self,
+        identity: CatalogScopeIdentity,
+    ) -> Arc<dyn ProviderCatalogControlFactory>;
+}
+
+/// Application-supplied logical catalog identity. An execution version is
+/// deliberately absent: changing credentials or configuration retires a
+/// generation, while replacing the source entry creates a different domain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogScopeIdentity {
+    provider_id: ConnectorProviderId,
+    instance_id: ConnectorInstanceId,
+    source_entry_id: uuid::Uuid,
+}
+
+impl CatalogScopeIdentity {
+    pub const fn new(
+        provider_id: ConnectorProviderId,
+        instance_id: ConnectorInstanceId,
+        source_entry_id: uuid::Uuid,
+    ) -> Self {
+        Self {
+            provider_id,
+            instance_id,
+            source_entry_id,
+        }
+    }
+
+    pub const fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
+    }
+    pub const fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+    pub const fn source_entry_id(&self) -> uuid::Uuid {
+        self.source_entry_id
+    }
+}
+
+/// Local materialization owner retained by Catalog Application until the
+/// desired entry is removed or replaced. Each invocation builds an independent
+/// generation; only explicitly catalog-scoped provider state is shared.
+pub trait ProviderCatalogControlFactory: Send + Sync {
+    fn activity_reader(&self) -> Option<Arc<dyn super::CatalogActivityReader>> {
+        None
+    }
 
     fn materialize(
         &self,
@@ -234,6 +284,16 @@ mod tests {
             unreachable!("static registry tests never invoke factories")
         }
 
+        fn open_catalog(
+            &self,
+            _identity: CatalogScopeIdentity,
+        ) -> Arc<dyn ProviderCatalogControlFactory> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            unreachable!("static registry tests never invoke factories")
+        }
+    }
+
+    impl ProviderCatalogControlFactory for Factory {
         fn materialize(
             &self,
             _properties: NormalizedCatalogProperties,

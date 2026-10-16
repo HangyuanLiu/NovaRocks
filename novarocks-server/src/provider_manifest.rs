@@ -465,6 +465,15 @@ mod tests {
             unreachable!("manifest projection never invokes provider behavior")
         }
 
+        fn open_catalog(
+            &self,
+            _identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            unreachable!("manifest projection never invokes provider behavior")
+        }
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for FixtureFactory {
         fn materialize(
             &self,
             _properties: NormalizedCatalogProperties,

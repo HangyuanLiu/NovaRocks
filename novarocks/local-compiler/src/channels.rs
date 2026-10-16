@@ -593,7 +593,11 @@ fn resolve_core_with_creation<H>(
             // itself: each output occurrence is a fresh channel, and a
             // repeated group value is one key, so its first ordinal
             // represents it. Group and argument roots read the child port.
-            NodeKind::Aggregate { .. } => {
+            NodeKind::Aggregate { .. }
+            | NodeKind::TopN {
+                reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
+                ..
+            } => {
                 single_child(&node.inputs)?;
                 let mut slots = Vec::new();
                 let mut port = Port::new();

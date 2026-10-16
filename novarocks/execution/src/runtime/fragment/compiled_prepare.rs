@@ -37,7 +37,7 @@ use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
 use crate::exec::operators::ResultBufferSinkFactory;
-use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
+use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::exchange::materialize_compiled_exchange_receivers;
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
@@ -273,8 +273,26 @@ pub fn compiled_sink_kind(
 /// legacy submission produces, so the Task host starts, observes and cleans
 /// it up unchanged.
 pub fn prepare_compiled_fragment(
+    submission: CompiledFragmentSubmission,
+    context: FragmentPrepareContext,
+) -> Result<DormantFragmentHandle, FragmentLaunchError> {
+    prepare_compiled_fragment_in(submission, context, None)
+}
+
+pub fn prepare_compiled_fragment_with_metadata_host(
+    submission: CompiledFragmentSubmission,
+    context: FragmentPrepareContext,
+    host: &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+) -> Result<DormantFragmentHandle, FragmentLaunchError> {
+    prepare_compiled_fragment_in(submission, context, Some(host))
+}
+
+fn prepare_compiled_fragment_in(
     mut submission: CompiledFragmentSubmission,
     context: FragmentPrepareContext,
+    schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
     // The write capabilities move into the one pipeline graph that owns them.
     let writers = std::mem::take(&mut submission.writers);
@@ -362,31 +380,24 @@ pub fn prepare_compiled_fragment(
                 error,
             )
         })?;
-        // Receiver schemas are created by the same BE tracker/control policy
-        // as operator schemas. The registry retains each independent schema,
-        // while this temporary factory exits with preparation.
-        let construction_error = |cause: crate::exec::pipeline::operator::ConstructionFailure| {
-            FragmentLaunchError::from_failure(
-                FragmentLaunchStage::Register,
-                FragmentLaunchErrorKind::ResourceUnavailable,
-                cause.into(),
-            )
-        };
-        let receiver_creation = if program.exchange_inputs().is_empty() {
-            None
-        } else {
-            let tracker = runtime_state.mem_tracker().ok_or_else(|| {
-                construction_error(
-                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                )
-            })?;
-            let profile = crate::exec::pipeline::pipeline::representation_construction_profile()
-                .map_err(crate::exec::pipeline::operator::ConstructionFailure::from)
-                .map_err(construction_error)?;
-            Some(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-                profile, tracker, runtime_state.error_state(),
-            ).map_err(construction_error)?)
-        };
+        // Both receiver lifetimes use the same tracker, model and creation
+        // author. Native explicitly retains its stop owner through retirement.
+        let (receiver_creation, receiver_construction_stop) =
+            if program.exchange_inputs().is_empty() {
+                (None, None)
+            } else {
+                let (factory, stop) =
+                    context
+                        .receiver_construction(&runtime_state)
+                        .map_err(|cause| {
+                            FragmentLaunchError::from_failure(
+                                FragmentLaunchStage::Register,
+                                FragmentLaunchErrorKind::ResourceUnavailable,
+                                cause.into(),
+                            )
+                        })?;
+                (Some(factory), stop)
+            };
         let receivers = materialize_compiled_exchange_receivers(
             program,
             finst_id,
@@ -403,7 +414,7 @@ pub fn prepare_compiled_fragment(
             };
             FragmentLaunchError::from_failure(FragmentLaunchStage::Register, kind, cause.into())
         })?;
-        resources.acquire_compiled_exchange(receivers.registrations)?;
+        resources.acquire_compiled_exchange(receivers.registrations, receiver_construction_stop)?;
         context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
 
         let result_sink = match program.graph().sink() {
@@ -457,7 +468,7 @@ pub fn prepare_compiled_fragment(
         )?;
         let scan_bindings =
             materialize_compiled_scan_bindings(program, &submission.scans, instance)?;
-        prepare_compiled_program_pipeline_execution_with_profiler(
+        prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
             Arc::clone(program),
             Duration::from_millis(50),
             sink,
@@ -469,6 +480,7 @@ pub fn prepare_compiled_fragment(
             pipeline_dop,
             runtime_state,
             Arc::clone(&context.event_sink),
+            schema_preparation,
         )
         .map_err(|error| {
             FragmentLaunchError::from_failure(

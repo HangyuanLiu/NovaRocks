@@ -594,6 +594,19 @@ impl StaticLayout {
         }
     }
 
+    /// Exact element-array geometry used by the typed slot metadata creator.
+    /// The creator requests this Vec backing and its independent Arc backing.
+    pub fn typed_slot_metadata_allocation_layout(
+        count: usize,
+    ) -> Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        std::alloc::Layout::array::<StaticSlotMetadata>(count).map_err(|_| {
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+        })
+    }
+
     pub fn try_new_typed_with_creator<H>(
         schema: SchemaRef,
         slots: Arc<[SlotId]>,
@@ -627,8 +640,7 @@ impl StaticLayout {
                     return Err(LayoutError::DuplicateSlot.into());
                 }
             }
-            let metadata_layout = std::alloc::Layout::array::<StaticSlotMetadata>(slots.len())
-                .map_err(|_| LayoutCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+            let metadata_layout = Self::typed_slot_metadata_allocation_layout(slots.len())?;
             if !slots.is_empty() {
                 request(metadata_layout)?;
             }
@@ -1435,6 +1447,36 @@ mod tests {
             StaticLayout::try_new(schema, Arc::from([SlotId::new(1), SlotId::new(1)])).unwrap_err(),
             LayoutError::DuplicateSlot
         );
+    }
+
+    #[test]
+    fn identity_distinguishes_complete_domains_with_the_same_carrier() {
+        let layout = |kind| {
+            let carrier = DataType::FixedSizeBinary(16);
+            typed_fixture(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    carrier.clone(),
+                    true,
+                )])),
+                Arc::from([SlotId::new(1)]),
+                vec![(complete(value(kind, true), &carrier), None)],
+                &OriginalControl::default(),
+            )
+            .unwrap()
+        };
+        let physical = layout(ValueKind::Scalar(DataType::FixedSizeBinary(16)))
+            .identity()
+            .unwrap();
+        let large = layout(ValueKind::Nominal(ValueLogicalType::LargeInt))
+            .identity()
+            .unwrap();
+        let uuid = layout(ValueKind::Nominal(ValueLogicalType::Uuid))
+            .identity()
+            .unwrap();
+        assert_ne!(physical, large);
+        assert_ne!(physical, uuid);
+        assert_ne!(large, uuid);
     }
 
     #[test]

@@ -144,33 +144,6 @@ pub(crate) fn execute_create_table_statement(
                     ));
                 }
             }
-            // This validation must precede the connector mutation dispatcher:
-            // its reconciliation path may inspect a not-yet-created table,
-            // whereas an invalid partition source is a deterministic statement
-            // error independent of catalog state.
-            for partition_field in &partition_fields {
-                let source_column = match partition_field {
-                    IcebergPartitionFieldExpr::Identity { column }
-                    | IcebergPartitionFieldExpr::Year { column }
-                    | IcebergPartitionFieldExpr::Month { column }
-                    | IcebergPartitionFieldExpr::Day { column }
-                    | IcebergPartitionFieldExpr::Hour { column }
-                    | IcebergPartitionFieldExpr::Bucket { column, .. }
-                    | IcebergPartitionFieldExpr::Truncate { column, .. }
-                    | IcebergPartitionFieldExpr::Void { column } => column,
-                };
-                if let Some(column) = columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(source_column))
-                    && matches!(column.data_type, novarocks_types::schema::SqlType::Variant)
-                {
-                    return Err(format!(
-                        "iceberg table column `{}` is variant; variant columns cannot appear in the partition spec. Use a non-variant source column for partition transforms.",
-                        column.name
-                    ));
-                }
-            }
-
             let target = crate::catalog_application::resolver::resolve_table_target(
                 context,
                 &stmt.name,
@@ -868,7 +841,7 @@ pub(crate) fn execute_drop_table_statement(
             novarocks_query_application::engine_error::EngineError::commit_unknown(
                 failure.to_string(),
             )
-            .to_string(),
+            .to_bracketed_user_message(),
         ),
         crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
             Err(error.to_string())

@@ -184,7 +184,7 @@ pub fn execute_metadata_maintenance(
             .to_string(),
         ),
         ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_string())
+            Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
         }
         ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
     }
@@ -215,7 +215,7 @@ pub fn execute_planned_metadata_maintenance(
             .to_string(),
         ),
         ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_string())
+            Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
         }
         ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
     }
@@ -239,7 +239,9 @@ fn resolved_error_message(value: ResolvedMetadataMaintenance) -> String {
         ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
             super::mutation::known_uncommitted_message(failure, &cleanup)
         }
-        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => failure.to_string(),
+        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
+            EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message()
+        }
         ResolvedMetadataMaintenance::ContractFailure { error, .. } => error.to_string(),
         ResolvedMetadataMaintenance::KnownCommitted(_) => {
             "metadata maintenance planning unexpectedly committed".to_string()
@@ -582,7 +584,7 @@ mod tests {
                 plan.operation_kind(),
                 plan.request_digest(),
                 plan.plan_digest(),
-                plan.state_digest(),
+                plan.intent_digest(),
                 ConnectorMetadataMaintenanceReceiptSummary::default(),
                 Bytes::new(),
             )
@@ -829,6 +831,49 @@ mod tests {
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unknown_maintenance_strings_preserve_the_canonical_outcome_without_reexecution() {
+        for planned in [false, true] {
+            let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
+            let resolver = Resolver::new(provider.clone());
+            let finalizer = Finalizer {
+                events: provider.events.clone(),
+            };
+            let operation = ConnectorMutationOperationId::new();
+            let outcome = if planned {
+                let session = MetadataMaintenanceSession::plan(
+                    &resolver,
+                    &provider.descriptor.instance_id,
+                    operation,
+                    table(&provider.descriptor.instance_id),
+                    MetadataMaintenanceIntent::rewrite_metadata_layout(),
+                    context(),
+                )
+                .unwrap();
+                execute_planned_metadata_maintenance(session, &finalizer)
+            } else {
+                execute_metadata_maintenance(
+                    &resolver,
+                    &finalizer,
+                    &provider.descriptor.instance_id,
+                    operation,
+                    table(&provider.descriptor.instance_id),
+                    MetadataMaintenanceIntent::rewrite_metadata_layout(),
+                    context(),
+                )
+            };
+            assert_eq!(
+                outcome.unwrap_err(),
+                "[CommitUnknown] Unavailable: response lost"
+            );
+            assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
+            assert!(provider.events.lock().unwrap().is_empty());
+        }
     }
 
     /// A provider that only answers the read-only observation. Everything a

@@ -24,7 +24,13 @@ use novarocks_type_contract::{
 };
 
 use super::domain::IcebergEqualityDeleteRecipe;
-use crate::commit::EqualityDeleteColumn;
+use crate::iceberg::arrow::schema_to_arrow_schema;
+use std::sync::Arc;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EqualityDeleteFileTarget {
+    pub arrow_schema: SchemaRef,
+}
 
 #[derive(Debug)]
 pub(crate) enum EqualitySchemaError {
@@ -105,38 +111,26 @@ impl Work<'_> {
         }
         Ok(())
     }
-    fn copy(&mut self, text: &str) -> Result<String, EqualitySchemaError> {
-        // This allocation is not a host grant. Only the completed copies are
-        // cooperative; allocator behavior remains the caller's obligation.
-        let mut output = self.opaque(|| String::with_capacity(text.len()))?;
-        self.append(&mut output, text)?;
-        Ok(output)
-    }
 }
 
-/// Preserve the legacy writer's exact schema-binding and diagnostics.
-pub(crate) fn resolve_equality_columns(
+/// Bind the complete frozen target projection before opening storage.
+pub(crate) fn equality_delete_target_from_recipe(
     recipe: &IcebergEqualityDeleteRecipe,
     expected_schema: &SchemaRef,
-) -> Result<Vec<EqualityDeleteColumn>, ConnectorError> {
+) -> Result<EqualityDeleteFileTarget, ConnectorError> {
     match resolve_core(recipe, expected_schema, &mut Work(None)) {
-        Ok(columns) => Ok(columns),
+        Ok(target) => Ok(target),
         Err(EqualitySchemaError::Source(error)) => Err(error),
         Err(EqualitySchemaError::Control(_)) => {
-            unreachable!("legacy schema binding has no control port")
+            unreachable!("runtime binding has no compile control")
         }
     }
 }
-
-/// The pure compiler borrows the original control and never retries through
-/// the legacy path. Debug rendering and Arrow cloning are opaque, finite
-/// operations on the caller's admitted schema, observed before and after;
-/// this does not prove their internal cooperation or allocation governance.
-pub(crate) fn resolve_equality_columns_for_compile(
+pub(crate) fn equality_delete_target_for_compile(
     recipe: &IcebergEqualityDeleteRecipe,
     expected_schema: &SchemaRef,
     control: &dyn PureCompileControl,
-) -> Result<Vec<EqualityDeleteColumn>, EqualitySchemaError> {
+) -> Result<EqualityDeleteFileTarget, EqualitySchemaError> {
     let mut work = Work(Some(CompileCheckpoints::try_new(
         control,
         CompilePhase::ProviderValidation,
@@ -148,353 +142,180 @@ pub(crate) fn resolve_equality_columns_for_compile(
     work.flush()?;
     result
 }
-
+fn invalid(message: impl Into<String>) -> EqualitySchemaError {
+    EqualitySchemaError::Source(ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        message,
+    ))
+}
 fn resolve_core(
     recipe: &IcebergEqualityDeleteRecipe,
     expected_schema: &SchemaRef,
     work: &mut Work<'_>,
-) -> Result<Vec<EqualityDeleteColumn>, EqualitySchemaError> {
+) -> Result<EqualityDeleteFileTarget, EqualitySchemaError> {
     let same_count = recipe.columns().len() == expected_schema.fields().len();
     work.step()?;
     if !same_count {
-        let message = work.opaque(|| {
+        return Err(invalid(work.opaque(|| {
             format!(
                 "Iceberg equality-delete handle names {} columns but its fragment input carries {}",
                 recipe.columns().len(),
                 expected_schema.fields().len()
             )
-        })?;
-        return Err(EqualitySchemaError::Source(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            message,
-        )));
+        })?));
     }
-    let mut columns = Vec::new();
-    for (frozen, actual) in recipe.columns().iter().zip(expected_schema.fields()) {
-        let name_matches = work.equal(frozen.name(), actual.name())?;
-        let type_matches = if name_matches {
-            let rendering = work.opaque(|| format!("{:?}", actual.data_type()))?;
-            work.equal(frozen.data_type(), &rendering)?
-        } else {
-            false
-        };
-        let matches = name_matches && type_matches && frozen.nullable() == actual.is_nullable();
-        work.step()?;
-        if !matches {
+    // Observe JSON as one finite library call, preserving the original control.
+    let target: crate::iceberg::spec::Schema = work
+        .opaque(|| serde_json::from_str(recipe.field_schema_json()))?
+        .map_err(|error| {
+            invalid(format!(
+                "decode frozen Iceberg equality-delete schema: {error}"
+            ))
+        })?;
+    let fields = target.as_struct().fields();
+    if fields.len() != recipe.columns().len() {
+        return Err(invalid(
+            "Iceberg equality-delete schema projection has a different column count",
+        ));
+    }
+    for ((frozen, actual), target) in recipe
+        .columns()
+        .iter()
+        .zip(expected_schema.fields())
+        .zip(fields)
+    {
+        if !work.equal(frozen.name(), actual.name())?
+            || !work.opaque(|| frozen.name().eq_ignore_ascii_case(&target.name))?
+            || frozen.field_id() != target.id
+        {
             let mut message = String::new();
             work.append(&mut message, "Iceberg equality-delete column `")?;
             work.append(&mut message, frozen.name())?;
             work.append(&mut message, "` does not match fragment input `")?;
             work.append(&mut message, actual.name())?;
             work.append(&mut message, "`")?;
-            return Err(EqualitySchemaError::Source(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                message,
-            )));
+            return Err(invalid(message));
         }
-        let name = work.copy(frozen.name())?;
-        let data_type = work.opaque(|| actual.data_type().clone())?;
-        // Public input field metadata is not the target field-ID authority.
-        // Retain the exact recipe ID and source order, including reordered keys.
-        columns.push(EqualityDeleteColumn {
-            name,
-            field_id: frozen.field_id(),
-            data_type,
-            nullable: actual.is_nullable(),
-        });
+        work.opaque(|| crate::commit::frozen_write::validate_writer_type(&target.field_type))?
+            .map_err(invalid)?;
         work.step()?;
     }
-    Ok(columns)
+    let arrow_schema = Arc::new(work.opaque(|| schema_to_arrow_schema(&target))?.map_err(
+        |error| {
+            invalid(format!(
+                "convert frozen Iceberg equality-delete schema: {error}"
+            ))
+        },
+    )?);
+    work.opaque(|| {
+        crate::commit::write_adaptation::validate_batch_schema(expected_schema, &arrow_schema)
+    })?
+    .map_err(invalid)?;
+    Ok(EqualityDeleteFileTarget { arrow_schema })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    use super::super::domain::IcebergEqualityDeleteColumnFacts;
-
+    use crate::commit::write_stack::domain::IcebergEqualityDeleteColumnFacts;
+    use arrow::datatypes::{DataType, Schema};
+    use std::sync::Mutex;
     struct Control {
         calls: Mutex<Vec<u32>>,
-        failure: Option<(usize, CompileControlError)>,
-        positive: Option<CompileControlError>,
-    }
-    impl Control {
-        fn accept() -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                failure: None,
-                positive: None,
-            }
-        }
+        refusal: Option<(usize, CompileControlError)>,
     }
     impl PureCompileControl for Control {
-        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-            assert_eq!(phase, CompilePhase::ProviderValidation);
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push(units);
-            if let Some((call, error)) = self.failure
-                && calls.len() == call
-            {
-                return Err(error);
-            }
-            if units == 256
-                && let Some(error) = self.positive
-            {
-                return Err(error);
+            if let Some((at, error)) = self.refusal {
+                if calls.len() == at {
+                    return Err(error);
+                }
             }
             Ok(())
         }
     }
-    fn causes() -> [CompileControlError; 3] {
-        [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ]
-    }
-    fn recipe(fields: &[(&str, i32, DataType, bool)]) -> IcebergEqualityDeleteRecipe {
-        IcebergEqualityDeleteRecipe::try_new(
-            fields
-                .iter()
-                .map(|(name, id, ty, nullable)| {
-                    IcebergEqualityDeleteColumnFacts::try_new(
-                        (*name).to_string(),
-                        *id,
-                        format!("{ty:?}"),
-                        *nullable,
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        )
-        .unwrap()
-    }
-    fn schema(fields: &[(&str, DataType, bool)]) -> SchemaRef {
-        Arc::new(Schema::new(
-            fields
-                .iter()
-                .map(|(name, ty, nullable)| Field::new(*name, ty.clone(), *nullable))
-                .collect::<Vec<_>>(),
-        ))
-    }
-    fn source(error: EqualitySchemaError) -> ConnectorError {
-        match error {
-            EqualitySchemaError::Source(error) => error,
-            EqualitySchemaError::Control(error) => panic!("unexpected control: {error}"),
+    fn control() -> Control {
+        Control {
+            calls: Mutex::new(vec![]),
+            refusal: None,
         }
     }
-    fn assert_control(
-        result: Result<Vec<EqualityDeleteColumn>, EqualitySchemaError>,
-        expected: CompileControlError,
-    ) {
-        assert!(matches!(result, Err(EqualitySchemaError::Control(actual)) if actual == expected));
-    }
-
-    #[test]
-    fn equality_schema_preserves_recipe_order_ids_and_complete_arrow_types() {
-        let child = Field::new("provider_child", DataType::Utf8, true).with_metadata(
-            HashMap::from([("provider.key".to_string(), "value".to_string())]),
-        );
-        let nested = DataType::Struct(vec![Arc::new(child)].into());
-        let recipe = recipe(&[
-            ("nested", 90, nested.clone(), true),
-            ("key", 3, DataType::Int64, false),
-        ]);
-        let actual = Arc::new(Schema::new(vec![
-            Field::new("nested", nested.clone(), true).with_metadata(HashMap::from([(
-                "PARQUET:field_id".to_string(),
-                "999".to_string(),
-            )])),
-            Field::new("key", DataType::Int64, false).with_metadata(HashMap::from([(
-                "PARQUET:field_id".to_string(),
-                "1000".to_string(),
-            )])),
-        ]));
-        let legacy = resolve_equality_columns(&recipe, &actual).unwrap();
-        let pure =
-            resolve_equality_columns_for_compile(&recipe, &actual, &Control::accept()).unwrap();
-        assert_eq!(pure, legacy);
-        assert_eq!(
-            pure.iter()
-                .map(|column| column.field_id)
-                .collect::<Vec<_>>(),
-            vec![90, 3]
-        );
-        assert_eq!(
-            pure.iter()
-                .map(|column| column.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["nested", "key"]
-        );
-        assert_eq!(pure[0].data_type, nested);
-        assert!(pure[0].nullable);
-        assert!(!pure[1].nullable);
-        assert_eq!(recipe.field_ids(), vec![3, 90]);
-    }
-
-    #[test]
-    fn equality_schema_retains_dictionary_debug_contract_and_nullable_exactness() {
-        let dictionary = DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
-        let recipe = recipe(&[("dict", 0, dictionary.clone(), false)]);
-        let actual = schema(&[("dict", dictionary.clone(), false)]);
-        let output =
-            resolve_equality_columns_for_compile(&recipe, &actual, &Control::accept()).unwrap();
-        assert_eq!(output, resolve_equality_columns(&recipe, &actual).unwrap());
-        assert_eq!(output[0].field_id, 0);
-        assert_eq!(output[0].data_type, dictionary);
-        // The legacy equality binder checks the frozen rendering, not storage
-        // writer support. Later owners remain responsible for that support.
-        let changed = schema(&[("dict", DataType::Utf8, false)]);
-        assert_eq!(
-            source(
-                resolve_equality_columns_for_compile(&recipe, &changed, &Control::accept())
-                    .unwrap_err()
-            ),
-            resolve_equality_columns(&recipe, &changed).unwrap_err()
-        );
-    }
-
-    #[test]
-    fn equality_schema_count_name_type_nullable_and_order_fail_with_legacy_diagnostics() {
-        let recipe = recipe(&[
-            ("a", 1, DataType::Int64, false),
-            ("b", 2, DataType::Utf8, true),
-        ]);
-        for actual in [
-            schema(&[("a", DataType::Int64, false)]),
-            schema(&[
-                ("renamed", DataType::Int64, false),
-                ("b", DataType::Utf8, true),
-            ]),
-            schema(&[("a", DataType::Int32, false), ("b", DataType::Utf8, true)]),
-            schema(&[("a", DataType::Int64, true), ("b", DataType::Utf8, true)]),
-            schema(&[("b", DataType::Utf8, true), ("a", DataType::Int64, false)]),
-        ] {
-            let legacy = resolve_equality_columns(&recipe, &actual).unwrap_err();
-            let pure = source(
-                resolve_equality_columns_for_compile(&recipe, &actual, &Control::accept())
-                    .unwrap_err(),
-            );
-            assert_eq!(pure, legacy);
-            assert_eq!(pure.kind(), ConnectorErrorKind::InvalidRequest);
-        }
-        assert_eq!(
-            resolve_equality_columns(&recipe, &schema(&[("a", DataType::Int64, false)]))
-                .unwrap_err()
-                .message(),
-            "Iceberg equality-delete handle names 2 columns but its fragment input carries 1"
-        );
-        assert_eq!(
-            resolve_equality_columns(
-                &recipe,
-                &schema(&[
-                    ("changed", DataType::Int64, false),
-                    ("b", DataType::Utf8, true)
-                ])
+    fn fixture(ty: serde_json::Value) -> (IcebergEqualityDeleteRecipe, SchemaRef) {
+        let json = serde_json::json!({"type":"struct", "schema-id":42, "fields":[{"id":77,"name":"key","required":false,"type":ty}]}).to_string();
+        (
+            IcebergEqualityDeleteRecipe::try_new(
+                vec![IcebergEqualityDeleteColumnFacts::try_new("key".into(), 77).unwrap()],
+                json.clone(),
             )
-            .unwrap_err()
-            .message(),
-            "Iceberg equality-delete column `a` does not match fragment input `changed`"
-        );
+            .unwrap(),
+            {
+                let frozen: crate::iceberg::spec::Schema = serde_json::from_str(&json).unwrap();
+                Arc::new(schema_to_arrow_schema(&frozen).unwrap())
+            },
+        )
     }
-
     #[test]
-    fn equality_schema_chunked_unicode_copy_preserves_values_without_a_new_name_cap() {
-        let name = "é🙂".repeat(900);
-        let recipe = recipe(&[(&name, 12, DataType::Int64, true)]);
-        let actual = schema(&[(&name, DataType::Int64, true)]);
-        let output =
-            resolve_equality_columns_for_compile(&recipe, &actual, &Control::accept()).unwrap();
-        assert_eq!(output, resolve_equality_columns(&recipe, &actual).unwrap());
-        assert_eq!(output[0].name, name);
-    }
-
-    #[test]
-    fn equality_schema_original_control_entry_refusal_precedes_source_validation() {
-        let recipe = recipe(&[("a", 1, DataType::Int64, false)]);
-        let wrong = Arc::new(Schema::empty());
-        for error in causes() {
-            let control = Control {
-                failure: Some((1, error)),
-                ..Control::accept()
-            };
-            assert_control(
-                resolve_equality_columns_for_compile(&recipe, &wrong, &control),
-                error,
-            );
-            assert_eq!(*control.calls.lock().unwrap(), vec![0]);
-        }
-    }
-
-    #[test]
-    fn equality_schema_real_long_name_comparison_stops_at_first_256_quantum() {
-        // The leaf does not invent a name admission limit. This already-built
-        // schema exercises actual byte comparisons, not anticipated byte work.
-        let name = "key".repeat(100_000);
-        let recipe = recipe(&[(&name, 77, DataType::Int64, false)]);
-        let actual = schema(&[(&name, DataType::Int64, false)]);
-        for error in causes() {
-            let control = Control {
-                positive: Some(error),
-                ..Control::accept()
-            };
-            assert_control(
-                resolve_equality_columns_for_compile(&recipe, &actual, &control),
-                error,
-            );
-            assert_eq!(*control.calls.lock().unwrap(), vec![0, 256]);
-        }
-    }
-
-    #[test]
-    fn equality_schema_success_tail_refusal_does_not_publish_columns_or_recheck() {
-        let recipe = recipe(&[("a", 1, DataType::Int64, false)]);
-        let actual = schema(&[("a", DataType::Int64, false)]);
-        let reference = Control::accept();
-        resolve_equality_columns_for_compile(&recipe, &actual, &reference).unwrap();
-        let calls = reference.calls.lock().unwrap().clone();
-        assert!(calls.last().is_some_and(|units| *units > 0 && *units < 256));
-        for error in causes() {
-            let control = Control {
-                failure: Some((calls.len(), error)),
-                ..Control::accept()
-            };
-            assert_control(
-                resolve_equality_columns_for_compile(&recipe, &actual, &control),
-                error,
-            );
-            assert_eq!(*control.calls.lock().unwrap(), calls);
-        }
-    }
-
-    #[test]
-    fn equality_schema_ordinary_failure_tail_preserves_primary_typed_control() {
-        let recipe = recipe(&[("a", 1, DataType::Int64, false)]);
-        let wrong = schema(&[("b", DataType::Int64, false)]);
-        let reference = Control::accept();
-        let expected =
-            source(resolve_equality_columns_for_compile(&recipe, &wrong, &reference).unwrap_err());
+    fn equality_target_uses_frozen_type_and_field_id() {
+        let (recipe, input) = fixture(serde_json::json!("timestamptz"));
+        let target = equality_delete_target_for_compile(&recipe, &input, &control()).unwrap();
         assert_eq!(
-            expected,
-            resolve_equality_columns(&recipe, &wrong).unwrap_err()
+            target,
+            equality_delete_target_from_recipe(&recipe, &input).unwrap()
         );
-        let calls = reference.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[1] > 0);
-        for error in causes() {
-            let control = Control {
-                failure: Some((2, error)),
-                ..Control::accept()
-            };
-            assert_control(
-                resolve_equality_columns_for_compile(&recipe, &wrong, &control),
-                error,
+        assert_eq!(
+            target
+                .arrow_schema
+                .field(0)
+                .metadata()
+                .get("PARQUET:field_id")
+                .unwrap(),
+            "77"
+        );
+        assert_eq!(
+            target.arrow_schema.field(0).data_type(),
+            &DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("+00:00".into())
+            )
+        );
+    }
+    #[test]
+    fn equality_target_rejects_variant_uuid_and_missing_projection() {
+        for ty in [serde_json::json!("variant"), serde_json::json!("uuid")] {
+            let (recipe, input) = fixture(ty);
+            assert!(
+                equality_delete_target_from_recipe(&recipe, &input)
+                    .unwrap_err()
+                    .message()
+                    .contains("does not support writing")
             );
-            assert_eq!(*control.calls.lock().unwrap(), calls);
+        }
+        let (recipe, _) = fixture(serde_json::json!("long"));
+        assert!(equality_delete_target_from_recipe(&recipe, &Arc::new(Schema::empty())).is_err());
+    }
+    #[test]
+    fn equality_target_original_control_refuses_entry_and_every_later_checkpoint() {
+        let (recipe, input) = fixture(serde_json::json!("long"));
+        let accepted = control();
+        equality_delete_target_for_compile(&recipe, &input, &accepted).unwrap();
+        let count = accepted.calls.lock().unwrap().len();
+        for at in 1..=count {
+            for error in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control {
+                    refusal: Some((at, error)),
+                    ..control()
+                };
+                assert!(
+                    matches!(equality_delete_target_for_compile(&recipe,&input,&control),Err(EqualitySchemaError::Control(actual)) if actual==error)
+                );
+                assert_eq!(control.calls.lock().unwrap().len(), at);
+            }
         }
     }
 }

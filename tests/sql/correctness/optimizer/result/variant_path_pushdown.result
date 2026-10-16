@@ -1,3 +1,8 @@
+-- query 2
+0
+IRU9_EMPTY_INT_OK rows=0 snapshot=absent id=optional-int v=optional-variant
+IRU9_FIXTURE_COMPLETE
+
 -- query 3
 Explain String
 PLAN FRAGMENT 0

@@ -483,6 +483,11 @@ fn decode_report_bounds(
         let Some(schema_field) = schema.field_by_id(field_id) else {
             continue;
         };
+        if matches!(schema_field.field_type.as_ref(), Type::Variant(_)) {
+            return Err(format!(
+                "Iceberg Variant statistics for field id {field_id} are unsupported because Variant writes are unsupported"
+            ));
+        }
         let prim = match &*schema_field.field_type {
             Type::Primitive(p) => p.clone(),
             other => {
@@ -591,4 +596,21 @@ fn i64_map_to_u64(
                 .map(|value| (field_id, value))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod variant_statistics_tests {
+    use super::*;
+    #[test]
+    fn variant_report_bounds_explain_unsupported_writer_statistics() {
+        let schema:crate::iceberg::spec::Schema=serde_json::from_value(serde_json::json!({"type":"struct","schema-id":42,"fields":[{"id":1,"name":"v","required":false,"type":"variant"}]})).unwrap();
+        let error = decode_report_bounds(
+            &schema,
+            Some(BTreeMap::from([(1, vec![0])])),
+            "lower_bounds",
+        )
+        .unwrap_err();
+        assert!(error.contains("Variant statistics"));
+        assert!(error.contains("Variant writes are unsupported"));
+    }
 }

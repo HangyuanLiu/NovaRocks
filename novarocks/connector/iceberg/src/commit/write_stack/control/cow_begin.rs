@@ -375,16 +375,19 @@ impl IcebergWriteSessionControl {
                     .map_err(invalid)?
                     .map(|n| n as u64),
             )?;
-            let schema_plan =
-                projection::SchemaOnlyPlan::inspect(metadata.current_schema(), &scope)
-                    .map_err(projection_error)?;
-            let schema_upper = schema_plan.retained_upper().map_err(projection_error)?;
             let recipe = own::data_recipe(
                 &metadata,
                 matches!(input, ConnectorWriteInputShape::RowLineage { .. }),
                 scope.upper(),
                 &validator,
                 &scope,
+            )
+            .map_err(own_error)?;
+            let schema_upper = own::target_schema_retained_upper::<OriginalResultCheckError>(
+                recipe
+                    .target_schema_json()
+                    .ok_or_else(|| invalid("COW data recipe lost its frozen target schema"))?
+                    .len() as u64,
             )
             .map_err(own_error)?;
             scope.reserve(add(schema_upper, recipe_heap(&recipe)?)?)?;

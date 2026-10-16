@@ -178,6 +178,20 @@ fn execute_standard_ctas_operation(
     ) {
         Ok(action) => match engine.stage_standard_ctas_target(action.handle.as_ref()) {
             Ok(StandardCtasStageOutcome::Prepared { target, .. }) => target,
+            Ok(StandardCtasStageOutcome::AppliedButUnusable {
+                receipt,
+                finalization,
+            }) => {
+                // The stage has an external effect, but the final table
+                // publication never started. Keep both facts independently.
+                let terminal = attempt
+                    .terminal_pre_dispatch_uncommitted()
+                    .expect("final CTAS publication has not started")
+                    .clone();
+                return Err(DmlError::executor(format!(
+                    "CTAS staging was applied but cannot continue: {finalization:?}; final table publication was not attempted"
+                )).with_publication_terminal(terminal).with_unusable_stage(receipt, finalization));
+            }
             Ok(StandardCtasStageOutcome::KnownUncommitted { failure })
             | Ok(StandardCtasStageOutcome::CommitUnknown { failure, .. })
             | Err(failure) => {
@@ -505,6 +519,7 @@ fn internal_failure(message: impl Into<String>) -> CtasFailure {
 
 #[cfg(test)]
 mod tests {
+    use crate::query_execution::dml::ctas::PreparedStandardCtasCatalogAction;
     use std::any::Any;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -656,6 +671,131 @@ mod tests {
 
         drop(prepared);
         assert_eq!(engine.staged_targets.load(Ordering::SeqCst), 0);
+    }
+
+    struct UnusableStageEngine {
+        operation_id: novarocks_spi::connector::ConnectorStagedCreateOperationId,
+        stages: AtomicUsize,
+        writes: AtomicUsize,
+        publishes: AtomicUsize,
+    }
+    impl CtasEngine for UnusableStageEngine {
+        fn prepare_standard_ctas_target(
+            &self,
+            _: &dyn crate::query_execution::dml::ctas::CtasPreparedSource,
+            publication_id: LakePublicationId,
+            _: CreatePolicy,
+        ) -> Result<PreparedStandardCtasCatalogAction, CtasFailure> {
+            assert_eq!(publication_id.to_bytes(), self.operation_id.to_bytes());
+            Ok(PreparedStandardCtasCatalogAction {
+                input_digest: [8; 32],
+                handle: Arc::new(TestAction),
+            })
+        }
+        fn stage_standard_ctas_target(
+            &self,
+            _: &dyn crate::query_execution::dml::ctas::CtasPreparedCatalogAction,
+        ) -> Result<StandardCtasStageOutcome, CtasFailure> {
+            self.stages.fetch_add(1, Ordering::SeqCst);
+            Ok(StandardCtasStageOutcome::AppliedButUnusable {
+                receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt::try_new(
+                    novarocks_spi::connector::ConnectorProviderBindingKey {
+                        instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
+                        incarnation: ProviderBindingEpoch::new(),
+                    },
+                    self.operation_id,
+                    novarocks_spi::connector::ConnectorStagedCreateReceiptPhase::Prepared,
+                    novarocks_spi::connector::ExternalMutationEffect::Applied,
+                    Bytes::from_static(b"stage-proof"),
+                )
+                .unwrap(),
+                finalization: ExternalMutationFinalization::Failed(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
+                        "injected unusable stage",
+                    ),
+                ),
+            })
+        }
+        fn prepare_standard_ctas_write(
+            &self,
+            _: &dyn crate::query_execution::dml::ctas::CtasPreparedSource,
+            _: &dyn crate::query_execution::dml::ctas::CtasPreparedTarget,
+        ) -> Result<PreparedStandardCtasWrite, CtasFailure> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            panic!("no source/write work may start after an unusable stage")
+        }
+        fn publish_standard_ctas(
+            &self,
+            _: &dyn crate::query_execution::dml::ctas::CtasPreparedCatalogAction,
+        ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
+            self.publishes.fetch_add(1, Ordering::SeqCst);
+            panic!("no final publication may start after an unusable stage")
+        }
+    }
+    #[test]
+    fn unusable_stage_retains_positive_receipt_without_starting_the_source_or_final_publication() {
+        let attempt = attempt();
+        let publication_id = attempt.header().publication_id();
+        let engine = UnusableStageEngine {
+            operation_id: ConnectorMutationOperationId::from_bytes(publication_id.to_bytes()),
+            stages: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        };
+        let failure = execute_standard_ctas_operation(
+            &engine,
+            "CREATE TABLE dst AS SELECT 1".to_owned(),
+            CtasTargetPreflightFacts {
+                provider_id: "iceberg".into(),
+                instance_id: "iceberg".into(),
+                control_runtime_id: [1; 16],
+                capability_version: 1,
+                target_namespace: "db".into(),
+                target_table: "target".into(),
+            },
+            PreparedCtasSource {
+                facts: crate::query_execution::dml::ctas::CtasPreparedSourceFacts {
+                    target_catalog: "iceberg".into(),
+                    target_namespace: "db".into(),
+                    target_table: "target".into(),
+                    source_catalog: None,
+                    source_database: "db".into(),
+                    plan_digest: [4; 32],
+                    schema_digest: [5; 32],
+                    execution_identity: [9; 32],
+                    output_columns: vec![],
+                },
+                handle: Arc::new(TestSource),
+            },
+            publication_id,
+            CreatePolicy::FailIfExists,
+            attempt,
+        )
+        .unwrap_err();
+        assert_eq!(engine.stages.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.publishes.load(Ordering::SeqCst), 0);
+        let stage = failure
+            .staged_create_preparation()
+            .expect("stage proof remains independent");
+        assert_eq!(stage.receipt.operation_id(), engine.operation_id);
+        assert_eq!(
+            stage.receipt.phase(),
+            novarocks_spi::connector::ConnectorStagedCreateReceiptPhase::Prepared
+        );
+        assert_eq!(
+            stage.receipt.effect(),
+            novarocks_spi::connector::ExternalMutationEffect::Applied
+        );
+        assert!(matches!(
+            stage.finalization,
+            ExternalMutationFinalization::Failed(_)
+        ));
+        assert_eq!(
+            failure.publication_terminal().unwrap().disposition(),
+            LakePublicationDisposition::KnownUncommitted
+        );
     }
 
     struct PublishUnknownEngine {

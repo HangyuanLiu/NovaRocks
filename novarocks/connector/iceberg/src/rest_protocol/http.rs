@@ -35,10 +35,8 @@ use crate::catalog_runtime::{REST_CONNECT_TIMEOUT, REST_READ_TIMEOUT};
 
 /// The HTTP client every REST request of one role goes through.
 ///
-/// On the frontend the same instance is handed to upstream through
-/// `RestCatalogBuilder::with_client` and used for NovaRocks requests and the
-/// token exchange, so one connection pool serves the whole session. Clones
-/// share that pool.
+/// The frontend session, catalog reads, mutations and token exchange share
+/// one role-local connection pool. Clones retain the same pool.
 #[derive(Clone)]
 pub(crate) struct RestHttpClient {
     inner: reqwest::Client,
@@ -53,20 +51,14 @@ impl fmt::Debug for RestHttpClient {
 }
 
 impl RestHttpClient {
-    /// Builds the production client: today's timeouts (connect 5 s, read
-    /// 30 s, no total deadline) plus the three L3 settings.
+    /// The caller's finite phase context bounds headers and body together.
+    /// No pool-wide read timer may preempt a longer evidence grant.
     pub(crate) fn new() -> Result<Self, String> {
-        Self::with_timeouts(REST_CONNECT_TIMEOUT, REST_READ_TIMEOUT)
+        Self::build(REST_CONNECT_TIMEOUT, None)
     }
 
-    /// Builds a client with explicit timeouts and otherwise the production
-    /// settings. Production always uses [`Self::new`].
-    ///
-    /// reqwest counts the read timeout from the start of the request,
-    /// connection setup included, while the connect timeout covers DNS, TCP,
-    /// TLS and proxy tunnel. Only a connect timeout shorter than the read
-    /// timeout guarantees that a stalled connection setup is reported as a
-    /// connect error (not written) rather than a read timeout.
+    /// Explicit transport timeouts are only for independent fault oracles.
+    #[cfg(test)]
     pub(crate) fn with_timeouts(
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -74,9 +66,16 @@ impl RestHttpClient {
         if connect_timeout >= read_timeout {
             return Err("REST connect timeout must be shorter than the read timeout".to_string());
         }
-        reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .read_timeout(read_timeout)
+        Self::build(connect_timeout, Some(read_timeout))
+    }
+
+    fn build(connect_timeout: Duration, read_timeout: Option<Duration>) -> Result<Self, String> {
+        let builder = reqwest::Client::builder().connect_timeout(connect_timeout);
+        let builder = match read_timeout {
+            Some(timeout) => builder.read_timeout(timeout),
+            None => builder,
+        };
+        builder
             // Routing is decided by the session binding only; a redirect
             // would let the server reroute outside it and could resend a
             // client secret to a new address (L4).
@@ -92,7 +91,8 @@ impl RestHttpClient {
             .map_err(|_| "build REST Iceberg HTTP client failed".to_string())
     }
 
-    /// The underlying client, for `RestCatalogBuilder::with_client`.
+    /// The underlying pool for independent dev-only SDK comparison.
+    #[cfg(test)]
     pub(crate) fn reqwest_client(&self) -> &reqwest::Client {
         &self.inner
     }
@@ -113,7 +113,21 @@ impl RestHttpClient {
             Ok(request) => request,
             Err(cause) => return (DispatchStage::NotWritten(cause), None),
         };
-        match self.inner.execute(request).await {
+        let executed = match context.deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, self.inner.execute(request)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return (
+                            DispatchStage::WrittenNoStatus(NoStatusCause::DeadlineExceeded),
+                            None,
+                        );
+                    }
+                }
+            }
+            None => self.inner.execute(request).await,
+        };
+        match executed {
             Ok(response) => {
                 let code = response.status().as_u16();
                 let header_names = response.headers().keys().cloned().collect();
@@ -203,6 +217,12 @@ impl RestRequest {
         }
     }
 
+    /// Retains the exact bytes whose fingerprint the publication journal froze.
+    pub(crate) fn with_encoded_json_body(mut self, bytes: Vec<u8>) -> Self {
+        self.body = Some(bytes);
+        self
+    }
+
     /// Attaches a JSON body; serialization failure means not written.
     pub(crate) fn with_json_body<T: serde::Serialize + ?Sized>(
         mut self,
@@ -253,12 +273,19 @@ impl RestRequest {
 }
 
 /// The caller's bounds on one request. Cancellation is dropping the future.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct RequestContext {
     deadline: Option<Instant>,
 }
 
 impl RequestContext {
+    /// Configuration, OAuth and catalog reads have one finite phase budget,
+    /// shared by response headers and every body chunk.
+    pub(crate) fn for_read() -> Self {
+        Self::with_deadline(Instant::now() + REST_READ_TIMEOUT)
+    }
+
     pub(crate) fn with_deadline(deadline: Instant) -> Self {
         Self {
             deadline: Some(deadline),
@@ -295,6 +322,13 @@ impl fmt::Debug for ResponseBody {
 }
 
 impl ResponseBody {
+    pub(crate) fn header(
+        &self,
+        name: reqwest::header::HeaderName,
+    ) -> Option<&reqwest::header::HeaderValue> {
+        self.response.headers().get(name)
+    }
+
     /// Reads the next chunk; `None` once the body is complete.
     ///
     /// Each chunk is followed by a Tokio cooperative-budget checkpoint and a
@@ -590,6 +624,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_client_does_not_preempt_a_grant_with_the_old_read_cap() {
+        let server = TestServer::start(
+            Script::new().on(
+                "GET",
+                "/long-evidence",
+                Reply::json(200, &serde_json::json!({"complete":true}))
+                    .with_delay(Duration::from_secs(31)),
+            ),
+        );
+        let context = RequestContext::with_deadline(Instant::now() + Duration::from_secs(45));
+        let (stage, body) = RestHttpClient::new()
+            .unwrap()
+            .send_once(
+                get(format!("{}/long-evidence", server.url())),
+                &[200],
+                &context,
+            )
+            .await;
+        assert!(
+            matches!(stage, DispatchStage::Status { code: 200, .. }),
+            "{stage:?}"
+        );
+        assert_eq!(
+            body.unwrap().read_to_end().await.unwrap(),
+            br#"{"complete":true}"#
+        );
+        assert_eq!(server.requests_to("GET", "/long-evidence").len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_body_read_stops_at_the_caller_deadline() {
         let server = TestServer::start(Script::new().on(
             "GET",
@@ -609,5 +673,53 @@ mod tests {
             Err(BodyReadError::DeadlineExceeded)
         );
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+    #[tokio::test]
+    async fn the_caller_deadline_bounds_waiting_for_response_headers() {
+        let server = TestServer::start(Script::new().on(
+            "GET",
+            "/table",
+            Reply::status(200).with_delay(Duration::from_secs(2)),
+        ));
+        let context = RequestContext::with_deadline(Instant::now() + Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let (stage, body) = test_client(Duration::from_secs(10))
+            .send_once(get(format!("{}/table", server.url())), &[200], &context)
+            .await;
+        assert_eq!(
+            stage,
+            DispatchStage::WrittenNoStatus(NoStatusCause::DeadlineExceeded)
+        );
+        assert!(body.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(server.count("GET", "/table"), 1);
+    }
+
+    #[tokio::test]
+    async fn response_header_wait_and_slow_body_share_one_deadline() {
+        let server = TestServer::start(
+            Script::new().on(
+                "GET",
+                "/table",
+                Reply::status(200)
+                    .with_delay(Duration::from_millis(100))
+                    .with_body(BodyPlan::Chunked(vec![
+                        (Duration::ZERO, b"a".to_vec()),
+                        (Duration::from_millis(100), b"b".to_vec()),
+                        (Duration::from_millis(100), b"c".to_vec()),
+                        (Duration::from_millis(100), b"d".to_vec()),
+                    ])),
+            ),
+        );
+        let context = RequestContext::with_deadline(Instant::now() + Duration::from_millis(250));
+        let (stage, body) = test_client(Duration::from_secs(2))
+            .send_once(get(format!("{}/table", server.url())), &[200], &context)
+            .await;
+        assert!(matches!(stage, DispatchStage::Status { code: 200, .. }));
+        assert_eq!(
+            body.unwrap().read_to_end().await,
+            Err(BodyReadError::DeadlineExceeded)
+        );
+        assert_eq!(server.count("GET", "/table"), 1);
     }
 }

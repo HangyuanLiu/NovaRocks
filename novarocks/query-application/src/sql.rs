@@ -575,22 +575,27 @@ fn lower_iceberg_action(
                 or_replace,
                 anchor,
                 options,
-            } => IcebergReferenceSqlAction::Create {
-                kind: match kind {
-                    IcebergReferenceKind::Branch => IcebergReferenceKindSql::Branch,
-                    IcebergReferenceKind::Tag => IcebergReferenceKindSql::Tag,
-                },
-                name: name.value.clone(),
-                if_not_exists: *if_not_exists,
-                or_replace: *or_replace,
-                anchor: match anchor {
-                    ReferenceAnchor::CurrentMain => ReferenceAnchorSql::CurrentMain,
-                    ReferenceAnchor::Version(value) => {
-                        ReferenceAnchorSql::Version(lower_command_literal(value)?)
-                    }
-                },
-                has_uninterpreted_provider_options: options.is_some(),
-            },
+            } => {
+                if options.is_some() {
+                    return Err("Iceberg reference retention options are not supported".to_string());
+                }
+                IcebergReferenceSqlAction::Create {
+                    kind: match kind {
+                        IcebergReferenceKind::Branch => IcebergReferenceKindSql::Branch,
+                        IcebergReferenceKind::Tag => IcebergReferenceKindSql::Tag,
+                    },
+                    name: name.value.clone(),
+                    if_not_exists: *if_not_exists,
+                    or_replace: *or_replace,
+                    anchor: match anchor {
+                        ReferenceAnchor::CurrentMain => ReferenceAnchorSql::CurrentMain,
+                        ReferenceAnchor::Version(value) => {
+                            ReferenceAnchorSql::Version(lower_command_literal(value)?)
+                        }
+                    },
+                    has_uninterpreted_provider_options: false,
+                }
+            }
             IcebergReferenceAction::Drop {
                 kind,
                 name,
@@ -1654,6 +1659,21 @@ mod tests {
                 }
             };
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn iceberg_lowering_rejects_unimplemented_reference_retention_options() {
+        for sql in [
+            "ALTER TABLE lake.db.events CREATE BRANCH dev RETAIN 7 DAYS",
+            "ALTER TABLE lake.db.events CREATE TAG release AS OF VERSION 7 RETAIN 3 DAYS",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse retained reference");
+            assert!(
+                lower_product_sql_command(&statement)
+                    .unwrap_err()
+                    .contains("retention options")
+            );
         }
     }
 }

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Canonical inline storage. Payload interpretation stays with each application.
-// Design: ADR-0178 (docs/adr/ADR-0178-inline-keyed-documents-and-snapshot-records.md)
+// Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
 
 pub(crate) mod envelope;
 pub(crate) mod expiry;

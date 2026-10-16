@@ -19,9 +19,10 @@
 use super::*;
 use crate::catalog::SnapshotLoading;
 use crate::commit::attempt::observation::PublicationJournal;
-use crate::commit::attempt::{
-    self, OwnerPublisher, PinnedExpiryPublisher, Publisher, RetryPolicy, TransitionalPublisher,
+use crate::commit::attempt::prepared::{
+    CatalogPublisher, PinnedExpiryPreparer, PublicationPreparer,
 };
+use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
     BaseIdentity, Dependency, FileChanges, FrozenRequest, IsolationLevel, OperationIntent,
     OperationIntentParts, OperationToken, RequestShape, StartSnapshot, TableTarget,
@@ -158,13 +159,13 @@ pub(super) fn execute(
     .with_snapshot_loading(SnapshotLoading::Refs);
     let policy = RetryPolicy::from_properties(metadata.properties())
         .map_err(|error| invalid(error.to_string()))?;
-    let journal = PublicationJournal::new(operation.token());
+    let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());
     let preflight_journal = journal.clone();
     let preflight_provider = provider.clone();
     let preflight_documents = documents.clone();
     let preflight_request = request.clone();
     let preflight = Arc::new(
-        move |frozen: &FrozenRequest, operation: &IcebergCommitOperation| {
+        move |frozen: &FrozenRequest, _operation: &IcebergCommitOperation| {
             let BaseIdentity::Existing { uuid, parent, .. } = frozen.base() else {
                 return Err(document_error(internal(
                     "keyed mutation acquired a create base",
@@ -234,22 +235,16 @@ pub(super) fn execute(
             Ok(())
         },
     );
-    let owner_publisher: Arc<dyn Publisher> = Arc::new(OwnerPublisher {
-        target: TransitionalPublisher {
-            catalog: Arc::clone(provider.runtime().novarocks_catalog()),
-            ident: intent.target().ident.clone(),
-            target_ref: "main".into(),
-            evidence: crate::catalog::error::CatalogCommitEvidence::for_target(
-                target.table.to_string(),
-            )
-            .with_target_uuid(metadata.uuid().to_string()),
-            recovery_preflight: preflight,
-        },
+    let owner_publisher: Arc<dyn PublicationPreparer> = Arc::new(CatalogPublisher {
+        catalog_operation: CatalogOperation::UpdateDocuments,
+        catalog: Arc::clone(provider.runtime().novarocks_catalog()),
+        ident: intent.target().ident.clone(),
+        target_ref: "main".into(),
         operation: operation.token(),
-        marker: None,
+        recovery_preflight: preflight,
     });
-    let inner: Arc<dyn Publisher> = if shape == RequestShape::DocumentExpiry {
-        Arc::new(PinnedExpiryPublisher {
+    let inner: Arc<dyn PublicationPreparer> = if shape == RequestShape::DocumentExpiry {
+        Arc::new(PinnedExpiryPreparer {
             inner: owner_publisher,
             base: StagingBase::Existing {
                 metadata: metadata.clone(),
@@ -259,7 +254,8 @@ pub(super) fn execute(
     } else {
         owner_publisher
     };
-    let publisher = journal.observe(inner);
+    let evidence_policy = inner.evidence_policy();
+    let publisher = journal.observe_prepared(inner);
     let preparer: Option<Box<dyn Preparer + Send + Sync>> = match &documents.mutation {
         KeyedMutation::Markers(markers) => Some(Box::new(MarkerPreparer(markers.clone()))),
         KeyedMutation::SlotChange(change) => Some(Box::new(SlotChangePreparer {
@@ -332,20 +328,72 @@ pub(super) fn execute(
             .runtime()
             .control_state()
             .invalidate_table_cache(&target.namespace, &target.table);
-        let refreshed = provider
-            .runtime()
-            .observe_table_classified_for_request_with_snapshots(
-                &target.namespace,
-                &target.table,
-                &request.context,
-                SnapshotLoading::Refs,
-            )
-            .map_err(|(kind, message)| ConnectorError::new(kind, message))
-            .and_then(|physical| observation::committed_version(&physical.into_table()));
+        let refreshed = journal
+            .current_entry()
+            .ok_or_else(|| internal("committed keyed publication has no journal entry"))
+            .and_then(|entry| journal.finalization_context(entry, evidence_policy))
+            .and_then(|grant| grant.for_io(&request.context))
+            .and_then(|context| {
+                let _finalizing = journal
+                    .current_entry()
+                    .and_then(|entry| journal.finalization_activity(entry));
+                let physical = provider
+                    .runtime()
+                    .observe_table_classified_for_request_with_snapshots(
+                        &target.namespace,
+                        &target.table,
+                        &context,
+                        SnapshotLoading::Refs,
+                    )
+                    .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+                let current = physical.into_table();
+                observation::validate_expected_object(object_id, current.metadata())?;
+                let entry = journal
+                    .current_entry()
+                    .expect("committed keyed publication entry");
+                let crate::catalog::error::CatalogOutcome::KnownCommitted {
+                    receipt: proof, ..
+                } = journal.commit_outcome(entry)
+                else {
+                    return Err(internal("committed keyed publication lost its proof"));
+                };
+                if proof
+                    .metadata_location
+                    .as_deref()
+                    .is_some_and(|location| current.metadata_location() != Some(location))
+                    || proof.snapshot_id.is_some_and(|snapshot| {
+                        current.metadata().current_snapshot_id() != Some(snapshot)
+                    })
+                {
+                    return Err(corrupt(
+                        "Post-publication keyed metadata no longer belongs to this operation",
+                    ));
+                }
+                observation::committed_version(&current)
+            });
         let (version, completion) = match refreshed {
             Ok(version) => (Some(version), finalization.clone()),
-            Err(error) => (None, ExternalMutationFinalization::Failed(failure(&error))),
+            Err(error) => (
+                None,
+                match finalization.clone() {
+                    ExternalMutationFinalization::Complete => {
+                        ExternalMutationFinalization::Failed(failure(&error))
+                    }
+                    ExternalMutationFinalization::Failed(owner) => {
+                        ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                            owner.kind(),
+                            format!(
+                                "{}; keyed metadata projection failed: {error}",
+                                owner.message()
+                            ),
+                        ))
+                    }
+                },
+            ),
         };
+        if let Some(entry) = journal.current_entry() {
+            journal.record_entry_finalization(entry, completion.clone());
+        }
         (*receipt, *finalization) = committed_metadata_receipt(
             provider,
             request.operation_id,

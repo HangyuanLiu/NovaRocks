@@ -29,8 +29,8 @@ use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::table::Table;
 use crate::iceberg::{Runtime, TableIdent};
-use crate::iceberg_catalog_rest::LoadTableResult;
 use crate::rest_protocol::minimal_view::{RawStorageCredential, StorageCredentials};
+use crate::rest_protocol::wire::LoadTableResult;
 
 /// Response-local storage delegation (`storage-credentials`).
 ///
@@ -114,6 +114,10 @@ impl FrozenLoadTable {
             },
             RestDelegation::new(credentials),
         )
+    }
+
+    pub(crate) fn metadata_location(&self) -> Option<&str> {
+        self.metadata_location.as_deref()
     }
 
     pub(crate) fn metadata(&self) -> &TableMetadata {

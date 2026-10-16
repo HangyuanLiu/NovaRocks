@@ -37,6 +37,7 @@ mod join;
 mod join_lowering_tests;
 mod lowering;
 mod original_requests;
+mod project_metadata;
 mod repeat;
 mod runtime_filter;
 mod scan;
@@ -65,6 +66,11 @@ mod assert_rows_lowering_tests;
 
 pub use lowering::{
     FragmentCompileError, LocalCompileOptions, compile_fragment, compile_fragment_with_creation,
+    compile_fragment_with_creation_and_project_metadata_host,
+    compile_fragment_with_project_metadata_host,
+};
+pub use project_metadata::{
+    ProjectMetadataFailure, ProjectMetadataOutput, ProjectMetadataScope, ProjectOutputRequestFacts,
 };
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};

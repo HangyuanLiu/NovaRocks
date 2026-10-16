@@ -512,6 +512,44 @@ fn compiled_unpivot_factory_refuses_a_node_that_is_not_an_unpivot() {
     assert!(error.contains("is not an Unpivot"), "{error}");
 }
 
+#[test]
+fn compiled_unpivot_retains_original_column_metadata_through_actual_input_exit() {
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeState;
+    for drain in [false, true] {
+        let program = unpivot_program();
+        let tracker = MemTracker::new_root("unpivot-input-column-owner");
+        let chunk = super::family_fixture::paid_input(&program, &tracker);
+        let charged = tracker.current();
+        let factory = CompiledUnpivotProcessorFactory::try_new(
+            Arc::clone(&program),
+            ProgramNodeId::new(1),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let mut operator = factory.create(1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().unwrap();
+        processor.push_chunk(&state, chunk).unwrap();
+        assert_eq!(tracker.current(), charged);
+        if drain {
+            let mut output = Vec::new();
+            while processor.has_output() {
+                output.push(processor.pull_chunk(&state).unwrap().unwrap());
+            }
+            assert_eq!(tracker.current(), 0);
+            assert_eq!(
+                output.iter().map(Chunk::len).sum::<usize>(),
+                UNPIVOT_ROWS.len() * 2,
+                "every literal input row has both frozen mappings"
+            );
+        }
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
 // ------------------------------------------------------ ChangeEventExpand
 
 const CHANGE_ROWS: [(i64, Option<i64>, Option<bool>); 4] = [

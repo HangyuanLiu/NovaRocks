@@ -1895,6 +1895,7 @@ impl IcebergTypedBoundary {
             );
         }
         let source = FilesTableSplitSource::try_new(FilesTableSplitSourceParams {
+            table_has_variant_history: crate::manifest::table_has_variant_history(&metadata),
             manifests: self.pinned_snapshot_manifests(reference)?,
             table_schema_json: serde_json::to_string(&table_schema).map_err(|error| {
                 corrupt(format!("iceberg table schema is not serializable: {error}"))
@@ -3992,34 +3993,28 @@ mod attempt_access_tests {
             crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone()),
         )
         .unwrap();
-        let catalog = original.novarocks_catalog().vendored_client();
-        let table = executor.block_on(async {
-            let namespace = crate::iceberg::NamespaceIdent::new("db".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .unwrap();
-            catalog
-                .create_table(
-                    &namespace,
-                    crate::iceberg::TableCreation::builder()
-                        .name("t".to_string())
-                        .schema(
-                            Schema::builder()
-                                .with_fields(vec![Arc::new(NestedField::required(
-                                    1,
-                                    "id",
-                                    Type::Primitive(PrimitiveType::Long),
-                                ))])
-                                .build()
-                                .unwrap(),
-                        )
-                        .format_version(FormatVersion::V2)
-                        .build(),
-                )
-                .await
-                .unwrap()
-        });
+        let incarnation = ProviderBindingEpoch::new();
+        let table = executor.block_on(
+            crate::catalog::admission_test_support::create_static_fixture_table(
+                &original,
+                incarnation,
+                crate::catalog::CatalogNamespaceName::new("db"),
+                crate::iceberg::TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(
+                        Schema::builder()
+                            .with_fields(vec![Arc::new(NestedField::required(
+                                1,
+                                "id",
+                                Type::Primitive(PrimitiveType::Long),
+                            ))])
+                            .build()
+                            .unwrap(),
+                    )
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            ),
+        );
         let loads = Arc::new(Mutex::new(Vec::new()));
         let owner = crate::catalog::admission_test_support::all_admitted_with_snapshot_trace(
             original.novarocks_catalog().clone(),
@@ -4036,7 +4031,7 @@ mod attempt_access_tests {
                 provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
                 instance_id: catalog_id.clone(),
             },
-            ProviderBindingEpoch::new(),
+            incarnation,
             CatalogHandle::new(catalog_id, CatalogVersion::from_bytes([1; 32])),
             HiveTransactionHandle::new(true, [2; 16]),
             context.clone(),
