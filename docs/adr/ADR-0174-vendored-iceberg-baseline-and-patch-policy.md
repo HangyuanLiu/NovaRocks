@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0179
+    scope: "P2 terminal builder exit and U4 Hadoop directory-discovery handoff to IRU-6c; unrelated baseline and patch policies remain active"
+    link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"
   - id: ADR-0178
     scope: "Core U8 Arrow writer schema override retention and Variant read capability deferral; unrelated baseline and patch rules remain active"
     link: "ADR-0178-iceberg-write-type-boundary-and-variant-layering.md"
@@ -79,7 +82,7 @@ cargo +1.98.1 package --no-verify --exclude-lockfile --offline \
 
 | 保留项 | 当前用途 | 删除 owner 与条件 |
 |---|---|---|
-| core P2、U4 | terminal `TableCommit` 构造、目录发现 | Connector catalog publication/storage 适配 owner 在不再依赖 SDK 构造器与目录扩展后删除 |
+| core U4 | Hadoop 目录发现 | IRU-6c 的 Connector storage discovery owner 迁移后删除；IRU-6a 保留现协议 |
 | core U2、P8、View API | REST 更新词汇、权威 stage 初始化、view carrier | Connector REST protocol owner 接管相应 wire/初始化/view 词汇并通过契约测试后删除 |
 | core U8 | Arrow writer schema override | Provider Variant 物理布局/writer owner 提供正式布局接缝并移除该 override 消费后删除 |
 | core P7a | 缺 `next-row-id` 的 v3 metadata 读取 | Connector 外部语义身份与兼容 owner 完成对应输入迁移并承接读取覆盖后删除 |

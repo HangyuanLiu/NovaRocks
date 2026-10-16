@@ -42,7 +42,8 @@ pub use outcome::{
     RemainingArtifact,
 };
 pub use request::{
-    BaseIdentity, FrozenBaseFacts, FrozenRequest, FrozenRequestParts, RequestShape, StagedCreateIdentity,
+    BaseIdentity, FrozenBaseFacts, FrozenRequest, FrozenRequestParts, RequestShape,
+    StagedCreateIdentity,
 };
 
 pub(crate) use request::validate_ref_retention_update;

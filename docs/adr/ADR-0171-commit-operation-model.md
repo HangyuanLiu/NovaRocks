@@ -5,6 +5,10 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0179
+    scope: "Late SDK carrier and transaction outcome, plus operation-owned reusable rewrite manifests; immutable intent, dependency, inheritance and artifact ownership contracts remain active"
+    link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"
 partially-supersedes:
   - id: ADR-0118
     scope: "Internal reuse of vendored transaction/action preparation; late TableCommit carrier conversion remains allowed"
@@ -29,6 +33,8 @@ code-anchors:
 ---
 
 ## 问题
+
+> **当前适用范围：** [ADR-0179](ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 已删除 late SDK `TableCommit` 转换与独立 transaction 结果，发布统一由冻结请求和 journal 拥有。rewrite-manifests 的可复用 manifest 现在归 Operation，依赖当前基线的 manifest-list 仍归 Attempt；旧文“当前不复用 manifest”不再适用于该路径。不可变意图、依赖验证、显式/继承字段和对象生命周期规则继续有效。
 
 一次 Iceberg 写操作遇到并发、取消或不确定提交时，由谁证明重新准备仍然正确，并决定准备产物的生命周期？
 

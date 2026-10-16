@@ -1227,6 +1227,68 @@ use novarocks_spi::connector::ConnectorErrorKind;
 
 /// One NovaRocks REST generation built exactly as production builds a static
 /// catalog, plus the independent Java oracle for the same namespace.
+// A fixture-only finalizer runs after the real Java response. It preserves
+// the adapter's evidence and any original owner work; only the added work fails.
+struct JavaFinalizationProbeDispatch {
+    inner: Box<dyn crate::catalog::publication_dispatch::PreparedCatalogDispatch>,
+    journal: crate::commit::attempt::observation::PublicationJournal<()>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait]
+impl crate::catalog::publication_dispatch::PreparedCatalogDispatch
+    for JavaFinalizationProbeDispatch
+{
+    async fn dispatch_once(
+        self: Box<Self>,
+        context: crate::catalog::publication::EvidenceContext,
+    ) -> crate::catalog::publication_dispatch::DispatchCompletion {
+        let mut completion = self.inner.dispatch_once(context).await;
+        completion.finalization = Some(Box::new(JavaFinalizationProbe {
+            inner: completion.finalization,
+            journal: self.journal,
+            polls: self.polls,
+        }));
+        completion
+    }
+}
+struct JavaFinalizationProbe {
+    inner: Option<Box<dyn crate::catalog::publication_dispatch::FinalizationWork>>,
+    journal: crate::commit::attempt::observation::PublicationJournal<()>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait]
+impl crate::catalog::publication_dispatch::FinalizationWork for JavaFinalizationProbe {
+    async fn run(
+        self: Box<Self>,
+        context: crate::catalog::publication::EvidenceContext,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        assert!(
+            matches!(
+                self.journal
+                    .commit_outcome(self.journal.current_entry().unwrap()),
+                CatalogOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    ..
+                }
+            ),
+            "Actual Java Applied evidence must be recorded before the first finalization poll"
+        );
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(inner) = self.inner {
+            assert_eq!(
+                inner.run(context).await,
+                novarocks_spi::connector::ExternalMutationFinalization::Complete
+            );
+        }
+        novarocks_spi::connector::ExternalMutationFinalization::Failed(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Internal,
+                "Injected finalization failure after actual Java publication",
+            ),
+        )
+    }
+}
+
 struct NovaRocksRest {
     java: Java,
     endpoints: Arc<RestEndpoints>,
@@ -1314,6 +1376,72 @@ impl NovaRocksRest {
         outcome
     }
 
+    async fn publish_with_failed_finalization(
+        &self,
+        request: FrozenRequest,
+        context: ConnectorRequestContext,
+    ) -> CatalogOutcome<CommitProof> {
+        use crate::catalog::publication_dispatch::PreparedPublication;
+        let token = request.artifacts().attempt().operation();
+        let evidence = novarocks_spi::connector::ExternalMutationEvidence::try_new(
+            2,
+            self.descriptor.clone(),
+            self.generation,
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "java_finalization_probe",
+            Bytes::from_static(b"{}"),
+        )
+        .unwrap();
+        let journal = crate::commit::attempt::observation::PublicationJournal::new(token);
+        journal.record(evidence, (), &request).unwrap();
+        let owner = Arc::clone(&self.owner);
+        let policy = owner.evidence_policy();
+        let probe_journal = journal.clone();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_polls = Arc::clone(&polls);
+        let entry = journal
+            .publish_once(
+                context,
+                policy,
+                move |descriptor, generation, preparation| async move {
+                    let prepared = owner
+                        .prepare_frozen_for_admission_test(
+                            request,
+                            CatalogOperation::AlterProperties,
+                            None,
+                            descriptor,
+                            generation,
+                            preparation,
+                        )
+                        .await?;
+                    Ok(match prepared {
+                        PreparedPublication::Mutation { binding, dispatch } => {
+                            PreparedPublication::Mutation {
+                                binding,
+                                dispatch: Box::new(JavaFinalizationProbeDispatch {
+                                    inner: dispatch,
+                                    journal: probe_journal,
+                                    polls: probe_polls,
+                                }),
+                            }
+                        }
+                        PreparedPublication::NoOp => {
+                            panic!("Property change must dispatch a real mutation")
+                        }
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let outcome = journal.commit_outcome(entry);
+        self.java.record(
+            "failed-finalization",
+            &json!({"journal-outcome":format!("{outcome:?}")}),
+        );
+        outcome
+    }
+
     fn namespace(&self) -> &NamespaceIdent {
         &self.java.namespace
     }
@@ -1326,35 +1454,134 @@ impl NovaRocksRest {
         );
     }
 
+    /// Use the same frozen catalog owner and journal as production. Retain the
+    /// real response only after its evidence and finalization are recorded.
+    async fn publish_catalog(
+        &self,
+        label: &str,
+        request: crate::catalog::catalog_request::CatalogPublicationRequest,
+    ) -> (CatalogOutcome<CommitProof>, Option<Vec<u8>>) {
+        use crate::catalog::catalog_request::{
+            CatalogCreatePublicationRequest, CatalogPublicationRequest,
+        };
+        let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
+        let frozen = match request {
+            CatalogPublicationRequest::CreateTable {
+                namespace,
+                creation,
+                no_op_if_exists,
+            } => self
+                .owner
+                .freeze_create_publication(CatalogCreatePublicationRequest {
+                    operation_id: operation_id.to_bytes(),
+                    namespace,
+                    creation,
+                    no_op_if_exists,
+                })
+                .unwrap(),
+            request => request.freeze(operation_id.to_bytes()).unwrap(),
+        };
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let result = crate::catalog::admission_test_support::publish_catalog_with_document(
+            Arc::clone(&self.owner),
+            frozen,
+            operation_id,
+            self.generation,
+            context.clone(),
+            self.java.binding.for_request(context),
+        )
+        .await;
+        self.java
+            .record(label, &json!({"journal-outcome":format!("{:?}", result.0)}));
+        result
+    }
+
     async fn create_namespace(&self) {
-        let outcome = self
-            .endpoints
-            .create_namespace(self.namespace(), HashMap::new())
+        let (outcome, _) = self
+            .publish_catalog(
+                "create-namespace",
+                crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new(
+                        self.namespace().join("."),
+                    ),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
             .await;
-        self.record("create-namespace", &outcome);
-        applied(&outcome, MutationEndpoint::CreateNamespace);
+        committed_catalog(&outcome);
     }
 
     async fn drop_namespace(&self) {
-        let outcome = self.endpoints.drop_namespace(self.namespace()).await;
-        self.record("drop-namespace", &outcome);
-        applied(&outcome, MutationEndpoint::DropNamespace);
+        let (outcome, _) = self
+            .publish_catalog(
+                "drop-namespace",
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropNamespace {
+                    namespace: crate::catalog::CatalogNamespaceName::new(
+                        self.namespace().join("."),
+                    ),
+                    no_op_if_missing: false,
+                },
+            )
+            .await;
+        committed_catalog(&outcome);
     }
 
     /// Create a table immediately (static access) and return the applied
-    /// response document.
+    /// response document; Java independently checks the receipt's identity.
     async fn create_table(&self, label: &str, name: &str) -> LoadTableResult {
-        let outcome = self
-            .endpoints
-            .create_table(self.namespace(), create_request(name))
+        let request = create_request(name);
+        let (outcome, document) = self
+            .publish_catalog(
+                label,
+                crate::catalog::catalog_request::CatalogPublicationRequest::CreateTable {
+                    namespace: crate::catalog::CatalogNamespaceName::new(
+                        self.namespace().join("."),
+                    ),
+                    creation: crate::iceberg::TableCreation::builder()
+                        .name(request.name)
+                        .schema(request.schema)
+                        .partition_spec(request.partition_spec.unwrap())
+                        .sort_order(request.write_order.unwrap())
+                        .properties(request.properties)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
             .await;
-        self.record(label, &outcome);
-        let receipt = applied(&outcome, MutationEndpoint::CreateTable);
-        let created: LoadTableResult =
-            serde_json::from_slice(outcome.document.as_deref().expect("applied document")).unwrap();
-        assert_eq!(receipt.uuid, Some(created.metadata.uuid()));
+        let receipt = committed_catalog(&outcome);
+        assert!(
+            document.is_none(),
+            "Ordinary create retains minimal evidence only"
+        );
+        let (loaded, _) = self
+            .endpoints
+            .load_table(&self.java.ident(name), false)
+            .await
+            .unwrap();
+        // Static fixture metadata comes from the original Provider session;
+        // storage authority remains the original explicit fixture binding.
+        let created = LoadTableResult {
+            metadata_location: loaded.metadata_location().map(str::to_owned),
+            metadata: loaded.metadata().clone(),
+            config: HashMap::new(),
+            storage_credentials: None,
+        };
+        assert_eq!(
+            receipt.table_uuid.as_deref(),
+            Some(created.metadata.uuid().to_string().as_str())
+        );
         assert!(receipt.metadata_location.is_some());
-        assert_eq!(receipt.metadata_location, created.metadata_location);
+        assert_eq!(
+            receipt.metadata_location.as_deref(),
+            created.metadata_location.as_deref()
+        );
         assert_eq!(created.metadata.format_version(), FormatVersion::V3);
         let oracle = self.java.load(&self.java.ident(name)).await.unwrap();
         assert_eq!(oracle.metadata.uuid(), created.metadata.uuid());
@@ -1363,9 +1590,18 @@ impl NovaRocksRest {
     }
 
     async fn drop_table(&self, label: &str, name: &str) {
-        let outcome = self.endpoints.drop_table(&self.java.ident(name)).await;
-        self.record(label, &outcome);
-        applied(&outcome, MutationEndpoint::DropTable);
+        let (outcome, _) = self
+            .publish_catalog(
+                label,
+                crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
+                    table: crate::catalog::CatalogTableName::new(self.namespace().join("."), name),
+                    no_op_if_missing: false,
+                    purge: false,
+                    capture: None,
+                },
+            )
+            .await;
+        committed_catalog(&outcome);
     }
 
     /// The raw status of an independent load.
@@ -1452,7 +1688,7 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
     let endpoints = &rest.endpoints;
     let namespace = rest.namespace();
 
-    // Upstream reads and NovaRocks requests share one session binding.
+    // Provider reads and prepared publications share the original session binding.
     let upstream = Arc::clone(&rest.owner);
     assert!(
         !upstream
@@ -1463,6 +1699,24 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
             .unwrap()
     );
     rest.create_namespace().await;
+    let (no_op, _) = rest
+        .publish_catalog(
+            "create-namespace-no-op",
+            crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                namespace: crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
+                properties: HashMap::new(),
+                no_op_if_exists: true,
+            },
+        )
+        .await;
+    assert!(matches!(
+        no_op,
+        CatalogOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            ..
+        }
+    ));
     assert!(
         upstream
             .namespace_exists(crate::catalog::CatalogNamespaceName::new(
@@ -1746,6 +2000,156 @@ async fn iru13a_java_rest_table_commit_shapes() {
     let unchanged = java.load(&ident).await.unwrap();
     assert_eq!(unchanged.metadata_location, updated.metadata_location);
     assert!(!unchanged.metadata.properties().contains_key("iru13a.stale"));
+
+    // RefRetention is a distinct frozen shape: Java checks both the reference
+    // and its full policy, then its explicit CAS removal. No snapshot is added.
+    let retained_ref = SnapshotReference::new(
+        snapshot,
+        SnapshotRetention::branch(Some(2), Some(3_600_000), Some(7_200_000)),
+    );
+    let operation = java.operation(&unchanged.metadata);
+    let context = operation.request_context().clone();
+    let request = super::freeze_existing_change(
+        ident.clone(),
+        "main",
+        &unchanged.metadata,
+        unchanged.metadata_location.as_deref().unwrap(),
+        RequestShape::RefRetention,
+        AttemptToken::new(operation.token(), 0),
+        PreparedChange {
+            requirements: vec![],
+            updates: vec![TableUpdate::SetSnapshotRef {
+                ref_name: "retained".into(),
+                reference: retained_ref.clone(),
+            }],
+        },
+        &context,
+    )
+    .unwrap();
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::UuidMatch { uuid })
+    );
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::RefSnapshotIdMatch {
+                r#ref: "retained".into(),
+                snapshot_id: None,
+            })
+    );
+    let outcome = rest
+        .publish(
+            "ref-retention-set",
+            request,
+            CatalogOperation::CreateBranch,
+            context,
+            None,
+        )
+        .await;
+    let receipt = committed_catalog(&outcome);
+    let retained = java.load(&ident).await.unwrap();
+    assert_eq!(
+        retained.metadata.refs().get("retained"),
+        Some(&retained_ref)
+    );
+    assert_eq!(retained.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(
+        retained.metadata.snapshots().count(),
+        unchanged.metadata.snapshots().count()
+    );
+    assert_eq!(
+        receipt.table_uuid.as_deref(),
+        Some(uuid.to_string().as_str())
+    );
+    assert_eq!(
+        receipt.metadata_location.as_deref(),
+        retained.metadata_location.as_deref()
+    );
+    let operation = java.operation(&retained.metadata);
+    let context = operation.request_context().clone();
+    let request = super::freeze_existing_change(
+        ident.clone(),
+        "main",
+        &retained.metadata,
+        retained.metadata_location.as_deref().unwrap(),
+        RequestShape::RefRetention,
+        AttemptToken::new(operation.token(), 0),
+        PreparedChange {
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "retained".into(),
+                snapshot_id: Some(snapshot),
+            }],
+            updates: vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: "retained".into(),
+            }],
+        },
+        &context,
+    )
+    .unwrap();
+    let outcome = rest
+        .publish(
+            "ref-retention-remove",
+            request,
+            CatalogOperation::DropBranch,
+            context,
+            None,
+        )
+        .await;
+    let receipt = committed_catalog(&outcome);
+    let removed = java.load(&ident).await.unwrap();
+    assert!(!removed.metadata.refs().contains_key("retained"));
+    assert_eq!(removed.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(
+        semantic_facts(&removed.metadata),
+        semantic_facts(&unchanged.metadata)
+    );
+    assert_eq!(
+        receipt.metadata_location.as_deref(),
+        removed.metadata_location.as_deref()
+    );
+
+    let (request, context) = freeze_metadata_fixture(
+        java,
+        ident.clone(),
+        &removed,
+        PreparedChange {
+            requirements: vec![],
+            updates: vec![set_property("finalization-probe", "committed")],
+        },
+    );
+    let outcome = rest
+        .publish_with_failed_finalization(request, context)
+        .await;
+    let CatalogOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::Applied,
+        receipt,
+        finalization: novarocks_spi::connector::ExternalMutationFinalization::Failed(failure),
+    } = outcome
+    else {
+        panic!("Actual Java commit must remain Applied with separate failed finalization");
+    };
+    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Internal);
+    assert_eq!(
+        failure.message(),
+        "Injected finalization failure after actual Java publication"
+    );
+    let finalized = java.load(&ident).await.unwrap();
+    assert_eq!(finalized.metadata.uuid(), uuid);
+    assert_eq!(finalized.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(
+        finalized
+            .metadata
+            .properties()
+            .get("finalization-probe")
+            .map(String::as_str),
+        Some("committed")
+    );
+    assert_eq!(
+        finalized.metadata_location.as_deref(),
+        receipt.metadata_location.as_deref()
+    );
 
     rest.drop_table("drop", "shapes").await;
     rest.drop_namespace().await;

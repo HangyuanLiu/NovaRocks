@@ -138,18 +138,11 @@ ALTER TABLE t ALTER COLUMN address.street SET NOT NULL;
 - identifier field（主键）禁止 `DROP NOT NULL`（spec 要求 identifier 必须 required）
 - `novarocks.nullability.attested.*` 这一族 property 由 schema 演进路径维护，PR #89 SET TBLPROPERTIES 路径会 reject 用户直接修改
 
-## ✅ DDL 失败原子回滚（commit 冲突重试）
+## DDL 发布与失败结果
 
-PR #88 引入 `commit_with_retry`：
+schema、分区、属性与 ref 等直接 DDL 路径冻结原表 UUID 和必要 requirements，经 prepared catalog owner 与唯一 journal 单次派发。确定冲突返回冲突，调用方可以重新发起新语句；Provider 不在这些路径内隐式重试。准备和锁等待遵循语句 deadline/stop；请求可能已发出后使用独立有限证据期限，Unknown 不重新派发，也不授权删除产物。
 
-- 最多 3 次重试，10 / 100 / 500 ms 指数退避（最差总窗口 ≤ 610 ms）
-- 仅在 `AssertCurrentSchemaIdMatch` / `AssertLastAssignedFieldIdMatch` / `AssertRefSnapshotIdMatch` / `CatalogCommitConflicts` 错误上重试
-- 每次重试前 `entry.invalidate_table_cache(...)` → 重新 `load_table` → 重新 build `Transaction`，保证用最新 metadata 重 plan
-- IO / 网络 / 数据校验错误一次性 fail，不 retry
-- 严格语义：重试时若发现"语义已达成"（例：重新 build 时 ADD 的列名已存在）一律 fail，绝不静默 success
-- atomic invariant：commit 失败时持久 metadata 字节级不变（commit 之前 in-memory build 完全丢弃）
-
-> **注意**：当前 retry 间隙没有 cancellation hook，因为 DDL 路径不持有 `QueryContext`。代码留 `// TODO(cancellation)` 标记，等 broader DDL cancellation 工作落地时一起接入。
+只有快照过期、manifest 重写等明确支持的维护入口，才在确定冲突后按操作意图、固定评价时间和重试总预算重准备。Applied 与物化/缓存收尾分开报告；Unknown 不能推出 metadata 未改变。详见 [ADR-0179](../../adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md)。
 
 ## ✅ SET / UNSET TBLPROPERTIES
 

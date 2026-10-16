@@ -1598,9 +1598,8 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
 /// is put back untouched and the caller is refused. There is no per-state
 /// branch to get wrong, which is what makes "no abort, no cleanup, no second
 /// dispatch after a possibly-applied request" structural here rather than a
-/// rule each caller has to remember. It is the same rule
-/// [`crate::catalog::transaction::Transaction`] enforces for every other
-/// publication family.
+/// rule each caller has to remember. The publication journal enforces the
+/// same single-dispatch rule for the external request itself.
 fn take_prepared(
     operations: &Mutex<HashMap<ConnectorStagedCreateOperationId, OperationState>>,
     operation_id: ConnectorStagedCreateOperationId,
