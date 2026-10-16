@@ -418,6 +418,7 @@ pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
                 || !step.meta.query_lifecycle_faults.is_empty()
                 || step.meta.query_lifecycle_structured_assertion.is_some()
                 || step.meta.native_observation_attempts.is_some()
+                || step.meta.task_update_replay_barrier == Some(true)
                 || step.meta.imv_stateless_rebuild.is_some()
                 || step.meta.imv_accelerator_wipe_restart.is_some()
                 || step
@@ -655,6 +656,11 @@ pub(crate) fn build(
                     meta.terminal_snapshot_conflict_be_index.is_none(),
                     "retired terminal snapshot fault has no current product owner"
                 );
+                ensure!(
+                    meta.task_update_replay_barrier != Some(true)
+                        || (faults.len() == 1 && faults[0].1 == "task-update-terminal-ack-drop"),
+                    "task_update_replay_barrier requires exactly one task-update-terminal-ack-drop fault"
+                );
                 let observations = marker_actions(meta);
                 let observation_attempts = observation_attempt_slots(meta)?;
                 ensure!(
@@ -706,16 +712,14 @@ pub(crate) fn build(
                         );
                         let target = refs[&be_key].reference.clone();
                         let token = &submissions[0].run_token;
-                        add(
-                            refs.get_mut(&fe_key).unwrap(),
-                            "native",
-                            json!({"action":format!("bind-{kind}"),"root":transport,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id,"target_process_receipt":target.process_receipt}),
-                        );
-                        add(
-                            refs.get_mut(&be_key).unwrap(),
-                            "native",
-                            json!({"action":kind,"root":transport,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id}),
-                        );
+                        let mut bind = json!({"action":format!("bind-{kind}"),"root":transport,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id,"target_process_receipt":target.process_receipt});
+                        let mut apply = json!({"action":kind,"root":transport,"backend_index":index,"statement_run_token":token,"target_session_id":target.session_id});
+                        if meta.task_update_replay_barrier == Some(true) {
+                            bind["hold_split_consumption_until_replay"] = json!(true);
+                            apply["hold_split_consumption_until_replay"] = json!(true);
+                        }
+                        add(refs.get_mut(&fe_key).unwrap(), "native", bind);
+                        add(refs.get_mut(&be_key).unwrap(), "native", apply);
                     }
                     for submission in &submissions {
                         for action in &observations {
@@ -990,6 +994,59 @@ mod tests {
         assert_eq!(fes[1]["grants"].as_array().unwrap().len(), 0);
         assert_ne!(fes[0]["session_id"], fes[1]["session_id"]);
     }
+    #[test]
+    fn replay_barrier_refines_only_the_selected_ack_drop_on_both_real_roles() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for enabled in [false, true] {
+            let input =
+                inputs(vec![step(1, "SELECT 45", QueryMeta {
+                query_lifecycle_fault: Some(crate::types::QueryLifecycleFaultDirective {
+                    kind: novarocks_failpoint::QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+                    be_index: 0,
+                }),
+                task_update_replay_barrier: enabled.then_some(true),
+                ..Default::default()
+            })]);
+            let (plan, _) = plan(&input, file.path()).unwrap();
+            let summaries = plan.planned_launch_summaries();
+            let selected = summaries
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|launch| launch["grants"].as_array().unwrap())
+                .filter(|grant| {
+                    matches!(
+                        grant["action"].as_str(),
+                        Some(
+                            "task-update-terminal-ack-drop" | "bind-task-update-terminal-ack-drop"
+                        )
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(selected.len(), 2);
+            for grant in selected {
+                assert_eq!(
+                    grant.get("hold_split_consumption_until_replay"),
+                    enabled.then_some(&serde_json::Value::Bool(true))
+                );
+            }
+        }
+        let orphan = inputs(vec![step(
+            1,
+            "SELECT 45",
+            QueryMeta {
+                task_update_replay_barrier: Some(true),
+                ..Default::default()
+            },
+        )]);
+        assert!(
+            plan(&orphan, file.path())
+                .unwrap_err()
+                .to_string()
+                .contains("requires exactly one")
+        );
+    }
+
     #[test]
     fn split_assignment_metadata_authorizes_the_actual_reader_owner() {
         let file = tempfile::NamedTempFile::new().unwrap();

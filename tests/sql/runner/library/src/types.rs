@@ -355,6 +355,8 @@ pub struct QueryMeta {
     /// legacy scalar remains for existing programmatic callers and for the
     /// primary BE-log token, while parsed SQL directives populate this list.
     pub query_lifecycle_faults: Vec<QueryLifecycleFaultDirective>,
+    /// Keep the selected ACK-drop input unconsumed until its exact live replay.
+    pub task_update_replay_barrier: Option<bool>,
     /// Typed outcome/source assertion for RFO-8R2 resilience cases. It is
     /// intentionally separate from `expect_error` and log assertions.
     pub query_lifecycle_structured_assertion: Option<QueryLifecycleStructuredAssertion>,

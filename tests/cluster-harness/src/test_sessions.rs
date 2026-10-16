@@ -366,9 +366,14 @@ impl ClusterTestSessionPlan {
                     intents.iter().map(move |intent|
             serde_json::json!({"role":role.label(),"session_id":intent.reference.session_id,
                 "process_receipt":intent.reference.process_receipt,"ordinary":intent.ordinary,
-                "binary":intent.binary,"grants":intent.declaration.domain_grants.iter().map(|grant|
-                    serde_json::json!({"domain":grant.domain,"grant_id":grant.grant_id,
-                        "action":grant.parameters.get("action")})).collect::<Vec<_>>()})
+                "binary":intent.binary,"grants":intent.declaration.domain_grants.iter().map(|grant| {
+                    let mut summary = serde_json::json!({"domain":grant.domain,"grant_id":grant.grant_id,
+                        "action":grant.parameters.get("action")});
+                    if let Some(enabled) = grant.parameters.get("hold_split_consumption_until_replay").and_then(Value::as_bool) {
+                        summary["hold_split_consumption_until_replay"] = Value::Bool(enabled);
+                    }
+                    summary
+                }).collect::<Vec<_>>()})
         )
                 })
                 .collect(),

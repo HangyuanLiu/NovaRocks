@@ -587,6 +587,13 @@ fn parse_meta_with_sql_error_descriptors(
                 })?;
                 meta.terminal_snapshot_conflict_be_index = Some(value);
             }
+            "task_update_replay_barrier" => {
+                anyhow::ensure!(
+                    meta.task_update_replay_barrier.is_none(),
+                    "duplicate task_update_replay_barrier directive"
+                );
+                meta.task_update_replay_barrier = Some(parse_bool(&raw_value)?);
+            }
             "query_lifecycle_fault" => {
                 let fault = parse_query_lifecycle_fault(&raw_value)?;
                 if meta.query_lifecycle_fault.is_none() {
@@ -995,6 +1002,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         query_lifecycle_fault: override_meta
             .query_lifecycle_fault
             .or(base.query_lifecycle_fault),
+        task_update_replay_barrier: override_meta
+            .task_update_replay_barrier
+            .or(base.task_update_replay_barrier),
         query_lifecycle_faults: if override_meta.query_lifecycle_faults.is_empty() {
             base.query_lifecycle_faults.clone()
         } else {
@@ -2292,6 +2302,24 @@ mod opt5_directive_tests {
         assert_eq!(
             assertion.error_source,
             Some(QueryLifecycleErrorSource::BackendAttestation)
+        );
+    }
+
+    #[test]
+    fn parse_meta_replay_barrier_is_explicit_and_rejects_repeated_or_malformed_input() {
+        let re = Regex::new(r"^--\s*@([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.*)$").unwrap();
+        let meta = parse_meta(&["-- @task_update_replay_barrier=true".into()], &re).unwrap();
+        assert_eq!(meta.task_update_replay_barrier, Some(true));
+        assert!(parse_meta(&["-- @task_update_replay_barrier=maybe".into()], &re).is_err());
+        assert!(
+            parse_meta(
+                &[
+                    "-- @task_update_replay_barrier=true".into(),
+                    "-- @task_update_replay_barrier=true".into()
+                ],
+                &re
+            )
+            .is_err()
         );
     }
 
