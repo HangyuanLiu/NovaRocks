@@ -18,9 +18,6 @@
 //! Shared helpers for snapshot-lifecycle maintenance commands
 //! (EXPIRE SNAPSHOTS / REMOVE ORPHAN FILES / REWRITE MANIFESTS).
 
-#[cfg(test)]
-#[path = "snapshot_lifecycle_helpers/expire_snapshots.rs"]
-pub mod expire_snapshots;
 #[path = "snapshot_lifecycle_helpers/reclamation.rs"]
 pub(crate) mod reclamation;
 #[path = "snapshot_lifecycle_helpers/retention.rs"]

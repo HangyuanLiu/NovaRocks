@@ -44,8 +44,6 @@ pub mod puffin_dv;
 pub(crate) mod recovery;
 pub mod ref_action;
 pub mod report;
-#[cfg(test)]
-pub mod retry;
 mod rewrite_data_files;
 mod row_delta;
 mod row_delta_dv_from_files;
@@ -85,11 +83,6 @@ pub use puffin_dv::{
     write_single_deletion_vector_puffin,
 };
 pub use ref_action::{RefAction, RefActionPlan, lower_ref_action};
-#[cfg(test)]
-pub use retry::{
-    COMMIT_RETRY_BACKOFF_MS, COMMIT_RETRY_MAX_ATTEMPTS, commit_with_retry,
-    is_retryable_commit_conflict,
-};
 pub use rewrite_data_files::{
     LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
 };
