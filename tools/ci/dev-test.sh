@@ -17,6 +17,7 @@
 # under the License.
 
 
+# Design: ADR-0181 (docs/adr/ADR-0181-unified-development-capabilities-and-executable-provenance.md)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"

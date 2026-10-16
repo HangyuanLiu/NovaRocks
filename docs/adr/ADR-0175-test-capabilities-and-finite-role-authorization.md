@@ -5,11 +5,12 @@ domain: [test-capabilities]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0181]
 date: 2026-10-14
 provenance:
   - "discussion: 2026-10-13 controlled test capabilities, actual build evidence and MV recovery ownership"
 code-anchors:
-  - "novarocks-server/src/build_information.rs (value)"
+  - "novarocks-server/library/src/build_information.rs (value)"
   - "novarocks/failpoint/src/session.rs (SessionDeclaration)"
   - "novarocks/failpoint/src/scope.rs (SessionScope, GrantHandle, ActionClaim)"
   - "novarocks/failpoint/src/liveness.rs (RunnerSession)"
