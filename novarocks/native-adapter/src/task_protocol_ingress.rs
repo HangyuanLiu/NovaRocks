@@ -1012,6 +1012,7 @@ mod tests {
             &self,
             _descriptor: &TaskDescriptor,
             _domain: &TaskDomainUpdate,
+            _operation: novarocks_execution_contract::TaskOperationId,
         ) -> Result<Option<u64>, HostRejection> {
             self.domains_applied.fetch_add(1, Ordering::SeqCst);
             Ok(None)

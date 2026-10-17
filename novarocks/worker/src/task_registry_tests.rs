@@ -218,6 +218,7 @@ struct TestTaskHost {
     capabilities_installed: AtomicUsize,
     submitted: AtomicUsize,
     domains_applied: AtomicUsize,
+    applied_domain_operations: Mutex<Vec<TaskOperationId>>,
     reporters: Mutex<Vec<TaskStatusReporter>>,
     retired_executions: Mutex<Vec<QueryContextRef>>,
     cancel_calls: Arc<AtomicUsize>,
@@ -394,9 +395,14 @@ impl TaskExecutionHost for TestTaskHost {
         &self,
         _descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
+        operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
         self.enter_preparation_stage(PreparationFailureStage::Domain)?;
         self.domains_applied.fetch_add(1, Ordering::SeqCst);
+        self.applied_domain_operations
+            .lock()
+            .expect("applied domain operations")
+            .push(operation);
         Ok(match domain {
             TaskDomainUpdate::SplitAssignment(_) => Some(0),
             _ => None,
@@ -2233,13 +2239,10 @@ fn a_replay_after_domains_advanced_redelivers_nothing_and_renews_nothing() {
         "{accepted:?}"
     );
     assert_eq!(fixture.task_host.domains_applied.load(Ordering::SeqCst), 2);
+    let update_operation = TaskOperationId::new_v7();
     let advanced = fixture.registry.update_task(
-        &UpdateTask::try_new(
-            TaskOperationId::new_v7(),
-            identity,
-            vec![split_batch(1, 2, 2)],
-        )
-        .expect("legal update"),
+        &UpdateTask::try_new(update_operation, identity, vec![split_batch(1, 2, 2)])
+            .expect("legal update"),
     );
     assert_eq!(
         advanced.outcome(),
@@ -2247,6 +2250,20 @@ fn a_replay_after_domains_advanced_redelivers_nothing_and_renews_nothing() {
         "{advanced:?}"
     );
     assert_eq!(fixture.task_host.domains_applied.load(Ordering::SeqCst), 3);
+    // The real host receives the owning request's identity for both initial
+    // domains and later updates, independent of development controls.
+    assert_eq!(
+        *fixture
+            .task_host
+            .applied_domain_operations
+            .lock()
+            .expect("applied operations"),
+        vec![
+            request.envelope().operation_id(),
+            request.envelope().operation_id(),
+            update_operation
+        ]
+    );
     let lease = fixture
         .registry
         .installed_lease(context)
@@ -2269,17 +2286,40 @@ fn a_replay_after_domains_advanced_redelivers_nothing_and_renews_nothing() {
         Some(lease),
         "a replay never renews the context lease"
     );
+    assert_eq!(
+        *fixture
+            .task_host
+            .applied_domain_operations
+            .lock()
+            .expect("applied operations"),
+        vec![
+            request.envelope().operation_id(),
+            request.envelope().operation_id(),
+            update_operation
+        ],
+        "a creation replay must not synthesize or apply a second operation"
+    );
 
     // The advanced watermark still stands: the next batch after it applies.
+    let next_operation = TaskOperationId::new_v7();
     let next = fixture.registry.update_task(
-        &UpdateTask::try_new(
-            TaskOperationId::new_v7(),
-            identity,
-            vec![split_batch(1, 3, 3)],
-        )
-        .expect("legal update"),
+        &UpdateTask::try_new(next_operation, identity, vec![split_batch(1, 3, 3)])
+            .expect("legal update"),
     );
     assert_eq!(next.outcome(), OperationOutcome::Accepted, "{next:?}");
+    assert_eq!(
+        *fixture
+            .task_host
+            .applied_domain_operations
+            .lock()
+            .expect("applied operations"),
+        vec![
+            request.envelope().operation_id(),
+            request.envelope().operation_id(),
+            update_operation,
+            next_operation
+        ]
+    );
     assert_eq!(fixture.task_host.prepared_bodies().len(), 1);
 }
 

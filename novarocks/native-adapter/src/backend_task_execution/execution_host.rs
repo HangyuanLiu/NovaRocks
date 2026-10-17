@@ -1011,9 +1011,7 @@ impl NativeTaskExecutionHost {
         identity: TaskIdentity,
         fragment_instance_id: UniqueId,
         assignment: &SplitAssignment,
-        #[cfg(novarocks_dev_controls)] operation: Option<
-            novarocks_execution_contract::TaskOperationId,
-        >,
+        _operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<u64, HostRejection> {
         let node = assignment.plan_node_id();
         let queue = runtime.splits.queue(node);
@@ -1150,25 +1148,23 @@ impl NativeTaskExecutionHost {
         // Only this successful, open-queue duplicate path can release input.
         // Closed/retired answers and an Idempotent registry verdict cannot.
         #[cfg(novarocks_dev_controls)]
-        if let Some(operation) = operation {
-            if let Some(gate) = runtime
-                .replay_gate
-                .lock()
-                .expect("task replay gate lock")
-                .as_ref()
+        if let Some(gate) = runtime
+            .replay_gate
+            .lock()
+            .expect("task replay gate lock")
+            .as_ref()
+        {
+            if assignment.no_more_splits()
+                && !sequences.is_empty()
+                && preflight.duplicate_sequences().len() == sequences.len()
             {
-                if assignment.no_more_splits()
-                    && !sequences.is_empty()
-                    && preflight.duplicate_sequences().len() == sequences.len()
-                {
-                    gate.observe_duplicate(
-                        identity,
-                        operation,
-                        node,
-                        sequences.first().expect("nonempty").sequence_id(),
-                        sequences.last().expect("nonempty").sequence_id(),
-                    );
-                }
+                gate.observe_duplicate(
+                    identity,
+                    _operation,
+                    node,
+                    sequences.first().expect("nonempty").sequence_id(),
+                    sequences.last().expect("nonempty").sequence_id(),
+                );
             }
         }
         Ok(queue.stats().queued_splits as u64)
@@ -1773,39 +1769,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         ))
     }
 
-    #[cfg(novarocks_dev_controls)]
-    fn apply_task_domain_for_operation(
-        &self,
-        descriptor: &TaskDescriptor,
-        domain: &TaskDomainUpdate,
-        operation: novarocks_execution_contract::TaskOperationId,
-    ) -> Result<Option<u64>, HostRejection> {
-        let TaskDomainUpdate::SplitAssignment(intent) = domain else {
-            return self.apply_task_domain(descriptor, domain);
-        };
-        let runtime = self
-            .task_runtime(descriptor.identity())
-            .ok_or_else(|| internal("split update has no actual installed task"))?;
-        let assignment = Self::split_assignment(intent.payload().as_ref())?;
-        if assignment.plan_node_id() != intent.node().get() {
-            return Err(protocol(
-                "split intent and payload name different plan nodes",
-            ));
-        }
-        self.deliver_splits(
-            &runtime,
-            descriptor.identity(),
-            descriptor.fragment_instance_id(),
-            &assignment,
-            Some(operation),
-        )
-        .map(Some)
-    }
-
     fn apply_task_domain(
         &self,
         descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
+        operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
         let identity = descriptor.identity();
         let runtime = self.task_runtime(identity).ok_or_else(|| {
@@ -1828,8 +1796,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     identity,
                     descriptor.fragment_instance_id(),
                     &assignment,
-                    #[cfg(novarocks_dev_controls)]
-                    None,
+                    operation,
                 )
                 .map(Some)
             }
@@ -4756,6 +4723,7 @@ pub(super) mod tests {
                     version: EdgeOpenVersion::FIRST,
                     edges: vec![ExchangeEdgeId::new(1).expect("nonzero edge")],
                 },
+                TaskOperationId::new_v7(),
             )
             .expect_err("no prepared fragment exists");
         assert!(
@@ -4963,6 +4931,7 @@ pub(super) mod tests {
                     version: EdgeOpenVersion::FIRST,
                     edges: vec![ExchangeEdgeId::new(9).expect("nonzero edge")],
                 },
+                TaskOperationId::new_v7(),
             )
             .expect_err("an unfrozen edge cannot be opened");
         assert!(unknown.detail().as_str().contains("edge open is illegal"));
@@ -4973,6 +4942,7 @@ pub(super) mod tests {
                 version: EdgeOpenVersion::FIRST,
                 edges: vec![edge],
             },
+            TaskOperationId::new_v7(),
         )
         .expect("a frozen edge opens at version one");
 
@@ -5020,8 +4990,12 @@ pub(super) mod tests {
             destination,
         };
         assert!(
-            host.apply_task_domain(&descriptor, &close(replacement_process))
-                .is_err()
+            host.apply_task_domain(
+                &descriptor,
+                &close(replacement_process),
+                TaskOperationId::new_v7()
+            )
+            .is_err()
         );
         let gate = host
             .task_runtime(producer)
@@ -5032,10 +5006,10 @@ pub(super) mod tests {
             .clone();
         assert!(!gate.is_normally_canceled());
 
-        host.apply_task_domain(&descriptor, &close(consumer))
+        host.apply_task_domain(&descriptor, &close(consumer), TaskOperationId::new_v7())
             .expect("exact destination closes");
         assert!(gate.is_normally_canceled());
-        host.apply_task_domain(&descriptor, &close(consumer))
+        host.apply_task_domain(&descriptor, &close(consumer), TaskOperationId::new_v7())
             .expect("repeat close is harmless");
         host.apply_task_domain(
             &descriptor,
@@ -5043,6 +5017,7 @@ pub(super) mod tests {
                 version: EdgeOpenVersion::FIRST,
                 edges: vec![edge],
             },
+            TaskOperationId::new_v7(),
         )
         .expect("edge grant after close is recorded");
         assert!(
@@ -5073,6 +5048,7 @@ pub(super) mod tests {
                     novarocks_proto_models::filter::RuntimeFilterEnvelope::default(),
                 )),
             },
+            TaskOperationId::new_v7(),
         )
         .expect("the context host accepts it");
         assert_eq!(facts.dynamic_filters_delivered.load(Ordering::SeqCst), 1);
@@ -5148,7 +5124,7 @@ pub(super) mod tests {
             ),
         );
         let rejection = host
-            .apply_task_domain(&descriptor, &update)
+            .apply_task_domain(&descriptor, &update, TaskOperationId::new_v7())
             .expect_err("a filter envelope is not a split batch");
         assert!(
             rejection
@@ -5182,6 +5158,7 @@ pub(super) mod tests {
                     Vec::new(),
                     SplitOffer::Seal,
                 ),
+                TaskOperationId::new_v7(),
             )
             .expect_err("two plan nodes is not one assignment");
         assert!(
@@ -5214,6 +5191,7 @@ pub(super) mod tests {
                 Vec::new(),
                 SplitOffer::Seal,
             ),
+            TaskOperationId::new_v7(),
         )
         .expect("a terminal marker needs no provider payload");
 
@@ -5243,6 +5221,7 @@ pub(super) mod tests {
                     SplitOffer::batch(SplitSequence::FIRST, SplitSequence::FIRST, false)
                         .expect("one split"),
                 ),
+                TaskOperationId::new_v7(),
             )
             .expect_err("no typed connector read execution exists");
         assert!(
@@ -7100,8 +7079,9 @@ pub(super) mod tests {
             &self,
             descriptor: &TaskDescriptor,
             domain: &TaskDomainUpdate,
+            operation: novarocks_execution_contract::TaskOperationId,
         ) -> Result<Option<u64>, HostRejection> {
-            self.inner.apply_task_domain(descriptor, domain)
+            self.inner.apply_task_domain(descriptor, domain, operation)
         }
     }
 
@@ -9938,6 +9918,7 @@ pub(super) mod tests {
                     SplitOffer::batch(SplitSequence::FIRST, SplitSequence::FIRST, true)
                         .expect("one split"),
                 ),
+                TaskOperationId::new_v7(),
             )
             .expect("the compiled scan's read execution decodes its split");
             // The fixture provider refuses every page stream, so the read of

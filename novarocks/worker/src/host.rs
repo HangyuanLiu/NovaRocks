@@ -487,18 +487,8 @@ pub trait TaskExecutionHost: Send + Sync {
         ))
     }
 
-    #[cfg(novarocks_dev_controls)]
-    fn apply_task_domain_for_operation(
-        &self,
-        descriptor: &TaskDescriptor,
-        domain: &TaskDomainUpdate,
-        _operation: novarocks_execution_contract::TaskOperationId,
-    ) -> Result<Option<u64>, HostRejection> {
-        self.apply_task_domain(descriptor, domain)
-    }
-
     /// Applies a task-scoped domain advance the owner already classified as
-    /// applicable.
+    /// applicable, under the original CreateTask or UpdateTask operation.
     ///
     /// Returns how many splits the plan node still holds after the offer, for
     /// the domains that have a queue. The sender reads it as backpressure, so
@@ -510,6 +500,7 @@ pub trait TaskExecutionHost: Send + Sync {
         &self,
         descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
+        operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection>;
 }
 

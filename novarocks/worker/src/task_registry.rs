@@ -1522,6 +1522,7 @@ impl TaskExecutionRegistry {
             &transaction.descriptor,
             &mut task_domains,
             request.initial_domains(),
+            operation,
         ) {
             Ok((receipts, _)) => receipts,
             Err(rejection) => {
@@ -1959,8 +1960,7 @@ impl TaskExecutionRegistry {
             &descriptor,
             request.domains(),
             &plan,
-            #[cfg(novarocks_dev_controls)]
-            Some(operation),
+            operation,
         ) {
             Ok(queued) => queued,
             Err(rejection) => {
@@ -4653,6 +4653,7 @@ mod preparation_snapshot_tests {
             &self,
             _: &TaskDescriptor,
             _: &TaskDomainUpdate,
+            _operation: novarocks_execution_contract::TaskOperationId,
         ) -> Result<Option<u64>, crate::HostRejection> {
             panic!("preparation observation applied task domain")
         }

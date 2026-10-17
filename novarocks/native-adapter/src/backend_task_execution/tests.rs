@@ -528,6 +528,7 @@ impl TaskExecutionHost for FakeTaskHost {
         &self,
         _descriptor: &TaskDescriptor,
         _domain: &TaskDomainUpdate,
+        _operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
         if self.fail_task_domain.load(Ordering::SeqCst) {
             return Err(HostRejection::new(
