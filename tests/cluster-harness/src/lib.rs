@@ -5409,11 +5409,6 @@ impl ServerHandle for CrossProcessServerHandle {
             .test_sessions
             .as_ref()
             .map_or(deadline, |plan| deadline.min(plan.deadline()));
-        let controller_cleanup = self
-            .test_sessions
-            .as_mut()
-            .map(|plan| plan.end_role(RoleSlot::Backend(index)))
-            .transpose();
         let old_process_id = self.backend_process_id(index);
         let prior_log = self.be_processes[index]
             .log_contents()
@@ -5425,9 +5420,17 @@ impl ServerHandle for CrossProcessServerHandle {
                 Err(anyhow::anyhow!("{identity:#}; capture prior log: {log:#}"))
             }
         };
+        // Preserve live fault holds until the old process has actually exited.
+        // Ending its session first can return an RPC rejection before the
+        // process loss that this restart is meant to inject.
         let stopped = self.be_processes[index]
             .kill_now()
             .with_context(|| format!("stop old cross-process BE[{index}] before restart"));
+        let controller_cleanup = self
+            .test_sessions
+            .as_mut()
+            .map(|plan| plan.end_role(RoleSlot::Backend(index)))
+            .transpose();
         let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
         let (old_process_id, prior_log) = combine_restart_evidence(evidence, exited)?;
         self.be_log_history[index].push_str(&prior_log);
