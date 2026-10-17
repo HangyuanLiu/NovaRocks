@@ -396,12 +396,12 @@ select st1 != null from ${case_db}.sc2 order by v1, fixture_order;
 
 -- query 112
 -- Frozen Map keys reject construction before comparison.
--- @expect_error=map literal key must not be NULL"), phase: Execution
+-- @expect_error=phase=EXECUTION, detail=fragment execution error (pipeline): operator[1] Push: map key must not be NULL
 select map{1:1,null:2} = map{1:1,2:null};
 
 -- query 113
 -- Frozen Map keys reject construction before comparison.
--- @expect_error=map literal key must not be NULL"), phase: Execution
+-- @expect_error=phase=EXECUTION, detail=fragment execution error (pipeline): operator[1] Push: map key must not be NULL
 select map{1:1,null:2} != map{1:1,2:null};
 
 -- query 114

@@ -88,7 +88,7 @@ SELECT map{1: "a", 2: "b"}[c1] FROM ${case_db}.map_top_n ORDER BY c1;
 -- query 14
 -- Frozen Map keys are non-null. Match both the constructor cause and the
 -- execution phase so a preparation or protocol failure cannot satisfy this case.
--- @expect_error=map literal key must not be NULL"), phase: Execution
+-- @expect_error=phase=EXECUTION, detail=fragment execution error (pipeline): operator[1] Push: map key must not be NULL
 SELECT map{null: "a", 2: "b"}[null];
 
 -- query 15
