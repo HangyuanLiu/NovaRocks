@@ -79,11 +79,12 @@ pub fn eval_map_literal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         "value",
     )?;
 
+    // Design: ADR-0183 (docs/adr/ADR-0183-map-keys-are-non-null-and-unique.md)
     // These assembled keys contain exactly this invocation's rows and pairs.
     // NULL values remain valid, but a NULL key cannot widen the frozen Map
     // contract. Check after the original child evaluation and coercion order.
     if keys.logical_null_count() > 0 {
-        return Err("map literal key must not be NULL".to_string().into());
+        return Err(super::common::MAP_KEY_NULL_MESSAGE.to_string().into());
     }
     let entries_fields = entry_fields_for_arrays(fields, &values);
     let entries = StructArray::new(entries_fields.clone(), vec![keys, values], None);
@@ -263,8 +264,31 @@ mod tests {
         let error = arena
             .eval(expr, &chunk)
             .expect_err("map key must be present");
-        assert_eq!(error, "map literal key must not be NULL");
+        assert_eq!(error, "map key must not be NULL");
     }
+    #[test]
+    fn map_literal_rejects_null_keys_produced_by_output_coercion() {
+        let chunk = one_row_chunk();
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("invalid integer".to_string())),
+            DataType::Utf8,
+        );
+        let value = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(10)), DataType::Int32);
+        let expr = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Map("map"),
+                args: vec![key, value],
+            },
+            map_type(),
+        );
+
+        assert_eq!(
+            arena.eval(expr, &chunk).unwrap_err(),
+            "map key must not be NULL"
+        );
+    }
+
     #[test]
     fn map_literal_preserves_null_value_slots_under_the_nonnull_key_contract() {
         let chunk = one_row_chunk();

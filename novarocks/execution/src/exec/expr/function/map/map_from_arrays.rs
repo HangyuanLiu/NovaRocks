@@ -147,17 +147,13 @@ pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             })?;
     }
 
-    let entries_fields = if out_keys.null_count() > 0 && !key_field.is_nullable() {
-        let mut adjusted = fields.iter().cloned().collect::<Vec<_>>();
-        adjusted[0] = Arc::new(Field::new(
-            key_field.name(),
-            key_field.data_type().clone(),
-            true,
-        ));
-        arrow::datatypes::Fields::from(adjusted)
-    } else {
-        fields.clone()
-    };
+    // Design: ADR-0183 (docs/adr/ADR-0183-map-keys-are-non-null-and-unique.md)
+    // Only keys assembled for non-NULL Map rows participate. Coercion may
+    // introduce NULL, but it cannot widen the frozen key field's nullability.
+    if out_keys.logical_null_count() > 0 {
+        return Err(super::common::MAP_KEY_NULL_MESSAGE.to_string().into());
+    }
+    let entries_fields = fields.clone();
     let entries_fields = if out_values.data_type() != value_field.data_type() {
         let mut adjusted = entries_fields.iter().cloned().collect::<Vec<_>>();
         adjusted[1] = Arc::new(Field::new(
@@ -184,4 +180,177 @@ pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     );
 
     Ok(Arc::new(map) as ArrayRef)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eval_map_from_arrays;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::function::FunctionKind;
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
+    use arrow::record_batch::RecordBatch;
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use novarocks_types::SlotId;
+    use std::sync::Arc;
+
+    fn map_type(key_type: DataType) -> DataType {
+        let entries = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new("key", key_type, false)),
+            Arc::new(Field::new("value", DataType::Int32, true)),
+        ]));
+        DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
+    }
+
+    fn evaluate(
+        keys: ListArray,
+        values: ListArray,
+        output_type: DataType,
+    ) -> Result<ArrayRef, String> {
+        let key_type = keys.data_type().clone();
+        let value_type = values.data_type().clone();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("keys", key_type.clone(), true),
+                Field::new("values", value_type.clone(), true),
+            ])),
+            vec![Arc::new(keys), Arc::new(values)],
+        )
+        .unwrap();
+        let key_slot = SlotId::new(1);
+        let value_slot = SlotId::new(2);
+        let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[key_slot, value_slot],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(ExprNode::SlotId(key_slot), key_type);
+        let value = arena.push_typed(ExprNode::SlotId(value_slot), value_type);
+        let args = [key, value];
+        let expr = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Map("map_from_arrays"),
+                args: args.to_vec(),
+            },
+            output_type,
+        );
+        eval_map_from_arrays(&arena, expr, &args, &chunk)
+    }
+
+    #[test]
+    fn map_from_arrays_rejects_null_key_in_a_mixed_batch() {
+        let keys = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1)]),
+            Some(vec![None]),
+        ]);
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(10)]),
+            Some(vec![Some(20)]),
+        ]);
+
+        assert_eq!(
+            evaluate(keys, values, map_type(DataType::Int32)).unwrap_err(),
+            "map key must not be NULL"
+        );
+    }
+
+    #[test]
+    fn map_from_arrays_rejects_null_key_produced_by_output_coercion() {
+        let keys = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(StringArray::from(vec!["invalid integer"])),
+            None,
+        );
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(10)])]);
+
+        assert_eq!(
+            evaluate(keys, values, map_type(DataType::Int32)).unwrap_err(),
+            "map key must not be NULL"
+        );
+    }
+
+    #[test]
+    fn map_from_arrays_whole_null_lists_remain_null_maps() {
+        // A NULL key-list row may retain NULL backing children. They are not
+        // entries of an output Map and must not fail the constructor.
+        let keys = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+            Arc::new(Int32Array::from(vec![None, Some(2), Some(3)])),
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(10)]),
+            None,
+            Some(vec![Some(30)]),
+        ]);
+        let output_type = map_type(DataType::Int32);
+        let output = evaluate(keys, values, output_type.clone()).unwrap();
+        let map = output.as_any().downcast_ref::<MapArray>().unwrap();
+
+        assert_eq!(map.data_type(), &output_type);
+        assert_eq!(map.len(), 3);
+        assert!(map.is_null(0));
+        assert!(map.is_null(1));
+        assert!(!map.is_null(2));
+        assert_eq!(map.value_offsets(), &[0, 0, 0, 1]);
+        assert_eq!(
+            map.keys()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[3]
+        );
+        assert_eq!(
+            map.values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[30]
+        );
+    }
+
+    #[test]
+    fn map_from_arrays_preserves_legal_order_empty_maps_null_values_and_key_cast() {
+        let keys = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(2), Some(1)]),
+            Some(vec![]),
+            Some(vec![Some(3)]),
+        ]);
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(20), None]),
+            Some(vec![]),
+            Some(vec![Some(30)]),
+        ]);
+        let output_type = map_type(DataType::Int64);
+        let output = evaluate(keys, values, output_type.clone()).unwrap();
+        let map = output.as_any().downcast_ref::<MapArray>().unwrap();
+
+        assert_eq!(map.data_type(), &output_type);
+        assert_eq!(map.null_count(), 0);
+        assert_eq!(map.value_offsets(), &[0, 2, 2, 3]);
+        assert_eq!(
+            map.keys()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[2, 1, 3]
+        );
+        assert_eq!(
+            map.values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(20), None, Some(30)]
+        );
+    }
 }

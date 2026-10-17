@@ -274,6 +274,12 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 - ADR-0090 — MV/View定义为何持久化用户有效SQL原文与解析上下文，而不是AST Display（active）
 - ADR-0101 — native SQL language authority 为何分离 parser、SQL semantic value 与 Frontend application request（active）
 
+### map-semantics
+
+领域哲学：Map 键域在构造时成立，不能由写出路径或运行时字段放宽来补救。非空且唯一是值语义；构造拒绝与具有明确优先级的合并分开，唯一性复用 GROUP BY 规范键等价。实施覆盖必须如实记录，局部入口的校验不代表所有生产者已经收敛。
+
+- [ADR-0183](ADR-0183-map-keys-are-non-null-and-unique.md) — Map 键为何非空且唯一，构造拒绝为何与合并优先级分开（active；当前字面量与数组构造落实 NULL key 拒绝，重复键与其他入口待收敛）
+
 ### runtime-role
 
 领域哲学：生产运行时只由 native FE/BE 角色组成。FE 拥有 SQL admission 和
