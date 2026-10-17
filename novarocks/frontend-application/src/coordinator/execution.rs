@@ -3468,6 +3468,12 @@ mod tests {
         use super::RelayedRootAnswer;
         use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultEnd};
         let (_control, _work, window) = test_root_window();
+        // On assertion failure, disconnect the scripted read before joining
+        // the runtime that may be blocked in that read.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let (release, releases) = std::sync::mpsc::channel();
         let transport = Arc::new(ScriptedRootResult {
             answers: Mutex::new(
@@ -3487,10 +3493,6 @@ mod tests {
             acknowledgements: Mutex::new(Vec::new()),
         });
         let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         let mut polls = start_test_polls(
             transport.clone(),
             root_task_for_test(),
@@ -3500,11 +3502,20 @@ mod tests {
         );
         assert!(polls.take_next().is_none());
         assert_eq!(wake.count(), 0);
+        let first_answer_deadline = Instant::now() + Duration::from_secs(10);
         release.send(()).unwrap();
         assert!(matches!(
-            answer_within(&mut polls, Duration::from_secs(10)),
+            answer_within(
+                &mut polls,
+                first_answer_deadline.saturating_duration_since(Instant::now())
+            ),
             Some(RelayedRootAnswer::NotReady)
         ));
+        // The relay publishes the answer before it emits the wake. Observe
+        // that wake within the same budget rather than assuming simultaneity.
+        while wake.count() == 0 && Instant::now() < first_answer_deadline {
+            std::thread::yield_now();
+        }
         assert!(wake.count() >= 1);
         release.send(()).unwrap();
         let Some(RelayedRootAnswer::Data(reply)) =
@@ -3541,6 +3552,12 @@ mod tests {
         let (_control, _work, window) = test_root_window();
         let (mut round, statuses, clock) =
             crate::task_execution::tests::synchronous_root_control_round();
+        // On assertion failure, disconnect the scripted read before joining
+        // the runtime that may be blocked in that read.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let (release, releases) = std::sync::mpsc::channel();
         let mut answers = std::collections::VecDeque::new();
         if accepted_data {
@@ -3554,10 +3571,6 @@ mod tests {
             acknowledgements: Mutex::new(Vec::new()),
         });
         let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         let root = round.root_task();
         let mut polls = Some(start_test_polls(
             transport.clone(),
