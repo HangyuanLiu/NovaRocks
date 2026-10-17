@@ -259,6 +259,21 @@ pub enum TaskFailurePhase {
     Execution,
 }
 
+impl TaskFailurePhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparation => "PREPARATION",
+            Self::Execution => "EXECUTION",
+        }
+    }
+}
+
+impl fmt::Display for TaskFailurePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A task's own bounded, redacted failure cause.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskFailure {
@@ -1212,6 +1227,14 @@ mod tests {
                 Err(TaskStatusError::InstalledPreparationFailure)
             );
         }
+    }
+
+    #[test]
+    fn task_failure_phase_has_stable_client_text() {
+        assert_eq!(TaskFailurePhase::Preparation.as_str(), "PREPARATION");
+        assert_eq!(TaskFailurePhase::Execution.as_str(), "EXECUTION");
+        assert_eq!(TaskFailurePhase::Preparation.to_string(), "PREPARATION");
+        assert_eq!(TaskFailurePhase::Execution.to_string(), "EXECUTION");
     }
 
     #[test]

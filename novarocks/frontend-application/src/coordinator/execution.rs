@@ -52,6 +52,7 @@ use crate::query_execution::profile::ProfileTerminalBuilder;
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::task_execution::sources::AttemptEstablishFacts;
+use crate::task_execution::termination::render_termination_detail;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
@@ -1442,8 +1443,10 @@ impl FrontendDistributedQueryCoordinator {
                     last_root_poll,
                     write_completion.as_mut(),
                 );
-                let detail =
-                    format!("task execution terminated: {detail:?}; terminal_round={waiting_on}");
+                let detail = format!(
+                    "task execution terminated: {}; terminal_round={waiting_on}",
+                    render_termination_detail(Some(&detail))
+                );
                 break Err(self.fail_task_round_with_root_reader(
                     &mut relayed_reader,
                     &mut root_result_polls,
@@ -2628,7 +2631,7 @@ fn statistics_all_success_failure_message(
         "statistics execution did not reach a success-compatible terminal set; \
          incompatible_tasks=[{}]; round_failure_cause={}",
         incompatible.join(", "),
-        format_termination_detail(round_failure_cause),
+        render_termination_detail(round_failure_cause),
     ))
 }
 
@@ -2657,21 +2660,8 @@ fn format_statistics_task_completion_fact(fact: &StatisticsTaskCompletionFact) -
         fact.identity.backend_process_id(),
         fact.terminal,
         fact.state.map_or("MISSING", TaskState::as_str),
-        format_termination_detail(fact.failure_cause.as_ref()),
+        render_termination_detail(fact.failure_cause.as_ref()),
     )
-}
-
-fn format_termination_detail(detail: Option<&TerminationDetail>) -> String {
-    match detail {
-        Some(TerminationDetail::Canceled(reason)) => format!("CANCELED(reason={reason})"),
-        Some(TerminationDetail::Aborted(cause)) => format!("ABORTED(cause={cause})"),
-        Some(TerminationDetail::Failed(failure)) => format!(
-            "FAILED(category={}, detail={})",
-            failure.category(),
-            failure.detail()
-        ),
-        None => "NONE".to_owned(),
-    }
 }
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
@@ -2918,7 +2908,7 @@ mod tests {
             .expect("non-finished tasks reject statistics completion");
         assert!(!message.contains("task_id=1,"));
         assert!(message.contains(&format!(
-            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=2, backend_process_id={}}}, terminal=true, state=FAILED, failure_cause=FAILED(category=RESOURCE_EXHAUSTED, detail=memory pool exhausted)",
+            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=2, backend_process_id={}}}, terminal=true, state=FAILED, failure_cause=FAILED(category=RESOURCE_EXHAUSTED, phase=EXECUTION, detail=memory pool exhausted)",
             execution_id.query_id(),
             failed_identity.backend_process_id(),
         )));
@@ -2928,7 +2918,7 @@ mod tests {
             aborted_identity.backend_process_id(),
         )));
         assert!(message.ends_with(
-            "round_failure_cause=FAILED(category=RESOURCE_EXHAUSTED, detail=memory pool exhausted)"
+            "round_failure_cause=FAILED(category=RESOURCE_EXHAUSTED, phase=EXECUTION, detail=memory pool exhausted)"
         ));
         assert!(
             statistics_all_success_failure_message(&facts[..1], None).is_none(),
