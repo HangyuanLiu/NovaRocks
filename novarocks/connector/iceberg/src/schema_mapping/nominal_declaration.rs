@@ -79,6 +79,7 @@ impl NominalSourceDomain {
     }
 }
 
+// Design: ADR-0182 (docs/adr/ADR-0182-iceberg-recursive-nominal-field-identities.md)
 /// The exact LoadedTable metadata properties author the declaration. Names
 /// resolve against that same current schema, and only stable IDs are retained.
 pub(crate) fn from_metadata(
