@@ -1472,17 +1472,7 @@ fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete
         SortOrder::unsorted_order(),
         "file:///nominal-source".into(),
         FormatVersion::V3,
-        HashMap::from([
-            ("novarocks.logical_type.native_hll".into(), "hll".into()),
-            (
-                "novarocks.logical_type.native_bitmap".into(),
-                "bitmap".into(),
-            ),
-            (
-                "novarocks.logical_type.wide_integer".into(),
-                "largeint".into(),
-            ),
-        ]),
+        HashMap::from([(crate::schema_mapping::nominal_declaration::PROPERTY.into(),r#"{"version":1,"fields":[{"id":1,"domain":"hll"},{"id":2,"domain":"bitmap"},{"id":3,"domain":"largeint"}]}"#.into())]),
     )
     .unwrap()
     .build()

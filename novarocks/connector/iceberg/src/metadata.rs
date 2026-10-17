@@ -71,7 +71,6 @@ use crate::scan_model::{
 };
 use crate::schema_facts::{iceberg_schema_def, row_lineage_enabled};
 
-const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
 use novarocks_spi::connector::{
     CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY as APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY,
@@ -300,7 +299,6 @@ impl IcebergMetadata {
             prepared_files: Vec::new(),
             explicit_files: None,
             row_mutation_frozen_source: false,
-            logical_type_columns: logical_type_columns(metadata.properties()),
             hidden_columns: hidden_internal_columns(metadata.properties()),
         };
         ConnectorTableHandle::try_new(
@@ -655,8 +653,14 @@ impl ConnectorMetadata for IcebergMetadata {
         let metadata = loaded.table.metadata();
         let definition_schema = metadata.current_schema().clone();
         let table_comment = metadata.properties().get("comment").cloned();
-        let mut base_schema =
-            crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+        let nominal_document =
+            crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(
+                metadata,
+            )?;
+        let mut base_schema = crate::scalar_integer_domain::sql_schema_from_document(
+            metadata.current_schema(),
+            &nominal_document,
+        )?;
         let hidden_columns = hidden_internal_columns(metadata.properties());
         base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
         // Carry the same frozen field facts a scan output schema carries, so the
@@ -667,7 +671,6 @@ impl ConnectorMetadata for IcebergMetadata {
             &iceberg_schema_def(metadata.current_schema()),
         )
         .map_err(corrupt)?;
-        let logical_type_columns = logical_type_columns(metadata.properties());
         let metadata_columns = metadata_column_names(metadata);
         let mut table_info =
             IcebergTableInfo {
@@ -750,7 +753,6 @@ impl ConnectorMetadata for IcebergMetadata {
             prepared_files,
             explicit_files: None,
             row_mutation_frozen_source: false,
-            logical_type_columns,
             hidden_columns,
         };
         let (schema, execution_schema) = if let Some(metadata_table_type) =
@@ -774,8 +776,8 @@ impl ConnectorMetadata for IcebergMetadata {
                 fields,
                 base_schema.metadata().clone(),
             ));
-            let execution = crate::schema_mapping::catalog_value::table(
-                metadata,
+            let execution = crate::schema_mapping::catalog_value::table_with_document(
+                &nominal_document,
                 definition_schema.as_ref(),
                 &payload.metadata_columns,
                 creation,
@@ -790,7 +792,7 @@ impl ConnectorMetadata for IcebergMetadata {
                 iceberg_schema: Some(definition_schema.as_ref()),
                 metadata_columns: &payload.metadata_columns,
                 hidden_columns: &payload.hidden_columns,
-                logical_type_columns: &payload.logical_type_columns,
+                nominal_declarations: &nominal_document.nominals,
                 serialized_metadata: payload
                     .table_info
                     .as_ref()
@@ -1434,7 +1436,6 @@ pub(crate) fn frozen_copy_on_write_source_payload(
         // A frozen source carries a complete explicit file set and must never
         // fall back to a catalog lookup.
         row_mutation_frozen_source: true,
-        logical_type_columns: logical_type_columns(metadata.properties()),
         hidden_columns: hidden_internal_columns(metadata.properties()),
     })
 }
@@ -1550,7 +1551,6 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
         prepared_files: Vec::new(),
         explicit_files: Some(vec![file]),
         row_mutation_frozen_source: true,
-        logical_type_columns: logical_type_columns(metadata.properties()),
         hidden_columns: hidden_internal_columns(metadata.properties()),
     };
     scope.active()?;
@@ -1694,8 +1694,6 @@ pub(crate) struct IcebergTablePayload {
     /// explicit file set and must never fall back to a catalog lookup.
     #[serde(default)]
     pub row_mutation_frozen_source: bool,
-    #[serde(default)]
-    pub logical_type_columns: BTreeMap<String, String>,
     #[serde(default)]
     pub hidden_columns: Vec<String>,
 }
@@ -2331,17 +2329,6 @@ fn read_reference_facts(
     )
 }
 
-fn logical_type_columns(properties: &HashMap<String, String>) -> BTreeMap<String, String> {
-    properties
-        .iter()
-        .filter_map(|(key, value)| {
-            let column = key.strip_prefix(LOGICAL_TYPE_PROPERTY_PREFIX)?;
-            matches!(value.to_ascii_lowercase().as_str(), "bitmap" | "hll")
-                .then(|| (column.to_ascii_lowercase(), value.to_ascii_lowercase()))
-        })
-        .collect()
-}
-
 fn hidden_internal_columns(properties: &HashMap<String, String>) -> Vec<String> {
     let mut hidden = Vec::new();
     for value in properties
@@ -2646,7 +2633,6 @@ mod plan_splits_pruning_tests {
             prepared_files: Vec::new(),
             explicit_files: None,
             row_mutation_frozen_source: false,
-            logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
         };
         ConnectorTableHandle::try_new(
@@ -2840,7 +2826,6 @@ mod plan_splits_pruning_tests {
                 prepared_files: Vec::new(),
                 explicit_files: Some(files),
                 row_mutation_frozen_source: false,
-                logical_type_columns: BTreeMap::new(),
                 hidden_columns: Vec::new(),
             },
             snapshot_id: None,
@@ -2903,7 +2888,6 @@ mod plan_splits_pruning_tests {
                 prepared_files: Vec::new(),
                 explicit_files: None,
                 row_mutation_frozen_source: true,
-                logical_type_columns: BTreeMap::new(),
                 hidden_columns: Vec::new(),
             },
             snapshot_id: Some(7),

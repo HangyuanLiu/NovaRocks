@@ -20,6 +20,7 @@ use crate::iceberg::spec::{
     FormatVersion, Literal, NestedField, PartitionSpec, SortOrder, TableMetadata,
     TableMetadataBuilder,
 };
+use crate::schema_mapping::nominal_declaration::PROPERTY;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -118,13 +119,18 @@ fn collect_cause<T>(
 }
 #[test]
 fn real_stock_history_noop_matches_original_and_cancel_stops_the_actual_history_scan() {
+    // Each check now visits one real schema field-ID lookup. Multiple
+    // declarations and actual retained schemas exercise the useful history
+    // loop without scanning unrelated fields to reproduce an old shape.
+    let domains = (1..=96).map(|id| (id, ScalarIntegerDomain::Int8)).collect();
     let metadata = loaded_history(
         96,
         32,
-        HashMap::from([(PROPERTY.to_string(), r#"{"95":"tinyint"}"#.to_string())]),
+        HashMap::from([(PROPERTY.to_string(), encode(&domains).unwrap())]),
     );
     assert_eq!(metadata.schemas_iter().count(), 32);
     let expected = metadata_declarations(&metadata).unwrap();
+    assert_eq!(expected.len(), 96);
     assert_eq!(
         metadata_declarations_checked::<ConnectorError>(&metadata, &|_| Ok(())).unwrap(),
         expected
@@ -135,7 +141,7 @@ fn real_stock_history_noop_matches_original_and_cancel_stops_the_actual_history_
     });
     let identity = (&*raw) as *const Canary;
     let original = RefCell::new(Some(raw));
-    let fields = Cell::new(0);
+    let lookups = Cell::new(0);
     let failed = Cell::new(false);
     let after = Cell::new(false);
     let result = metadata_declarations_checked::<Cause>(&metadata, &|point| {
@@ -143,8 +149,8 @@ fn real_stock_history_noop_matches_original_and_cancel_stops_the_actual_history_
             after.set(true)
         }
         if point == CheckPoint::HistoryField {
-            fields.set(fields.get() + 1);
-            if fields.get() == 500 {
+            lookups.set(lookups.get() + 1);
+            if lookups.get() == 40 {
                 failed.set(true);
                 return Err(Cause::Check(original.borrow_mut().take().unwrap()));
             }
@@ -154,39 +160,9 @@ fn real_stock_history_noop_matches_original_and_cancel_stops_the_actual_history_
     let facts = collect_cause(result, identity, &drops);
     drop(original.into_inner());
     assert_eq!(facts, (true, true));
-    assert_eq!(fields.get(), 500);
+    assert_eq!(lookups.get(), 40);
+    assert!(lookups.get() < expected.len() * metadata.schemas_iter().count());
     assert!(!after.get());
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-}
-#[test]
-fn actual_legacy_field_filter_stops_before_finishing_its_wide_schema_and_keeps_original_cause() {
-    let metadata = loaded_history(
-        512,
-        1,
-        HashMap::from([(format!("{LEGACY_PREFIX}FIELD_512"), "SmallInt".to_string())]),
-    );
-    let expected = metadata_declarations(&metadata).unwrap();
-    assert_eq!(expected.get(&512), Some(&ScalarIntegerDomain::Int16));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let raw = Box::new(Canary {
-        drops: drops.clone(),
-    });
-    let identity = (&*raw) as *const Canary;
-    let original = RefCell::new(Some(raw));
-    let visits = Cell::new(0);
-    let result = metadata_declarations_checked::<Cause>(&metadata, &|point| {
-        if point == CheckPoint::LegacyField {
-            visits.set(visits.get() + 1);
-            if visits.get() == 128 {
-                return Err(Cause::Check(original.borrow_mut().take().unwrap()));
-            }
-        }
-        Ok(())
-    });
-    let facts = collect_cause(result, identity, &drops);
-    drop(original.into_inner());
-    assert_eq!(facts, (true, true));
-    assert_eq!(visits.get(), 128);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 #[test]
@@ -217,12 +193,12 @@ fn actual_schema_validation_walk_stops_with_original_cause_and_no_new_publicatio
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 #[test]
-fn actual_serde_map_visitor_returns_unformatted_checker_cause_after_partial_map_drop() {
+fn actual_serde_document_visitor_returns_unformatted_checker_cause_after_partial_map_drop() {
     let raw = (1..=512)
-        .map(|id| format!("\"{id}\":\"tinyint\""))
+        .map(|id| format!(r#"{{"id":{id},"domain":"tinyint"}}"#))
         .collect::<Vec<_>>()
         .join(",");
-    let raw = format!("{{{raw}}}");
+    let raw = format!(r#"{{"version":1,"fields":[{raw}]}}"#);
     assert_eq!(decode(&raw).unwrap().len(), 512);
     let drops = Arc::new(AtomicUsize::new(0));
     let original_box = Box::new(Canary {
@@ -248,7 +224,7 @@ fn actual_serde_map_visitor_returns_unformatted_checker_cause_after_partial_map_
 }
 #[test]
 fn original_error_order_and_text_remain_with_noop_and_before_later_validation_checks() {
-    let too_large = "x".repeat(MAX_BYTES + 1);
+    let too_large = "x".repeat((1 << 20) + 1);
     let properties = HashMap::from([(PROPERTY.to_string(), too_large)]);
     let calls = Cell::new(0);
     let actual = declarations_checked::<ConnectorError>(&schema(1, 0), &properties, &|_| {
@@ -261,14 +237,14 @@ fn original_error_order_and_text_remain_with_noop_and_before_later_validation_ch
         actual,
         ConnectorError::new(
             ConnectorErrorKind::ResourceExhausted,
-            "Iceberg scalar integer declarations exceed the hard limit"
+            "Iceberg nominal declarations exceed the hard limit"
         )
     );
     assert_eq!(calls.get(), 0);
     for raw in [
-        r#"{"1":"tinyint","1":"smallint"}"#,
-        r#"{"0":"tinyint"}"#,
-        r#"{"1":"other"}"#,
+        r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"},{"id":1,"domain":"smallint"}]}"#,
+        r#"{"version":1,"fields":[{"id":0,"domain":"tinyint"}]}"#,
+        r#"{"version":1,"fields":[{"id":1,"domain":"other"}]}"#,
         r#"{} trailing"#,
     ] {
         assert_eq!(

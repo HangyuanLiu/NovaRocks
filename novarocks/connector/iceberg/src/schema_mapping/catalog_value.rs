@@ -38,8 +38,27 @@ pub(crate) fn table(
     pseudo_columns: &[String],
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
+    creation.work(1)?;
+    let document = super::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
     table_with_metadata_root_policy(
-        metadata,
+        &document,
+        declaration,
+        pseudo_columns,
+        MetadataRootPolicy::Ordinary,
+        creation,
+    )
+}
+
+/// Reuse the same validated document for catalog schema and planning facts.
+pub(crate) fn table_with_document(
+    document: &super::nominal_declaration::TableNominalDocument,
+    declaration: &Schema,
+    pseudo_columns: &[String],
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<ConnectorReadExecutionSchema, Failure> {
+    creation.work(1)?;
+    table_with_metadata_root_policy(
+        document,
         declaration,
         pseudo_columns,
         MetadataRootPolicy::Ordinary,
@@ -55,8 +74,10 @@ pub(crate) fn frozen_row_mutation_table(
     pseudo_columns: &[String],
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
+    creation.work(1)?;
+    let document = super::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
     table_with_metadata_root_policy(
-        metadata,
+        &document,
         declaration,
         pseudo_columns,
         MetadataRootPolicy::FrozenRowMutation,
@@ -71,18 +92,14 @@ enum MetadataRootPolicy {
 }
 
 fn table_with_metadata_root_policy(
-    metadata: &TableMetadata,
+    document: &super::nominal_declaration::TableNominalDocument,
     declaration: &Schema,
     pseudo_columns: &[String],
     metadata_roots: MetadataRootPolicy,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
-    creation.work(1)?;
-    let integers = crate::scalar_integer_domain::of_schema(
-        declaration,
-        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
-    )?;
-    let nominals = super::nominal_declaration::from_metadata(metadata)?;
+    let integers = crate::scalar_integer_domain::of_schema(declaration, &document.integers)?;
+    let nominals = &document.nominals;
     creation.work(1)?;
     let count = declaration
         .as_struct()
@@ -99,7 +116,7 @@ fn table_with_metadata_root_policy(
         let value = super::typed_value::from_field(
             field,
             !field.required,
-            &nominals,
+            nominals,
             integers.get(&field.id).copied(),
             creation,
         )?

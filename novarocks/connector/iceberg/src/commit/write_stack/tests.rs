@@ -3318,8 +3318,8 @@ fn scalar_integer_staged_target_handle(
         crate::iceberg::spec::FormatVersion::V2,
         std::collections::HashMap::from([
             (
-                crate::scalar_integer_domain::PROPERTY.to_string(),
-                r#"{"1":"tinyint","2":"smallint"}"#.to_string(),
+                crate::schema_mapping::nominal_declaration::PROPERTY.to_string(),
+                r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"},{"id":2,"domain":"smallint"}]}"#.to_string(),
             ),
             (
                 crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),

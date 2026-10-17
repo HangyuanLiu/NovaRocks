@@ -31,6 +31,10 @@ tinyint	int	2	0
 tiny_type	widened_sum	tiny_count
 tinyint	-1	2
 
--- query 9
-wide_type	wide_sum	wide_count
-bigint	127	3
+-- query 10
+tiny_type	tiny_sum	tiny_count
+tinyint	-1	2
+
+-- query 11
+wide_type	wide_count
+bigint	0

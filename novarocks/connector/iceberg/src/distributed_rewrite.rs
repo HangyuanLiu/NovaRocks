@@ -1911,8 +1911,8 @@ mod tests {
             "file:///warehouse/db/t".to_string(),
             FormatVersion::V3,
             std::collections::HashMap::from([(
-                crate::scalar_integer_domain::PROPERTY.to_string(),
-                r#"{"1":"tinyint"}"#.to_string(),
+                crate::schema_mapping::nominal_declaration::PROPERTY.to_string(),
+                r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"}]}"#.to_string(),
             )]),
         )
         .unwrap()

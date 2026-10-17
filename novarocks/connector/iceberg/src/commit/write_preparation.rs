@@ -966,7 +966,6 @@ mod tests {
             prepared_files: Vec::new(),
             explicit_files: None,
             row_mutation_frozen_source: false,
-            logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
         }
     }
@@ -2009,8 +2008,8 @@ mod tests {
             "file:///warehouse/db/partitioned".to_string(),
             FormatVersion::V2,
             HashMap::from([(
-                crate::scalar_integer_domain::PROPERTY.to_string(),
-                r#"{"2":"smallint"}"#.to_string(),
+                crate::schema_mapping::nominal_declaration::PROPERTY.to_string(),
+                r#"{"version":1,"fields":[{"id":2,"domain":"smallint"}]}"#.to_string(),
             )]),
         )
         .expect("metadata builder")

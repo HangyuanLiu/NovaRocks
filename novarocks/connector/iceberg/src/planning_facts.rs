@@ -165,7 +165,8 @@ pub struct IcebergTablePlanningFactsInput<'a> {
     pub iceberg_schema: Option<&'a crate::iceberg::spec::Schema>,
     pub metadata_columns: &'a [String],
     pub hidden_columns: &'a [String],
-    pub logical_type_columns: &'a BTreeMap<String, String>,
+    pub(crate) nominal_declarations:
+        &'a crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
     pub serialized_metadata: Option<&'a str>,
     pub namespace: &'a Arc<str>,
     pub instance_id: &'a ConnectorInstanceId,
@@ -181,7 +182,6 @@ pub fn table_planning_facts(
         .iter()
         .enumerate()
         .map(|(ordinal, field)| {
-            let name = field.name().to_ascii_lowercase();
             let visibility = if field
                 .metadata()
                 .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
@@ -195,9 +195,17 @@ pub fn table_planning_facts(
             } else {
                 ConnectorTableColumnVisibility::Sql
             };
-            let semantic_kind = match input.logical_type_columns.get(&name).map(String::as_str) {
-                Some("bitmap") => ConnectorTableColumnSemanticKind::Bitmap,
-                Some("hll") => ConnectorTableColumnSemanticKind::Hll,
+            let domain = input
+                .iceberg_schema
+                .and_then(|schema| schema.as_struct().fields().get(ordinal))
+                .and_then(|source| input.nominal_declarations.get(&source.id));
+            let semantic_kind = match domain {
+                Some(crate::schema_mapping::nominal_declaration::NominalSourceDomain::Bitmap) => {
+                    ConnectorTableColumnSemanticKind::Bitmap
+                }
+                Some(crate::schema_mapping::nominal_declaration::NominalSourceDomain::Hll) => {
+                    ConnectorTableColumnSemanticKind::Hll
+                }
                 _ => ConnectorTableColumnSemanticKind::None,
             };
             let role = if input
@@ -528,17 +536,27 @@ mod tests {
             Field::new("internal", DataType::Utf8, true).with_metadata(hidden_metadata),
         ]));
         let metadata_columns = vec!["row_id".to_string()];
-        let logical_type_columns =
-            BTreeMap::from([(String::from("payload"), String::from("bitmap"))]);
+        let nominal_declarations = BTreeMap::from([(
+            1,
+            crate::schema_mapping::nominal_declaration::NominalSourceDomain::Bitmap,
+        )]);
+        let source_schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::optional(
+                1,
+                "payload",
+                crate::iceberg::spec::PrimitiveType::Binary.into(),
+            ))])
+            .build()
+            .unwrap();
         let namespace = Arc::from("db");
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let context = context();
         let facts = table_planning_facts(IcebergTablePlanningFactsInput {
             schema: &schema,
-            iceberg_schema: None,
+            iceberg_schema: Some(&source_schema),
             metadata_columns: &metadata_columns,
             hidden_columns: &[],
-            logical_type_columns: &logical_type_columns,
+            nominal_declarations: &nominal_declarations,
             serialized_metadata: None,
             namespace: &namespace,
             instance_id: &instance_id,
@@ -647,7 +665,7 @@ mod tests {
             iceberg_schema,
             metadata_columns: &[],
             hidden_columns: &[],
-            logical_type_columns: &BTreeMap::new(),
+            nominal_declarations: &BTreeMap::new(),
             serialized_metadata: None,
             namespace: &namespace,
             instance_id: &instance_id,
@@ -870,7 +888,7 @@ mod tests {
             iceberg_schema: Some(iceberg_schema.as_ref()),
             metadata_columns: &[],
             hidden_columns: &[],
-            logical_type_columns: &BTreeMap::new(),
+            nominal_declarations: &BTreeMap::new(),
             serialized_metadata: Some(&serialized),
             namespace: &namespace,
             instance_id: &instance_id,
@@ -935,7 +953,7 @@ mod tests {
             iceberg_schema: Some(iceberg_schema.as_ref()),
             metadata_columns: &[],
             hidden_columns: &[],
-            logical_type_columns: &BTreeMap::new(),
+            nominal_declarations: &BTreeMap::new(),
             serialized_metadata: Some(&serialized),
             namespace: &namespace,
             instance_id: &instance_id,

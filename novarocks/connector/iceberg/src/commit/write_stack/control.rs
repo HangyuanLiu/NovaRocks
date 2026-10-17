@@ -3632,11 +3632,7 @@ mod statistics_contract_tests {
                 Type::Primitive(PrimitiveType::Binary),
             )),
         ]);
-        let properties = [
-            ("novarocks.logical_type.h".into(), "hll".into()),
-            ("novarocks.logical_type.b".into(), "bitmap".into()),
-            ("novarocks.logical_type.n".into(), "largeint".into()),
-        ]
+        let properties = [(crate::schema_mapping::nominal_declaration::PROPERTY.into(),r#"{"version":1,"fields":[{"id":1,"domain":"hll"},{"id":2,"domain":"bitmap"},{"id":3,"domain":"largeint"}]}"#.into())]
         .into();
         let arrow = crate::scalar_integer_domain::sql_schema(&iceberg, &properties).unwrap();
         use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};

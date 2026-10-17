@@ -138,7 +138,7 @@ fn recursive_declarations_survive_sdk_create_and_author_complete_values() {
 }
 
 #[test]
-fn nominal_documents_reject_corruption_and_conflicting_legacy_claims() {
+fn nominal_documents_reject_corruption_and_unknown_versions() {
     for raw in [
         r#"{"version":2,"fields":[]}"#,
         r#"{"version":1,"fields":[{"id":1,"domain":"largeint"},{"id":1,"domain":"largeint"}]}"#,
@@ -157,15 +157,10 @@ fn nominal_documents_reject_corruption_and_conflicting_legacy_claims() {
         ))])
         .build()
         .unwrap();
-    let mut properties = HashMap::from([
-        (
-            PROPERTY.into(),
-            encode(&BTreeMap::from([(1, NominalSourceDomain::Hll)])).unwrap(),
-        ),
-        ("novarocks.logical_type.state".into(), "bitmap".into()),
-    ]);
-    assert!(from_properties(&schema, &properties).is_err());
-    properties.insert("novarocks.logical_type.state".into(), "hll".into());
+    let mut properties = HashMap::from([(
+        PROPERTY.into(),
+        encode(&BTreeMap::from([(1, NominalSourceDomain::Hll)])).unwrap(),
+    )]);
     assert_eq!(
         from_properties(&schema, &properties).unwrap().get(&1),
         Some(&NominalSourceDomain::Hll)

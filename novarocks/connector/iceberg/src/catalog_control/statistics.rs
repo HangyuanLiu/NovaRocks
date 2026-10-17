@@ -1066,7 +1066,6 @@ mod tests {
             prepared_files: Vec::new(),
             explicit_files: None,
             row_mutation_frozen_source: false,
-            logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
         }
     }
@@ -1295,11 +1294,7 @@ mod tests {
             ])
             .build()
             .unwrap();
-        let properties = [
-            ("novarocks.logical_type.h".into(), "hll".into()),
-            ("novarocks.logical_type.b".into(), "bitmap".into()),
-            ("novarocks.logical_type.n".into(), "largeint".into()),
-        ]
+        let properties = [(crate::schema_mapping::nominal_declaration::PROPERTY.into(),r#"{"version":1,"fields":[{"id":1,"domain":"hll"},{"id":2,"domain":"bitmap"},{"id":3,"domain":"largeint"}]}"#.into())]
         .into();
         let execution = execution_fixture(&schema, properties);
         let requirements =

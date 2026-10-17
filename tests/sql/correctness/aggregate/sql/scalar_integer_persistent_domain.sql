@@ -47,7 +47,7 @@ SELECT typeof(renamed) AS renamed_type,typeof(t) AS reused_name_type,count(renam
 FROM ${case_db}.scalar_integer_domain GROUP BY 1,2;
 
 -- query 7
--- @expect_error=Iceberg MODIFY cannot change a scalar integer domain without changing its physical schema
+-- @expect_error=Iceberg MODIFY cannot change a nominal scalar integer domain without rewriting stored values
 ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN age INT;
 
 -- query 8
@@ -56,11 +56,22 @@ SELECT typeof(renamed) AS tiny_type,sum(CAST(renamed AS INT)) AS widened_sum,cou
 FROM ${case_db}.scalar_integer_domain GROUP BY 1;
 
 -- query 9
+-- ADR-0182 binds a declared narrow domain to INT storage throughout its history.
+-- @expect_error=Iceberg MODIFY cannot change a nominal scalar integer domain without rewriting stored values
 ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN renamed BIGINT;
-INSERT INTO ${case_db}.scalar_integer_domain (id,renamed) VALUES(999,128);
-SELECT typeof(renamed) AS wide_type,sum(renamed) AS wide_sum,count(renamed) AS wide_count
-FROM ${case_db}.scalar_integer_domain GROUP BY 1;
 
 -- query 10
+-- Refusal leaves the original domain and values intact; 128 still overflows TINYINT.
+INSERT INTO ${case_db}.scalar_integer_domain (id,renamed) VALUES(999,128);
+SELECT typeof(renamed) AS tiny_type,sum(renamed) AS tiny_sum,count(renamed) AS tiny_count
+FROM ${case_db}.scalar_integer_domain GROUP BY 1;
+
+-- query 11
+-- An ordinary field without a nominal declaration can still widen normally.
+ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN t BIGINT;
+SELECT typeof(t) AS wide_type,count(t) AS wide_count
+FROM ${case_db}.scalar_integer_domain GROUP BY 1;
+
+-- query 12
 -- @skip_result_check=true
 DROP TABLE ${case_db}.scalar_integer_domain;
