@@ -1324,7 +1324,15 @@ impl PipelineDriver {
                 self.operator_terminal_signal = Some(state.clone());
                 state
             }
-            (None, DriverState::Failed(_)) => {
+            (None, DriverState::Failed(error)) => {
+                // Cleanup can cancel shared operators and wake another driver
+                // before this one returns to the executor. Publish the actual
+                // first cause before those secondary failures become visible.
+                let errors = self.runtime_state.error_state();
+                errors.set_error(error.clone());
+                let state = DriverState::Failed(
+                    errors.error().expect("the fragment failure was published"),
+                );
                 self.fail_operators();
                 self.operator_terminal_signal = Some(state.clone());
                 state
@@ -3233,6 +3241,88 @@ mod terminal_signal_tests {
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
     }
+
+    struct RootCancelledDuringFailure(Arc<AtomicBool>);
+
+    impl Operator for RootCancelledDuringFailure {
+        fn name(&self) -> &str {
+            "RootCancelledDuringFailure"
+        }
+
+        fn activate(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+            if self.0.load(Ordering::SeqCst) {
+                Err("root producer was cancelled".to_string().into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct RunPeerDuringFailure {
+        cancelled: Arc<AtomicBool>,
+        peer: Arc<Mutex<PipelineDriver>>,
+        completion: Arc<super::super::global_driver_executor::FragmentCompletion>,
+    }
+
+    impl Operator for RunPeerDuringFailure {
+        fn name(&self) -> &str {
+            "RunPeerDuringFailure"
+        }
+
+        fn on_driver_failure(&mut self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+            // Force the peer to return to the executor before the originating
+            // driver finishes cleanup. No scheduler timing or sleeps apply.
+            let DriverState::Failed(error) = self.peer.lock().unwrap().process(Duration::ZERO)
+            else {
+                panic!("the root peer must observe the terminal error");
+            };
+            assert!(self.completion.fail(error));
+        }
+    }
+
+    #[test]
+    fn originating_failure_precedes_cleanup_induced_peer_failure() {
+        use super::super::global_driver_executor::FragmentCompletion;
+
+        let runtime = Arc::new(RuntimeState::default());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let completion = FragmentCompletion::new(2);
+        let peer = Arc::new(Mutex::new(PipelineDriver::new(
+            2,
+            vec![Box::new(RootCancelledDuringFailure(Arc::clone(&cancelled)))],
+            None,
+            vec![],
+            Arc::clone(&runtime),
+            None,
+        )));
+        let mut origin = PipelineDriver::new(
+            1,
+            vec![Box::new(RunPeerDuringFailure {
+                cancelled,
+                peer,
+                completion: Arc::clone(&completion),
+            })],
+            None,
+            vec![],
+            Arc::clone(&runtime),
+            None,
+        );
+        let original =
+            ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted)
+                .at_operator(3, PipelineOperation::Push);
+        assert_eq!(
+            origin.finish_with_state(DriverState::Failed(original.clone())),
+            DriverState::Failed(original.clone())
+        );
+        // The peer already reached completion, just as an executor worker can
+        // while the originating worker remains in an operator callback.
+        assert!(!completion.fail(original.clone()));
+        assert_eq!(completion.conclusion(), Some(Err(original.clone())));
+        assert_eq!(runtime.error(), Some(original));
+        assert!(completion.stopped_fact().is_none());
+    }
+
     mod typed_construction_driver_tests {
         use super::*;
         use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
