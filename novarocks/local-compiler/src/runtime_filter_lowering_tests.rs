@@ -154,6 +154,22 @@ fn add_scan_typed(
     distribution: Distribution,
     types: &[ValueType],
 ) -> Vec<ValueId> {
+    add_scan_typed_at(
+        builder,
+        distribution,
+        types,
+        SCAN,
+        ProviderReadOccurrenceId::new(0),
+    )
+}
+
+fn add_scan_typed_at(
+    builder: &mut FragmentBuilder,
+    distribution: Distribution,
+    types: &[ValueType],
+    node: NodeId,
+    occurrence: ProviderReadOccurrenceId,
+) -> Vec<ValueId> {
     let columns = columns(types.len());
     let provider = columns
         .iter()
@@ -163,7 +179,7 @@ fn add_scan_typed(
                 .add_value(
                     ty.clone(),
                     ValueOrigin::ProviderField {
-                        scan_node: SCAN,
+                        scan_node: node,
                         field: column.clone(),
                     },
                 )
@@ -172,9 +188,9 @@ fn add_scan_typed(
         .collect::<Vec<_>>();
     builder
         .add_scan(
-            SCAN,
+            node,
             NodeKind::Scan {
-                occurrence: ProviderReadOccurrenceId::new(0),
+                occurrence,
                 relation: Box::new(Relation::Data(DataRelation {
                     read: ProviderReadReference {
                         binding: binding(),
@@ -238,6 +254,22 @@ fn frozen_read_typed(
     schema: arrow_schema::Schema,
     dynamic_filters: Vec<StaticScanDynamicFilter>,
 ) -> FrozenConnectorRead {
+    let values = schema
+        .fields()
+        .iter()
+        .map(|field| ValueType::new(field.data_type().clone(), field.is_nullable()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    frozen_read_declared_typed(singleton, types, schema, values, dynamic_filters)
+}
+
+fn frozen_read_declared_typed(
+    singleton: bool,
+    types: &[ConnectorValueType],
+    schema: arrow_schema::Schema,
+    values: Box<[ValueType]>,
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+) -> FrozenConnectorRead {
     let width = types.len();
     let draft = ConnectorReadRelationRecipeDraft::try_new(
         binding(),
@@ -280,7 +312,8 @@ fn frozen_read_typed(
         vec![],
     )
     .unwrap();
-    let public = crate::scan_lowering_tests::typed_public_schema(source, None, schema);
+    let public =
+        crate::scan_lowering_tests::typed_public_schema_with_types(source, None, schema, values);
     FrozenConnectorRead::try_new(scan, public).unwrap()
 }
 
@@ -640,6 +673,13 @@ fn packages(
     let scans = read
         .map(|read| BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]))
         .unwrap_or_default();
+    packages_with_reads(plan, scans)
+}
+
+fn packages_with_reads(
+    plan: &PhysicalPlan,
+    scans: BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
+) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
@@ -1287,12 +1327,22 @@ fn runtime_filter_shapes_outside_m1_are_refused_by_name() {
         JOIN,
         "ordered-domain runtime filter",
     );
-    refused(
-        &aggregate_topn(),
-        Some(1),
-        AGGREGATE,
-        "Aggregate TopN runtime-filter producer",
-    );
+    let program = compile(&aggregate_topn(), Some(1))
+        .expect("Complete zero-call ordered aggregation is installed");
+    let id = node_of(&program, |kind| {
+        matches!(kind, ProgramNodeKind::Aggregate { .. })
+    });
+    let ProgramNodeKind::Aggregate {
+        functions,
+        topn_filters,
+        ..
+    } = program.graph().nodes()[id.index()].kind()
+    else {
+        unreachable!()
+    };
+    assert!(functions.is_empty());
+    assert_eq!(topn_filters.len(), 1);
+    assert_eq!(topn_filters[0].limit.get(), 5);
 }
 
 /// `SELECT v0 FROM t GROUP BY v0 ORDER BY v0 LIMIT 5` whose aggregate
@@ -1389,12 +1439,16 @@ fn ordered_filter(
 }
 
 fn aggregate_topn() -> Arc<FragmentPackage> {
+    aggregate_topn_typed(int64(), int64())
+}
+
+fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage> {
     let mut builder = FragmentBuilder::new(PROBE);
-    let scan = add_scan(&mut builder, Distribution::Singleton);
+    let scan = add_scan_typed(&mut builder, Distribution::Singleton, &[ty.clone()]);
     // The group key republishes the scan value itself.
     let grouped = scan[0];
     let group_key = builder
-        .add_expression(AGGREGATE, int64(), ExprKind::Value(grouped))
+        .add_expression(AGGREGATE, ty.clone(), ExprKind::Value(grouped))
         .unwrap();
     builder
         .add_row_consuming(
@@ -1411,7 +1465,7 @@ fn aggregate_topn() -> Arc<FragmentPackage> {
         )
         .unwrap();
     let order_key = builder
-        .add_expression(TOPN, int64(), ExprKind::Value(grouped))
+        .add_expression(TOPN, ty.clone(), ExprKind::Value(grouped))
         .unwrap();
     builder
         .add_top_n(
@@ -1431,10 +1485,11 @@ fn aggregate_topn() -> Arc<FragmentPackage> {
     let fragment = builder
         .finish_definition(TOPN, FragmentSink::Result, dop())
         .unwrap();
+    let mut result = result_port(PROBE, TOPN, &[grouped]);
+    result.fields[0].ty = ty.clone();
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(fragment).unwrap();
-    plan.set_result_port(result_port(PROBE, TOPN, &[grouped]))
-        .unwrap();
+    plan.set_result_port(result).unwrap();
     plan.add_runtime_filter(ordered_filter(
         PROBE,
         AGGREGATE,
@@ -1442,7 +1497,7 @@ fn aggregate_topn() -> Arc<FragmentPackage> {
         TOPN,
         TopNPhase::Single,
         scan[0],
-        int64(),
+        domain,
         SortDirection::Ascending,
         NullOrdering::Last,
         5,
@@ -1451,9 +1506,18 @@ fn aggregate_topn() -> Arc<FragmentPackage> {
     let plan = plan
         .finish()
         .unwrap_or_else(|error| panic!("the aggregate TopN filter plan validates: {error:?}"));
-    packages(&plan, Some(frozen_read(true, vec![dynamic_filter()])))
-        .remove(&PROBE)
-        .unwrap()
+    let read = frozen_read_declared_typed(
+        true,
+        &[connector_type_for_value_type(&ty).unwrap()],
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "v0",
+            ty.data_type().clone(),
+            ty.nullable(),
+        )]),
+        Box::from([ty]),
+        vec![dynamic_filter()],
+    );
+    packages(&plan, Some(read)).remove(&PROBE).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,3 +2126,6 @@ fn a_runtime_filter_key_root_never_reuses_a_relational_call_use() {
 mod grouped_topn_lowering_tests;
 
 pub(super) use grouped_topn_lowering_tests::ordered_scan_package;
+
+#[path = "complete_topn_lowering_tests.rs"]
+mod complete_topn_lowering_tests;

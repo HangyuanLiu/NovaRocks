@@ -102,13 +102,16 @@ pub fn single_key_ordered_filter_digests_observed<E>(
     Ok((comparator, order.finalize().into()))
 }
 
-/// Static payload domain of a direct-scan ordered filter. This admits no
+/// Static payload domain of an ordered Scan filter. This admits no
 /// array provenance, allocation capacity, or interpretation of nominal values.
 /// Preparation and optional planner placement must use this same contract.
 pub fn is_ordered_filter_flat_payload_type(
     value_type: &novarocks_type_contract::FunctionValueType,
 ) -> bool {
     use novarocks_type_contract::ValueKind;
+    if value_type.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt {
+        return matches!(value_type.data_type(), DataType::FixedSizeBinary(16));
+    }
     matches!(
         value_type.value_type().kind(),
         ValueKind::Scalar(_) | ValueKind::String | ValueKind::Binary
@@ -860,12 +863,18 @@ mod tests {
             }
             for (data_type, logical) in [
                 (DataType::Utf8, ValueLogicalType::Json),
-                (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
                 (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
             ] {
                 let ty = V::try_with_logical_type(data_type, nullable, logical).unwrap();
                 assert!(!is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
             }
+            let largeint = V::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                nullable,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap();
+            assert!(is_ordered_filter_flat_payload_type(&largeint));
         }
     }
 

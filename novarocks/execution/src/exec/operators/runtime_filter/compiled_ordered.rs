@@ -163,7 +163,16 @@ impl CompiledOrderedScanFactory {
             };
             let order = host.shared_order_contract(binding.consumer.contract(), control)?;
             let key = root_value_type(&program, site)?;
-            if order.keys().len() != 1 || order.keys()[0].value_type() != Some(&key) {
+            let domain_matches = match order.keys() {
+                [order_key] => match order_key.value_type() {
+                    Some(expected) => {
+                        key.same_value_domain_observed(expected, || control.checkpoint(1))?
+                    }
+                    None => false,
+                },
+                _ => false,
+            };
+            if !domain_matches {
                 return Err(invalid(
                     "compiled ordered Scan key root differs from its complete frozen type",
                 ));

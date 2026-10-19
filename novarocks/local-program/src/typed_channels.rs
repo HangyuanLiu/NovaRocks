@@ -922,7 +922,8 @@ impl ProgramTypedChannels {
                 _ => {}
             }
             // Ordered sites reuse exactly the existing evaluated group/scan
-            // key. Complete metadata and root nullability remain mandatory.
+            // key. Each root retains its own NULL fact; the bound shares the
+            // value domain across validated endpoints, not their nullability.
             match node.kind() {
                 ProgramNodeKind::Aggregate {
                     group_by,
@@ -940,19 +941,16 @@ impl ProgramTypedChannels {
                             continue;
                         };
                         // Other ordered shapes retain their existing named
-                        // unsupported gate; this is the installed Utf8 lane.
-                        if !matches!(key.value_type.data_type(), arrow_schema::DataType::Utf8)
-                            || !crate::is_ordered_filter_flat_payload_type(&key.value_type)
-                        {
+                        // unsupported gate; this is the installed key domain.
+                        if !crate::is_aggregate_topn_key_type(&key.value_type) {
                             continue;
                         }
                         if group_by.get(filter.group_key_ordinal) != Some(&filter.group_key_expr) {
                             return Err(ProgramChannelTypeError::WrongShape);
                         }
-                        same_value(
+                        same_ordered_value(
                             self.definition(ProgramExpressionArena::Main, filter.group_key_expr)?,
                             &key.value_type,
-                            false,
                             work,
                         )?;
                     }
@@ -968,15 +966,12 @@ impl ProgramTypedChannels {
                             let [key] = keys.as_slice() else {
                                 continue;
                             };
-                            if !matches!(key.value_type.data_type(), arrow_schema::DataType::Utf8)
-                                || !crate::is_ordered_filter_flat_payload_type(&key.value_type)
-                            {
+                            if !crate::is_aggregate_topn_key_type(&key.value_type) {
                                 continue;
                             }
-                            same_value(
+                            same_ordered_value(
                                 self.definition(ProgramExpressionArena::Main, filter.expr_id)?,
                                 &key.value_type,
-                                false,
                                 work,
                             )?;
                         }
@@ -1110,6 +1105,18 @@ fn same_carrier(
     } else {
         Err(ProgramChannelTypeError::TypeMismatch)
     }
+}
+fn same_ordered_value(
+    actual: &FunctionValueType,
+    expected: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramChannelTypeError> {
+    if !actual.same_value_domain_observed(expected, || {
+        work.step().map_err(ProgramChannelTypeError::from)
+    })? {
+        return Err(ProgramChannelTypeError::TypeMismatch);
+    }
+    same_carrier(actual.data_type(), expected.data_type(), work)
 }
 fn same_value(
     actual: &FunctionValueType,
