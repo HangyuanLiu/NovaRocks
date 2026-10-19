@@ -68,11 +68,20 @@ pub(crate) fn exact_requested_write_fields_at_schema(
     requested: &[ConnectorWriteFieldRequest],
     creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
-    let execution =
-        crate::schema_mapping::catalog_value::table(metadata, iceberg_schema, &[], creation)
-            .map_err(crate::metadata::metadata_creation_error)?;
+    creation
+        .work(0)
+        .map_err(crate::metadata::metadata_creation_error)?;
+    let document =
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
+    let execution = crate::schema_mapping::catalog_value::table_with_document(
+        &document,
+        iceberg_schema,
+        &[],
+        creation,
+    )
+    .map_err(crate::metadata::metadata_creation_error)?;
     exact_requested_write_fields_from_declaration(
-        metadata,
+        &document,
         iceberg_schema,
         requested,
         &execution,
@@ -83,13 +92,14 @@ pub(crate) fn exact_requested_write_fields_at_schema(
 /// Borrow an already-authored provider declaration at the same frozen schema.
 /// Source fields still come from the original format projection.
 pub(crate) fn exact_requested_write_fields_from_declaration(
-    metadata: &TableMetadata,
+    document: &crate::schema_mapping::nominal_declaration::TableNominalDocument,
     iceberg_schema: &Schema,
     requested: &[ConnectorWriteFieldRequest],
     execution: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
-    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
+    let arrow_schema =
+        crate::scalar_integer_domain::sql_schema_from_document(iceberg_schema, document)?;
     requested
         .iter()
         .map(|request| {
@@ -294,11 +304,7 @@ mod tests {
 
     #[test]
     fn frozen_write_fields_keep_provider_uuid_variant_and_declared_opaque_domains() {
-        let metadata = metadata(HashMap::from([
-            ("novarocks.logical_type.hll".into(), "hll".into()),
-            ("novarocks.logical_type.bitmap".into(), "bitmap".into()),
-            ("novarocks.logical_type.largeint".into(), "largeint".into()),
-        ]));
+        let metadata = metadata(HashMap::from([(crate::schema_mapping::nominal_declaration::PROPERTY.into(),r#"{"version":1,"fields":[{"id":3,"domain":"hll"},{"id":4,"domain":"bitmap"},{"id":5,"domain":"largeint"}]}"#.into())]));
         let expected = [
             (
                 "uuid",
@@ -362,8 +368,16 @@ mod tests {
             ("uuid", "largeint"),
         ] {
             let metadata = metadata(HashMap::from([(
-                format!("novarocks.logical_type.{name}"),
-                domain.to_string(),
+                crate::schema_mapping::nominal_declaration::PROPERTY.into(),
+                format!(
+                    r#"{{"version":1,"fields":[{{"id":{},"domain":"{domain}"}}]}}"#,
+                    match name {
+                        "plain_fixed" => 6,
+                        "plain_binary" => 7,
+                        "uuid" => 1,
+                        _ => unreachable!(),
+                    }
+                ),
             )]));
             let request = ConnectorWriteFieldRequest::new(Field::new(name, DataType::Null, true));
             let error = crate::metadata::with_pure_schema_creation(&context(), |creation| {

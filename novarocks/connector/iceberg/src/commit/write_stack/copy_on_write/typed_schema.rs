@@ -127,8 +127,8 @@ mod tests {
             HashMap::from([
                 ("write.row-lineage".to_string(), "true".to_string()),
                 (
-                    crate::scalar_integer_domain::PROPERTY.to_string(),
-                    r#"{"2":"tinyint"}"#.to_string(),
+                    crate::schema_mapping::nominal_declaration::PROPERTY.to_string(),
+                    r#"{"version":1,"fields":[{"id":2,"domain":"tinyint"}]}"#.to_string(),
                 ),
             ]),
         )

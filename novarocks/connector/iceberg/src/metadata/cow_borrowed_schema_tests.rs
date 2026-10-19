@@ -90,8 +90,8 @@ fn snapshot(base: &TableMetadata, id: i64, schema_id: i32, sequence: i64) -> Sna
 fn loaded_stock_metadata(version: FormatVersion) -> TableMetadata {
     let properties = HashMap::from([
         (
-            crate::scalar_integer_domain::PROPERTY.to_string(),
-            r#"{"1":"tinyint"}"#.to_string(),
+            crate::schema_mapping::nominal_declaration::PROPERTY.to_string(),
+            r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"}]}"#.to_string(),
         ),
         (HIDDEN_COLUMNS_PROPERTY.to_string(), "hidden".to_string()),
     ]);
@@ -227,27 +227,9 @@ fn historical_cow_projection_keeps_nominal_domains_and_raw_carriers_distinct() {
         .with_fields(fields.clone())
         .build()
         .unwrap();
-    fields.push(Arc::new(NestedField::optional(
-        10,
-        "current_only",
-        PrimitiveType::Boolean.into(),
-    )));
-    let current_schema = IcebergSchema::builder()
-        .with_fields(fields)
-        .build()
-        .unwrap();
     let properties = HashMap::from([
-        (
-            crate::scalar_integer_domain::PROPERTY.into(),
-            r#"{"1":"tinyint"}"#.into(),
-        ),
-        (HIDDEN_COLUMNS_PROPERTY.into(), "hidden".into()),
-        (format!("{LOGICAL_TYPE_PROPERTY_PREFIX}h"), "hll".into()),
-        (format!("{LOGICAL_TYPE_PROPERTY_PREFIX}b"), "bitmap".into()),
-        (
-            format!("{LOGICAL_TYPE_PROPERTY_PREFIX}n"),
-            "largeint".into(),
-        ),
+        (crate::schema_mapping::nominal_declaration::PROPERTY.into(),r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"},{"id":4,"domain":"hll"},{"id":5,"domain":"bitmap"},{"id":6,"domain":"largeint"}]}"#.into()),
+        (HIDDEN_COLUMNS_PROPERTY.into(),"hidden".into()),
     ]);
     let base = TableMetadataBuilder::new(
         historical_schema,
@@ -261,6 +243,24 @@ fn historical_cow_projection_keeps_nominal_domains_and_raw_carriers_distinct() {
     .build()
     .unwrap()
     .metadata;
+    // CREATE normalizes field IDs. Evolve the exact persisted declaration;
+    // reusing the pre-CREATE IDs would assign domains to different fields.
+    let mut fields = base.current_schema().as_struct().fields().to_vec();
+    fields.push(Arc::new(NestedField::optional(
+        base.last_column_id() + 1,
+        "current_only",
+        PrimitiveType::Boolean.into(),
+    )));
+    let current_schema = IcebergSchema::builder()
+        .with_fields(fields)
+        .build()
+        .unwrap();
+    for name in ["h", "b", "n", "raw", "u"] {
+        assert_eq!(
+            current_schema.field_by_name(name).unwrap().id,
+            base.current_schema().field_by_name(name).unwrap().id
+        );
+    }
     let old = snapshot(&base, 40, base.current_schema_id(), 1);
     let history = base
         .into_builder(None)

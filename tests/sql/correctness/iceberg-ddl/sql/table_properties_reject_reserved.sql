@@ -37,9 +37,9 @@ ALTER TABLE p SET TBLPROPERTIES ('identifier-field-ids' = '[1]');
 ALTER TABLE p SET TBLPROPERTIES ('current-schema-id' = '5');
 
 -- query 5
--- Integer declarations are schema-owned, including the retired property form.
--- @expect_error=Iceberg scalar integer declarations are owned by schema mutations
+-- ADR-0182: this ordinary property does not author any type domain.
 ALTER TABLE p SET TBLPROPERTIES ('novarocks.logical_type.foo' = 'TINYINT');
+ALTER TABLE p UNSET TBLPROPERTIES ('novarocks.logical_type.foo');
 
 -- query 6
 -- @expect_error=novarocks.* namespace is reserved
@@ -61,5 +61,10 @@ ALTER TABLE p SET TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:
 CREATE TABLE shredding_create (id INT) TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int');
 
 -- query 10
+-- Only the current nominal document namespace authors these type facts.
+-- @expect_error=Iceberg nominal declarations are owned by schema mutations
+ALTER TABLE p SET TBLPROPERTIES ('novarocks.nominal-types.v1' = '{"version":1,"fields":[]}');
+
+-- query 11
 DROP TABLE p;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};

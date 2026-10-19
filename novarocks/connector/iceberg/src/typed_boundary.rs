@@ -1501,6 +1501,12 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         procedure: novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure,
     ) -> Result<Option<Self::Table>, ConnectorError> {
         let novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(group) = procedure;
+        group
+            .content()
+            .validate_owner(&novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            })?;
         // Reuse the existing frozen-artifact construction, but retain the
         // resulting concrete handle instead of encoding it into a carrier.
         if system_relation_of(name.table_name()).is_some() {
@@ -2342,6 +2348,8 @@ fn pinned_table_handle_with_schema_and_domain(
     let table_schema_json = serde_json::to_string(schema.as_ref())
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
 
+    let document =
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
     let read_domain = read_domain()?;
     IcebergTableHandle::try_new(IcebergTableHandleParams {
         schema_table_name: name.clone(),
@@ -2364,12 +2372,12 @@ fn pinned_table_handle_with_schema_and_domain(
     })?
     .with_scalar_integer_domains(crate::scalar_integer_domain::of_schema(
         &schema,
-        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+        &document.integers,
     )?)?
     .with_nominal_declarations(
         crate::schema_mapping::nominal_declaration::restrict_to_schema(
             &schema,
-            &crate::schema_mapping::nominal_declaration::from_metadata(metadata)?,
+            &document.nominals,
         )?,
     )
 }
@@ -2428,9 +2436,11 @@ fn pinned_change_window_handle(
         )));
     }
 
-    let domains = crate::scalar_integer_domain::metadata_declarations(metadata)?;
-    let from_domains = crate::scalar_integer_domain::of_schema(&from_schema, &domains)?;
-    let to_domains = crate::scalar_integer_domain::of_schema(&to_schema, &domains)?;
+    let document =
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
+    let domains = &document.integers;
+    let from_domains = crate::scalar_integer_domain::of_schema(&from_schema, domains)?;
+    let to_domains = crate::scalar_integer_domain::of_schema(&to_schema, domains)?;
     if from_domains != to_domains {
         return Err(unsupported(
             "Iceberg change-window endpoints have different declared scalar integer domains",
@@ -2476,7 +2486,7 @@ fn pinned_change_window_handle(
     .with_nominal_declarations(
         crate::schema_mapping::nominal_declaration::restrict_to_schema(
             &to_schema,
-            &crate::schema_mapping::nominal_declaration::from_metadata(metadata)?,
+            &document.nominals,
         )?,
     )
     .map(Some)
@@ -4364,8 +4374,8 @@ mod manifest_statistics_tests {
             "memory://change-domain".to_string(),
             FormatVersion::V2,
             HashMap::from([(
-                "novarocks.logical_type.tiny".to_string(),
-                "tinyint".to_string(),
+                crate::schema_mapping::nominal_declaration::PROPERTY.to_string(),
+                r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"}]}"#.to_string(),
             )]),
         )
         .unwrap();

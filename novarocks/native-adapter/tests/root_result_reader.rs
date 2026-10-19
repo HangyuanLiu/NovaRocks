@@ -212,6 +212,7 @@ impl TaskExecutionHost for Host {
         &self,
         _: &TaskDescriptor,
         _: &TaskDomainUpdate,
+        _operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
         Ok(None)
     }

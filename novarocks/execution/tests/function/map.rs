@@ -828,7 +828,7 @@ fn test_map_from_arrays_length_mismatch() {
 }
 
 #[test]
-fn test_map_from_arrays_keeps_null_key_entries() {
+fn test_map_from_arrays_rejects_null_key_entries() {
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
@@ -863,11 +863,9 @@ fn test_map_from_arrays_keeps_null_key_entries() {
     );
     let expr = typed_null(&mut arena, map_type);
 
-    let out = eval_map_function("map_from_arrays", &arena, expr, &[keys, values], &chunk).unwrap();
-    let map = out.as_any().downcast_ref::<MapArray>().unwrap();
-    assert_eq!(map.value_length(0), 2);
-    let key_arr = map.keys();
-    assert!(key_arr.is_null(0));
+    let err = eval_map_function("map_from_arrays", &arena, expr, &[keys, values], &chunk)
+        .expect_err("NULL keys must reject the whole Map construction");
+    assert_eq!(err, "map key must not be NULL");
 }
 
 // ---------------------------------------------------------------------------

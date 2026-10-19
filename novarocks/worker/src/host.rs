@@ -393,6 +393,15 @@ pub trait RunnableTask: fmt::Debug + Send + Sync {
     fn abort(&self, cause: AbortCause);
 }
 
+/// A test-only reservation rolls back unless the real ACK-drop takes custody.
+#[cfg(novarocks_dev_controls)]
+pub trait TestTaskUpdateConsumptionReservation: Send {
+    /// Called only after the actual accepted terminal ACK-drop claim exists.
+    fn activate(&mut self) -> Result<(), String>;
+    /// Transfers the pause only once the boundary really drops that ACK.
+    fn acknowledgement_dropped(&mut self);
+}
+
 /// The task side of execution.
 ///
 /// The three install steps are called in exactly the order the creation
@@ -465,8 +474,21 @@ pub trait TaskExecutionHost: Send + Sync {
         reporter: TaskStatusReporter,
     ) -> Result<Arc<dyn RunnableTask>, HostRejection>;
 
+    /// Reserves a finite input pause for an explicitly opted-in test fault.
+    #[cfg(novarocks_dev_controls)]
+    fn reserve_test_update_consumption(
+        &self,
+        _request: &novarocks_execution_contract::UpdateTask,
+        _control: novarocks_failpoint::scope::ControlCancellation,
+    ) -> Result<Box<dyn TestTaskUpdateConsumptionReservation>, HostRejection> {
+        Err(HostRejection::new(
+            TaskFailureCategory::Internal,
+            "this execution host does not support a controlled split-consumption gate",
+        ))
+    }
+
     /// Applies a task-scoped domain advance the owner already classified as
-    /// applicable.
+    /// applicable, under the original CreateTask or UpdateTask operation.
     ///
     /// Returns how many splits the plan node still holds after the offer, for
     /// the domains that have a queue. The sender reads it as backpressure, so
@@ -478,6 +500,7 @@ pub trait TaskExecutionHost: Send + Sync {
         &self,
         descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
+        operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection>;
 }
 

@@ -1576,6 +1576,7 @@ mod tests {
             &self,
             _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
             _: &novarocks_execution_contract::task_execution::operation::TaskDomainUpdate,
+            _operation: novarocks_execution_contract::TaskOperationId,
         ) -> Result<Option<u64>, novarocks_worker::HostRejection> {
             panic!("metrics fixture must not advance a task")
         }

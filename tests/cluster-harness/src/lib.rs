@@ -2776,6 +2776,15 @@ pub trait ServerHandle: Send {
     fn be_current_log_contents(&self, index: usize) -> Result<String> {
         self.be_log_contents(index)
     }
+    /// Observe current live-role output without retaining its lifecycle owner
+    /// across the caller's cancellation/deadline wait.
+    fn be_current_live_log_line(
+        &self,
+        index: usize,
+        _matches: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
+        bail!("live BE log observation is unsupported by this server mode (index={index})")
+    }
     #[allow(dead_code)]
     fn residual_process_ids(&self) -> Vec<u32> {
         Vec::new()
@@ -5283,6 +5292,15 @@ impl ServerHandle for CrossProcessServerHandle {
         self.be_processes[index].log_contents()
     }
 
+    fn be_current_live_log_line(
+        &self,
+        index: usize,
+        matches: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index].live_log_line(matches)
+    }
+
     fn fe_log_count(&self, needle: &str) -> Result<usize> {
         Ok(
             self.fe_log_history.match_indices(needle).count()
@@ -5391,11 +5409,6 @@ impl ServerHandle for CrossProcessServerHandle {
             .test_sessions
             .as_ref()
             .map_or(deadline, |plan| deadline.min(plan.deadline()));
-        let controller_cleanup = self
-            .test_sessions
-            .as_mut()
-            .map(|plan| plan.end_role(RoleSlot::Backend(index)))
-            .transpose();
         let old_process_id = self.backend_process_id(index);
         let prior_log = self.be_processes[index]
             .log_contents()
@@ -5407,9 +5420,17 @@ impl ServerHandle for CrossProcessServerHandle {
                 Err(anyhow::anyhow!("{identity:#}; capture prior log: {log:#}"))
             }
         };
+        // Preserve live fault holds until the old process has actually exited.
+        // Ending its session first can return an RPC rejection before the
+        // process loss that this restart is meant to inject.
         let stopped = self.be_processes[index]
             .kill_now()
             .with_context(|| format!("stop old cross-process BE[{index}] before restart"));
+        let controller_cleanup = self
+            .test_sessions
+            .as_mut()
+            .map(|plan| plan.end_role(RoleSlot::Backend(index)))
+            .transpose();
         let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
         let (old_process_id, prior_log) = combine_restart_evidence(evidence, exited)?;
         self.be_log_history[index].push_str(&prior_log);

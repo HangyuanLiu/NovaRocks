@@ -25,12 +25,11 @@ use novarocks_spi::connector::read_stack::{
     Bound, ConnectorValue, ConnectorValueType, Domain, Range, ValueSet,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) const PROPERTY: &str = "novarocks.scalar_integer_domains.v1";
-const LEGACY_PREFIX: &str = "novarocks.logical_type.";
-const MAX_BYTES: usize = 1 << 20;
 const MAX_FIELDS: usize = 16384;
 
 #[derive(
@@ -163,8 +162,6 @@ impl ScalarIntegerDomain {
 pub(crate) enum CheckPoint {
     DecodeEntry,
     DeclarationId,
-    Property,
-    LegacyField,
     ValidationId,
     ValidationField,
     ValidationDefault,
@@ -174,138 +171,42 @@ pub(crate) enum CheckPoint {
     HistoryField,
 }
 
-/// Resolve legacy current-schema names once, into stable provider-owned IDs.
-/// Ordinary callers retain the original signature and use the same kernel.
+/// Project the top-level integer view from the sole durable document.
+#[cfg(test)]
 pub(crate) fn declarations(
     schema: &Schema,
     properties: &HashMap<String, String>,
 ) -> Result<ScalarIntegerDomains, ConnectorError> {
     declarations_checked(schema, properties, &|_| Ok(()))
 }
-
+#[cfg(test)]
 pub(crate) fn declarations_checked<E: From<ConnectorError>>(
     schema: &Schema,
     properties: &HashMap<String, String>,
     check: &dyn Fn(CheckPoint) -> Result<(), E>,
 ) -> Result<ScalarIntegerDomains, E> {
-    let mut domains = match properties.get(PROPERTY) {
-        Some(raw) if raw.len() > MAX_BYTES => {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg scalar integer declarations exceed the hard limit",
-            )
-            .into());
-        }
-        Some(raw) => decode_checked(raw, check)?,
-        None => BTreeMap::new(),
-    };
-    if domains.len() > MAX_FIELDS {
-        return Err(
-            corrupt("Iceberg scalar integer declarations have invalid field IDs or count").into(),
-        );
-    }
-    for id in domains.keys() {
-        check(CheckPoint::DeclarationId)?;
-        if *id <= 0 {
-            return Err(corrupt(
-                "Iceberg scalar integer declarations have invalid field IDs or count",
-            )
-            .into());
-        }
-    }
-    let mut names = std::collections::HashSet::new();
-    for (key, value) in properties {
-        check(CheckPoint::Property)?;
-        let Some(name) = key.strip_prefix(LEGACY_PREFIX) else {
-            continue;
-        };
-        let value = value.to_ascii_lowercase();
-        if !matches!(value.as_str(), "tinyint" | "smallint") {
-            continue;
-        }
-        if !names.insert(name.to_ascii_lowercase()) {
-            return Err(corrupt("ambiguous Iceberg legacy scalar integer declaration").into());
-        }
-        // Same full filter and first ambiguity error; retain every match in
-        // the original order before evaluating the original single-field rule.
-        let mut fields = Vec::new();
-        for field in schema.as_struct().fields() {
-            check(CheckPoint::LegacyField)?;
-            if field.name.eq_ignore_ascii_case(name) {
-                fields.push(field);
-            }
-        }
-        let [field] = fields.as_slice() else {
-            return Err(corrupt(
-                "Iceberg legacy scalar integer declaration does not identify one current top-level field",
-            ).into());
-        };
-        if field.field_type.as_ref() != &Type::Primitive(PrimitiveType::Int) {
-            return Err(corrupt(
-                "Iceberg active legacy scalar integer declaration requires INT storage",
-            )
-            .into());
-        }
-        let domain = ScalarIntegerDomain::parse(&value)?;
-        if let Some(previous) = domains.insert(field.id, domain)
-            && previous != domain
-        {
-            return Err(corrupt(
-                "Iceberg scalar integer field-ID declaration differs from its legacy declaration",
-            )
-            .into());
-        }
-    }
-    validate_schema_checked(schema, &domains, check)?;
-    Ok(domains)
+    Ok(
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_properties_checked(
+            schema, properties, check,
+        )?
+        .integers,
+    )
 }
-
-/// Check every retained ID against authoritative schema history.
 pub(crate) fn metadata_declarations(
     metadata: &crate::iceberg::spec::TableMetadata,
 ) -> Result<ScalarIntegerDomains, ConnectorError> {
     metadata_declarations_checked(metadata, &|_| Ok(()))
 }
-
 pub(crate) fn metadata_declarations_checked<E: From<ConnectorError>>(
     metadata: &crate::iceberg::spec::TableMetadata,
     check: &dyn Fn(CheckPoint) -> Result<(), E>,
 ) -> Result<ScalarIntegerDomains, E> {
-    let domains = declarations_checked(metadata.current_schema(), metadata.properties(), check)?;
-    for id in domains.keys() {
-        check(CheckPoint::HistoryDomain)?;
-        let mut found_int = false;
-        for schema in metadata.schemas_iter() {
-            check(CheckPoint::HistorySchema)?;
-            let mut found = None;
-            for field in schema.as_struct().fields() {
-                check(CheckPoint::HistoryField)?;
-                if field.id == *id {
-                    found = Some(field);
-                    break;
-                }
-            }
-            if let Some(field) = found {
-                found_int |= field.field_type.as_ref() == &Type::Primitive(PrimitiveType::Int);
-                if !matches!(
-                    field.field_type.as_ref(),
-                    Type::Primitive(PrimitiveType::Int | PrimitiveType::Long)
-                ) {
-                    return Err(corrupt(
-                        "Iceberg retained scalar integer field ID has incompatible storage history",
-                    )
-                    .into());
-                }
-            }
-        }
-        if !found_int {
-            return Err(corrupt(
-                "Iceberg scalar integer declaration has no proven INT storage history",
-            )
-            .into());
-        }
-    }
-    Ok(domains)
+    Ok(
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata_checked(
+            metadata, check,
+        )?
+        .integers,
+    )
 }
 
 pub(crate) fn validate_schema(
@@ -357,12 +258,13 @@ pub(crate) fn validate_schema_checked<E: From<ConnectorError>>(
         if domains.contains_key(&field.id)
             && !matches!(
                 field.field_type.as_ref(),
-                Type::Primitive(PrimitiveType::Int | PrimitiveType::Long)
+                Type::Primitive(PrimitiveType::Int)
             )
         {
-            return Err(corrupt(
-                "Iceberg scalar integer declaration requires top-level INT storage",
-            )
+            return Err(corrupt(format!(
+                "Iceberg scalar integer declaration field ID {} requires top-level INT storage",
+                field.id
+            ))
             .into());
         }
     }
@@ -379,7 +281,10 @@ pub(crate) fn validate_schema_checked<E: From<ConnectorError>>(
                 }
             }
             if !top_level {
-                return Err(corrupt("Iceberg scalar integer declaration is not top-level").into());
+                return Err(corrupt(format!(
+                    "Iceberg scalar integer declaration field ID {id} is not top-level"
+                ))
+                .into());
             }
         }
     }
@@ -403,219 +308,72 @@ pub(crate) fn of_schema(
         .collect())
 }
 
-// Production ordinary wrappers already select the shared checked decoder's
-// noop specialization. Keep this original private test entry without a dead
-// production helper.
 #[cfg(test)]
 fn decode(raw: &str) -> Result<ScalarIntegerDomains, ConnectorError> {
-    decode_checked(raw, &|_| Ok(()))
+    let schema = Schema::builder()
+        .build()
+        .map_err(|error| corrupt(error.to_string()))?;
+    declarations(
+        &schema,
+        &HashMap::from([(
+            crate::schema_mapping::nominal_declaration::PROPERTY.into(),
+            raw.into(),
+        )]),
+    )
 }
-
+#[cfg(test)]
 fn decode_checked<E: From<ConnectorError>>(
     raw: &str,
     check: &dyn Fn(CheckPoint) -> Result<(), E>,
 ) -> Result<ScalarIntegerDomains, E> {
-    // Serde's Visitor error type cannot carry the caller's E. This stack-local
-    // slot moves E back out after serde unwinds its partial map. It allocates
-    // no E wrapper and never formats/clones the original cause.
-    struct Map<'a, E> {
-        check: &'a dyn Fn(CheckPoint) -> Result<(), E>,
-        failure: &'a std::cell::RefCell<Option<E>>,
-    }
-    impl<'de, E> serde::de::Visitor<'de> for Map<'_, E> {
-        type Value = ScalarIntegerDomains;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a bounded unique scalar integer field-ID map")
-        }
-        fn visit_map<M: serde::de::MapAccess<'de>>(
-            self,
-            mut input: M,
-        ) -> Result<Self::Value, M::Error> {
-            let mut domains = BTreeMap::new();
-            loop {
-                if let Err(original) = (self.check)(CheckPoint::DecodeEntry) {
-                    *self.failure.borrow_mut() = Some(original);
-                    // Existing fixed diagnostic allocation only; outer E is
-                    // returned instead, so this sentinel never escapes as a
-                    // provider failure or formats arbitrary caller payload.
-                    return Err(serde::de::Error::custom(
-                        "duplicate, invalid, or excessive scalar integer field IDs",
-                    ));
-                }
-                let Some((id, domain)) = input.next_entry::<i32, ScalarIntegerDomain>()? else {
-                    break;
-                };
-                if id <= 0 || domains.len() >= MAX_FIELDS || domains.insert(id, domain).is_some() {
-                    return Err(serde::de::Error::custom(
-                        "duplicate, invalid, or excessive scalar integer field IDs",
-                    ));
-                }
-            }
-            Ok(domains)
-        }
-    }
-    let failure = std::cell::RefCell::new(None);
-    let mut decoder = serde_json::Deserializer::from_str(raw);
-    let decoded = serde::de::Deserializer::deserialize_map(
-        &mut decoder,
-        Map {
-            check,
-            failure: &failure,
-        },
-    );
-    if let Some(original) = failure.into_inner() {
-        return Err(original);
-    }
-    let domains = decoded.map_err(|error| {
-        corrupt(format!(
-            "invalid Iceberg scalar integer declarations: {error}"
-        ))
-    })?;
-    decoder.end().map_err(|error| corrupt(error.to_string()))?;
-    Ok(domains)
+    let schema = Schema::builder()
+        .build()
+        .map_err(|error| corrupt(error.to_string()))?;
+    declarations_checked(
+        &schema,
+        &HashMap::from([(
+            crate::schema_mapping::nominal_declaration::PROPERTY.into(),
+            raw.into(),
+        )]),
+        check,
+    )
 }
-
-pub(crate) fn encode(domains: &ScalarIntegerDomains) -> Result<String, ConnectorError> {
-    let json = serde_json::to_string(domains).map_err(|error| corrupt(error.to_string()))?;
-    if json.len() > MAX_BYTES || domains.len() > MAX_FIELDS {
-        return Err(corrupt(
-            "Iceberg scalar integer declarations exceed the hard limit",
-        ));
-    }
-    Ok(json)
+#[cfg(test)]
+fn encode(domains: &ScalarIntegerDomains) -> Result<String, ConnectorError> {
+    crate::schema_mapping::nominal_declaration::encode_views(&BTreeMap::new(), domains)
 }
 
 pub(crate) fn metadata_sql_schema(
     metadata: &crate::iceberg::spec::TableMetadata,
     schema: &Schema,
 ) -> Result<SchemaRef, ConnectorError> {
-    let domains = metadata_declarations(metadata)?;
+    sql_schema_from_document(
+        schema,
+        &crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(metadata)?,
+    )
+}
+pub(crate) fn sql_schema_from_document(
+    schema: &Schema,
+    document: &crate::schema_mapping::nominal_declaration::TableNominalDocument,
+) -> Result<SchemaRef, ConnectorError> {
     let arrow = apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(schema).map_err(corrupt)?,
         schema,
-        &domains,
+        &document.integers,
     )?;
-    apply_source_logical_schema(arrow, schema, metadata.properties())
+    crate::schema_mapping::nominal_declaration::apply_to_arrow(arrow, schema, &document.nominals)
 }
-
 #[cfg(test)]
 pub(crate) fn sql_schema(
     schema: &Schema,
     properties: &HashMap<String, String>,
 ) -> Result<SchemaRef, ConnectorError> {
-    let domains = declarations(schema, properties)?;
-    let arrow = apply_schema(
-        crate::schema_mapping::sql_read_schema_from_iceberg(schema).map_err(corrupt)?,
+    sql_schema_from_document(
         schema,
-        &domains,
-    )?;
-    apply_source_logical_schema(arrow, schema, properties)
-}
-
-/// These legacy declarations address top-level names, not retained field IDs.
-/// They cannot prove a renamed historical field or a domain from its carrier.
-fn apply_source_logical_schema(
-    arrow: SchemaRef,
-    schema: &Schema,
-    properties: &HashMap<String, String>,
-) -> Result<SchemaRef, ConnectorError> {
-    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
-
-    let storage_fields = schema.as_struct().fields();
-    if arrow.fields().len() != storage_fields.len() {
-        return Err(corrupt("Iceberg logical source schema arity differs"));
-    }
-    let mut declared = BTreeMap::new();
-    for (key, value) in properties {
-        let Some(name) = key.strip_prefix(LEGACY_PREFIX) else {
-            continue;
-        };
-        let logical = match value.to_ascii_lowercase().as_str() {
-            "hll" => ValueLogicalType::Hll,
-            "bitmap" => ValueLogicalType::Bitmap,
-            "largeint" => ValueLogicalType::LargeInt,
-            // Scalar integers retain their existing field-ID/history rules.
-            // Other properties do not author one of these opaque domains.
-            _ => continue,
-        };
-        let mut matches = storage_fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.name.eq_ignore_ascii_case(name));
-        let Some((ordinal, storage)) = matches.next() else {
-            // Current metadata can declare a column absent from a historical
-            // schema. Its name proves nothing about another historical field.
-            continue;
-        };
-        if matches.next().is_some() || declared.insert(ordinal, logical).is_some() {
-            return Err(corrupt("Iceberg logical source declaration is ambiguous"));
-        }
-        let expected_storage = match logical {
-            ValueLogicalType::Hll | ValueLogicalType::Bitmap => PrimitiveType::Binary,
-            ValueLogicalType::LargeInt => PrimitiveType::Fixed(16),
-            _ => unreachable!("only declared opaque domains reach storage validation"),
-        };
-        if storage.field_type.as_ref() != &Type::Primitive(expected_storage) {
-            return Err(corrupt(
-                "Iceberg logical declaration differs from its exact storage carrier",
-            ));
-        }
-    }
-    let mut fields = Vec::with_capacity(arrow.fields().len());
-    for (ordinal, (field, storage)) in arrow.fields().iter().zip(storage_fields).enumerate() {
-        if field.name() != &storage.name || field.is_nullable() == storage.required {
-            return Err(corrupt("Iceberg logical source field identity differs"));
-        }
-        let logical =
-            declared
-                .get(&ordinal)
-                .copied()
-                .unwrap_or_else(|| match storage.field_type.as_ref() {
-                    Type::Primitive(PrimitiveType::Uuid) => ValueLogicalType::Uuid,
-                    Type::Variant(_) => ValueLogicalType::Variant,
-                    _ => ValueLogicalType::Physical,
-                });
-        let expected_carrier = match logical {
-            ValueLogicalType::Hll | ValueLogicalType::Bitmap => Some(DataType::Binary),
-            ValueLogicalType::LargeInt => Some(DataType::FixedSizeBinary(16)),
-            _ => None,
-        };
-        if expected_carrier
-            .as_ref()
-            .is_some_and(|expected| field.data_type() != expected)
-        {
-            return Err(corrupt("Iceberg logical source SQL carrier differs"));
-        }
-        if field.metadata().contains_key(NR_LOGICAL_TYPE_KEY)
-            && field_logical_type(field).map_err(|error| corrupt(error.to_string()))? != logical
-        {
-            return Err(corrupt(
-                "Iceberg logical source metadata conflicts with its declaration",
-            ));
-        }
-        logical
-            .validate_carrier(field.data_type())
-            .map_err(|error| corrupt(error.to_string()))?;
-        if declared.contains_key(&ordinal) {
-            // This is the provider's SQL schema projection. Runtime value
-            // domains are authored separately from frozen source declarations.
-            let mut authored = field.as_ref().clone();
-            authored.metadata_mut().insert(
-                NR_LOGICAL_TYPE_KEY.into(),
-                logical
-                    .metadata_value()
-                    .expect("declared opaque domain")
-                    .into(),
-            );
-            fields.push(Arc::new(authored));
-        } else {
-            fields.push(field.clone());
-        }
-    }
-    Ok(Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        fields,
-        arrow.metadata().clone(),
-    )))
+        &crate::schema_mapping::nominal_declaration::TableNominalDocument::from_properties_checked::<
+            ConnectorError,
+        >(schema, properties, &|_| Ok(()))?,
+    )
 }
 
 pub(crate) fn apply_schema(
@@ -653,6 +411,7 @@ pub(crate) fn apply_schema(
 mod tests {
     use super::*;
     use crate::iceberg::spec::NestedField;
+    use crate::schema_mapping::nominal_declaration::PROPERTY;
     use arrow::array::{Int8Array, Int16Array};
 
     fn schema(fields: &[(i32, &str)]) -> Schema {
@@ -674,18 +433,13 @@ mod tests {
     }
 
     #[test]
-    fn scalar_integer_legacy_declarations_freeze_exact_sql_domains() {
+    fn scalar_integer_unified_declarations_freeze_exact_sql_domains() {
         let storage = schema(&[(7, "t"), (8, "s"), (9, "plain")]);
-        let properties = HashMap::from([
-            (
-                "novarocks.logical_type.t".to_string(),
-                "tinyint".to_string(),
-            ),
-            (
-                "novarocks.logical_type.s".to_string(),
-                "smallint".to_string(),
-            ),
-        ]);
+        let properties = HashMap::from([(
+            PROPERTY.to_string(),
+            r#"{"version":1,"fields":[{"id":7,"domain":"tinyint"},{"id":8,"domain":"smallint"}]}"#
+                .to_string(),
+        )]);
         let read = sql_schema(&storage, &properties).unwrap();
         assert_eq!(
             read.fields()
@@ -705,7 +459,7 @@ mod tests {
         let domains = declarations(&storage, &properties).unwrap();
         assert_eq!(
             encode(&domains).unwrap(),
-            r#"{"7":"tinyint","8":"smallint"}"#
+            r#"{"version":1,"fields":[{"id":7,"domain":"tinyint"},{"id":8,"domain":"smallint"}]}"#
         );
     }
 
@@ -713,16 +467,11 @@ mod tests {
     fn scalar_integer_stable_ids_preserve_rename_and_dropped_historical_field() {
         let historical = schema(&[(7, "old"), (8, "retained")]);
         let current = schema(&[(7, "renamed"), (9, "old")]);
-        let properties = HashMap::from([
-            (
-                PROPERTY.to_string(),
-                r#"{"7":"tinyint","8":"smallint"}"#.to_string(),
-            ),
-            (
-                "novarocks.logical_type.renamed".to_string(),
-                "tinyint".to_string(),
-            ),
-        ]);
+        let properties = HashMap::from([(
+            PROPERTY.to_string(),
+            r#"{"version":1,"fields":[{"id":7,"domain":"tinyint"},{"id":8,"domain":"smallint"}]}"#
+                .to_string(),
+        )]);
         let domains = declarations(&current, &properties).unwrap();
         let current_read = apply_schema(
             crate::schema_mapping::sql_read_schema_from_iceberg(&current).unwrap(),
@@ -750,9 +499,9 @@ mod tests {
     fn scalar_integer_corrupt_declarations_are_not_type_overrides() {
         let storage = schema(&[(1, "t")]);
         for raw in [
-            r#"{"1":"tinyint","1":"smallint"}"#,
-            r#"{"-1":"tinyint"}"#,
-            r#"{"1":"int32"}"#,
+            r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"},{"id":1,"domain":"smallint"}]}"#,
+            r#"{"version":1,"fields":[{"id":-1,"domain":"tinyint"}]}"#,
+            r#"{"version":1,"fields":[{"id":1,"domain":"int32"}]}"#,
             r#"{"1":"tinyint"} {}"#,
         ] {
             assert_eq!(
@@ -779,7 +528,10 @@ mod tests {
             crate::iceberg::spec::SortOrder::unsorted_order(),
             "memory://unproven-long".to_string(),
             crate::iceberg::spec::FormatVersion::V3,
-            HashMap::from([(PROPERTY.to_string(), r#"{"1":"tinyint"}"#.to_string())]),
+            HashMap::from([(
+                PROPERTY.to_string(),
+                r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"}]}"#.to_string(),
+            )]),
         )
         .unwrap()
         .build()
@@ -788,19 +540,6 @@ mod tests {
         assert!(
             metadata_declarations(&metadata).is_err(),
             "a LONG-only field has no narrow INT history"
-        );
-        assert!(
-            declarations(
-                &storage,
-                &HashMap::from([
-                    (PROPERTY.to_string(), r#"{"1":"tinyint"}"#.to_string()),
-                    (
-                        "novarocks.logical_type.t".to_string(),
-                        "smallint".to_string()
-                    )
-                ])
-            )
-            .is_err()
         );
     }
 
@@ -901,8 +640,8 @@ mod tests {
         let error = declarations(
             &schema,
             &HashMap::from([(
-                "novarocks.logical_type.tiny".to_string(),
-                "tinyint".to_string(),
+                PROPERTY.to_string(),
+                r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"}]}"#.to_string(),
             )]),
         )
         .unwrap_err();
@@ -958,12 +697,28 @@ mod tests {
             .unwrap()
     }
 
-    fn opaque_source_properties() -> HashMap<String, String> {
-        HashMap::from([
-            (format!("{LEGACY_PREFIX}H"), "HLL".into()),
-            (format!("{LEGACY_PREFIX}b"), "bitmap".into()),
-            (format!("{LEGACY_PREFIX}l"), "largeint".into()),
-        ])
+    fn opaque_source_properties(schema: &Schema) -> HashMap<String, String> {
+        let nominals = [
+            (
+                "h",
+                crate::schema_mapping::nominal_declaration::NominalSourceDomain::Hll,
+            ),
+            (
+                "b",
+                crate::schema_mapping::nominal_declaration::NominalSourceDomain::Bitmap,
+            ),
+            (
+                "l",
+                crate::schema_mapping::nominal_declaration::NominalSourceDomain::LargeInt,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, domain)| (schema.field_by_name(name).unwrap().id, domain))
+        .collect();
+        HashMap::from([(
+            PROPERTY.into(),
+            crate::schema_mapping::nominal_declaration::encode(&nominals).unwrap(),
+        )])
     }
 
     #[test]
@@ -976,12 +731,20 @@ mod tests {
             crate::iceberg::spec::SortOrder::unsorted_order(),
             "memory://opaque-source".into(),
             crate::iceberg::spec::FormatVersion::V3,
-            opaque_source_properties(),
+            HashMap::new(),
         )
         .unwrap()
         .build()
         .unwrap()
         .metadata;
+        let properties = opaque_source_properties(metadata.current_schema());
+        let metadata = metadata
+            .into_builder(None)
+            .set_properties(properties)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
         // Table creation assigns the persisted field IDs. Compare annotations
         // against that actual owner schema rather than the pre-creation IDs.
         let base =
@@ -1032,6 +795,11 @@ mod tests {
     fn source_domain_authoring_keeps_actual_field_annotations_and_dictionary_identity() {
         use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
         let storage = opaque_source_schema();
+        let declarations = crate::schema_mapping::nominal_declaration::from_properties(
+            &storage,
+            &opaque_source_properties(&storage),
+        )
+        .unwrap();
         let base = crate::schema_mapping::sql_read_schema_from_iceberg(&storage).unwrap();
         let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
         let mut annotations = fields[0].metadata().clone();
@@ -1060,9 +828,12 @@ mod tests {
             fields,
             HashMap::from([("schema.annotation".into(), "retained".into())]),
         ));
-        let projected =
-            apply_source_logical_schema(annotated.clone(), &storage, &opaque_source_properties())
-                .unwrap();
+        let projected = crate::schema_mapping::nominal_declaration::apply_to_arrow(
+            annotated.clone(),
+            &storage,
+            &declarations,
+        )
+        .unwrap();
         annotations.insert(NR_LOGICAL_TYPE_KEY.into(), "hll".into());
         assert_eq!(projected.field(0).metadata(), &annotations);
         assert_eq!(projected.field(5).dict_id(), Some(93));
@@ -1076,7 +847,12 @@ mod tests {
         assert_eq!(projected.metadata(), annotated.metadata());
         // An identical explicit declaration is checked, not overwritten.
         assert!(
-            apply_source_logical_schema(projected, &storage, &opaque_source_properties()).is_ok()
+            crate::schema_mapping::nominal_declaration::apply_to_arrow(
+                projected,
+                &storage,
+                &declarations
+            )
+            .is_ok()
         );
     }
 
@@ -1084,10 +860,21 @@ mod tests {
     fn source_domain_declarations_reject_wrong_storage_carrier_and_explicit_metadata() {
         use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
         let storage = opaque_source_schema();
+        let declarations = crate::schema_mapping::nominal_declaration::from_properties(
+            &storage,
+            &opaque_source_properties(&storage),
+        )
+        .unwrap();
         for (name, value) in [("json", "hll"), ("fixed", "bitmap"), ("plain", "largeint")] {
             let error = sql_schema(
                 &storage,
-                &HashMap::from([(format!("{LEGACY_PREFIX}{name}"), value.into())]),
+                &HashMap::from([(
+                    PROPERTY.into(),
+                    format!(
+                        r#"{{"version":1,"fields":[{{"id":{},"domain":"{value}"}}]}}"#,
+                        storage.field_by_name(name).unwrap().id
+                    ),
+                )]),
             )
             .unwrap_err();
             assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
@@ -1098,10 +885,10 @@ mod tests {
             let mut metadata = fields[ordinal].metadata().clone();
             metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
             fields[ordinal] = Arc::new(fields[ordinal].as_ref().clone().with_metadata(metadata));
-            let error = apply_source_logical_schema(
+            let error = crate::schema_mapping::nominal_declaration::apply_to_arrow(
                 Arc::new(arrow::datatypes::Schema::new(fields)),
                 &storage,
-                &opaque_source_properties(),
+                &declarations,
             )
             .unwrap_err();
             assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
@@ -1110,26 +897,23 @@ mod tests {
             let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
             fields[0] = Arc::new(fields[0].as_ref().clone().with_data_type(carrier));
             assert!(
-                apply_source_logical_schema(
+                crate::schema_mapping::nominal_declaration::apply_to_arrow(
                     Arc::new(arrow::datatypes::Schema::new(fields)),
                     &storage,
-                    &opaque_source_properties()
+                    &declarations
                 )
                 .is_err()
             );
         }
-        let mut duplicate = opaque_source_properties();
-        duplicate.insert(format!("{LEGACY_PREFIX}h"), "hll".into());
-        assert!(sql_schema(&storage, &duplicate).is_err());
     }
 
     #[test]
-    fn current_name_declarations_do_not_invent_historical_or_json_domains() {
+    fn current_field_id_declarations_do_not_invent_other_historical_or_json_domains() {
         use novarocks_type_contract::{ValueLogicalType, field_logical_type};
         let historical = Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::optional(
-                    10,
+                    99,
                     "old_h",
                     Type::Primitive(PrimitiveType::Binary),
                 )),
@@ -1141,15 +925,44 @@ mod tests {
             ])
             .build()
             .unwrap();
-        let mut properties = opaque_source_properties();
-        properties.insert(format!("{LEGACY_PREFIX}json"), "json".into());
-        let projected = sql_schema(&historical, &properties).unwrap();
+        let properties = opaque_source_properties(&opaque_source_schema());
+        let declarations = crate::schema_mapping::nominal_declaration::from_properties(
+            &opaque_source_schema(),
+            &properties,
+        )
+        .unwrap();
+        let projected = crate::schema_mapping::nominal_declaration::apply_to_arrow(
+            crate::schema_mapping::sql_read_schema_from_iceberg(&historical).unwrap(),
+            &historical,
+            &declarations,
+        )
+        .unwrap();
         for field in projected.fields() {
             assert_eq!(
                 field_logical_type(field).unwrap(),
                 ValueLogicalType::Physical
             );
         }
+        // A renamed historical occurrence with the same stable ID retains its
+        // independently authored domain; names do not erase field identity.
+        let renamed = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                10,
+                "old_h",
+                Type::Primitive(PrimitiveType::Binary),
+            ))])
+            .build()
+            .unwrap();
+        let projected = crate::schema_mapping::nominal_declaration::apply_to_arrow(
+            crate::schema_mapping::sql_read_schema_from_iceberg(&renamed).unwrap(),
+            &renamed,
+            &declarations,
+        )
+        .unwrap();
+        assert_eq!(
+            field_logical_type(projected.field(0)).unwrap(),
+            ValueLogicalType::Hll
+        );
     }
 }
 

@@ -43,6 +43,7 @@ use super::round::{AcknowledgementObserver, TaskRound, TurnPump};
 use super::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use super::split_transport::SplitDeliveryBridge;
 use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
+use super::termination::render_termination_detail;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::task_transport::{
     AttemptWireFacts, CoveredTaskStatusSubscriber, NativeTaskOperationSink, TaskAckIntake,
@@ -380,7 +381,10 @@ impl ManifestAssembledRound {
                             AttemptFailureClass::ExecutionFailure,
                             QueryExecutionError::new(
                                 QueryExecutionErrorKind::Failed,
-                                format!("Native Task attempt terminated: {detail:?}"),
+                                format!(
+                                    "Native Task attempt terminated: {}",
+                                    render_termination_detail(Some(detail))
+                                ),
                             ),
                         ));
                     if self.actor_gate.prepare_convergence() {

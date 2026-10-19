@@ -162,15 +162,22 @@ pub(crate) fn prepare_row_mutation(
         .collect::<Vec<_>>();
     let (target_fields, identity_fields) =
         crate::metadata::with_pure_schema_creation(&request.context, |creation| {
-            let execution = crate::schema_mapping::catalog_value::table(
-                &metadata,
+            creation
+                .work(0)
+                .map_err(crate::metadata::metadata_creation_error)?;
+            let document =
+                crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(
+                    &metadata,
+                )?;
+            let execution = crate::schema_mapping::catalog_value::table_with_document(
+                &document,
                 &target_iceberg_schema,
                 &payload.metadata_columns,
                 creation,
             )
             .map_err(crate::metadata::metadata_creation_error)?;
             let targets = exact_requested_write_fields_from_declaration(
-                &metadata,
+                &document,
                 &target_iceberg_schema,
                 &requested_target_fields,
                 &execution,
@@ -626,7 +633,6 @@ mod tests {
                 prepared_files: Vec::new(),
                 explicit_files: None,
                 row_mutation_frozen_source: false,
-                logical_type_columns: BTreeMap::new(),
                 hidden_columns: Vec::new(),
             };
             ConnectorTableHandle::try_new(
@@ -1404,7 +1410,9 @@ mod tests {
             b"iceberg/row-mutation-preparation/v1/ice/11111111-2222-3333-4444-555555555555/main/none/CopyOnWrite"
         );
     }
-    fn scalar_integer_metadata_with_older_base_schema() -> TableMetadata {
+    fn scalar_integer_metadata_with_older_base_schema(
+        current_id_storage: PrimitiveType,
+    ) -> TableMetadata {
         let base_schema = Arc::new(
             IcebergSchema::builder()
                 .with_fields(vec![
@@ -1429,7 +1437,7 @@ mod tests {
         let evolved = IcebergSchema::builder()
             .with_schema_id(2)
             .with_fields(vec![
-                NestedField::required(1, "wide", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(1, "renamed_id", Type::Primitive(current_id_storage)).into(),
                 NestedField::optional(2, "renamed", Type::Primitive(PrimitiveType::Int)).into(),
                 NestedField::optional(3, "later", Type::Primitive(PrimitiveType::Int)).into(),
             ])
@@ -1444,8 +1452,8 @@ mod tests {
             [
                 (ROW_LINEAGE_ON.0.to_string(), ROW_LINEAGE_ON.1.to_string()),
                 (
-                    crate::scalar_integer_domain::PROPERTY.to_string(),
-                    r#"{"1":"tinyint","2":"smallint"}"#.to_string(),
+                    crate::schema_mapping::nominal_declaration::PROPERTY.to_string(),
+                    r#"{"version":1,"fields":[{"id":1,"domain":"tinyint"},{"id":2,"domain":"smallint"}]}"#.to_string(),
                 ),
             ]
             .into_iter()
@@ -1521,9 +1529,34 @@ mod tests {
     }
 
     #[test]
+    fn real_row_mutation_rejects_nominal_storage_changed_in_retained_history() {
+        let owner = owner();
+        let metadata = scalar_integer_metadata_with_older_base_schema(PrimitiveType::Long);
+        for target_ref in ["dev", "main"] {
+            let error = match prepare_row_mutation(
+                request(
+                    PayloadSpec::new(&metadata).handle(),
+                    target_ref,
+                    ConnectorRowMutationIntent::Delete,
+                ),
+                &owner,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("changed nominal storage must refuse before writer preparation"),
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+            assert!(
+                error
+                    .message()
+                    .contains("field ID 1 conflicts with retained storage type")
+            );
+        }
+    }
+
+    #[test]
     fn real_row_mutation_pins_scalar_domains_to_the_resolved_old_or_current_schema() {
         let owner = owner();
-        let metadata = scalar_integer_metadata_with_older_base_schema();
+        let metadata = scalar_integer_metadata_with_older_base_schema(PrimitiveType::Int);
         // Signed target fields are the provider's exact frozen fields, so each
         // carries the Iceberg field-id annotation of the resolved schema.
         let provider_field = |name: &str, data_type: DataType, nullable: bool, field_id: i32| {
@@ -1548,7 +1581,7 @@ mod tests {
                 "main",
                 42,
                 vec![
-                    provider_field("wide", DataType::Int64, false, 1),
+                    provider_field("renamed_id", DataType::Int8, false, 1),
                     provider_field("renamed", DataType::Int16, true, 2),
                     provider_field("later", DataType::Int32, true, 3),
                 ],

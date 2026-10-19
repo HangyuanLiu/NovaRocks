@@ -405,6 +405,7 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
         _domain: &TaskDomainUpdate,
+        _operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,

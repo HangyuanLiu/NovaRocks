@@ -19,6 +19,8 @@ use arrow::datatypes::{DataType, Field, Fields};
 use arrow_buffer::OffsetBuffer;
 use std::sync::Arc;
 
+pub(super) const MAP_KEY_NULL_MESSAGE: &str = "map key must not be NULL";
+
 pub(super) fn row_index(row: usize, len: usize) -> usize {
     novarocks_functions::builtin::map_lookup_core::row_index(row, len)
 }

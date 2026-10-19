@@ -528,6 +528,7 @@ impl TaskExecutionHost for FakeTaskHost {
         &self,
         _descriptor: &TaskDescriptor,
         _domain: &TaskDomainUpdate,
+        _operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<u64>, HostRejection> {
         if self.fail_task_domain.load(Ordering::SeqCst) {
             return Err(HostRejection::new(
@@ -2544,6 +2545,29 @@ fn a_split_receipt_reports_the_queue_depth_the_offer_left_behind() {
         Some(7),
         "the depth the execution side measured must reach the sender"
     );
+}
+
+#[cfg(novarocks_dev_controls)]
+#[test]
+fn an_opted_in_replay_gate_fails_explicitly_on_a_host_without_that_capability() {
+    let fixture = Fixture::new();
+    fixture.establish(1);
+    let identity = fixture.identity(1, 1, 1);
+    fixture.create(identity, 5);
+    let request = UpdateTask::try_new(
+        TaskOperationId::new_v7(),
+        identity,
+        vec![split_update(3, 1, 3, true, 21)],
+    )
+    .unwrap();
+    let control = crate::test_controls::tests::controlled_replay(10_000);
+    let grant = control.role.scope().grants_for("native").pop().unwrap();
+    let error = fixture
+        .registry
+        .reserve_test_update_consumption(&request, grant.cancellation())
+        .err()
+        .expect("an unsupported host cannot silently omit the declared gate");
+    assert!(error.detail().as_str().contains("does not support"));
 }
 
 #[test]
