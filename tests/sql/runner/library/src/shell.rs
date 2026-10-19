@@ -263,6 +263,11 @@ mod bounded_tests {
     }
     #[test]
     fn expired_clock_never_spawns_and_timeout_stops_the_owned_group() {
+        // This fixture exercises a short payload deadline. Establish its
+        // invocation lease before starting that clock; a failed first lease
+        // must never be adopted by later tests in the same native invocation.
+        novarocks_test_support::ensure_run_retention(Instant::now() + Duration::from_secs(10))
+            .unwrap();
         let directory = tempfile::TempDir::new().unwrap();
         let marker = directory.path().join("spawned");
         let sql = format!("shell: printf created > '{}'", marker.display());
