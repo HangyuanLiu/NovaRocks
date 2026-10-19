@@ -505,7 +505,8 @@ fn fetch_rows(
                 "B returned another schema"
             );
             ensure!(
-                u32::from_le_bytes(wire[10..14].try_into()?) == 1,
+                // LocalCompiler allocates the sole receiver channel from slot zero.
+                u32::from_le_bytes(wire[10..14].try_into()?) == 0,
                 "B result slot differs"
             );
             let chunks =
