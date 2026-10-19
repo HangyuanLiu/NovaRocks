@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(loom)]
-fn main() {}
 #[cfg(not(loom))]
-fn main() {
+#[test]
+fn attribution_reconcile() {
     use novarocks_memory::attribution::{AttributingAllocator, binding};
     use novarocks_memory::lane::{ResponsibilityClass, StoreHandle, global_store};
     use std::alloc::{GlobalAlloc, Layout, System};

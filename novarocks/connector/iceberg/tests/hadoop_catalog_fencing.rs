@@ -128,12 +128,12 @@ fn minio_strict_and_noop_two_process_fencing() {
 }
 
 /// The parent process invokes this exact libtest entry in two independent
-/// processes. Running it during an ordinary test invocation is a no-op.
+/// processes. It requires the parent's inputs and is excluded from ordinary
+/// test invocations.
 #[test]
+#[ignore = "internal helper invoked exactly by the two-process fencing tests"]
 fn hadoop_fencing_child_process_entry() {
-    if std::env::var_os(CHILD_ENV).is_none() {
-        return;
-    }
+    assert_eq!(required_env(CHILD_ENV), "1", "invalid child process marker");
 
     let warehouse = required_env(WAREHOUSE_ENV);
     let namespace = required_env(NAMESPACE_ENV);
@@ -307,6 +307,7 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
     for index in 0..2 {
         let child = Command::new(std::env::current_exe().expect("current test executable"))
             .args([
+                "--ignored",
                 "--exact",
                 "hadoop_fencing_child_process_entry",
                 "--nocapture",
