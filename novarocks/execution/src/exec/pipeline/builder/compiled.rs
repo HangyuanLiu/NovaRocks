@@ -88,8 +88,7 @@ impl CompiledOrderedFilterContext {
         let mut needed = false;
         let is_installed = |contract: &StaticFilterContract| {
             matches!(contract, StaticFilterContract::Ordered { keys, .. }
-                if matches!(keys.as_slice(), [key] if key.value_type.data_type() == &arrow::datatypes::DataType::Utf8
-                    && novarocks_local_program::is_ordered_filter_flat_payload_type(&key.value_type)))
+                if matches!(keys.as_slice(), [key] if novarocks_local_program::is_aggregate_topn_key_type(&key.value_type)))
         };
         for node in program.graph().nodes() {
             work.step()?;
@@ -650,8 +649,7 @@ fn build_node(
             let ordered_binding = runtime_filters.iter().find(|binding| matches!(binding.consumer.contract(), StaticFilterContract::Ordered { .. }));
             let ordered_factory = if let Some(binding) = ordered_binding {
                 if !matches!(binding.consumer.contract(), StaticFilterContract::Ordered { keys, .. }
-                    if matches!(keys.as_slice(), [key] if key.value_type.data_type() == &arrow::datatypes::DataType::Utf8
-                        && novarocks_local_program::is_ordered_filter_flat_payload_type(&key.value_type))) {
+                    if matches!(keys.as_slice(), [key] if novarocks_local_program::is_aggregate_topn_key_type(&key.value_type))) {
                     return Err(format!(
                         "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
                         id.index(), binding.consumer.binding_id(),
@@ -818,35 +816,17 @@ fn build_node(
             // Preserve the original driver-local Partial -> exchange -> Final
             // chronology. Grouped states hash actual emitted key slots; a
             // group-less state uses the original Single exchange.
-            let mut ordered_input = None;
-            let factory = if let Some(ordered) = ordered.filter(|_| !topn_filters.is_empty()) {
-                // Only the installed ordered lane needs its actual child width
-                // before creating producer partitions. The reader's width is
-                // not the downstream Partial aggregate's width.
-                let build = build_node(program, *input, ctx, error, Some(ordered))?;
-                let session = ctx.runtime_filter_execution.session.as_ref().ok_or_else(|| {
-                    novarocks_functions::KernelFailure::InvalidProgram(
-                        novarocks_functions::KernelDiagnostic::new(
-                            "compiled ordered Aggregate TopN has no Task runtime-filter session",
-                        ),
-                    )
-                })?;
-                let factory = CompiledAggregateProcessorFactory::try_new_ordered(
-                    Arc::clone(program), id, Arc::clone(error), Arc::clone(session),
-                    build.pipeline.dop, &ordered.host, &ordered.control,
-                )?;
-                ordered_input = Some(build);
-                factory
+            let mut factory = if ordered.is_some() && !topn_filters.is_empty() {
+                CompiledAggregateProcessorFactory::prepare_ordered(
+                    Arc::clone(program), id, Arc::clone(error),
+                )?
             } else {
                 CompiledAggregateProcessorFactory::try_new(
                     Arc::clone(program), id, Arc::clone(error),
                 )?
             };
             let complete = factory.completes_groups();
-            let mut build = match ordered_input {
-                Some(build) => build,
-                None => build_node(program, *input, ctx, error, ordered)?,
-            };
+            let mut build = build_node(program, *input, ctx, error, ordered)?;
             if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
                 let partition_slots = factory.local_group_partition_slots();
                 let (partial, final_stage) = factory.into_local_update_stages()?;
@@ -863,15 +843,30 @@ fn build_node(
                         partitions,
                     )
                 };
-                build.pipeline.factories.push(Box::new(final_stage));
+                factory = final_stage;
             } else {
                 if complete {
                     build = gather_to_one(build, ctx, node_id);
                 } else {
                     build.stream = StreamDesc::any(build.pipeline.dop);
                 }
-                build.pipeline.factories.push(Box::new(factory));
             }
+            if let Some(ordered) = ordered.filter(|_| !topn_filters.is_empty()) {
+                let session = ctx.runtime_filter_execution.session.as_ref().ok_or_else(|| {
+                    novarocks_functions::KernelFailure::InvalidProgram(
+                        novarocks_functions::KernelDiagnostic::new(
+                            "compiled ordered Aggregate TopN has no Task runtime-filter session",
+                        ),
+                    )
+                })?;
+                // The processor that now owns the original endpoint acquires
+                // its producer using this actual pipeline's width.
+                factory.install_ordered(
+                    Arc::clone(session), build.pipeline.dop,
+                    &ordered.host, &ordered.control,
+                )?;
+            }
+            build.pipeline.factories.push(Box::new(factory));
             Ok(build)
         }
         ProgramNodeKind::Analytic { input, .. } => {

@@ -264,6 +264,8 @@ fn prepare_aggregate_schema(
 
 pub struct CompiledAggregateProcessorFactory {
     name: String,
+    node: ProgramNodeId,
+    owns_ordered_endpoint: bool,
     program: Arc<LocalProgram>,
     sites: Vec<ProgramExpressionRootSite>,
     groups: usize,
@@ -295,27 +297,63 @@ impl CompiledAggregateProcessorFactory {
         host: &OrderedTopNAllocationHost,
         control: &RuntimeKernelControl,
     ) -> ExecutionResult<Self> {
-        let mut factory = Self::try_new_parts(program, node, error, true)?;
-        if factory.grouping != CompiledAggregateGrouping::Partial
-            || factory.calls.is_empty()
-            || factory
-                .calls
-                .iter()
-                .any(|call| call.merge || call.contract.distinct())
+        let mut factory = Self::prepare_ordered(program, node, error)?;
+        factory.install_ordered(session, actual_dop, host, control)?;
+        Ok(factory)
+    }
+
+    /// Prepare the original aggregate lifecycle without opening or retaining a
+    /// producer. Local split/gather must settle before an endpoint is attached.
+    pub(crate) fn prepare_ordered(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+    ) -> Result<Self, String> {
+        Self::try_new_parts(program, node, error, true)
+    }
+
+    pub(crate) fn install_ordered(
+        &mut self,
+        session: RuntimeFilterSessionRef,
+        actual_dop: i32,
+        host: &OrderedTopNAllocationHost,
+        control: &RuntimeKernelControl,
+    ) -> ExecutionResult<()> {
+        if !self.owns_ordered_endpoint {
+            return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "compiled aggregate does not own an ordered producer endpoint",
+            ))
+            .into());
+        }
+        if self.topn.is_some() {
+            return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "compiled Aggregate TopN producer is already installed",
+            ))
+            .into());
+        }
+        if self.grouping == CompiledAggregateGrouping::Partial
+            && (self.calls.is_empty()
+                || self
+                    .calls
+                    .iter()
+                    .any(|call| call.merge || call.contract.distinct()))
         {
             return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
                 "compiled ordered Aggregate TopN requires a non-distinct logical-input Partial aggregate",
             )).into());
         }
-        factory.topn = Some(CompiledAggregateTopNFactory::try_new(
-            &factory.program,
-            node,
+        // Preserve an already published task failure at this installation
+        // boundary before the cooperative kernel sees only a stopped state.
+        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        self.topn = Some(CompiledAggregateTopNFactory::try_new(
+            &self.program,
+            self.node,
             session,
             actual_dop,
             host,
             control,
         )?);
-        Ok(factory)
+        Ok(())
     }
 
     fn try_new_parts(
@@ -340,7 +378,8 @@ impl CompiledAggregateProcessorFactory {
         else {
             return Err(format!("compiled local node {at} is not an Aggregate"));
         };
-        if !topn_filters.is_empty() && !allow_ordered {
+        let owns_ordered_endpoint = !topn_filters.is_empty();
+        if owns_ordered_endpoint && !allow_ordered {
             return Err(format!(
                 "compiled Aggregate at local node {at} with TopN runtime filters is not executable"
             ));
@@ -424,6 +463,8 @@ impl CompiledAggregateProcessorFactory {
         let groups = group_by.len();
         Ok(Self {
             name: format!("COMPILED_AGGREGATE (node={at})"),
+            node,
+            owns_ordered_endpoint,
             program,
             sites,
             groups,
@@ -449,6 +490,11 @@ impl CompiledAggregateProcessorFactory {
     /// Consume the already prepared local lifecycle. The intermediate schema
     /// is authored by each exact call's existing full intermediate type.
     pub(crate) fn into_local_update_stages(self) -> Result<(Self, Self), String> {
+        if self.topn.is_some() {
+            return Err(
+                "compiled aggregate must split before installing its ordered producer".into(),
+            );
+        }
         if !self.requires_local_update_stages() {
             return Err(
                 "compiled aggregate local stages differ from its actual update node".into(),
@@ -484,6 +530,8 @@ impl CompiledAggregateProcessorFactory {
         }
         let partial = Self {
             name: format!("{} LOCAL_PARTIAL", self.name),
+            node: self.node,
+            owns_ordered_endpoint: false,
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
             groups: self.groups,
@@ -498,6 +546,8 @@ impl CompiledAggregateProcessorFactory {
         };
         let final_stage = Self {
             name: format!("{} LOCAL_FINAL", self.name),
+            node: self.node,
+            owns_ordered_endpoint: self.owns_ordered_endpoint,
             program: self.program,
             sites: Vec::new(),
             groups: self.groups,
@@ -528,12 +578,18 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
     }
 
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        let (topn, failed) = match self
-            .topn
-            .as_ref()
-            .map(|factory| factory.create_for_driver(&self.program, dop, driver_id))
-            .transpose()
-        {
+        let prepared = if self.owns_ordered_endpoint && self.topn.is_none() {
+            Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "compiled aggregate ordered producer endpoint is not installed",
+            ))
+            .into())
+        } else {
+            self.topn
+                .as_ref()
+                .map(|factory| factory.create_for_driver(&self.program, dop, driver_id))
+                .transpose()
+        };
+        let (topn, failed) = match prepared {
             Ok(topn) => (topn, None),
             Err(error) => (None, Some(error)),
         };
