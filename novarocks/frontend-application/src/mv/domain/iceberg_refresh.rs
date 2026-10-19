@@ -156,7 +156,6 @@ trait IcebergMvRefreshSource:
 /// constructor so a frontend composition must name every dependency.
 #[derive(Clone)]
 pub struct IcebergMvCorePorts {
-    sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -183,10 +182,8 @@ impl IcebergMvCorePorts {
         readiness: Arc<MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     ) -> Self {
         Self {
-            sql_emission_mode,
             functions,
             constant_policy,
             catalog_service,
@@ -210,10 +207,8 @@ impl IcebergMvCorePorts {
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     ) -> Self {
         Self {
-            sql_emission_mode,
             functions,
             constant_policy,
             catalog_service,
@@ -263,12 +258,6 @@ impl IcebergMvCorePorts {
 
     pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.constant_policy
-    }
-
-    pub(crate) const fn sql_emission_mode(
-        &self,
-    ) -> novarocks_sql::compiler::SqlPhysicalEmissionMode {
-        self.sql_emission_mode
     }
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
@@ -975,7 +964,6 @@ fn prepare_iceberg_mv_create_with_ports(
         &canonical_select_query,
         ports.function_catalog().as_ref(),
         ports.constant_policy(),
-        ports.sql_emission_mode(),
         completion_control.clone(),
     )?;
     let refresh_contract = derive_imv_refresh_contract(&analysis, &completion_control)?;

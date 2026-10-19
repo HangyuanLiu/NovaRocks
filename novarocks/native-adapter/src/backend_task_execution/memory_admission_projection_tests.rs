@@ -137,3 +137,42 @@ fn actual_schema_tracker_refusal_is_projected_as_resource_without_text_inference
         TaskFailureCategory::ResourceExhausted
     );
 }
+
+#[test]
+fn compiled_capability_refusal_does_not_reclassify_content_or_control_failures() {
+    use super::{CompiledPackageError, compiled_package_rejection};
+    use novarocks_type_contract::CompileControlError;
+    let identity = TaskIdentity::new(
+        QueryExecutionId::new(QueryId::new(97421, 97422), AttemptId::new(1).unwrap()).unwrap(),
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    );
+    for (error, expected) in [
+        (
+            CompiledPackageError::Unsupported("FULL OUTER hash join".into()),
+            TaskFailureCategory::Unsupported,
+        ),
+        (
+            CompiledPackageError::Refused("unsupported diagnostic from malformed package".into()),
+            TaskFailureCategory::Protocol,
+        ),
+        (
+            CompiledPackageError::Control(CompileControlError::ResourceExhausted),
+            TaskFailureCategory::ResourceExhausted,
+        ),
+        (
+            CompiledPackageError::Control(CompileControlError::Cancelled),
+            TaskFailureCategory::Execution,
+        ),
+        (
+            CompiledPackageError::Control(CompileControlError::DeadlineExceeded),
+            TaskFailureCategory::Execution,
+        ),
+    ] {
+        assert_eq!(
+            compiled_package_rejection(identity, error).category(),
+            expected
+        );
+    }
+}

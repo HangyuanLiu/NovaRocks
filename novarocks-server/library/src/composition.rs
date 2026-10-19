@@ -645,21 +645,15 @@ pub fn compose_frontend_role_config(
         query_blocking_workers,
         query_blocking_queue,
     ));
-    // Static plan carrier hook: the frontend freezes the one carrier this
-    // island's backends interpret, under the same package admission the
-    // backend receiver uses. Production keeps the frontend's plan-tree
-    // carrier untouched.
-    match static_plan.frontend_carrier() {
-        FrontendStaticPlanCarrier::PlanTree => {}
-        #[cfg(feature = "physical-wire-v2-candidate")]
-        FrontendStaticPlanCarrier::CompiledPackage { admission, limits } => {
-            execution = execution.with_static_plan_carrier(
-                novarocks_frontend_application::StaticPlanCarrier::CompiledPackage(
-                    novarocks_frontend_application::CompiledPackageCarrier::new(admission, limits),
-                ),
-            );
-        }
-    }
+    // The frontend freezes the one carrier its island's backends interpret,
+    // under the same structural package admission as their receiver.
+    let FrontendStaticPlanCarrier::CompiledPackage { admission, limits } =
+        static_plan.frontend_carrier();
+    execution = execution.with_static_plan_carrier(
+        novarocks_frontend_application::StaticPlanCarrier::CompiledPackage(
+            novarocks_frontend_application::CompiledPackageCarrier::new(admission, limits),
+        ),
+    );
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =

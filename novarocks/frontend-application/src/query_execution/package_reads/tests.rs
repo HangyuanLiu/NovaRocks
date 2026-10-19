@@ -331,10 +331,7 @@ fn query_scope(
     (root, query_permit, scope, capacity)
 }
 
-fn request_for(
-    sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-) -> SqlFinalPlanCompileRequest {
+fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
     SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([9; 16]).expect("plan version"),
         SqlStatementInput::sql(sql),
@@ -349,7 +346,6 @@ fn request_for(
         builtin_sql_function_catalog().snapshot(),
         crate::query_execution::constant_eval::constant_evaluator(),
         crate::application::test_constant_policy(),
-        emission_mode,
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
             min: 1,
@@ -370,16 +366,12 @@ impl PaimonFixture {
     fn complete(
         &self,
         sql: &str,
-        carrier: StaticPlanCarrier,
+        _carrier: StaticPlanCarrier,
     ) -> CompletedPlanWithAccess<FrozenProviderRead> {
-        self.complete_with_emission(sql, carrier.sql_emission_mode())
+        self.complete_statement(sql)
     }
 
-    fn complete_with_emission(
-        &self,
-        sql: &str,
-        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-    ) -> CompletedPlanWithAccess<FrozenProviderRead> {
+    fn complete_statement(&self, sql: &str) -> CompletedPlanWithAccess<FrozenProviderRead> {
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
             ConnectorStopOwner::new().view(),
@@ -416,8 +408,7 @@ impl PaimonFixture {
         );
         self.runtime
             .block_on(
-                FinalPlanCompletionDriver::new(Arc::new(source))
-                    .complete(request_for(sql, emission_mode), &scope),
+                FinalPlanCompletionDriver::new(Arc::new(source)).complete(request_for(sql), &scope),
             )
             .unwrap_or_else(|failure| panic!("{sql}: completes against Paimon: {failure}"))
     }
@@ -688,7 +679,7 @@ fn a_paimon_scan_freezes_a_compiled_package_the_provider_and_local_compilers_acc
 fn a_paimon_scan_still_freezes_into_the_plan_tree() {
     let fixture = paimon_fixture();
     let tree = encode(
-        fixture.complete_with_emission(SCAN_SQL, StaticPlanCarrier::PlanTree.sql_emission_mode()),
+        fixture.complete_statement(SCAN_SQL),
         &StaticPlanCarrier::PlanTree,
     )
     .unwrap_or_else(|error| panic!("{SCAN_SQL}: the plan tree encodes: {error}"));

@@ -22,8 +22,8 @@ use novarocks_sql::{
     binding::SqlFunctionBinding,
     compiler::{
         SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent, SqlCompiler,
-        SqlFunctionCatalog, SqlOptimizeRequest, SqlPhysicalEmissionMode, SqlPlannerTableSnapshot,
-        SqlPlanningEnvironment, SqlStatementInput, builtin_sql_function_catalog,
+        SqlFunctionCatalog, SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
+        SqlStatementInput, builtin_sql_function_catalog,
     },
 };
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -280,7 +280,6 @@ fn optimize(catalog: &TableParentCatalog) -> Result<(), SqlCompileError> {
         &EVALUATOR,
         None,
         super::pure_differential::constant_policy(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
     ))?
     .into_pending()?;

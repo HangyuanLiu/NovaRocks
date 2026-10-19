@@ -59,16 +59,12 @@ pub(crate) fn launch_server(
     runner_config: &RunnerConfig,
     launch_profile: LaunchProfile,
     test_sessions: Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>,
-    explicit_candidate: Option<&Path>,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
         ClusterMode::CrossProcess => {
             let options = CrossProcessClusterOptions {
-                binary: match explicit_candidate {
-                    Some(binary) => binary.to_path_buf(),
-                    None => discover_novarocks_binary(repo_root)?,
-                },
+                binary: discover_novarocks_binary(repo_root)?,
                 fe_binary: None,
                 be_binaries: Vec::new(),
                 expected_eligible_backend_count: None,

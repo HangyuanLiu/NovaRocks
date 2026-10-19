@@ -34,7 +34,6 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
-mod emission_mode;
 mod scalar_presence_catalog;
 pub use crate::planner::distributed::build::{
     AggregateRuntimeDemand, CheckedSqlResultDeclaration, ResultDeclarationError,
@@ -49,7 +48,6 @@ pub use crate::planner::distributed::build::{
 };
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
-pub use emission_mode::SqlPhysicalEmissionMode;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
@@ -963,7 +961,6 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
     pub(crate) environment: SqlPlanningEnvironment,
-    pub(crate) emission_mode: SqlPhysicalEmissionMode,
     pub(crate) catalog: Option<&'a dyn SqlCatalogSnapshot>,
     pub(crate) functions: Option<&'a dyn SqlFunctionCatalog>,
     pub(crate) owned_functions: Option<Arc<dyn SqlFunctionCatalog>>,
@@ -986,7 +983,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
         constant_evaluator: &'static dyn SqlConstantEvaluator,
         mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        emission_mode: SqlPhysicalEmissionMode,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -994,7 +990,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
             intent,
             session,
             environment,
-            emission_mode,
             catalog: Some(catalog),
             functions: Some(functions),
             owned_functions: None,
@@ -1022,7 +1017,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
         environment: SqlPlanningEnvironment,
         constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        emission_mode: SqlPhysicalEmissionMode,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -1030,7 +1024,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
             intent,
             session,
             environment,
-            emission_mode,
             catalog: None,
             functions: None,
             owned_functions: None,
@@ -1043,14 +1036,12 @@ impl<'a> SqlAnalyzeRequest<'a> {
     }
 
     fn freeze_scalar_presence_scope(&mut self) {
-        if self.emission_mode == SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration {
-            // Retain the same original catalogue after the original entry control check.
-            let scoped = self
-                .function_catalog()
-                .map(|functions| functions.snapshot_for_scalar_presence());
-            self.functions = None;
-            self.owned_functions = scoped;
-        }
+        // Retain the same original catalogue after the original entry control check.
+        let scoped = self
+            .function_catalog()
+            .map(|functions| functions.snapshot_for_scalar_presence());
+        self.functions = None;
+        self.owned_functions = scoped;
     }
 
     pub(crate) fn check_control(&self) -> Result<(), SqlCompileError> {
@@ -1224,7 +1215,6 @@ enum SqlCompileOutputKind {
 /// SQL consumes the opaque rewrite snapshot and keeps logical-plan ownership
 /// internal; Core receives only the rendered lines.
 pub struct SqlImvRefreshExplainContext<'a> {
-    pub emission_mode: SqlPhysicalEmissionMode,
     pub canonical_query: Box<novarocks_parser::ast::Query>,
     pub imv_rewrite: SqlImvPlanningInput,
     pub current_catalog: Option<String>,
@@ -1243,7 +1233,6 @@ pub struct SqlImvRefreshExplainContext<'a> {
 /// parsed syntax and its frozen catalog snapshot in, but receives only the
 /// opaque analyzed-MV carrier back.
 pub struct SqlMvRefreshAnalysisContext<'a> {
-    pub emission_mode: SqlPhysicalEmissionMode,
     pub query: Box<novarocks_parser::ast::Query>,
     pub current_database: String,
     pub catalog: &'a dyn SqlCatalogSnapshot,
@@ -1258,7 +1247,6 @@ pub fn analyze_mv_refresh_input(
     context: SqlMvRefreshAnalysisContext<'_>,
 ) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, SqlCompileError> {
     let SqlMvRefreshAnalysisContext {
-        emission_mode,
         query,
         current_database,
         catalog,
@@ -1275,13 +1263,8 @@ pub fn analyze_mv_refresh_input(
     .map_err(SqlCompileError::Compilation)?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
         .map_err(SqlCompileError::from)?;
-    let scoped_functions = match emission_mode {
-        SqlPhysicalEmissionMode::OriginalNativeV1 => None,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
-            Some(functions.snapshot_for_scalar_presence())
-        }
-    };
-    let functions = scoped_functions.as_deref().unwrap_or(functions);
+    let scoped_functions = functions.snapshot_for_scalar_presence();
+    let functions = scoped_functions.as_ref();
     let (resolved, _, factory) = crate::analyzer::analyze_with_function_catalog(
         &query,
         catalog.planner_table_provider(),
@@ -1302,7 +1285,6 @@ pub fn compile_imv_refresh_explain_lines(
     context: SqlImvRefreshExplainContext<'_>,
 ) -> Result<Vec<String>, SqlCompileError> {
     let SqlImvRefreshExplainContext {
-        emission_mode,
         canonical_query,
         imv_rewrite,
         current_catalog,
@@ -1329,7 +1311,6 @@ pub fn compile_imv_refresh_explain_lines(
         functions,
         constant_evaluator,
         constant_policy,
-        emission_mode,
         control,
     );
     let explain_control = request.control().clone();
@@ -1349,7 +1330,6 @@ fn imv_refresh_explain_request<'a>(
     functions: &'a dyn SqlFunctionCatalog,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
     constant_policy: novarocks_functions::ConstantPolicy,
-    emission_mode: SqlPhysicalEmissionMode,
     control: SqlCompileControl,
 ) -> SqlAnalyzeRequest<'a> {
     SqlAnalyzeRequest::new(
@@ -1367,7 +1347,6 @@ fn imv_refresh_explain_request<'a>(
         constant_evaluator,
         None,
         constant_policy,
-        emission_mode,
         control,
     )
     .with_imv_rewrite(imv_rewrite)
@@ -1681,17 +1660,7 @@ impl SqlCompiler {
                 },
             )));
         }
-        let mut settings = request.session.optimizer_settings.clone();
-        // The original carrier retains Rows only after complete aggregation.
-        // Both optimizer entrypoints consume this single effective setting.
-        if request.emission_mode == SqlPhysicalEmissionMode::OriginalNativeV1
-            && !settings
-                .disabled_rules
-                .iter()
-                .any(|rule| rule == "PushDownTopNToPreAgg")
-        {
-            settings.disabled_rules.push("PushDownTopNToPreAgg".into());
-        }
+        let settings = request.session.optimizer_settings.clone();
         if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
             && (!logical_input
                 || !matches!(request.environment, SqlPlanningEnvironment::NotApplicable))
@@ -2313,7 +2282,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
         )
     }
@@ -2345,7 +2313,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
         )
     }
@@ -2639,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_topn_mode_and_user_disable_reach_the_public_optimize_entry() {
+    fn grouped_topn_user_disable_reaches_the_public_optimize_entry() {
         use crate::optimizer::operator::{AggMode, Operator};
         fn inspect(node: &crate::optimizer::OptimizedOperatorNode, forbid_preagg: bool) -> usize {
             let own = usize::from(matches!(node.op, Operator::PhysicalTopN(_)));
@@ -2654,10 +2621,7 @@ mod tests {
                 .map(|child| inspect(child, forbid_preagg))
                 .sum::<usize>()
         }
-        for mode in [
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        ] {
+        {
             for user_disabled in [false, true] {
                 let catalog = CountingTableCatalog::new();
                 let cancellation = Arc::new(Cancellation::default());
@@ -2667,7 +2631,6 @@ mod tests {
                 input.statement = SqlStatementInput::sql(
                     "SELECT order_id, COUNT(*) FROM orders GROUP BY order_id ORDER BY order_id LIMIT 10",
                 );
-                input.emission_mode = mode;
                 if user_disabled {
                     input
                         .session
@@ -2676,8 +2639,7 @@ mod tests {
                         .push("PushDownTopNToPreAgg".into());
                 }
                 let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
-                let must_disable =
-                    user_disabled || mode == SqlPhysicalEmissionMode::OriginalNativeV1;
+                let must_disable = user_disabled;
                 assert_eq!(
                     analyzed
                         .settings
@@ -2720,7 +2682,6 @@ mod tests {
             &FUNCTIONS,
             noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
 
@@ -2748,7 +2709,6 @@ mod tests {
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
         let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
-            emission_mode: SqlPhysicalEmissionMode::OriginalNativeV1,
             constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query(
                 "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM missing_table",
@@ -2797,7 +2757,6 @@ mod tests {
         let functions = crate::functions::build_builtin_engine_function_catalog()
             .expect("builtin function catalog");
         let input = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
-            emission_mode: SqlPhysicalEmissionMode::OriginalNativeV1,
             constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query("SELECT order_id FROM orders"),
             current_database: "db".to_string(),
@@ -2827,7 +2786,6 @@ mod tests {
         let functions = crate::functions::build_builtin_engine_function_catalog()
             .expect("builtin function catalog");
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
-            emission_mode: SqlPhysicalEmissionMode::OriginalNativeV1,
             constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query("SELECT order_id FROM missing_orders"),
             current_database: "db".to_string(),
@@ -2869,7 +2827,6 @@ mod tests {
                 noop_constant_evaluator(),
                 None,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control(None, &cancellation),
             );
             let optimized = analyze_then_optimize(request)
@@ -2890,7 +2847,6 @@ mod tests {
                 optimized.function_catalog,
                 optimized.root_allow_throw_exception,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
@@ -2990,7 +2946,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
         let optimized = analyze_then_optimize(request)
@@ -3010,7 +2965,6 @@ mod tests {
             optimized.function_catalog,
             optimized.root_allow_throw_exception,
             crate::constant::test_constant_policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             &SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -3052,7 +3006,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
 
@@ -3083,7 +3036,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
 
@@ -3133,7 +3085,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
         assert!(matches!(
@@ -3164,7 +3115,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
         let optimized = analyze_then_optimize(request)
@@ -3354,7 +3304,6 @@ mod tests {
             noop_constant_evaluator(),
             None,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         );
         let optimized = analyze_then_optimize(request)
@@ -3417,7 +3366,6 @@ mod tests {
                 noop_constant_evaluator(),
                 None,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control(None, &cancellation),
             );
             let optimized = analyze_then_optimize(request)
@@ -3438,7 +3386,6 @@ mod tests {
                 optimized.function_catalog,
                 optimized.root_allow_throw_exception,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()

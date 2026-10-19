@@ -21,9 +21,7 @@ use novarocks_functions::{
     FunctionArgumentType, FunctionBindingError, FunctionResultType, FunctionValueType,
     PureCallLifecycle,
 };
-use novarocks_sql::compiler::{
-    SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
-};
+use novarocks_sql::compiler::{SqlCompileControl, builtin_sql_function_catalog};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
 };
@@ -46,11 +44,8 @@ fn e08s1_time_static_profile_actual_source_and_all_six_nullable_profiles_use_sam
     let original = builtin_sql_function_catalog().snapshot();
     let exact = original.snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        for binding in bindings(mode) {
+    {
+        for binding in bindings() {
             exact
                 .admit_bound_lifecycle_observed(&binding, PureCallLifecycle::Scalar, &control)
                 .unwrap();

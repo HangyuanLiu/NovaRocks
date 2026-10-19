@@ -17,6 +17,7 @@ sql.analyze.invalid_argument	Analyze
 sql.analyze.invalid_literal	Analyze
 sql.analyze.invalid_query_shape	Analyze
 sql.analyze.type_mismatch	Analyze
+sql.analyze.unavailable_implementation	Analyze
 sql.analyze.unknown_column	Analyze
 sql.analyze.unknown_function	Analyze
 sql.analyze.unknown_table	Analyze

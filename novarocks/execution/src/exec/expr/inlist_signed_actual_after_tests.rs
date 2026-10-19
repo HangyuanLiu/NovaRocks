@@ -27,7 +27,7 @@ use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailu
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramRootInput, StaticExprKind, root_input_layout,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, PureCompileControl,
 };
@@ -52,11 +52,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn compiled(sql: &str, dtype: DataType) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
-    let source = sql_source_with_single_field_and_core_residuals(
-        sql,
-        Field::new("k", dtype, true),
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = sql_source_with_single_field_and_core_residuals(sql, Field::new("k", dtype, true));
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
     let programs = programs_with_catalogue_and_original_inlist_source(&source, &functions);
@@ -419,7 +415,6 @@ fn inlist_signed_actual_original_control_codec_roundtrip_and_invalid_ordered_use
         let source = sql_source_with_single_field_and_core_residuals(
             sql,
             Field::new("k", DataType::Int64, true),
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         );
         let policy = novarocks_functions::ConstantPolicy {
             max_rows: 64,

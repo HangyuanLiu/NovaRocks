@@ -21,14 +21,14 @@ use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 const SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/project/sql/project_append_trailing_char_if_absent_semantics.sql"
 ));
-fn check(mode: SqlPhysicalEmissionMode) {
-    let owner = sql_source(SQL, DataType::Int64, mode);
+fn check() {
+    let owner = sql_source(SQL, DataType::Int64);
     let mut count = 0;
     for fragment in owner.plan().fragments().values() {
         for (id, node) in fragment.expressions().iter() {
@@ -66,7 +66,7 @@ fn check(mode: SqlPhysicalEmissionMode) {
             assert_eq!(node.ty, function.result_type);
             assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
             eprintln!(
-                "append_trailing actual retained source mode={mode:?} fragment={:?} definition={id:?} signature={function:?} original_request={request:?} ordered_children={args:?}",
+                "append_trailing actual retained source mode=compiled fragment={:?} definition={id:?} signature={function:?} original_request={request:?} ordered_children={args:?}",
                 fragment.id()
             );
             count += 1;
@@ -76,13 +76,10 @@ fn check(mode: SqlPhysicalEmissionMode) {
         count > 0,
         "actual corpus SQL keeps a real function call with no-op fold"
     );
-    eprintln!("append_trailing actual retained call count mode={mode:?} count={count}");
+    eprintln!("append_trailing actual retained call count mode=compiled count={count}");
 }
-#[test]
-fn append_trailing_actual_original_sql_kept_call_source() {
-    check(SqlPhysicalEmissionMode::OriginalNativeV1)
-}
+
 #[test]
 fn append_trailing_actual_candidate_sql_kept_call_source() {
-    check(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
+    check()
 }

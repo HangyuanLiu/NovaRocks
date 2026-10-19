@@ -20,8 +20,8 @@ use arrow::datatypes::DataType;
 use novarocks_parser::ast::{self, SyntaxEq};
 use novarocks_sql::compiler::{
     SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError,
-    SqlCompileIntent, SqlCompiler, SqlExpressionConstants, SqlPhysicalEmissionMode,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    SqlCompileIntent, SqlCompiler, SqlExpressionConstants, SqlPlannerTableSnapshot,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use novarocks_types::schema::ColumnDef;
@@ -98,7 +98,6 @@ fn analyze(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         crate::application::test_constant_policy(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         control,
     ))?
     .into_pending()

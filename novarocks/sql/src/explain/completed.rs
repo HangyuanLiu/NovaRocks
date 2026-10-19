@@ -3820,7 +3820,6 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

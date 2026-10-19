@@ -315,3 +315,56 @@ impl From<novarocks_local_program::PreparedWriterCallsError> for NativeFragmentD
         )
     }
 }
+
+impl From<crate::native_type_decode::NativeTypeDecodeError> for NativeFragmentDecodeError {
+    fn from(error: crate::native_type_decode::NativeTypeDecodeError) -> Self {
+        match error {
+            crate::native_type_decode::NativeTypeDecodeError::Protocol(cause) => {
+                Self::Protocol(cause)
+            }
+            crate::native_type_decode::NativeTypeDecodeError::Construction(cause) => {
+                Self::Construction(cause)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_type_error_tests {
+    use super::*;
+    use crate::native_type_decode::NativeTypeDecodeError;
+    use novarocks_type_contract::{
+        CompileControlError, owned_resources::layout::LayoutResourceError,
+    };
+
+    #[test]
+    fn shared_type_protocol_errors_retain_the_exact_path_kind_and_detail() {
+        let protocol = ProtocolError::new(
+            FieldPath::root("runtime_filter")
+                .field("logical_domain")
+                .index(3),
+            ProtocolErrorKind::InvalidValue,
+            "fixture invalid reference",
+        );
+        let legacy = NativeFragmentDecodeError::from(NativeTypeDecodeError::from(protocol.clone()));
+        assert_eq!(legacy.protocol(), Some(&protocol));
+        assert!(legacy.construction_cause().is_none());
+    }
+
+    #[test]
+    fn shared_type_construction_errors_retain_the_original_typed_cause() {
+        for cause in [
+            NativeTypeConstructionError::Control(CompileControlError::Cancelled),
+            NativeTypeConstructionError::Control(CompileControlError::DeadlineExceeded),
+            NativeTypeConstructionError::Control(CompileControlError::ResourceExhausted),
+            NativeTypeConstructionError::Capacity("fixture capacity".into()),
+            NativeTypeConstructionError::Resource(LayoutResourceError::Arithmetic),
+            NativeTypeConstructionError::Resource(LayoutResourceError::SourceModel),
+        ] {
+            let legacy =
+                NativeFragmentDecodeError::from(NativeTypeDecodeError::from(cause.clone()));
+            assert_eq!(legacy.construction_cause(), Some(&cause));
+            assert!(legacy.protocol().is_none());
+        }
+    }
+}

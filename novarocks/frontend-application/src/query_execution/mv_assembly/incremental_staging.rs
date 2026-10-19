@@ -362,7 +362,6 @@ fn bind_incremental_write_dataflow(
                 crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_mv_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalRefreshAnalyzeContext {
- emission_mode:query_kernel.static_plan_carrier().sql_emission_mode(),
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     imv_rewrite: imv_rewrite_input,
                     write_mode,
@@ -407,10 +406,7 @@ fn bind_incremental_write_dataflow(
                         .finish(
                             novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
                                 novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                    version,
-                                    dop,
-                                    reads,
-                                    query_kernel.static_plan_carrier().sql_emission_mode(),
+                                    version, dop, reads,
                                 ),
                                 targets,
                             ),
@@ -462,7 +458,6 @@ fn bind_incremental_write_dataflow(
                 crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
- emission_mode:query_kernel.static_plan_carrier().sql_emission_mode(),
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                     join_mode,
@@ -509,10 +504,7 @@ fn bind_incremental_write_dataflow(
                         .finish(
                             novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
                                 novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                    version,
-                                    dop,
-                                    reads,
-                                    query_kernel.static_plan_carrier().sql_emission_mode(),
+                                    version, dop, reads,
                                 ),
                                 targets,
                             ),

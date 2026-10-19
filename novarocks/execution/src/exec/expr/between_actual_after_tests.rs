@@ -27,7 +27,7 @@ use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailu
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramRootInput, StaticExprKind, root_input_layout,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, PureCompileControl,
 };
@@ -52,11 +52,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn compiled(sql: &str) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
-    let source = sql_source(
-        sql,
-        DataType::Int64,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = sql_source(sql, DataType::Int64);
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
     let programs = programs_with_catalogue(&source, &functions);
@@ -362,11 +358,7 @@ fn between_actual_after_original_control_codec_roundtrip_and_invalid_four_use_re
         ("SELECT k BETWEEN 1 AND 5 FROM fixture.source", false),
         ("SELECT k NOT BETWEEN 1 AND 5 FROM fixture.source", true),
     ] {
-        let source = sql_source(
-            sql,
-            DataType::Int64,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
+        let source = sql_source(sql, DataType::Int64);
         let policy = novarocks_functions::ConstantPolicy {
             max_rows: 64,
             max_array_nodes: 1024,

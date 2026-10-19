@@ -77,6 +77,8 @@ pub enum CompiledPackageError {
     /// The package is not receivable, its providers refuse it, or the
     /// compiler refuses one of its shapes.
     Refused(String),
+    /// A valid package needs an explicitly unavailable compiler/provider capability.
+    Unsupported(String),
     TypeMaterialization(TypeMaterializationRefusal),
     ProjectMetadata(PreparationMemoryRefusal),
     ProjectMetadataRequest(MetadataRequestError),
@@ -88,7 +90,7 @@ impl fmt::Display for CompiledPackageError {
             Self::Control(cause) => cause.fmt(f),
             Self::Construction(cause) => cause.fmt(f),
             Self::Decode(cause) => cause.fmt(f),
-            Self::Refused(detail) => f.write_str(detail),
+            Self::Refused(detail) | Self::Unsupported(detail) => f.write_str(detail),
             Self::TypeMaterialization(cause) => cause.fmt(f),
             Self::ProjectMetadata(cause) => cause.fmt(f),
             Self::ProjectMetadataRequest(cause) => cause.fmt(f),
@@ -102,11 +104,72 @@ impl Error for CompiledPackageError {
             Self::Control(cause) => Some(cause),
             Self::Construction(cause) => Some(cause),
             Self::Decode(cause) => Some(cause),
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::Unsupported(_) => None,
             Self::TypeMaterialization(cause) => Some(cause),
             Self::ProjectMetadata(cause) => Some(cause),
             Self::ProjectMetadataRequest(cause) => Some(cause),
         }
+    }
+}
+
+fn local_compile_failure(
+    error: novarocks_local_compiler::FragmentCompileError,
+) -> CompiledPackageError {
+    if let novarocks_local_compiler::FragmentCompileError::Control(cause) = error {
+        return CompiledPackageError::Control(cause);
+    }
+    let detail = format!("package does not compile: {error}");
+    if error.is_unsupported() {
+        CompiledPackageError::Unsupported(detail)
+    } else {
+        CompiledPackageError::Refused(detail)
+    }
+}
+
+fn provider_preparation_failure<E: Error + 'static>(
+    error: ProviderPreparationError<E>,
+) -> CompiledPackageError {
+    use novarocks_connector_contract::{
+        ConnectorError, ConnectorErrorKind, PureProviderCatalogError, PureProviderProgramError,
+    };
+    use novarocks_spi::connector::{ConnectorCodecError, ConnectorCodecErrorKind};
+    if let ProviderPreparationError::Control(cause) = error {
+        return CompiledPackageError::Control(cause);
+    }
+    let (ProviderPreparationError::Read { error: cause, .. }
+    | ProviderPreparationError::Write { error: cause, .. }) = &error
+    else {
+        unreachable!("control cause handled above");
+    };
+    if let PureProviderProgramError::Control(cause) = cause {
+        return CompiledPackageError::Control(*cause);
+    }
+    let unsupported = match cause {
+        PureProviderProgramError::Catalog(
+            PureProviderCatalogError::ReadUnavailable(_)
+            | PureProviderCatalogError::WriteUnavailable(_),
+        ) => true,
+        PureProviderProgramError::Contract(cause) => {
+            cause.kind() == ConnectorErrorKind::Unsupported
+        }
+        PureProviderProgramError::Provider(cause) => {
+            // The production provider error is the SPI codec vocabulary. Other
+            // generic owners must supply an equally explicit typed capability.
+            let cause = cause as &(dyn Error + 'static);
+            cause
+                .downcast_ref::<ConnectorCodecError>()
+                .is_some_and(|cause| cause.kind() == ConnectorCodecErrorKind::Unsupported)
+                || cause
+                    .downcast_ref::<ConnectorError>()
+                    .is_some_and(|cause| cause.kind() == ConnectorErrorKind::Unsupported)
+        }
+        _ => false,
+    };
+    let detail = format!("package providers refuse it: {error}");
+    if unsupported {
+        CompiledPackageError::Unsupported(detail)
+    } else {
+        CompiledPackageError::Refused(detail)
     }
 }
 
@@ -409,12 +472,7 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
         )
         .then_some(NonZeroUsize::MIN);
         let validated = validate_fragment_providers(Arc::new(package), &self.providers, control)
-            .map_err(|error| match error {
-                ProviderPreparationError::Control(cause) => CompiledPackageError::Control(cause),
-                other => {
-                    CompiledPackageError::Refused(format!("package providers refuse it: {other}"))
-                }
-            })?;
+            .map_err(provider_preparation_failure)?;
         use novarocks_type_contract::ValueSchemaCreationFactory;
         let mut temporary = type_scopes
             .begin_scope()
@@ -464,9 +522,7 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
                     CompiledPackageError::Refused(format!("package does not compile: {error}"))
                 }
             },
-            FragmentCreationError::Compile(other) => {
-                CompiledPackageError::Refused(format!("package does not compile: {other}"))
-            }
+            FragmentCreationError::Compile(other) => local_compile_failure(other),
         })?;
         Ok(if native {
             CompiledTaskProgram::native(program, runtime_filters)
@@ -614,3 +670,111 @@ impl PureCompileControl for TaskPreparationControl {
 #[cfg(test)]
 #[path = "compiled_metadata_host_tests.rs"]
 mod metadata_host_tests;
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use novarocks_connector_contract::{
+        ConnectorError, ConnectorErrorKind, ConnectorProviderId, PureProviderCatalogError,
+        PureProviderProgramError,
+    };
+    use novarocks_physical_plan::NodeId;
+    use novarocks_spi::connector::{
+        ConnectorCodecError, ConnectorCodecErrorKind, ConnectorFieldPath,
+    };
+
+    fn provider(error: PureProviderProgramError<ConnectorCodecError>) -> CompiledPackageError {
+        provider_preparation_failure(ProviderPreparationError::Read {
+            node: NodeId::new(1),
+            error,
+        })
+    }
+
+    #[test]
+    fn only_typed_provider_capabilities_become_unsupported() {
+        for kind in [
+            ConnectorCodecErrorKind::Unsupported,
+            ConnectorCodecErrorKind::Capacity,
+            ConnectorCodecErrorKind::InvalidValue,
+            ConnectorCodecErrorKind::VersionMismatch,
+        ] {
+            let error = provider(PureProviderProgramError::Provider(
+                ConnectorCodecError::new(
+                    ConnectorFieldPath::root("scan"),
+                    kind,
+                    "unsupported text cannot classify a failure",
+                ),
+            ));
+            assert_eq!(
+                matches!(error, CompiledPackageError::Unsupported(_)),
+                kind == ConnectorCodecErrorKind::Unsupported
+            );
+        }
+        let id = ConnectorProviderId::parse("iceberg").unwrap();
+        for cause in [
+            PureProviderCatalogError::ReadUnavailable(id.clone()),
+            PureProviderCatalogError::WriteUnavailable(id.clone()),
+        ] {
+            assert!(matches!(
+                provider(PureProviderProgramError::Catalog(cause)),
+                CompiledPackageError::Unsupported(_)
+            ));
+        }
+        assert!(matches!(
+            provider(PureProviderProgramError::Catalog(
+                PureProviderCatalogError::MissingProvider(id)
+            )),
+            CompiledPackageError::Refused(_)
+        ));
+        for kind in [
+            ConnectorErrorKind::Unsupported,
+            ConnectorErrorKind::ResourceExhausted,
+            ConnectorErrorKind::InvalidRequest,
+            ConnectorErrorKind::Internal,
+            ConnectorErrorKind::Unavailable,
+        ] {
+            let error = provider(PureProviderProgramError::Contract(ConnectorError::new(
+                kind,
+                "unsupported diagnostic",
+            )));
+            assert_eq!(
+                matches!(error, CompiledPackageError::Unsupported(_)),
+                kind == ConnectorErrorKind::Unsupported
+            );
+        }
+        let opaque = ProviderPreparationError::Read {
+            node: NodeId::new(1),
+            error: PureProviderProgramError::Provider(std::io::Error::other(
+                "unsupported capability",
+            )),
+        };
+        assert!(matches!(
+            provider_preparation_failure(opaque),
+            CompiledPackageError::Refused(_)
+        ));
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            assert!(
+                matches!(provider_preparation_failure::<ConnectorCodecError>(ProviderPreparationError::Control(cause)),
+                CompiledPackageError::Control(actual) if actual == cause)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_compiler_content_is_not_a_capability_refusal() {
+        use novarocks_local_compiler::FragmentCompileError;
+        assert!(
+            matches!(local_compile_failure(FragmentCompileError::Unsupported {
+            node: Some(NodeId::new(7)), feature: "FULL OUTER hash join"
+        }), CompiledPackageError::Unsupported(detail) if detail.contains("FULL OUTER hash join"))
+        );
+        assert!(matches!(
+            local_compile_failure(FragmentCompileError::Invalid("unsupported diagnostic")),
+            CompiledPackageError::Refused(_)
+        ));
+    }
+}

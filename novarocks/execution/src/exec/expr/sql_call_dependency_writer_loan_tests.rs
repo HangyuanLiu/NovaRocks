@@ -23,11 +23,8 @@ use novarocks_sql::compiler::{
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 #[test]
 fn sql_call_dependency_loan_actual_writer_statistics_retains_value_channel_and_phase() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        let (owner, _catalogue) = source(mode, true, DataType::Int64, "BIGINT");
+    {
+        let (owner, _catalogue) = source(true, DataType::Int64, "BIGINT");
         let control = SqlCompileControl::unbounded();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
         let mut count = 0;

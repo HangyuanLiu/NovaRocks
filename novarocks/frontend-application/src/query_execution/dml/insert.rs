@@ -163,7 +163,7 @@ pub trait InsertEngine: Send + Sync {
     fn run_iceberg_write(
         &self,
         prepared: &dyn IcebergPreparedInsert,
-    ) -> Result<IcebergWriteReport, String>;
+    ) -> Result<IcebergWriteReport, crate::dml::error::DmlExecutionError>;
 
     fn commit_iceberg_write_terminal(
         &self,
@@ -418,7 +418,7 @@ impl InsertEngine for DmlExecutionKernel {
     fn run_iceberg_write(
         &self,
         prepared: &dyn IcebergPreparedInsert,
-    ) -> Result<IcebergWriteReport, String> {
+    ) -> Result<IcebergWriteReport, crate::dml::error::DmlExecutionError> {
         let prepared = downcast_prepared(prepared)?;
         Ok(iceberg_write_report_from_result(
             prepared.prepared.run_coordinated_write()?,

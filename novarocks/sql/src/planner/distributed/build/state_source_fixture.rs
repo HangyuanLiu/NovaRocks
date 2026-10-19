@@ -21,9 +21,7 @@ use super::contract_lowering::{ContractLoweringError, lower_final_physical_plan}
 use crate::analysis::{ExprKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
 use crate::binding::{AggregateArgumentSource, SqlFunctionBinding};
 use crate::column_id::ColumnId;
-use crate::compiler::{
-    SqlAuthoredPhysicalPlan, SqlCompileError, SqlFunctionCatalog, SqlPhysicalEmissionMode,
-};
+use crate::compiler::{SqlAuthoredPhysicalPlan, SqlCompileError, SqlFunctionCatalog};
 use crate::planner::payload::{AggregateCall, PlanValuesNode};
 use crate::planner::physical::{
     AggMode, AggregateOutputLayout, PhysicalHashAggregateNode, PhysicalPlanKind, PhysicalPlanNode,
@@ -232,7 +230,6 @@ fn union(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
 pub fn ordinary_union_source(
     sum_constants: Option<(i64, i64, i64)>,
     intermediate: bool,
-    mode: SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let (name, left, right, final_args) = match sum_constants {
@@ -261,7 +258,6 @@ pub fn ordinary_union_source(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         crate::constant::test_constant_policy(),
-        mode,
         control,
     )
     .map_err(|e| match e {
@@ -279,7 +275,6 @@ pub fn ordinary_union_source(
 /// while merge's OWN literal source remains a complete non-null constant.
 pub fn ordinary_extrema_constant_state_source_for_test(
     maximum: bool,
-    mode: SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let name = if maximum { "max" } else { "min" };
@@ -327,7 +322,6 @@ pub fn ordinary_extrema_constant_state_source_for_test(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         crate::constant::test_constant_policy(),
-        mode,
         control,
     )
     .map_err(|e| match e {
@@ -342,7 +336,6 @@ pub fn ordinary_extrema_constant_state_source_for_test(
 /// One original aggregate update source is moved/borrowed across its phases.
 pub fn ordered_array_state_source_for_test(
     intermediate: bool,
-    mode: SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let narrow_input = TypedExpr {
@@ -434,7 +427,6 @@ pub fn ordered_array_state_source_for_test(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         crate::constant::test_constant_policy(),
-        mode,
         control,
     )
     .map_err(|e| match e {

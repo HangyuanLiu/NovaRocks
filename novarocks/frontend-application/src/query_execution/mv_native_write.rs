@@ -253,7 +253,12 @@ pub(crate) fn encode_compile_error(
             novarocks_sql::compiler::SqlCompileError::Compilation(error)
         }
         novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
-            novarocks_sql::compiler::SqlCompileError::Compilation(message.into())
+            novarocks_sql::compiler::SqlCompileError::Compilation(
+                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
+                    message,
+                )
+                .to_bracketed_user_message(),
+            )
         }
     }
 }
@@ -307,4 +312,20 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         operation_id: uuid::Uuid,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), String>;
+}
+
+#[cfg(test)]
+mod capability_identity_tests {
+    #[test]
+    fn mv_encode_capability_refusal_keeps_the_client_identity() {
+        let error = super::encode_compile_error(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "change-stream router",
+            ),
+        );
+        assert!(
+            matches!(error, novarocks_sql::compiler::SqlCompileError::Compilation(message)
+            if message == "[UnsupportedCompiledShape] change-stream router")
+        );
+    }
 }

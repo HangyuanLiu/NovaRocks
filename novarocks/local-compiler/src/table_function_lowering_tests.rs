@@ -975,22 +975,84 @@ fn zipped_arguments_share_one_pass_through_read_and_map_reordered_results() {
 }
 
 #[test]
-fn table_function_without_an_installed_table_kernel_is_refused_by_name() {
+fn table_function_unknown_identity_is_not_a_capability_refusal() {
     let fixture = fixture(
         &Shape::inner(vec![Out::Key, Out::Result(0)]),
         &unnest_catalog(),
     );
     let error = try_compile(fixture.package, &rand_catalog()).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            FragmentCompileError::Unsupported {
-                node: Some(TABLE),
-                feature: "table function without an installed pure TableV1 kernel",
-            }
-        ),
-        "{error}"
-    );
+    assert!(!error.is_unsupported());
+    assert!(matches!(
+        &error,
+        FragmentCompileError::Owner { error, .. }
+            if matches!(error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+                Some(crate::expressions::ExpressionLoweringError::Specialization(
+                    novarocks_functions::FunctionSpecializationFailure::Binding(
+                        novarocks_functions::FunctionBindingError::UnknownFunction))))
+    ));
+}
+
+#[test]
+fn table_function_unknown_overload_is_not_a_capability_refusal() {
+    let catalog = unnest_catalog();
+    let fixture = fixture(&Shape::inner(vec![Out::Result(0)]), &catalog);
+    let mut node = fixture.package.fragment().nodes()[&TABLE].clone();
+    let NodeKind::TableFunction { function, .. } = &mut node.kind else {
+        panic!("expected the fixture table function")
+    };
+    let unknown = FunctionOverloadId::try_new("test.table/unknown-overload/v1").unwrap();
+    function.overload = unknown.clone();
+    let mut work =
+        novarocks_type_contract::CompileCheckpoints::try_new(&Control, CompilePhase::LowerProgram)
+            .unwrap();
+    let error =
+        crate::table_function::admit_table_function(&node, &catalog, &mut work).unwrap_err();
+    assert!(!error.is_unsupported());
+    assert!(matches!(
+        &error,
+        FragmentCompileError::Owner { error, .. }
+            if matches!(error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+                Some(crate::expressions::ExpressionLoweringError::Specialization(
+                    novarocks_functions::FunctionSpecializationFailure::Binding(
+                        novarocks_functions::FunctionBindingError::UnknownOverload(actual))))
+                    if actual == &unknown)
+    ));
+}
+
+/// Lookup-level coverage: a pure seal cannot contain a metadata-only entry.
+#[test]
+fn table_function_metadata_without_pure_owner_remains_a_capability_refusal() {
+    let catalog = unnest_catalog();
+    let fixture = fixture(&Shape::inner(vec![Out::Result(0)]), &catalog);
+    let NodeKind::TableFunction { function, .. } = &fixture.package.fragment().nodes()[&TABLE].kind
+    else {
+        panic!("expected the fixture table function")
+    };
+    let original = catalog
+        .metadata()
+        .definition("unnest", FunctionKind::Table)
+        .unwrap();
+    let metadata_only = novarocks_functions::FunctionDefinition::try_new_bound(
+        original.canonical_name(),
+        original.visibility(),
+        original.binding_declaration().unwrap().clone(),
+        Arc::new(original.binding_resolver().unwrap().clone()),
+    )
+    .unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder.register(metadata_only).unwrap();
+    let metadata = builder.seal_bound().unwrap();
+    let error =
+        crate::table_function::table_function_abi(function, &metadata, &Control).unwrap_err();
+    assert!(error.is_unsupported());
+    assert!(matches!(
+        &error,
+        FragmentCompileError::Owner { error, .. }
+            if matches!(error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+                Some(crate::expressions::ExpressionLoweringError::Specialization(
+                    novarocks_functions::FunctionSpecializationFailure::MissingPureImplementation(actual)))
+                    if actual == &function.overload)
+    ));
 }
 
 #[test]

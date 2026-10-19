@@ -1376,7 +1376,10 @@ impl PreparedDmlWriteAssembly {
 
     pub(crate) fn finish(
         self,
-    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    ) -> Result<
+        crate::query_execution::outcome::QueryExecutionResult,
+        crate::dml::error::DmlExecutionError,
+    > {
         let (query_execution, request) = self.into_request()?;
         execute_distributed_write_request(&query_execution, request)
     }
@@ -1501,7 +1504,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         DmlQueryExecutionKernel::constant_policy(state),
-        DmlQueryExecutionKernel::static_plan_carrier(state).sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)
@@ -1568,7 +1570,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         statistics_requirements,
         &optimizer_settings,
         decimal_overflow_policy,
-        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -1803,12 +1804,15 @@ fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionO
 fn execute_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     request: crate::query_execution::contract::DistributedQueryRequest,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+) -> Result<
+    crate::query_execution::outcome::QueryExecutionResult,
+    crate::dml::error::DmlExecutionError,
+> {
     query_execution
         .execute(request)
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
-        .map_err(|error| error.to_string())
+        .map_err(crate::dml::error::DmlExecutionError::from)
 }
 
 #[cfg(test)]

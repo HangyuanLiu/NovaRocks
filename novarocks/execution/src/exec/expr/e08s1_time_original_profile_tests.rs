@@ -23,15 +23,15 @@ use novarocks_functions::{
 };
 use novarocks_physical_plan::ExprKind;
 use novarocks_sql::compiler::{
-    SqlCallDependencySite, SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
+    SqlCallDependencySite, SqlCompileControl, builtin_sql_function_catalog,
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 const SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/project/sql/project_time_to_sec_roundtrip_negative_semantics.sql"
 ));
-pub(super) fn bindings(mode: SqlPhysicalEmissionMode) -> Vec<ResolvedFunctionBinding> {
-    let owner = sql_source(SQL, DataType::Int64, mode);
+pub(super) fn bindings() -> Vec<ResolvedFunctionBinding> {
+    let owner = sql_source(SQL, DataType::Int64);
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut out = Vec::new();
@@ -53,7 +53,7 @@ pub(super) fn bindings(mode: SqlPhysicalEmissionMode) -> Vec<ResolvedFunctionBin
             assert_eq!(binding.logical_argument_count, 1);
             assert_eq!(binding.selected.argument_types.len(), 1);
             eprintln!(
-                "TIME original corpus source mode={mode:?} fragment={:?} source={:?} binding={binding:?}",
+                "TIME original corpus source mode=compiled fragment={:?} source={:?} binding={binding:?}",
                 fragment.id(),
                 source.id
             );
@@ -95,7 +95,7 @@ pub(super) fn domains() -> [DataType; 3] {
 fn e08s1_time_original_profile_actual_roundtrip_loans_and_original_no_added_validation() {
     let original = builtin_sql_function_catalog().snapshot();
     let control = SqlCompileControl::unbounded();
-    for binding in bindings(SqlPhysicalEmissionMode::OriginalNativeV1) {
+    for binding in bindings() {
         original
             .admit_bound_lifecycle_observed(&binding, PureCallLifecycle::Scalar, &control)
             .unwrap();

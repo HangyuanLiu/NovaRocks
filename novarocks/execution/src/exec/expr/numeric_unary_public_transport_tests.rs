@@ -33,15 +33,12 @@ use novarocks_query_application::{
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, ResultDeclarationError, SessionOptimizerSettings, SqlCompileControl,
     SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
-    SqlPhysicalEmissionMode, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-    builtin_sql_function_catalog, noop_constant_evaluator,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+    noop_constant_evaluator,
 };
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{ptr, sync::Mutex};
-fn table_free_sql(
-    sql: &str,
-    emission_mode: SqlPhysicalEmissionMode,
-) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+fn table_free_sql(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
@@ -73,7 +70,6 @@ fn table_free_sql(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -149,16 +145,8 @@ fn freeze(
 fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
     for dt in [DataType::Int8, DataType::Int16, DataType::Int32] {
         let sql = "SELECT -k AS original_negated, k AS original_source, -k AS repeated_alias FROM fixture";
-        let original = nonnull_source(sql, dt.clone(), SqlPhysicalEmissionMode::OriginalNativeV1);
-        let source = nonnull_source(
-            sql,
-            dt.clone(),
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
-        assert_eq!(
-            source.emission_mode(),
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration
-        );
+        let original = nonnull_source(sql, dt.clone());
+        let source = nonnull_source(sql, dt.clone());
         let borrowed = source
             .checked_original_result_declaration_observed(&SqlCompileControl::unbounded())
             .unwrap()
@@ -218,11 +206,7 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
         // Preserve the original false-public-obligation rejection at the
         // exact root boundary. Only the two computed negations are forged.
         let wrong_candidate = CompletedPhysicalPlanCandidate::for_sql_program(
-            nonnull_source(
-                sql,
-                dt.clone(),
-                SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            ),
+            nonnull_source(sql, dt.clone()),
             &SqlCompileControl::unbounded(),
         )
         .unwrap();
@@ -252,10 +236,6 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
             "{refusal}"
         );
         let candidate = freeze_root_purpose(candidate);
-        assert_eq!(
-            candidate.sql_emission_mode(),
-            Some(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
-        );
         let output =
             OutputContract::from_completed_candidate(QueryExecutionKind::Read, &candidate).unwrap();
         assert_eq!(output.fields().len(), 3);
@@ -305,17 +285,12 @@ fn numeric_unary_public_transport_original_and_unchanged_nested_types_use_actual
         "SELECT 1 AS a, CAST(NULL AS VARCHAR) AS b",
         "SELECT CAST([CAST(1 AS INT)] AS ARRAY<INT>) AS nested",
     ] {
-        for mode in [
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        ] {
-            let source = table_free_sql(sql, mode);
+        {
+            let source = table_free_sql(sql);
             let port = source.plan().result_port().unwrap();
             let original = source.original_public_result_declaration().unwrap();
             assert_eq!(original.fields(), port.fields.as_ref());
-            if mode == SqlPhysicalEmissionMode::OriginalNativeV1 {
-                assert!(ptr::eq(original.original_port(), port));
-            }
+
             let candidate = CompletedPhysicalPlanCandidate::for_sql_program(
                 source,
                 &SqlCompileControl::unbounded(),
@@ -352,7 +327,6 @@ fn numeric_unary_public_transport_observed_receipt_preserves_first_control_cause
     let source = nonnull_source(
         &format!("SELECT -k AS `{label}` FROM fixture"),
         DataType::Int8,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
     let ok = Trace {
         calls: Mutex::new(Vec::new()),

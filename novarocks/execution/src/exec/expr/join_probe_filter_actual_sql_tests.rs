@@ -20,7 +20,6 @@ use super::ndv_filter_actual_sql_source_tests::sql_source_with_columns;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::RuntimeFilterConsumerTarget;
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
 
 fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
     let original = include_str!(concat!(
@@ -48,7 +47,6 @@ fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
             assert!(statement.starts_with("SELECT"));
             sql_source_with_columns(
                 &statement.replace("${case_db}", "fixture"),
-                SqlPhysicalEmissionMode::OriginalNativeV1,
                 &[("id", DataType::Int64), ("v", DataType::Int64)],
             )
         })

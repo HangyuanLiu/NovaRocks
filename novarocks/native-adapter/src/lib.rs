@@ -106,6 +106,7 @@ pub mod native_server;
 pub mod native_transport_admission;
 pub mod native_transport_geometry;
 pub(crate) mod native_type_construction;
+pub(crate) mod native_type_decode;
 #[cfg(test)]
 mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;

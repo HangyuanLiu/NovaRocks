@@ -555,7 +555,6 @@ fn finish(source: &PhysicalPlanNode, control: &Control) -> Result<(), ContractLo
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         scalar::policy(),
-        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         control,
     )?
     .finish_observed(control)
@@ -625,7 +624,6 @@ fn finish_without_actual_canonical_source(
         Arc::clone(functions),
         false,
         scalar::policy(),
-        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         control,
     )?;
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(source, &mut visitor.work)?;

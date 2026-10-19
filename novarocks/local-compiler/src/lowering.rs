@@ -88,6 +88,18 @@ pub enum FragmentCompileError {
         error: Box<dyn Error + Send + Sync>,
     },
 }
+impl FragmentCompileError {
+    /// Capability admission is a typed fact, independent of diagnostic text.
+    pub fn is_unsupported(&self) -> bool {
+        match self {
+            Self::Unsupported { .. } => true,
+            Self::Owner { error, .. } => error
+                .downcast_ref::<ExpressionLoweringError>()
+                .is_some_and(ExpressionLoweringError::is_unsupported),
+            _ => false,
+        }
+    }
+}
 impl fmt::Display for FragmentCompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2439,4 +2451,52 @@ pub fn compile_fragment_with_project_metadata_host<P: ProjectMetadataScope>(
         );
         crate::creation::finish_attempt(result, work)
     })
+}
+
+#[cfg(test)]
+mod capability_admission_tests {
+    use super::*;
+    use novarocks_functions::{
+        FunctionBindingError, FunctionOverloadId, FunctionSpecializationFailure,
+    };
+    use novarocks_physical_plan::ExprId;
+
+    #[test]
+    fn capability_identity_survives_private_expression_ownership() {
+        let overload = FunctionOverloadId::try_new("fixture/missing/pure-v1").unwrap();
+        for error in [
+            ExpressionLoweringError::UnsupportedExpression(ExprId::new(7)),
+            ExpressionLoweringError::Binding(FunctionBindingError::UnavailableImplementation(
+                overload.clone(),
+            )),
+            ExpressionLoweringError::Specialization(
+                FunctionSpecializationFailure::MissingPureImplementation(overload),
+            ),
+        ] {
+            let error = FragmentCompileError::from(error);
+            assert!(matches!(error, FragmentCompileError::Owner { .. }));
+            assert!(error.is_unsupported(), "{error}");
+        }
+        assert!(
+            FragmentCompileError::Unsupported {
+                node: None,
+                feature: "FULL OUTER hash join"
+            }
+            .is_unsupported()
+        );
+        for error in [
+            FragmentCompileError::from(ExpressionLoweringError::Invalid(
+                "unsupported is diagnostic text",
+            )),
+            FragmentCompileError::from(ExpressionLoweringError::Binding(
+                FunctionBindingError::UnknownFunction,
+            )),
+            FragmentCompileError::Invalid("unsupported is diagnostic text"),
+            FragmentCompileError::from("unsupported is diagnostic text".to_owned()),
+            FragmentCompileError::Control(CompileControlError::Cancelled),
+            FragmentCompileError::Control(CompileControlError::ResourceExhausted),
+        ] {
+            assert!(!error.is_unsupported(), "{error}");
+        }
+    }
 }

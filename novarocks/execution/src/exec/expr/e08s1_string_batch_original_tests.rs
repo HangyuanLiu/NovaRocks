@@ -22,7 +22,7 @@ use novarocks_functions::{
 };
 use novarocks_physical_plan::ExprKind;
 use novarocks_sql::compiler::{
-    SqlCallDependencySite, SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
+    SqlCallDependencySite, SqlCompileControl, builtin_sql_function_catalog,
 };
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 const LENGTH_SQL: &str = include_str!(concat!(
@@ -45,12 +45,9 @@ pub(super) const NAMES: [&str; 7] = [
     "lpad",
     "rpad",
 ];
-pub(super) fn calls(
-    index: usize,
-    mode: SqlPhysicalEmissionMode,
-) -> Vec<(String, ResolvedFunctionBinding)> {
+pub(super) fn calls(index: usize) -> Vec<(String, ResolvedFunctionBinding)> {
     let sql = [LENGTH_SQL, INTEGER_SQL, REMAINING_MEASUREMENT][index];
-    let owner = sql_source(sql, DataType::Int64, mode);
+    let owner = sql_source(sql, DataType::Int64);
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut out = Vec::new();
@@ -89,7 +86,7 @@ pub(super) fn calls(
                 FunctionResultType::Scalar(_)
             ));
             eprintln!(
-                "string static original source case={index} mode={mode:?} fragment={:?} source={:?} binding={binding:?}",
+                "string static original source case={index} mode=compiled fragment={:?} source={:?} binding={binding:?}",
                 fragment.id(),
                 source.id
             );
@@ -106,7 +103,7 @@ pub(super) fn calls(
 fn original(index: usize) {
     let catalog = builtin_sql_function_catalog().snapshot();
     let control = SqlCompileControl::unbounded();
-    for (_, binding) in calls(index, SqlPhysicalEmissionMode::OriginalNativeV1) {
+    for (_, binding) in calls(index) {
         catalog
             .admit_bound_lifecycle_observed(&binding, PureCallLifecycle::Scalar, &control)
             .unwrap();

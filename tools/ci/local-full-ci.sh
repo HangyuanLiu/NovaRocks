@@ -879,6 +879,7 @@ ci_classify_sql_log() {
   local row_suite
   local row_case
   local remaining
+  local error_tag
   local error_code
   local status_line
   local status
@@ -891,7 +892,7 @@ ci_classify_sql_log() {
 
   [ -f "$log_path" ] || return 1
 
-  # Expected-error PASS lines can include engine_error_code=..., so prefer
+  # Expected-error PASS lines can include either error-code tag, so prefer
   # case timing FAIL rows when the runner emitted them.
   failed_case_keys="$(ci_sql_failed_case_keys "$log_path")"
   failed_case_count="$(ci_case_key_count "$failed_case_keys")"
@@ -905,15 +906,16 @@ ci_classify_sql_log() {
     fi
 
     case "$line" in
-      *PASS*engine_error_code=*)
+      *PASS*engine_error_code=*|*PASS*sql_error_code=*)
         continue
         ;;
     esac
 
     remaining="$line"
-    while [[ "$remaining" =~ engine_error_code=([A-Za-z0-9_]+) ]]; do
-      error_code="${BASH_REMATCH[1]}"
-      remaining="${remaining#*engine_error_code=$error_code}"
+    while [[ "$remaining" =~ (engine_error_code|sql_error_code)=([A-Za-z0-9_.]+) ]]; do
+      error_tag="${BASH_REMATCH[1]}"
+      error_code="${BASH_REMATCH[2]}"
+      remaining="${remaining#*"$error_tag=$error_code"}"
       row_suite="${current_suite:-$suite}"
       row_case="${current_case:-unknown}"
 

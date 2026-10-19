@@ -54,13 +54,13 @@ const STATIC_PLAN_INTERPRETER_DOMAIN: &[u8] = b"novarocks.static-plan-interprete
 
 /// The one static plan interpreter a process composes.
 ///
-/// The descriptor digest is identical for every binary built from one tree,
-/// whichever interpreter it composed, so the interpreter enters the
-/// compatibility material explicitly: two processes that read different
-/// static carriers never share an island.
+/// Production composes the compiled package carrier and its exact sealed pure
+/// catalogue. The component retains that catalogue digest so different pure
+/// support remains incompatible even when all other process inputs agree.
+/// The legacy tree vocabulary remains only until its wire is retired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticPlanInterpreter {
-    /// Reads the plan-tree carrier and interprets it with the plan decoder.
+    /// Legacy plan-tree component, retained while its wire callers are removed.
     PlanTree,
     /// Reads the physical package carrier and compiles it with the sealed
     /// pure function catalogue this digest identifies.
@@ -810,14 +810,17 @@ mod tests {
     /// Production identity is a pure function of its inputs: deriving it
     /// again yields the same island, never a per-process value.
     #[test]
-    fn a_plan_tree_identity_is_deterministic() {
+    fn a_compiled_identity_is_deterministic() {
+        let interpreter = StaticPlanInterpreter::CompiledPackage {
+            pure_function_catalog_digest: [0x51; 32],
+        };
         assert_eq!(
-            with_interpreter(StaticPlanInterpreter::PlanTree).id(),
-            with_interpreter(StaticPlanInterpreter::PlanTree).id()
+            with_interpreter(interpreter).id(),
+            with_interpreter(interpreter).id()
         );
         assert_eq!(
-            with_interpreter(StaticPlanInterpreter::PlanTree).static_plan_interpreter(),
-            StaticPlanInterpreter::PlanTree
+            with_interpreter(interpreter).static_plan_interpreter(),
+            interpreter
         );
     }
 }

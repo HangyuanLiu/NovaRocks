@@ -51,6 +51,7 @@ pub struct DmlError {
 #[derive(Debug)]
 pub enum DmlExecutionError {
     Engine(String),
+    UnsupportedCompiledShape(String),
     Analyze(AnalyzeError),
     Cow(crate::query_execution::dml::mutation_flow::CowFailure),
     Control(novarocks_type_contract::CompileControlError),
@@ -82,14 +83,27 @@ impl DmlExecutionError {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
             novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => Self::Engine(error),
             novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
-                Self::Engine(message.into())
+                Self::UnsupportedCompiledShape(message.into())
             }
+        }
+    }
+
+    pub(crate) fn into_abort_parts(self) -> (String, Option<EngineErrorCode>) {
+        match self {
+            Self::UnsupportedCompiledShape(reason) => {
+                (reason, Some(EngineErrorCode::UnsupportedCompiledShape))
+            }
+            other => (other.to_string(), None),
         }
     }
 
     pub(crate) fn into_dml_error(self, source: Option<&str>) -> DmlError {
         match self {
             Self::Engine(error) => DmlError::executor(error),
+            Self::UnsupportedCompiledShape(reason) => {
+                let error = novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(reason);
+                DmlError::executor(error.to_user_message()).with_engine_error_code(error.code())
+            }
             Self::Analyze(error) => match error.control_error() {
                 Some(error) => DmlError::compile_control(error),
                 None => DmlError::admit(error.to_user_error(source)),
@@ -108,6 +122,22 @@ impl From<novarocks_sql::compiler::SqlCompileError> for DmlExecutionError {
 impl From<novarocks_plan_codec::PhysicalEncodeError> for DmlExecutionError {
     fn from(error: novarocks_plan_codec::PhysicalEncodeError) -> Self {
         Self::from_encode(error)
+    }
+}
+
+impl From<crate::query_execution::contract::DistributedQueryError> for DmlExecutionError {
+    fn from(error: crate::query_execution::contract::DistributedQueryError) -> Self {
+        if error.engine_error_code() == Some(EngineErrorCode::UnsupportedCompiledShape) {
+            // Identity came from the original typed failure. Remove only our
+            // own renderer's prefix when transporting the underlying message.
+            let reason = error
+                .message()
+                .strip_prefix("[UnsupportedCompiledShape] ")
+                .unwrap_or(error.message());
+            Self::UnsupportedCompiledShape(reason.to_owned())
+        } else {
+            Self::Engine(error.to_string())
+        }
     }
 }
 
@@ -142,6 +172,8 @@ impl std::fmt::Display for DmlExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Engine(error) => formatter.write_str(error),
+            Self::UnsupportedCompiledShape(reason) => formatter.write_str(
+                &novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(reason.clone()).to_bracketed_user_message()),
             Self::Analyze(error) => error.fmt(formatter),
             Self::Cow(error) => error.fmt(formatter),
             Self::Control(error) => error.fmt(formatter),
@@ -353,6 +385,21 @@ impl std::error::Error for DmlError {
 mod compile_control_tests {
     use super::*;
     use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn encode_capability_refusal_keeps_its_identity_through_dml_projection() {
+        let error = DmlExecutionError::from_encode(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "change-stream router",
+            ),
+        )
+        .into_dml_error(None);
+        assert_eq!(
+            error.engine_error_code(),
+            Some(EngineErrorCode::UnsupportedCompiledShape)
+        );
+        assert_eq!(error.message, "change-stream router");
+    }
 
     #[test]
     fn compile_and_encode_failures_retain_exact_control_until_dml_terminal() {

@@ -424,7 +424,7 @@ fn plan_packages(plan: &p::PhysicalPlan) -> BTreeMap<p::FragmentId, p::FragmentP
 #[test]
 fn runtime_filter_package_roundtrips_its_plan_binding_slice_byte_identically() {
     use p::RuntimeFilterBindingRole::{Consumer, Producer};
-    let plan = crate::physical_encode::tests::finish_ordered_join_build_filter_plan();
+    let plan = crate::runtime_filter_test_support::finish_ordered_join_build_filter_plan();
     let numbered = p::runtime_filter_bindings(&plan).unwrap();
     let join_fragment = p::FragmentId::new(42);
     let filter = p::RuntimeFilterId::new(40);

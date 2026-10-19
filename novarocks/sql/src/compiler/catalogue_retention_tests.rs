@@ -25,7 +25,6 @@ use super::*;
 use crate::compiler::{
     SessionOptimizerSettings, builtin_sql_function_catalog, noop_constant_evaluator,
 };
-use novarocks_functions::{AggregateOverloadMetadata, FunctionVisibility};
 use std::sync::{
     Weak,
     atomic::{AtomicUsize, Ordering},
@@ -78,6 +77,52 @@ impl SqlFunctionCatalog for CountingCatalog {
         });
         *self.observations.latest.lock().unwrap() = Some(Arc::downgrade(&captured));
         captured
+    }
+    fn snapshot_for_scalar_presence(&self) -> Arc<dyn SqlFunctionCatalog> {
+        // Keep the observer outside the real admitted catalogue. Snapshot
+        // observations must identify the actual wrapper used by optimization,
+        // rather than its unwrapped metadata source. The scope does not prepare
+        // an owner or replace any binding/implementation declaration.
+        Arc::new(Self {
+            inner: self.inner.snapshot_for_scalar_presence(),
+            observations: self.observations.clone(),
+            assert_capture_before_binding: self.assert_capture_before_binding,
+        })
+    }
+    fn admit_bound_lifecycle_observed(
+        &self,
+        binding: &novarocks_functions::ResolvedFunctionBinding,
+        lifecycle: novarocks_functions::PureCallLifecycle,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        self.inner
+            .admit_bound_lifecycle_observed(binding, lifecycle, control)
+    }
+    fn admit_bound_environment_observed(
+        &self,
+        binding: &novarocks_functions::ResolvedFunctionBinding,
+        environment: &[novarocks_type_contract::SemanticParameterRef],
+        parameters: &novarocks_type_contract::SemanticParameters,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        self.inner
+            .admit_bound_environment_observed(binding, environment, parameters, control)
+    }
+    fn admit_authored_environment_observed(
+        &self,
+        binding: &crate::binding::SqlFunctionBinding,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        self.inner
+            .admit_authored_environment_observed(binding, control)
+    }
+    fn admit_native_bitnot_source_observed(
+        &self,
+        source: &novarocks_functions::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        self.inner
+            .admit_native_bitnot_source_observed(source, control)
     }
     fn select_exact_overload_observed(
         &self,
@@ -294,7 +339,6 @@ fn tracked_request(sql: &str, catalog: &Arc<CountingCatalog>) -> SqlFinalPlanCom
         catalog.clone(),
         template.constant_evaluator,
         template.constant_policy,
-        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         template.control,
         template.dop_domain,
         template.scan_read_budget,
@@ -391,7 +435,6 @@ fn catalogue_dml_read_completion_retains_its_optimized_owner_without_recapture()
         noop_constant_evaluator(),
         None,
         crate::constant::test_constant_policy(),
-        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
     ))
     .expect("actual analysis")
@@ -401,7 +444,6 @@ fn catalogue_dml_read_completion_retains_its_optimized_owner_without_recapture()
     let (completion, needs) = crate::planning::dml::begin_final_dml_read_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
         &SessionOptimizerSettings::default(),
-        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
     )
     .expect("actual DML optimization");
     let optimizer_snapshot = catalog.last_snapshot();
@@ -452,24 +494,13 @@ fn catalogue_analyze_captures_once_before_bindings_and_retains_that_exact_owner(
     use novarocks_spi::connector::{
         StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
     };
-    let exact = crate::functions::test_exact_aggregate_catalog(
-        "$test_blob_aggregate",
-        FunctionVisibility::Hidden,
-        [AggregateOverloadMetadata::try_new(
-            "test/blob-aggregate/i64/v1",
-            [DataType::Int64],
-            DataType::Binary,
-            DataType::Binary,
-            "test/blob-state/v1",
-        )
-        .expect("actual declared aggregate")],
-    );
+    let exact = crate::functions::test_installed_blob_aggregate_catalog();
     let inner: Arc<dyn SqlFunctionCatalog> = Arc::new(exact);
     let catalog = CountingCatalog::new(inner, true);
     let input_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, true);
     let requirement = StatisticsRequiredAggregation::try_new(
         StatisticsScanColumn::try_new(0, "id", input_type.clone()).expect("input"),
-        "$test_blob_aggregate",
+        novarocks_connector_iceberg_functions::ICEBERG_THETA_AGGREGATE_NAME,
         StatisticsArtifactIdentity::try_new(vec![7], "test-blob-v1").expect("artifact"),
     )
     .expect("requirement");

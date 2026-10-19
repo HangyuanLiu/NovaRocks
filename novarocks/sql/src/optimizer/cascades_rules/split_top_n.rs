@@ -275,67 +275,200 @@ mod tests {
     }
 
     #[test]
-    fn grouped_topn_completes_with_rows_budgets_after_global_aggregation() {
-        use novarocks_physical_plan::{AggregateGrouping, NodeKind, TopNReduction};
+    fn grouped_topn_completion_keeps_state_and_row_budgets_on_their_actual_producers() {
+        use novarocks_physical_plan::{
+            AggregateGrouping, AggregatePhase, NodeKind, RuntimeFilterConsumerActivation,
+            RuntimeFilterDomain, RuntimeFilterProducerTarget, TopNPhase, TopNReduction,
+        };
 
-        for sql in [
-            "SELECT order_key, COUNT(*), MIN(order_key), MAX(order_key) FROM orders GROUP BY order_key ORDER BY order_key LIMIT 2",
-            "SELECT DISTINCT order_key FROM orders ORDER BY order_key DESC LIMIT 2",
+        fn assert_complete_rows(
+            plan: &novarocks_physical_plan::PhysicalPlan,
+            fragment: &novarocks_physical_plan::Fragment,
+            node: &novarocks_physical_plan::PhysicalNode,
+        ) {
+            use novarocks_physical_plan::{ExprKind, RowMultiplicity};
+            assert_eq!(
+                node.output_properties.row_multiplicity,
+                RowMultiplicity::SingleCopy
+            );
+            match &node.kind {
+                NodeKind::Aggregate {
+                    grouping: AggregateGrouping::Complete,
+                    ..
+                } => {}
+                NodeKind::Project { expressions } => {
+                    // Only an identity projection may carry this fixture's
+                    // completed row contract through to its quota.
+                    assert!(expressions.iter().all(|(expression, _)| matches!(
+                        fragment.expressions().get(*expression).unwrap().kind,
+                        ExprKind::Value(_)
+                    )));
+                    assert_eq!(node.inputs.len(), 1);
+                    assert_complete_rows(plan, fragment, &fragment.nodes()[&node.inputs[0]]);
+                }
+                NodeKind::TopN {
+                    reduction: TopNReduction::Rows,
+                    ..
+                } => {
+                    assert_eq!(node.inputs.len(), 1);
+                    assert_complete_rows(plan, fragment, &fragment.nodes()[&node.inputs[0]]);
+                }
+                NodeKind::ExchangeSource { edge, imports } => {
+                    let edge = &plan.edges()[edge];
+                    assert_eq!(edge.destination.fragment, fragment.id());
+                    assert_eq!(edge.destination.node, node.id);
+                    assert_eq!(edge.destination.receive_mapping.as_ref(), imports.as_ref());
+                    assert_eq!(
+                        edge.partitioning.source_multiplicity,
+                        RowMultiplicity::SingleCopy
+                    );
+                    assert_eq!(
+                        edge.partitioning.destination_multiplicity,
+                        RowMultiplicity::SingleCopy
+                    );
+                    let source = &plan.fragments()[&edge.source.fragment];
+                    assert_complete_rows(plan, source, &source.nodes()[&source.root()]);
+                }
+                other => panic!("a Rows budget has no exact complete-group source: {other:?}"),
+            }
+        }
+
+        for (sql, has_aggregate_state) in [
+            (
+                "SELECT order_key, COUNT(*), MIN(order_key), MAX(order_key) FROM orders GROUP BY order_key ORDER BY order_key LIMIT 2",
+                true,
+            ),
+            (
+                "SELECT DISTINCT order_key FROM orders ORDER BY order_key DESC LIMIT 2",
+                false,
+            ),
         ] {
-            // This drives the real optimizer and physical completion with a
-            // runtime-split provider and a distributed DOP domain. Completion
-            // must prove the TopN and aggregate sequences, not just memo shape.
+            // The real optimizer owns the selected grouping path. Compiled
+            // preaggregation can add a state budget before complete groups;
+            // DISTINCT keeps Rows because it produces no aggregate state.
             let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
             let plan = owner.plan();
-            assert!(plan.fragments().values().any(|fragment| {
-                fragment.nodes().values().any(|node| {
-                    matches!(
-                        node.kind,
-                        NodeKind::Aggregate {
-                            grouping: AggregateGrouping::Complete,
-                            ..
-                        }
-                    )
-                })
-            }));
-            let mut topn_count = 0;
+            let mut rows = 0;
+            let mut grouped_states = 0;
             for fragment in plan.fragments().values() {
                 for node in fragment.nodes().values() {
-                    if let NodeKind::TopN {
+                    let NodeKind::TopN {
                         reduction, phase, ..
                     } = &node.kind
-                    {
-                        topn_count += 1;
-                        assert!(matches!(reduction, TopNReduction::Rows));
-                        if matches!(phase, novarocks_physical_plan::TopNPhase::Partial { .. }) {
-                            let input = &fragment.nodes()[&node.inputs[0]];
-                            assert!(
-                                matches!(
-                                    input.kind,
-                                    NodeKind::Aggregate {
-                                        grouping: AggregateGrouping::Complete,
-                                        ..
-                                    }
-                                ),
-                                "a grouped row budget must read complete groups"
+                    else {
+                        continue;
+                    };
+                    match reduction {
+                        TopNReduction::Rows => {
+                            rows += 1;
+                            assert_eq!(node.inputs.len(), 1);
+                            assert_eq!(
+                                node.required_inputs[0].row_multiplicity,
+                                novarocks_physical_plan::RowMultiplicity::SingleCopy
                             );
-                            assert!(plan.runtime_filters().values().any(|filter| {
-                                filter.producers.iter().any(|producer| {
-                                    producer.endpoint.fragment == fragment.id()
-                                        && producer.endpoint.node == input.id
-                                        && matches!(producer.target,
-                                            novarocks_physical_plan::RuntimeFilterProducerTarget::AggregateTopNKey { topn, .. }
-                                                if topn == node.id)
-                                }) && filter.consumers.iter().all(|consumer| {
-                                    matches!(consumer.activation,
-                                        novarocks_physical_plan::RuntimeFilterConsumerActivation::NonBlockingLive { .. })
-                                })
-                            }), "the normal planner must publish a nonblocking key bound from the complete aggregate");
+                            assert_complete_rows(
+                                plan,
+                                fragment,
+                                &fragment.nodes()[&node.inputs[0]],
+                            );
+                            if matches!(phase, TopNPhase::Partial { .. }) {
+                                let input = &fragment.nodes()[&node.inputs[0]];
+                                assert!(
+                                    matches!(
+                                        input.kind,
+                                        NodeKind::Aggregate {
+                                            grouping: AggregateGrouping::Complete,
+                                            ..
+                                        }
+                                    ),
+                                    "a row quota must read complete groups: {sql} {input:?}"
+                                );
+                            }
+                        }
+                        TopNReduction::GroupedStates {
+                            group_by, calls, ..
+                        } => {
+                            grouped_states += 1;
+                            assert!(has_aggregate_state);
+                            assert!(matches!(phase, TopNPhase::Partial { .. }));
+                            let input = &fragment.nodes()[&node.inputs[0]];
+                            let NodeKind::Aggregate {
+                                grouping: AggregateGrouping::Partial,
+                                group_by: producer_keys,
+                                calls: producer_calls,
+                            } = &input.kind
+                            else {
+                                panic!(
+                                    "a state budget must read its direct Partial producer: {sql} {input:?}"
+                                );
+                            };
+                            assert_eq!(
+                                group_by.iter().map(|(_, value)| value).collect::<Vec<_>>(),
+                                producer_keys
+                                    .iter()
+                                    .map(|(_, value)| value)
+                                    .collect::<Vec<_>>()
+                            );
+                            assert_eq!(calls.len(), producer_calls.len());
+                            assert!(!calls.is_empty());
+                            for (call, producer) in calls.iter().zip(producer_calls) {
+                                let AggregatePhase::Intermediate { sequence } = call.binding.phase
+                                else {
+                                    panic!("grouped state budgets author Intermediate reductions");
+                                };
+                                assert_eq!(Some(sequence), producer.binding.phase.sequence());
+                                assert_ne!(call.id, producer.id);
+                                assert_ne!(call.output, producer.output);
+                                let mut binding = producer.binding.clone();
+                                binding.phase = call.binding.phase;
+                                assert_eq!(call.binding, binding);
+                            }
                         }
                     }
                 }
             }
-            assert!(topn_count > 0, "the grouped query must retain its TopN");
+            assert!(rows > 0, "the final sequence retains its row quota: {sql}");
+            assert_eq!(
+                grouped_states > 0,
+                has_aggregate_state,
+                "only the aggregate query has Partial state quotas: {sql}"
+            );
+
+            // Optional RF placement is a separate proof: the compiled direct
+            // Partial frontier admits UTF-8 only. The Int64 fixture cannot
+            // demand that optional capability. Mandatory UTF-8 publication is
+            // covered by the actual ordered-aggregate completion regression.
+            for filter in plan.runtime_filters().values() {
+                assert!(!filter.producers.is_empty());
+                assert!(!filter.consumers.is_empty());
+                for producer in &filter.producers {
+                    let fragment = &plan.fragments()[&producer.endpoint.fragment];
+                    let aggregate = &fragment.nodes()[&producer.endpoint.node];
+                    let NodeKind::Aggregate { grouping, .. } = &aggregate.kind else {
+                        panic!("AggregateTopN filter must keep its aggregate producer");
+                    };
+                    let RuntimeFilterProducerTarget::AggregateTopNKey { topn, .. } =
+                        producer.target
+                    else {
+                        panic!("the grouped fixture has only AggregateTopN producers");
+                    };
+                    assert_eq!(fragment.nodes()[&topn].inputs.as_ref(), &[aggregate.id]);
+                    if *grouping == AggregateGrouping::Partial {
+                        let RuntimeFilterDomain::Ordered { key, .. } = &filter.domain else {
+                            panic!("AggregateTopN uses an ordered domain");
+                        };
+                        assert_eq!(
+                            key.ty.data_type(),
+                            &arrow::datatypes::DataType::Utf8,
+                            "a numeric Partial producer is outside the compiled RF frontier"
+                        );
+                    }
+                }
+                assert!(filter.consumers.iter().all(|consumer| matches!(
+                    consumer.activation,
+                    RuntimeFilterConsumerActivation::NonBlockingLive { .. }
+                )));
+            }
         }
     }
 }

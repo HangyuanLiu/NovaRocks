@@ -16,16 +16,12 @@
 // under the License.
 //! Same public MV entrypoints; generated calls must use the original Exact loan.
 use super::e08s1_mv_original_catalogue_tests::run_with_denied_loan;
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use std::sync::atomic::Ordering;
 #[test]
 fn e08s1_mv_exact_generated_bindings_borrow_one_scoped_catalogue_before_reentry() {
     for incremental in [false, true] {
-        let (result, observations) = run_with_denied_loan(
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            incremental,
-            true,
-        );
+        let (result, observations) = run_with_denied_loan(incremental, true);
         let error =
             result.expect_err("the test-owned pure capability loan is explicitly unavailable");
         assert!(

@@ -51,19 +51,16 @@ use novarocks_sql::compiler::{
 
 pub(super) fn hll_sql_source(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     columns: &[(&str, DataType)],
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     hll_sql_source_with_semantics(
         sql,
-        emission_mode,
         columns,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )
 }
 fn hll_sql_source_with_semantics(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     columns: &[(&str, DataType)],
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -98,7 +95,6 @@ fn hll_sql_source_with_semantics(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -208,11 +204,9 @@ fn hll_sql_source_with_semantics(
 const TYPEDESC_SQL: &str = "SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation') */ grp, CAST(avg(v) AS DECIMAL(18,4)) AS avg_v, ndv(k) AS ndv_k, hll_union_agg(hll_hash(k)) AS hll_k, CAST(percentile_approx(d,0.5) AS DECIMAL(18,4)) AS p50_d FROM fixture.agg_state_typedesc_contract GROUP BY grp ORDER BY grp";
 const HLL_SQL: &str = "select hll_union(hll_hash(c1)) from fixture.t1";
 fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
-    use novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1;
     vec![
         hll_sql_source(
             TYPEDESC_SQL,
-            OriginalNativeV1,
             &[
                 ("grp", DataType::Int32),
                 ("k", DataType::Int32),
@@ -220,11 +214,7 @@ fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
                 ("d", DataType::Float64),
             ],
         ),
-        hll_sql_source(
-            HLL_SQL,
-            OriginalNativeV1,
-            &[("c1", DataType::Int32), ("c2", DataType::Int32)],
-        ),
+        hll_sql_source(HLL_SQL, &[("c1", DataType::Int32), ("c2", DataType::Int32)]),
     ]
 }
 #[test]

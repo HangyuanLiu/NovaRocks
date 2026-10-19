@@ -25,6 +25,7 @@ syntax = "proto3";
 package novarocks.plan;
 
 import "common.proto";
+import public "execution_shared.proto";
 import "catalog.proto";
 import "connector_read.proto";
 import "connector_write.proto";
@@ -75,20 +76,7 @@ message PlanFragment {
   novarocks.physical_semantics_v2.SemanticParameters semantic_parameters = 18;
 }
 
-// One explicit owner's complete value bindings. Logical and binding IDs form
-// independent sparse namespaces. References never use an implicit latest table.
-message ExecutionTypeTable {
-  repeated novarocks.value_type.LogicalTypeDefinition logical_types = 1;
-  repeated ExecutionValueBinding value_bindings = 2;
-}
 
-message ExecutionValueBinding {
-  optional uint32 id = 1;
-  optional uint32 logical_type_id = 2;
-  // Accurate value layout; per-batch encoding and BE capabilities are separate.
-  // Nested novarocks.arrow_type.ArrowPhysicalField logical refs use this same table's logical IDs.
-  novarocks.arrow_type.ArrowPhysicalType value_layout = 3;
-}
 
 // Binding between one CTE and its exchange receiver nodes.
 // Owner: produced by the future FE/native plan encoder and consumed by the
@@ -343,70 +331,15 @@ enum RuntimeFilterApplyPoint {
   RUNTIME_FILTER_APPLY_POINT_NODE_OUTPUT = 2;
 }
 
-// One independently decoded runtime-filter type domain. No fragment reference
-// or endpoint expression supplies the semantic owner of this container.
-message RuntimeFilterTypeDomain {
-  novarocks.common.TypeDesc value_type = 1;
-  ExecutionTypeTable execution_types = 2;
-}
 
-message RuntimeFilterContract {
-  RuntimeFilterTypeDomain logical_domain = 3;
-  oneof kind {
-    RuntimeFilterMembershipContract membership = 1;
-    RuntimeFilterOrderedContract ordered = 2;
-  }
-}
 
-enum RuntimeFilterMembershipNullSemantics {
-  RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_UNSPECIFIED = 0;
-  RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_NEVER_MATCHES = 1;
-  RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_NULL_SAFE_EQUAL = 2;
-}
 
-message RuntimeFilterMembershipContract {
-  reserved 1, 2;
-  reserved "canonical_schema", "schema_digest";
 
-  RuntimeFilterMembershipNullSemantics null_semantics = 3;
-}
 
-message RuntimeFilterOrderedContract {
-  repeated RuntimeFilterOrderKey keys = 1;
-  bytes comparator_digest = 2;
-  bytes order_contract_digest = 3;
-}
 
-message RuntimeFilterOrderKey {
-  novarocks.common.TypeDesc type = 1;
-  RuntimeFilterSortDirection direction = 2;
-  RuntimeFilterNullOrder null_order = 3;
-}
 
-enum RuntimeFilterSortDirection {
-  RUNTIME_FILTER_SORT_DIRECTION_UNSPECIFIED = 0;
-  RUNTIME_FILTER_SORT_DIRECTION_ASCENDING = 1;
-  RUNTIME_FILTER_SORT_DIRECTION_DESCENDING = 2;
-}
 
-enum RuntimeFilterNullOrder {
-  RUNTIME_FILTER_NULL_ORDER_UNSPECIFIED = 0;
-  RUNTIME_FILTER_NULL_ORDER_FIRST = 1;
-  RUNTIME_FILTER_NULL_ORDER_LAST = 2;
-}
 
-message RuntimeFilterReductionContract {
-  oneof kind {
-    bool set_union = 1;
-    bool tighten_ordered_bound = 2;
-    RuntimeFilterTopKReduction merge_topk_summary = 3;
-  }
-}
-
-message RuntimeFilterTopKReduction {
-  uint32 k = 1;
-  bytes contract_digest = 2;
-}
 
 message RuntimeFilterJoinBuildKey {
   uint32 ordinal = 1;
@@ -448,43 +381,10 @@ message RuntimeFilterSourceBoundaryTarget {
   reserved "scan_domain_target";
 }
 
-enum RuntimeFilterContributionKind {
-  RUNTIME_FILTER_CONTRIBUTION_KIND_UNSPECIFIED = 0;
-  RUNTIME_FILTER_CONTRIBUTION_KIND_VALUE_DOMAIN_DELTA = 1;
-  RUNTIME_FILTER_CONTRIBUTION_KIND_FINAL_DOMAIN_SHARD = 2;
-  RUNTIME_FILTER_CONTRIBUTION_KIND_ORDERED_BOUND_UPDATE = 3;
-  RUNTIME_FILTER_CONTRIBUTION_KIND_TOPK_SUMMARY = 4;
-  RUNTIME_FILTER_CONTRIBUTION_KIND_PRODUCER_CLOSED = 5;
-}
 
-enum RuntimeFilterCompletionRequirement {
-  RUNTIME_FILTER_COMPLETION_REQUIREMENT_UNSPECIFIED = 0;
-  RUNTIME_FILTER_COMPLETION_REQUIREMENT_PRODUCER_CLOSED = 1;
-  RUNTIME_FILTER_COMPLETION_REQUIREMENT_FENCED_COMMITTED_DOMAIN_FROZEN = 2;
-}
 
-enum RuntimeFilterArtifactCapability {
-  RUNTIME_FILTER_ARTIFACT_CAPABILITY_UNSPECIFIED = 0;
-  RUNTIME_FILTER_ARTIFACT_CAPABILITY_MEMBERSHIP = 1;
-  RUNTIME_FILTER_ARTIFACT_CAPABILITY_ORDERED_RANGE = 2;
-  RUNTIME_FILTER_ARTIFACT_CAPABILITY_EMPTY_DOMAIN = 3;
-}
 
-message RuntimeFilterConsumerActivation {
-  oneof kind {
-    bool blocking_snapshot = 1;
-    RuntimeFilterLateApplyGranularity non_blocking_live = 2;
-  }
-}
 
-enum RuntimeFilterLateApplyGranularity {
-  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_UNSPECIFIED = 0;
-  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_ROW = 1;
-  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_BATCH = 2;
-  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_ROW_GROUP = 3;
-  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_SPLIT = 4;
-  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_FILE = 5;
-}
 
 // Directed data-flow edge between two fragments.
 // Owner: produced by the future FE/native plan encoder and consumed by the

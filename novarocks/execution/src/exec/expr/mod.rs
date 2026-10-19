@@ -1812,9 +1812,6 @@ mod float_arithmetic_conversion_author_tests;
 mod grouping_sets_actual_sql_placement_tests;
 
 #[cfg(test)]
-mod e08s1_original_lifecycle_baseline_tests;
-
-#[cfg(test)]
 mod e08s1_owned_lifecycle_tests;
 
 #[cfg(test)]

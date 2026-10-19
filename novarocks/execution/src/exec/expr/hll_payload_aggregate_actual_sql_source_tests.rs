@@ -22,11 +22,9 @@ use novarocks_physical_plan::{
     StaticFunctionArgument,
 };
 fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
-    use novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1;
     vec![
         super::hll_hash_actual_sql_source_tests::hll_sql_source(
             "SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation') */ grp, CAST(avg(v) AS DECIMAL(18,4)) AS avg_v, ndv(k) AS ndv_k, hll_union_agg(hll_hash(k)) AS hll_k, CAST(percentile_approx(d,0.5) AS DECIMAL(18,4)) AS p50_d FROM fixture.agg_state_typedesc_contract GROUP BY grp ORDER BY grp",
-            OriginalNativeV1,
             &[
                 ("grp", DataType::Int32),
                 ("k", DataType::Int32),
@@ -36,7 +34,6 @@ fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
         ),
         super::hll_hash_actual_sql_source_tests::hll_sql_source(
             "select hll_union(hll_hash(c1)) from fixture.t1",
-            OriginalNativeV1,
             &[("c1", DataType::Int32), ("c2", DataType::Int32)],
         ),
     ]

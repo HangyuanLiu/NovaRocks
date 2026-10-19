@@ -210,7 +210,7 @@ fn sixteen_original_frames_and_nullable_wrappers_keep_each_backing_in_both_drop_
                         assert!(errors.is_empty());
                         (values, None, Some(wrapper))
                     } else {
-                        let mut frame = RuntimeScalarFrameForTest::try_new(
+                        let mut frame = RuntimeScalarFrameForTest::try_new_with_allocation_host(
                             program.clone(),
                             site(&program),
                             runtime.clone(),
@@ -505,7 +505,7 @@ fn shared_original_shift_wrappers_keep_their_exact_fixture_contract() {
     let runtime = runtime(&binding);
     let program = program_typed("bit_shift_left", &DataType::Int64, &binding);
     let input = batch(&program, false, 4096);
-    let mut frame = RuntimeScalarFrameForTest::try_new(
+    let mut frame = RuntimeScalarFrameForTest::try_new_with_allocation_host(
         program.clone(),
         site(&program),
         runtime.clone(),

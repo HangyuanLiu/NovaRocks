@@ -828,7 +828,6 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
         catalog.snapshot(),
         &RECORDER,
         policy(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
         PipelineDopDomain {
             min: 1,

@@ -21,9 +21,7 @@ use novarocks_functions::{
     FunctionArgumentType, FunctionBindingError, FunctionResultType, FunctionValueType,
     PureCallLifecycle,
 };
-use novarocks_sql::compiler::{
-    SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
-};
+use novarocks_sql::compiler::{SqlCompileControl, builtin_sql_function_catalog};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
 };
@@ -45,11 +43,8 @@ fn e08s1_append_static_full_original_source_nullability_and_delayed_suffix_are_a
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        for binding in bindings(mode) {
+    {
+        for binding in bindings() {
             // The retained corpus includes empty, two-byte, multibyte and NULL suffixes.
             // Support admission has no ConstantValue or row-payload access.
             scoped
@@ -89,7 +84,7 @@ fn e08s1_append_static_refuses_stale_complete_profile_before_any_preparation() {
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    let binding = bindings(SqlPhysicalEmissionMode::OriginalNativeV1).remove(0);
+    let binding = bindings().remove(0);
     let mut stale = Vec::new();
     for index in 0..2 {
         for ty in [
@@ -177,7 +172,7 @@ impl PureCompileControl for Trace {
 fn e08s1_append_static_all_actual_compile_prefixes_preserve_three_causes_no_tail() {
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
-    let binding = bindings(SqlPhysicalEmissionMode::OriginalNativeV1).remove(0);
+    let binding = bindings().remove(0);
     let good = Trace {
         events: Mutex::new(Vec::new()),
         refuse: None,

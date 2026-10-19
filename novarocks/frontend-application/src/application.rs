@@ -975,10 +975,15 @@ impl FrontendExecutionConfig {
             native_compatibility_id,
             function_catalog,
             constant_policy,
-            // Production freezes plan trees; a compiled-package composition
-            // selects its carrier explicitly.
+            // Default composition freezes the same package structure that the
+            // production receiver admits.
             static_plan_carrier:
-                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+                crate::query_execution::package_freeze::StaticPlanCarrier::CompiledPackage(
+                    crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                        novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                    ),
+                ),
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             mv_remote_effect_policy:

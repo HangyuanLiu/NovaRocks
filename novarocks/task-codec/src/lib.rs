@@ -2703,6 +2703,34 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_task_failure_round_trips_category_and_both_phases() {
+        use novarocks_execution_contract::TaskFailurePhase;
+        for (phase, installed) in [
+            (TaskFailurePhase::Preparation, false),
+            (TaskFailurePhase::Execution, true),
+        ] {
+            let failed = TaskStatus::try_new_with_installed(
+                identity(2, 3, backend()),
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Failed,
+                Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
+                    TaskFailureCategory::Unsupported,
+                    SafeDetail::truncating("FULL OUTER hash join"),
+                    phase,
+                ))),
+                TaskOutputFacts::default(),
+                installed,
+            )
+            .unwrap();
+            let wire = encode_task_status(&failed);
+            assert_eq!(
+                decode_task_status(&wire, FieldPath::root("unsupported")).unwrap(),
+                failed
+            );
+        }
+    }
+
+    #[test]
     fn installed_history_and_preparation_failure_phase_are_required_wire_facts() {
         let task = identity(2, 3, backend());
         let accepted = TaskStatus::created(task);

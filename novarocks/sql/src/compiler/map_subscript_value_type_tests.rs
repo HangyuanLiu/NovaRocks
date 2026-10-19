@@ -65,7 +65,6 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,
@@ -124,7 +123,6 @@ fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

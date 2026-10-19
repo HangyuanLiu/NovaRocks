@@ -30,7 +30,7 @@ use novarocks_local_program::{
     root_input_layout,
 };
 use novarocks_physical_plan::ExprKind;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{sync::Arc, time::Duration};
 struct Control;
@@ -64,11 +64,7 @@ fn between_count(source: &SqlAuthoredPhysicalPlan) -> usize {
 }
 #[test]
 fn between_sql_source_original_required_native_case_retains_actual_bound_decimal_domains() {
-    let source = sql_source(
-        REQUIRED,
-        DataType::Int64,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
+    let source = sql_source(REQUIRED, DataType::Int64);
     assert_eq!(between_count(&source), 1);
     for fragment in source.plan().fragments().values() {
         for (_, node) in fragment.expressions().iter() {
@@ -99,11 +95,7 @@ fn between_sql_source_original_required_native_case_retains_actual_bound_decimal
     }
 }
 fn evaluate(sql: &str, input: ArrayRef, low: ArrayRef, high: ArrayRef, negated: bool, truth: bool) {
-    let source = sql_source(
-        sql,
-        input.data_type().clone(),
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = sql_source(sql, input.data_type().clone());
     assert_eq!(
         between_count(&source),
         1,

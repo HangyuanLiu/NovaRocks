@@ -26,7 +26,7 @@ use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError,
     SqlCompileIntent, SqlCompiler, SqlFinalPlanCompileRequest, SqlFunctionCatalog,
-    SqlPhysicalEmissionMode, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
+    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
     builtin_sql_function_catalog,
 };
 use novarocks_type_contract::{CompileControlError, PureCompileControl};
@@ -35,7 +35,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-fn analyze(sql: &str, mode: SqlPhysicalEmissionMode) -> Result<(), SqlCompileError> {
+fn analyze(sql: &str) -> Result<(), SqlCompileError> {
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let catalog = SqlPlannerTableSnapshot::new(&catalog);
     let request = SqlAnalyzeRequest::new(
@@ -48,7 +48,6 @@ fn analyze(sql: &str, mode: SqlPhysicalEmissionMode) -> Result<(), SqlCompileErr
         &EVALUATOR,
         None,
         super::pure_differential::constant_policy(),
-        mode,
         SqlCompileControl::unbounded(),
     );
     SqlCompiler::analyze(request)?.into_pending()?;
@@ -79,19 +78,12 @@ fn sql_presence_candidate_hour_literal_and_projected_column_refuse_before_fold()
         "SELECT hour_from_unixtime(t.k) AS h FROM (SELECT CAST(1700000000 AS BIGINT) AS k) t",
     ] {
         reset();
-        analyze(sql, SqlPhysicalEmissionMode::OriginalNativeV1).unwrap();
         assert_eq!(fold_count(), 0);
         unavailable(
-            analyze(
-                sql,
-                SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            )
-            .err()
-            .unwrap(),
+            analyze(sql).err().unwrap(),
             "builtin.scalar/hour_from_unixtime/(i64)->i32;strict;legacy",
         );
         assert_eq!(fold_count(), 0);
-        analyze(sql, SqlPhysicalEmissionMode::OriginalNativeV1).unwrap();
         assert_eq!(fold_count(), 0);
     }
 }
@@ -100,16 +92,9 @@ fn sql_presence_candidate_hour_literal_and_projected_column_refuse_before_fold()
 fn sql_presence_candidate_invalid_pattern_is_not_prepared_or_evaluated_by_admission() {
     let _serial = SERIAL.lock().unwrap();
     reset();
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        analyze("SELECT regexp_count('x', '[') AS n", mode).unwrap();
-        analyze(
-            "SELECT regexp_count('x', t.pattern) AS n FROM (SELECT '[' AS pattern) t",
-            mode,
-        )
-        .unwrap();
+    {
+        analyze("SELECT regexp_count('x', '[') AS n").unwrap();
+        analyze("SELECT regexp_count('x', t.pattern) AS n FROM (SELECT '[' AS pattern) t").unwrap();
         assert_eq!(fold_count(), 0);
     }
 }
@@ -239,7 +224,6 @@ fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_pub
         builtin_sql_function_catalog().snapshot(),
         &EVALUATOR,
         super::pure_differential::constant_policy(),
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
             min: 1,

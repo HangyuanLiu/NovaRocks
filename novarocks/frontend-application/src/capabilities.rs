@@ -464,7 +464,6 @@ pub fn maintenance_read_command_executor(
 /// Leaf ports for MV metadata and refresh execution.
 #[derive(Clone)]
 pub struct MvCommandPorts {
-    sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -497,10 +496,8 @@ impl MvCommandPorts {
             Arc<dyn novarocks_mv_application::management::ManagementAuditSink>,
         >,
         constant_policy: novarocks_functions::ConstantPolicy,
-        sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     ) -> Self {
         Self {
-            sql_emission_mode,
             functions,
             constant_policy,
             catalog_service,
@@ -529,7 +526,6 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
             Arc::clone(&ports.storage_observation),
             Arc::clone(&ports.management_entrance),
             ports.constant_policy,
-            ports.sql_emission_mode,
         );
     let backend = Arc::new(
         crate::mv::domain::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
@@ -732,7 +728,6 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.mv_readiness,
         ports.mv_storage_observation,
         ports.constant_policy,
-        ports.static_plan_carrier.sql_emission_mode(),
     )
     .with_management_entrance(ports.mv_management_entrance);
     Arc::new(
@@ -898,7 +893,6 @@ pub fn background_maintenance_attempt(
 /// Leaf ports for the Frontend-owned MV background worker.
 #[derive(Clone)]
 pub(crate) struct MvBackgroundPorts {
-    sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -919,10 +913,8 @@ impl MvBackgroundPorts {
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        sql_emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     ) -> Self {
         Self {
-            sql_emission_mode,
             functions,
             constant_policy,
             catalog_service,
@@ -949,7 +941,6 @@ pub(crate) fn mv_background_bindings(
         Arc::clone(&ports.readiness),
         Arc::clone(&ports.storage_observation),
         ports.constant_policy,
-        ports.sql_emission_mode,
     )
     .with_management_entrance(ports.management_entrance);
     crate::mv::background::MvBackgroundBindings {

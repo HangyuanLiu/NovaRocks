@@ -386,7 +386,6 @@ pub fn prepare_completed_statistics_collection(
                 },
             ])
             .map_err(contract_violation)?,
-            static_plan_carrier.sql_emission_mode(),
         ),
         execution
             .sql_semantics()

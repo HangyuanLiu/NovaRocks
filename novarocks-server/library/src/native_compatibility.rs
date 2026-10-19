@@ -459,29 +459,13 @@ mod tests {
         }
     }
 
-    /// A candidate binary and a production binary built from one tree share
-    /// the descriptor, catalogue, implementation, plan and carrier
-    /// components; the interpreter each composed alone puts them on different
-    /// islands, while the production identity stays a pure function of its
-    /// inputs.
+    /// Pure support remains part of compatibility after compiled becomes the
+    /// sole production composition: a different installed seal is a different
+    /// island even when every other compatibility input agrees.
     #[test]
-    fn candidate_and_production_binaries_from_one_tree_are_different_islands() {
+    fn compiled_catalogue_support_separates_production_islands() {
         let manifest = server_manifest();
         let production = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            PLAN_TREE,
-        )
-        .unwrap();
-        let production_again = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            PLAN_TREE,
-        )
-        .unwrap();
-        let candidate = resolve_native_compatibility_material(
             manifest.contracts(),
             [0x31; 32],
             [0x41; 32],
@@ -490,31 +474,49 @@ mod tests {
             },
         )
         .unwrap();
+        let production_again = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            StaticPlanInterpreter::CompiledPackage {
+                pure_function_catalog_digest: [0x51; 32],
+            },
+        )
+        .unwrap();
+        let other_catalog = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            StaticPlanInterpreter::CompiledPackage {
+                pure_function_catalog_digest: [0x52; 32],
+            },
+        )
+        .unwrap();
 
         assert_eq!(production.id(), production_again.id());
-        assert_ne!(production.id(), candidate.id());
+        assert_ne!(production.id(), other_catalog.id());
         assert_ne!(
             production.static_plan_interpreter_digest(),
-            candidate.static_plan_interpreter_digest()
+            other_catalog.static_plan_interpreter_digest()
         );
         assert_eq!(
             production.descriptor_digest(),
-            candidate.descriptor_digest()
+            other_catalog.descriptor_digest()
         );
         assert_eq!(
             production.function_catalog_digest(),
-            candidate.function_catalog_digest()
+            other_catalog.function_catalog_digest()
         );
         assert_eq!(
             production.execution_implementation_manifest_digest(),
-            candidate.execution_implementation_manifest_digest()
+            other_catalog.execution_implementation_manifest_digest()
         );
         assert_eq!(
             production.plan_contract_digest(),
-            candidate.plan_contract_digest()
+            other_catalog.plan_contract_digest()
         );
-        assert_eq!(production.carriers(), candidate.carriers());
-        assert_eq!(production.epoch(), candidate.epoch());
+        assert_eq!(production.carriers(), other_catalog.carriers());
+        assert_eq!(production.epoch(), other_catalog.epoch());
     }
     #[test]
     fn prior_peer_without_to_base64_source_receipt_has_a_distinct_plan_digest() {

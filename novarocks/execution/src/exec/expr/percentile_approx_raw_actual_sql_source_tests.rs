@@ -19,7 +19,7 @@ use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 const SEMANTICS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/aggregate/sql/agg_percentile_semantics.sql"
@@ -37,17 +37,13 @@ fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
         .unwrap()
         .0
         .replace("${case_db}", "fixture");
-    let first = super::approx_percentile_actual_sql_source_tests::approx_sql_source(
-        sql.trim(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
+    let first = super::approx_percentile_actual_sql_source_tests::approx_sql_source(sql.trim());
     let sql = UNION
         .lines()
         .find(|line| line.starts_with("select percentile_approx_raw("))
         .unwrap();
     let second = super::hll_hash_actual_sql_source_tests::hll_sql_source(
         sql,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         &[("c1", DataType::Int32), ("c2", DataType::Float64)],
     );
     vec![first, second]

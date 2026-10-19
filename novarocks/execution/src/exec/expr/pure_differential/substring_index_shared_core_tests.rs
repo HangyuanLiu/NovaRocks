@@ -158,17 +158,14 @@ fn c12_p3_substring_index_fixed_forward_boundaries_constants_and_empty_match_v1(
     collection.finish();
 }
 #[test]
-fn c12_p3_substring_index_actual_sql_keeps_ordered_three_child_types_in_both_modes() {
+fn c12_p3_substring_index_actual_sql_keeps_ordered_three_child_types_for_compiled() {
     use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
     use novarocks_physical_plan::{
         ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
     };
-    use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
     let types = [DataType::Utf8, DataType::Utf8, DataType::Int32];
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         let fields = ["txt", "delim", "cnt"]
             .into_iter()
             .zip(&types)
@@ -177,7 +174,6 @@ fn c12_p3_substring_index_actual_sql_keeps_ordered_three_child_types_in_both_mod
         let owner = sql_source_with_declared_fields(
             "SELECT substring_index(txt,delim,cnt) FROM t",
             &fields,
-            mode,
         );
         let mut count = 0;
         for fragment in owner.plan().fragments().values() {
@@ -216,7 +212,7 @@ fn c12_p3_substring_index_actual_sql_keeps_ordered_three_child_types_in_both_mod
                 }
                 assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
                 count += 1;
-                println!("C12-P3 retained {mode:?} definition={id:?} children={args:?}");
+                println!("C12-P3 retained compiled definition={id:?} children={args:?}");
             }
         }
         assert!(count > 0);

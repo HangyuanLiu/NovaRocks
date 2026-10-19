@@ -15,17 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original public LogicalOnly analysis uses actual lexical bindings without folding.
-use super::sql_scalar_presence_original_tests::{EVALUATOR, SERIAL, fold_count, reset, session};
+use super::sql_scalar_presence_original_tests::{EVALUATOR, session};
 use novarocks_sql::compiler::{
     SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent, SqlCompiler,
-    SqlPhysicalEmissionMode, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
+    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
     builtin_sql_function_catalog,
 };
-pub(super) fn logical(
-    sql: &str,
-    mode: SqlPhysicalEmissionMode,
-    raw_limit: Option<i64>,
-) -> Result<(), SqlCompileError> {
+pub(super) fn logical(sql: &str, raw_limit: Option<i64>) -> Result<(), SqlCompileError> {
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let tables = SqlPlannerTableSnapshot::new(&catalog);
     let mut source_session = session();
@@ -42,21 +38,8 @@ pub(super) fn logical(
         &EVALUATOR,
         None,
         super::pure_differential::constant_policy(),
-        mode,
         SqlCompileControl::unbounded(),
     ))?
     .into_complete()?;
     Ok(())
-}
-#[test]
-fn e08s1_logical_environment_original_absent_source_does_not_add_admission() {
-    let _serial = SERIAL.lock().unwrap();
-    for sql in [
-        "SELECT GROUP_CONCAT(REVERSE('abc'))",
-        "SELECT FROM_UNIXTIME(CAST(ABS(CAST(1 AS BIGINT)) AS BIGINT))",
-    ] {
-        reset();
-        logical(sql, SqlPhysicalEmissionMode::OriginalNativeV1, None).unwrap();
-        assert_eq!(fold_count(), 0, "LogicalOnly does not run a calculator");
-    }
 }

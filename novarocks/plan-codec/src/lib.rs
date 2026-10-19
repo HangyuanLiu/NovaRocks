@@ -52,6 +52,7 @@ pub(crate) mod physical_fragment_envelope_v2;
 pub mod physical_node_v2;
 pub mod physical_package_metadata_v2;
 pub mod physical_package_v2;
+pub use physical_package_v2::PhysicalEncodeError;
 pub mod physical_properties_v2;
 pub mod physical_provider_binding_v2;
 pub mod physical_provider_read_v2;
@@ -79,11 +80,16 @@ pub mod physical_writer_recipe_v2;
 pub mod physical_writer_schema_v2;
 pub mod resource_preflight_v2;
 mod resource_source_model;
+#[cfg(test)]
+mod runtime_filter_test_support;
+mod sealed_write_targets;
+mod runtime_filter_facts;
+pub use runtime_filter_facts::runtime_filter_comparator_digest;
 pub mod value_type_table;
 mod write_targets;
 
 pub use physical_encode::{
-    NativeFragmentPreparationSource, NoPhysicalV1PrivateFacts, PhysicalEncodeError,
+    NativeFragmentPreparationSource, NoPhysicalV1PrivateFacts,
     PhysicalTypedCteConsumerView, PhysicalV1CteConsumer, PhysicalV1PrivateFacts,
     PhysicalV1RuntimeFilterBinding, PhysicalV1RuntimeFilterBindingRole, PhysicalV1ScanColumn,
     PhysicalV1ScanFact, PhysicalV1WriteFact, ScanRuntimeFilterBindings,
@@ -98,7 +104,7 @@ pub use physical_v1::{
     preflight_physical_plan_v1,
 };
 
-pub use write_targets::SealedWriteTargets;
+pub use sealed_write_targets::SealedWriteTargets;
 
 // Refuse flags that would make capability reporting disagree with compiled seams.
 #[cfg(any(

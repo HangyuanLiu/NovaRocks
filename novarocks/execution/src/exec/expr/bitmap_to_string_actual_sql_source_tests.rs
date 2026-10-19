@@ -49,19 +49,11 @@ use novarocks_sql::compiler::{
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-pub(super) fn bitmap_sql_source(
-    sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    bitmap_sql_source_with_semantics(
-        sql,
-        emission_mode,
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )
+pub(super) fn bitmap_sql_source(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    bitmap_sql_source_with_semantics(sql, novarocks_sql::sql_mode::SqlSemanticSettings::default())
 }
 fn bitmap_sql_source_with_semantics(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
@@ -95,7 +87,6 @@ fn bitmap_sql_source_with_semantics(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -214,10 +205,7 @@ fn bitmap_to_string_actual_original_required_sql_full_signature_source() {
     use novarocks_physical_plan::{
         ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
     };
-    let source = bitmap_sql_source(
-        SQL,
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
+    let source = bitmap_sql_source(SQL);
     let mut count = 0;
     for fragment in source.plan().fragments().values() {
         for (id, node) in fragment.expressions().iter() {
@@ -265,10 +253,7 @@ fn bitmap_to_string_actual_original_required_sql_full_signature_source() {
 #[test]
 fn bitmap_to_string_actual_original_required_sql_complete_compilation() {
     // Permanent intended contract: RED before installation, unchanged GREEN after.
-    let source = bitmap_sql_source(
-        SQL,
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
+    let source = bitmap_sql_source(SQL);
     let results = super::filter_conjunction_actual_sql_compiler_tests::compiler_results(
         &source,
         &super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue(),

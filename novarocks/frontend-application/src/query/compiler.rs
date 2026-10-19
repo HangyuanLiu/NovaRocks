@@ -148,7 +148,7 @@ impl FrontendQueryCompilerError {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
             novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => Self::Engine(error),
             novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
-                Self::Engine(message.into())
+                Self::Engine(novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(message).to_bracketed_user_message())
             }
         }
     }
@@ -624,7 +624,6 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
-            self.query.static_plan_carrier().sql_emission_mode(),
             sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
@@ -720,7 +719,6 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
-            self.query.static_plan_carrier().sql_emission_mode(),
             sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
@@ -892,7 +890,6 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
-            self.query.static_plan_carrier().sql_emission_mode(),
             sql_compile_control_from_execution(execution),
             Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
@@ -1025,7 +1022,6 @@ impl FrontendQueryCompiler {
             crate::query_execution::constant_eval::constant_evaluator(),
             mv_definitions,
             self.constant_policy(),
-            self.query.static_plan_carrier().sql_emission_mode(),
             sql_compile_control_from_execution(execution),
         ))
     }
@@ -1162,6 +1158,21 @@ fn scalar_root_output_from_public_port(
 mod compile_control_tests {
     use super::*;
     use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn encode_capability_refusal_preserves_the_client_engine_code() {
+        let error = FrontendQueryCompilerError::from_encode(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("CTE multicast"),
+        );
+        assert!(matches!(error, FrontendQueryCompilerError::Engine(message)
+            if message == "[UnsupportedCompiledShape] CTE multicast"));
+        let error = FrontendQueryCompilerError::from_encode(
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".to_owned()),
+        );
+        assert!(
+            matches!(error, FrontendQueryCompilerError::Engine(message) if message == "unsupported diagnostic")
+        );
+    }
 
     #[test]
     fn query_compile_encode_and_analyze_preserve_control_category() {

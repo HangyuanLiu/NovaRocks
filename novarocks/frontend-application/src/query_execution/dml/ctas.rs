@@ -294,11 +294,31 @@ pub struct CtasFailure {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CtasUserError {
+    UnsupportedCompiledShape(String),
     Analyze(novarocks_sql::analyze_error::AnalyzeError),
     Control(novarocks_type_contract::CompileControlError),
 }
 
 impl CtasFailure {
+    fn unsupported_compiled_shape(reason: String) -> Self {
+        Self {
+            kind: CtasFailureKind::Unsupported,
+            message:
+                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
+                    reason.clone(),
+                )
+                .to_bracketed_user_message(),
+            user_error: Some(CtasUserError::UnsupportedCompiledShape(reason)),
+        }
+    }
+
+    pub(crate) fn compiled_shape_refusal(&self) -> Option<&str> {
+        match self.user_error.as_ref() {
+            Some(CtasUserError::UnsupportedCompiledShape(reason)) => Some(reason),
+            _ => None,
+        }
+    }
+
     /// Retains the typed failure until the CTAS statement boundary can render
     /// its parser-owned span against the original SQL source.
     fn analyze(error: novarocks_sql::analyze_error::AnalyzeError) -> Self {
@@ -345,14 +365,14 @@ impl CtasFailure {
         match self.user_error.as_ref() {
             Some(CtasUserError::Control(error)) => Some(*error),
             Some(CtasUserError::Analyze(error)) => error.control_error(),
-            None => None,
+            Some(CtasUserError::UnsupportedCompiledShape(_)) | None => None,
         }
     }
 
     pub(crate) fn user_error(&self, source: Option<&str>) -> Option<UserError> {
         match self.user_error.as_ref()? {
             CtasUserError::Analyze(error) => Some(error.to_user_error(source)),
-            CtasUserError::Control(_) => None,
+            CtasUserError::Control(_) | CtasUserError::UnsupportedCompiledShape(_) => None,
         }
     }
 }
@@ -667,7 +687,6 @@ fn plan_query_for_ctas_source(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         state.constant_policy(),
-        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -684,11 +703,8 @@ fn plan_query_for_ctas_source(
     let optimize_request =
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
     let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
-    let source = novarocks_sql::planning::dml::compile_ctas_source(
-        optimize_request,
-        state.static_plan_carrier().sql_emission_mode(),
-    )
-    .map_err(CtasFailure::from_compile)?;
+    let source = novarocks_sql::planning::dml::compile_ctas_source(optimize_request)
+        .map_err(CtasFailure::from_compile)?;
     Ok(PlannedCtasSourceQuery {
         decimal_overflow_policy,
         source,
@@ -1493,19 +1509,50 @@ fn staged_write_failed(
     target: &dyn CtasWriteTarget,
     message: impl Into<String>,
 ) -> StandardCtasWriteOutcome {
-    let mut message = message.into();
-    if let Err(error) = target.mark_write_unknown() {
-        message.push_str(&format!(
-            "; standard CTAS target rejected write-unknown transition: {error}"
-        ));
-    }
-    StandardCtasWriteOutcome::KnownUncommitted {
-        failure: CtasFailure {
+    staged_write_failure(
+        target,
+        CtasFailure {
+            kind: CtasFailureKind::Unavailable,
+            message: message.into(),
+            user_error: None,
+        },
+    )
+}
+
+fn staged_distributed_write_failed(
+    target: &dyn CtasWriteTarget,
+    context: &str,
+    error: crate::query_execution::contract::DistributedQueryError,
+) -> StandardCtasWriteOutcome {
+    let (reason, code) = crate::dml::error::DmlExecutionError::from(error).into_abort_parts();
+    let message = format!("{context}: {reason}");
+    let failure = if code == Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape) {
+        CtasFailure::unsupported_compiled_shape(message)
+    } else {
+        CtasFailure {
             kind: CtasFailureKind::Unavailable,
             message,
             user_error: None,
-        },
+        }
+    };
+    staged_write_failure(target, failure)
+}
+
+fn staged_write_failure(
+    target: &dyn CtasWriteTarget,
+    mut failure: CtasFailure,
+) -> StandardCtasWriteOutcome {
+    if let Err(error) = target.mark_write_unknown() {
+        failure.message.push_str(&format!(
+            "; standard CTAS target rejected write-unknown transition: {error}"
+        ));
+        if let Some(CtasUserError::UnsupportedCompiledShape(reason)) = failure.user_error.as_mut() {
+            reason.push_str(&format!(
+                "; standard CTAS target rejected write-unknown transition: {error}"
+            ));
+        }
     }
+    StandardCtasWriteOutcome::KnownUncommitted { failure }
 }
 
 fn standard_ctas_unsupported() -> CtasFailure {
@@ -1941,6 +1988,9 @@ impl CtasEngine for DmlExecutionKernel {
             crate::dml::error::DmlExecutionError::Control(error) => CtasFailure::control(error),
             crate::dml::error::DmlExecutionError::Analyze(error) => CtasFailure::analyze(error),
             crate::dml::error::DmlExecutionError::Engine(error) => internal_failure(error),
+            crate::dml::error::DmlExecutionError::UnsupportedCompiledShape(reason) => {
+                CtasFailure::unsupported_compiled_shape(reason)
+            }
             crate::dml::error::DmlExecutionError::Cow(error) => {
                 // This private CTAS planner never opens a COW session. Reject
                 // any future violation while still on the original synchronous
@@ -2016,18 +2066,20 @@ impl CtasEngine for DmlExecutionKernel {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        return Ok(staged_write_failed(
+                        return Ok(staged_distributed_write_failed(
                             prepared.target.as_ref(),
-                            format!("CTAS write did not complete: {error}"),
+                            "CTAS write did not complete",
+                            error,
                         ));
                     }
                 };
                 let write = match outcome.into_write() {
                     Ok(write) => write,
                     Err(error) => {
-                        return Ok(staged_write_failed(
+                        return Ok(staged_distributed_write_failed(
                             prepared.target.as_ref(),
-                            format!("CTAS write reached no terminal: {error}"),
+                            "CTAS write reached no terminal",
+                            error,
                         ));
                     }
                 };
@@ -2174,6 +2226,44 @@ impl CtasEngine for DmlExecutionKernel {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn runtime_refusal_marks_write_unknown_and_keeps_uncommitted_publication_fact() {
+        use novarocks_types::EngineErrorCode;
+        for code in [None, Some(EngineErrorCode::UnsupportedCompiledShape)] {
+            let target = RecordingTarget::default();
+            let error = crate::query_execution::contract::DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                "unsupported diagnostic",
+            )
+            .with_engine_error_code(code);
+            let outcome =
+                staged_distributed_write_failed(&target, "CTAS write did not complete", error);
+            let StandardCtasWriteOutcome::KnownUncommitted { failure } = outcome else {
+                panic!("publication remains uncommitted");
+            };
+            assert_eq!(target.unknown.load(Ordering::SeqCst), 1);
+            assert!(target.bound().is_empty());
+            assert_eq!(failure.compiled_shape_refusal().is_some(), code.is_some());
+            assert!(failure.message.contains("CTAS write did not complete"));
+        }
+    }
+
+    #[test]
+    fn compiled_capability_retains_its_typed_ctas_cause() {
+        let failure = CtasFailure::unsupported_compiled_shape("change-stream router".into());
+        assert_eq!(failure.kind, CtasFailureKind::Unsupported);
+        assert_eq!(
+            failure.compiled_shape_refusal(),
+            Some("change-stream router")
+        );
+        assert_eq!(
+            failure.message,
+            "[UnsupportedCompiledShape] change-stream router"
+        );
+        assert!(failure.compile_control_error().is_none());
+        assert!(failure.user_error(None).is_none());
+    }
 
     use novarocks_spi::connector::ConnectorError;
 

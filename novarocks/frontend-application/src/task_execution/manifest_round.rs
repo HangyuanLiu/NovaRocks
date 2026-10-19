@@ -376,17 +376,7 @@ impl ManifestAssembledRound {
                 // authoritative cause, so recovery classification never fixes
                 // an incomplete failure fact.
                 if !detail.is_derived() {
-                    let terminal =
-                        NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-                            AttemptFailureClass::ExecutionFailure,
-                            QueryExecutionError::new(
-                                QueryExecutionErrorKind::Failed,
-                                format!(
-                                    "Native Task attempt terminated: {}",
-                                    render_termination_detail(Some(detail))
-                                ),
-                            ),
-                        ));
+                    let terminal = NativeAttemptTerminal::Failed(task_termination_failure(detail));
                     if self.actor_gate.prepare_convergence() {
                         self.terminal = Some(terminal.clone());
                         return terminal;
@@ -558,6 +548,33 @@ fn begin_terminal_cleanup(round: &mut TaskRound, split_delivery: &SplitDeliveryB
     split_delivery.abandon("Native attempt entered convergence");
 }
 
+fn task_termination_failure(
+    detail: &novarocks_execution_contract::TerminationDetail,
+) -> NativeAttemptPreparationFailure {
+    use novarocks_execution_contract::{TaskFailureCategory, TerminationDetail};
+    let message = format!(
+        "Native Task attempt terminated: {}",
+        render_termination_detail(Some(detail))
+    );
+    let (class, message) = if matches!(detail,
+        TerminationDetail::Failed(failure) if failure.category() == TaskFailureCategory::Unsupported)
+    {
+        (
+            AttemptFailureClass::Unsupported,
+            novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
+                message,
+            )
+            .to_bracketed_user_message(),
+        )
+    } else {
+        (AttemptFailureClass::ExecutionFailure, message)
+    };
+    NativeAttemptPreparationFailure::new(
+        class,
+        QueryExecutionError::new(QueryExecutionErrorKind::Failed, message),
+    )
+}
+
 fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
     let topology_requirement = match &error {
         TaskExecutionError::ParticipantUnobservable {
@@ -647,6 +664,42 @@ fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_task_capability_uses_the_same_client_identity_as_result_observation() {
+        use novarocks_execution_contract::{
+            SafeDetail, TaskFailure, TaskFailureCategory, TaskFailurePhase, TerminationDetail,
+        };
+        for category in [
+            TaskFailureCategory::Unsupported,
+            TaskFailureCategory::Protocol,
+        ] {
+            let detail = TerminationDetail::Failed(TaskFailure::new_in_phase(
+                category,
+                SafeDetail::truncating("FULL OUTER hash join"),
+                TaskFailurePhase::Preparation,
+            ));
+            let failure = task_termination_failure(&detail);
+            if category == TaskFailureCategory::Unsupported {
+                assert_eq!(failure.class(), AttemptFailureClass::Unsupported);
+                assert!(
+                    failure
+                        .error()
+                        .message()
+                        .starts_with("[UnsupportedCompiledShape] ")
+                );
+            } else {
+                assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+                assert!(
+                    !failure
+                        .error()
+                        .message()
+                        .starts_with("[UnsupportedCompiledShape]")
+                );
+            }
+            assert!(failure.error().message().contains("FULL OUTER hash join"));
+        }
+    }
 
     struct UnusedConvergenceSource;
 

@@ -94,6 +94,7 @@ pub enum MutationStageOutcome {
     NoOp,
     AbortRequired {
         reason: String,
+        engine_error_code: Option<novarocks_types::EngineErrorCode>,
         handle: Arc<dyn MutationAbort>,
     },
     CommitRequired(Arc<dyn MutationCommit>),
@@ -566,8 +567,10 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     }
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::AbortRequired {
                         reason,
+                        engine_error_code,
                         execution,
                     } => Ok(MutationStageOutcome::AbortRequired {
+                        engine_error_code,
                         handle: Arc::new(CoreMutationAbort {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),
@@ -598,8 +601,10 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     }
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::AbortRequired {
                         reason,
+                        engine_error_code,
                         execution,
                     } => Ok(MutationStageOutcome::AbortRequired {
+                        engine_error_code,
                         handle: Arc::new(CoreMutationAbort {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),

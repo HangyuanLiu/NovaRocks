@@ -189,46 +189,7 @@ impl PhysicalV1PrivateFacts for NoPhysicalV1PrivateFacts {
     }
 }
 
-/// Typed original-control failures remain distinct from invalid legacy wire facts.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PhysicalEncodeError {
-    Control(novarocks_type_contract::CompileControlError),
-    Invalid(String),
-    UnsupportedCapability(&'static str),
-}
-impl std::fmt::Display for PhysicalEncodeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Control(error) => error.fmt(formatter),
-            Self::Invalid(error) => formatter.write_str(error),
-            Self::UnsupportedCapability(message) => formatter.write_str(message),
-        }
-    }
-}
-impl std::error::Error for PhysicalEncodeError {}
-impl From<String> for PhysicalEncodeError {
-    fn from(error: String) -> Self {
-        Self::Invalid(error)
-    }
-}
-impl From<&str> for PhysicalEncodeError {
-    fn from(error: &str) -> Self {
-        Self::Invalid(error.into())
-    }
-}
-impl From<novarocks_type_contract::CompileControlError> for PhysicalEncodeError {
-    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
-        Self::Control(error)
-    }
-}
-impl From<novarocks_functions::FunctionBindingError> for PhysicalEncodeError {
-    fn from(error: novarocks_functions::FunctionBindingError) -> Self {
-        match error {
-            novarocks_functions::FunctionBindingError::Control(error) => Self::Control(error),
-            other => Self::Invalid(other.to_string()),
-        }
-    }
-}
+pub(crate) use crate::physical_package_v2::PhysicalEncodeError;
 
 /// One caller supplies type profiles, actual allocation admission, control and
 /// storage retention. Every fragment and independently decoded schema owns its
@@ -1275,104 +1236,10 @@ fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/// The comparator this plan's ordered runtime filter is compared under.
-///
-/// Both the wire contract and the facts an attempt deploys from name the
-/// comparator by digest, and they must name the same one. Deriving it once
-/// here is what makes that true by construction rather than by review.
-pub fn physical_v1_runtime_filter_comparator_digest(
-    filter: &novarocks_physical_plan::RuntimeFilter,
-) -> Result<Option<[u8; 32]>, String> {
-    let novarocks_physical_plan::RuntimeFilterDomain::Ordered { key, .. } = &filter.domain else {
-        return Ok(None);
-    };
-    let (comparator_digest, _) =
-        runtime_filter_order_digests(&key.ty.data_type(), key.direction, key.null_ordering)?;
-    Ok(Some(comparator_digest))
-}
-
-fn runtime_filter_order_digests(
-    data_type: &arrow::datatypes::DataType,
-    direction: novarocks_physical_plan::SortDirection,
-    null_ordering: novarocks_physical_plan::NullOrdering,
-) -> Result<([u8; 32], [u8; 32]), String> {
-    runtime_filter_order_digests_observed(data_type, direction, null_ordering, || Ok(()))
-}
-
-/// Feed the same canonical bytes into both fixed-size digest states. No
-/// timezone-dependent temporary Vec or assumed fixed key size is allocated.
-fn runtime_filter_order_digests_observed<E: From<String>>(
-    data_type: &arrow::datatypes::DataType,
-    direction: novarocks_physical_plan::SortDirection,
-    null_ordering: novarocks_physical_plan::NullOrdering,
-    observe: impl FnMut() -> Result<(), E>,
-) -> Result<([u8; 32], [u8; 32]), E> {
-    use novarocks_local_program::{FilterNullOrder, FilterSortDirection};
-    novarocks_local_program::single_key_ordered_filter_digests_observed(
-        match direction {
-            novarocks_physical_plan::SortDirection::Ascending => FilterSortDirection::Ascending,
-            novarocks_physical_plan::SortDirection::Descending => FilterSortDirection::Descending,
-        },
-        match null_ordering {
-            novarocks_physical_plan::NullOrdering::First => FilterNullOrder::First,
-            novarocks_physical_plan::NullOrdering::Last => FilterNullOrder::Last,
-        },
-        |emit| visit_runtime_filter_key_type(data_type, &mut |bytes| emit(bytes)),
-        observe,
-    )
-}
-
-fn visit_runtime_filter_key_type<E: From<String>>(
-    data_type: &arrow::datatypes::DataType,
-    emit: &mut impl FnMut(&[u8]) -> Result<(), E>,
-) -> Result<(), E> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    match data_type {
-        DataType::Boolean => emit(&[1])?,
-        DataType::Int8 => emit(&[2])?,
-        DataType::Int16 => emit(&[3])?,
-        DataType::Int32 => emit(&[4])?,
-        DataType::Int64 => emit(&[5])?,
-        DataType::FixedSizeBinary(16) => emit(&[6])?,
-        DataType::Utf8 => emit(&[9])?,
-        DataType::Date32 => emit(&[10])?,
-        DataType::Timestamp(unit, timezone) => {
-            emit(&[
-                11,
-                match unit {
-                    TimeUnit::Second => 1,
-                    TimeUnit::Millisecond => 2,
-                    TimeUnit::Microsecond => 3,
-                    TimeUnit::Nanosecond => 4,
-                },
-            ])?;
-            if let Some(timezone) = timezone {
-                let length = u32::try_from(timezone.len()).map_err(|_| {
-                    E::from("runtime-filter timezone length exceeds u32".to_string())
-                })?;
-                emit(&[1])?;
-                emit(&length.to_be_bytes())?;
-                emit(timezone.as_bytes())?;
-            } else {
-                emit(&[0])?;
-            }
-        }
-        DataType::Decimal128(precision, scale)
-            if *precision != 0
-                && *precision <= 38
-                && *scale <= 38
-                && (*scale <= 0 || (*scale as u8) <= *precision) =>
-        {
-            emit(&[12, *precision, *scale as u8])?;
-        }
-        _ => {
-            return Err(E::from(
-                "runtime-filter ordered key type is unsupported".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
+pub use crate::runtime_filter_facts::runtime_filter_comparator_digest as physical_v1_runtime_filter_comparator_digest;
+use crate::runtime_filter_facts::{
+    runtime_filter_order_digests_observed, visit_runtime_filter_key_type,
+};
 
 const NATIVE_V1_PLAN_FRAGMENT_PREFIX_DEPTH: usize = 2;
 // Covers operator/item carriers and the fixed WindowFrame/WindowBound branch.
@@ -6345,20 +6212,11 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    fn codec_constant_policy() -> novarocks_constant_contract::ConstantPolicy {
-        novarocks_constant_contract::ConstantPolicy {
-            max_rows: 4096,
-            max_array_nodes: 4096,
-            max_logical_elements: 65536,
-            max_retained_buffer_bytes: 8 * 1024 * 1024,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 16,
-            max_metadata_bytes: 65536,
-            max_library_validation_work: 8 * 1024 * 1024,
-            max_library_validation_bytes: 32 * 1024 * 1024,
-        }
-    }
+    use crate::runtime_filter_test_support::{
+        CodecTestControl, append_test_i64_values, codec_constant_policy,
+        finish_ordered_join_build_filter_plan, fixture_i64_constants, fixture_i64_reference,
+        properties, test_hash_scheme,
+    };
 
     fn codec_i64_constant(value: i64) -> novarocks_constant_contract::ConstantValue {
         let ty = FunctionValueType::new(DataType::Int64, false);
@@ -6379,38 +6237,7 @@ pub(crate) mod tests {
 
     // Explicit scalar inputs shared by legacy plan fixtures. Pool rows remain
     // source facts; referencing one row does not re-author its value or type.
-    fn fixture_i64_constants() -> novarocks_physical_plan::ConstantPools {
-        use arrow::array::{Array, Int64Array};
-        let pool = novarocks_constant_contract::ConstantPool::try_new(
-            Arc::new(arrow::datatypes::Field::new(
-                "source",
-                DataType::Int64,
-                false,
-            )),
-            FunctionValueType::new(DataType::Int64, false),
-            Int64Array::from(vec![1, 2, 7, 9]).to_data(),
-            codec_constant_policy(),
-            novarocks_type_contract::CompilePhase::Encode,
-            &CodecTestControl,
-        )
-        .unwrap();
-        let mut constants = novarocks_physical_plan::ConstantPools::empty();
-        constants
-            .insert(novarocks_physical_plan::ConstantPoolId::new(0), pool)
-            .unwrap();
-        constants
-    }
 
-    fn fixture_i64_reference(value: i64) -> ExprKind {
-        let ordinal = [1, 2, 7, 9]
-            .iter()
-            .position(|candidate| *candidate == value)
-            .expect("the fixture must explicitly author its source value");
-        ExprKind::Constant(novarocks_physical_plan::ConstantReference {
-            pool: novarocks_physical_plan::ConstantPoolId::new(0),
-            ordinal: u32::try_from(ordinal).unwrap(),
-        })
-    }
 
     fn fragment_with_checked_constant(
         value: &novarocks_constant_contract::ConstantValue,
@@ -6704,16 +6531,6 @@ pub(crate) mod tests {
         }
     }
 
-    struct CodecTestControl;
-    impl novarocks_type_contract::PureCompileControl for CodecTestControl {
-        fn checkpoint(
-            &self,
-            _: novarocks_type_contract::CompilePhase,
-            _: u32,
-        ) -> Result<(), novarocks_type_contract::CompileControlError> {
-            Ok(())
-        }
-    }
 
     use std::sync::Arc;
 
@@ -7678,85 +7495,6 @@ pub(crate) mod tests {
         let mut forged_result = function;
         forged_result.result_type = FunctionValueType::new(DataType::Utf8, false);
         assert!(validate_test_scalar(&catalog, &forged_result).is_err());
-    }
-
-    #[test]
-    fn ordered_runtime_filter_digest_matches_canonical_int64_golden() {
-        let (comparator, order) = runtime_filter_order_digests(
-            &DataType::Int64,
-            novarocks_physical_plan::SortDirection::Ascending,
-            novarocks_physical_plan::NullOrdering::Last,
-        )
-        .unwrap();
-        assert_eq!(
-            hex::encode(comparator),
-            "ef75ae29c8dd2bce7ddb857cfff1d89b8afa8c30950bd3afb669ffb52d8755d8"
-        );
-        assert_eq!(
-            hex::encode(order),
-            "ee277431b71d9a36652809581e72c910c527d050916ec4c96ac2f4b4636549bb"
-        );
-        assert!(
-            runtime_filter_order_digests(
-                &DataType::Float64,
-                novarocks_physical_plan::SortDirection::Ascending,
-                novarocks_physical_plan::NullOrdering::Last,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn ordered_runtime_filter_digest_streams_long_timezone_bytes_and_original_refusals() {
-        #[derive(Debug, Eq, PartialEq)]
-        enum Failure {
-            Invalid(String),
-            Control(novarocks_type_contract::CompileControlError),
-        }
-        impl From<String> for Failure {
-            fn from(value: String) -> Self {
-                Self::Invalid(value)
-            }
-        }
-        use novarocks_type_contract::CompileControlError;
-        let timezone = "UTC".repeat(80);
-        let ty = DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Nanosecond,
-            Some(timezone.clone().into()),
-        );
-        let direction = novarocks_physical_plan::SortDirection::Descending;
-        let nulls = novarocks_physical_plan::NullOrdering::First;
-        let mut count = 0;
-        let baseline = runtime_filter_order_digests_observed(&ty, direction, nulls, || {
-            count += 1;
-            Ok::<_, Failure>(())
-        })
-        .unwrap();
-        assert_eq!(
-            baseline,
-            runtime_filter_order_digests(&ty, direction, nulls).unwrap()
-        );
-        assert_eq!(count, 13 + timezone.len());
-        for reason in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ] {
-            for stop in 0..count {
-                let mut seen = 0;
-                let result = runtime_filter_order_digests_observed(&ty, direction, nulls, || {
-                    let ordinal = seen;
-                    seen += 1;
-                    if ordinal == stop {
-                        Err(Failure::Control(reason))
-                    } else {
-                        Ok(())
-                    }
-                });
-                assert_eq!(result, Err(Failure::Control(reason)));
-                assert_eq!(seen, stop + 1);
-            }
-        }
     }
 
     #[test]
@@ -8973,13 +8711,6 @@ pub(crate) mod tests {
         );
     }
 
-    fn properties() -> PhysicalProperties {
-        PhysicalProperties {
-            distribution: Distribution::Singleton,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        }
-    }
 
     fn finish_limit_chain_plan(depth: usize) -> PhysicalPlan {
         assert!(depth > 0);
@@ -9600,59 +9331,7 @@ pub(crate) mod tests {
         assert!(error.contains("message depth"), "{error}");
     }
 
-    fn append_test_i64_values(
-        builder: &mut FragmentBuilder,
-        literal_value: i64,
-    ) -> (NodeId, ValueId) {
-        let node = builder.reserve_node_id().unwrap();
-        let ty = ValueType::new(DataType::Int64, false);
-        let literal = builder
-            .add_expression(node, ty.clone(), fixture_i64_reference(literal_value))
-            .unwrap();
-        let value = builder
-            .add_value(
-                ty,
-                ValueOrigin::NodeOutput {
-                    node,
-                    output_ordinal: 0,
-                },
-            )
-            .unwrap();
-        builder
-            .insert_node_unchecked(PhysicalNode {
-                id: node,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: properties(),
-                output: OutputPort {
-                    node,
-                    columns: Box::from([value]),
-                },
-                kind: NodeKind::Values {
-                    rows: Box::from([Box::from([literal])]),
-                },
-            })
-            .unwrap();
-        (node, value)
-    }
 
-    fn test_hash_scheme(seed: u8) -> novarocks_physical_plan::HashPartitionScheme {
-        novarocks_physical_plan::HashPartitionScheme {
-            space: novarocks_physical_plan::PartitionSpaceId::try_new([seed; 32]).unwrap(),
-            count: novarocks_physical_plan::PartitionCountParameter {
-                id: novarocks_physical_plan::PartitionCountParameterId::try_new(
-                    [seed.wrapping_add(1); 32],
-                )
-                .unwrap(),
-                admissible: novarocks_physical_plan::PartitionCountDomain {
-                    min: 1,
-                    max: 64,
-                    requires_power_of_two: true,
-                },
-            },
-            definition: novarocks_physical_plan::HashDefinition::native_exchange(),
-        }
-    }
 
     #[test]
     fn wire_v1_refuses_group_key_budgets_instead_of_encoding_row_topn() {
@@ -9958,357 +9637,7 @@ pub(crate) mod tests {
         plan.finish_observed(&CodecTestControl).unwrap()
     }
 
-    fn test_runtime_filter_coverage(
-        witness: novarocks_physical_plan::RuntimeFilterWitnessId,
-    ) -> novarocks_physical_plan::RuntimeFilterCoverage {
-        use novarocks_physical_plan::RuntimeFilterCoverageNode;
 
-        novarocks_physical_plan::RuntimeFilterCoverage {
-            nodes: Box::from([
-                RuntimeFilterCoverageNode::Witness(witness),
-                RuntimeFilterCoverageNode::AllOf {
-                    children: Box::from([0]),
-                },
-            ]),
-            root: 1,
-        }
-    }
-
-    pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
-        use novarocks_physical_plan::{
-            EdgeDestination, EdgePartitioning, EdgeSource, NullOrdering,
-            OrderedComparisonAlgorithm, RuntimeFilter, RuntimeFilterApplyPoint,
-            RuntimeFilterArtifactCapability, RuntimeFilterCompletion, RuntimeFilterConsumer,
-            RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget,
-            RuntimeFilterContributionKind, RuntimeFilterDomain, RuntimeFilterEqualityWitness,
-            RuntimeFilterEqualityWitnessId, RuntimeFilterId, RuntimeFilterKind,
-            RuntimeFilterLifecycle, RuntimeFilterOrderKey, RuntimeFilterPolicy,
-            RuntimeFilterProducer, RuntimeFilterProducerProgress, RuntimeFilterProducerTarget,
-            RuntimeFilterReduction, RuntimeFilterWitnessId, SortDirection,
-        };
-
-        let left_fragment = FragmentId::new(40);
-        let right_fragment = FragmentId::new(41);
-        let join_fragment = FragmentId::new(42);
-        let left_edge = EdgeId::new(40);
-        let right_edge = EdgeId::new(41);
-        let scheme = test_hash_scheme(40);
-        let ty = ValueType::new(DataType::Int64, false);
-
-        let mut left_builder = FragmentBuilder::new(left_fragment);
-        let (left_source_node, left_source_value) = append_test_i64_values(&mut left_builder, 1);
-        let left_source = left_builder
-            .finish_definition(
-                left_source_node,
-                FragmentSink::Stream { edge: left_edge },
-                PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: false,
-                },
-            )
-            .unwrap();
-        let mut right_builder = FragmentBuilder::new(right_fragment);
-        let (right_source_node, right_source_value) = append_test_i64_values(&mut right_builder, 2);
-        let right_source = right_builder
-            .finish_definition(
-                right_source_node,
-                FragmentSink::Stream { edge: right_edge },
-                PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: false,
-                },
-            )
-            .unwrap();
-
-        let mut join_builder = FragmentBuilder::new(join_fragment);
-        let left = join_builder.reserve_node_id().unwrap();
-        let left_value = join_builder
-            .add_value(
-                ty.clone(),
-                ValueOrigin::ExchangeImport {
-                    edge: left_edge,
-                    source_value: left_source_value,
-                },
-            )
-            .unwrap();
-        let left_properties = PhysicalProperties {
-            distribution: Distribution::Hash {
-                keys: Box::from([left_value]),
-                scheme: scheme.clone(),
-            },
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        join_builder
-            .insert_node_unchecked(PhysicalNode {
-                id: left,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: left_properties.clone(),
-                output: OutputPort {
-                    node: left,
-                    columns: Box::from([left_value]),
-                },
-                kind: NodeKind::ExchangeSource {
-                    edge: left_edge,
-                    imports: Box::from([(left_source_value, left_value)]),
-                },
-            })
-            .unwrap();
-
-        let right = join_builder.reserve_node_id().unwrap();
-        let right_value = join_builder
-            .add_value(
-                ty.clone(),
-                ValueOrigin::ExchangeImport {
-                    edge: right_edge,
-                    source_value: right_source_value,
-                },
-            )
-            .unwrap();
-        let right_properties = PhysicalProperties {
-            distribution: Distribution::Hash {
-                keys: Box::from([right_value]),
-                scheme: scheme.clone(),
-            },
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        join_builder
-            .insert_node_unchecked(PhysicalNode {
-                id: right,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: right_properties.clone(),
-                output: OutputPort {
-                    node: right,
-                    columns: Box::from([right_value]),
-                },
-                kind: NodeKind::ExchangeSource {
-                    edge: right_edge,
-                    imports: Box::from([(right_source_value, right_value)]),
-                },
-            })
-            .unwrap();
-        let aggregate = join_builder.reserve_node_id().unwrap();
-        let group_key = join_builder
-            .add_expression(aggregate, ty.clone(), ExprKind::Value(right_value))
-            .unwrap();
-        join_builder
-            .insert_node_unchecked(PhysicalNode {
-                id: aggregate,
-                inputs: Box::from([right]),
-                required_inputs: Box::from([right_properties.clone()]),
-                output_properties: right_properties.clone(),
-                output: OutputPort {
-                    node: aggregate,
-                    columns: Box::from([right_value]),
-                },
-                kind: NodeKind::Aggregate {
-                    group_by: Box::from([(group_key, right_value)]),
-                    calls: Box::default(),
-                    grouping: novarocks_physical_plan::AggregateGrouping::Complete,
-                },
-            })
-            .unwrap();
-        let join = join_builder.reserve_node_id().unwrap();
-        let left_key = join_builder
-            .add_expression(join, ty.clone(), ExprKind::Value(left_value))
-            .unwrap();
-        let right_key = join_builder
-            .add_expression(join, ty.clone(), ExprKind::Value(right_value))
-            .unwrap();
-        join_builder
-            .insert_node_unchecked(PhysicalNode {
-                id: join,
-                inputs: Box::from([left, aggregate]),
-                required_inputs: Box::from([left_properties.clone(), right_properties]),
-                output_properties: left_properties,
-                output: OutputPort {
-                    node: join,
-                    columns: Box::from([left_value, right_value]),
-                },
-                kind: NodeKind::HashJoin {
-                    kind: JoinKind::Inner,
-                    keys: Box::from([JoinKey {
-                        left: left_key,
-                        right: right_key,
-                        null_safe: false,
-                    }]),
-                    build_side: JoinSide::Right,
-                    distribution: JoinDistribution::Partitioned,
-                    residual: None,
-                    null_extended: Box::default(),
-                },
-            })
-            .unwrap();
-        let filter_id = RuntimeFilterId::new(40);
-        join_builder.attach_runtime_filter(filter_id).unwrap();
-        let join_stage = join_builder
-            .finish_definition(
-                join,
-                FragmentSink::Result,
-                PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: false,
-                },
-            )
-            .unwrap();
-
-        let witness = RuntimeFilterWitnessId::new(40);
-        let equality = RuntimeFilterEqualityWitnessId::new(40);
-        let filter = RuntimeFilter {
-            id: filter_id,
-            kind: RuntimeFilterKind::MinMax,
-            domain: RuntimeFilterDomain::Ordered {
-                key: RuntimeFilterOrderKey {
-                    ty: ty.clone(),
-                    direction: SortDirection::Ascending,
-                    null_ordering: NullOrdering::Last,
-                },
-                inclusive: true,
-                comparator: OrderedComparisonAlgorithm::NativeScalarOrderV1,
-            },
-            lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-            reduction: RuntimeFilterReduction::UnionOrderedHull,
-            availability_coverage: test_runtime_filter_coverage(witness),
-            terminal_coverage: test_runtime_filter_coverage(witness),
-            equality_witnesses: Box::from([RuntimeFilterEqualityWitness {
-                id: equality,
-                fragment: join_fragment,
-                join,
-                key_ordinal: 0,
-                domain_side: JoinSide::Right,
-            }]),
-            producers: Box::from([RuntimeFilterProducer {
-                witness,
-                endpoint: novarocks_physical_plan::RuntimeFilterEndpoint {
-                    fragment: join_fragment,
-                    node: join,
-                    values: Box::from([right_value]),
-                },
-                apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 1 },
-                contribution_kinds: Box::from([
-                    RuntimeFilterContributionKind::FinalOrderedHullShard,
-                    RuntimeFilterContributionKind::ProducerClosed,
-                ]),
-                completion: RuntimeFilterCompletion::FencedCommittedDomain,
-                progress: RuntimeFilterProducerProgress {
-                    build_edges: Box::from([right_edge]),
-                    non_build_edges: Box::from([left_edge]),
-                },
-                target: RuntimeFilterProducerTarget::JoinBuildKey { equality },
-            }]),
-            consumers: Box::from([RuntimeFilterConsumer {
-                endpoint: novarocks_physical_plan::RuntimeFilterEndpoint {
-                    fragment: join_fragment,
-                    node: join,
-                    values: Box::from([left_value]),
-                },
-                apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
-                capabilities: Box::from([
-                    RuntimeFilterArtifactCapability::OrderedRange,
-                    RuntimeFilterArtifactCapability::EmptyDomain,
-                ]),
-                activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
-                target: RuntimeFilterConsumerTarget::JoinProbeKey { equality },
-            }]),
-            policy: RuntimeFilterPolicy {
-                max_contribution_bytes: 1024,
-                max_artifact_bytes: 1024,
-                deadline_ms: 100,
-                max_retries: 1,
-            },
-        };
-
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([40; 16]).unwrap())
-            .with_constant_pools(fixture_i64_constants());
-        plan.add_fragment(left_source).unwrap();
-        plan.add_fragment(right_source).unwrap();
-        plan.add_fragment(join_stage).unwrap();
-        plan.add_edge(Edge {
-            id: left_edge,
-            kind: EdgeKind::Stream,
-            source: EdgeSource {
-                fragment: left_fragment,
-                projection: Box::from([left_source_value]),
-            },
-            destination: EdgeDestination {
-                fragment: join_fragment,
-                node: left,
-                receive_mapping: Box::from([(left_source_value, left_value)]),
-            },
-            partitioning: EdgePartitioning {
-                source: Distribution::Hash {
-                    keys: Box::from([left_source_value]),
-                    scheme: scheme.clone(),
-                },
-                source_multiplicity: RowMultiplicity::SingleCopy,
-                destination: Distribution::Hash {
-                    keys: Box::from([left_value]),
-                    scheme: scheme.clone(),
-                },
-                destination_multiplicity: RowMultiplicity::SingleCopy,
-            },
-        })
-        .unwrap();
-        plan.add_edge(Edge {
-            id: right_edge,
-            kind: EdgeKind::Stream,
-            source: EdgeSource {
-                fragment: right_fragment,
-                projection: Box::from([right_source_value]),
-            },
-            destination: EdgeDestination {
-                fragment: join_fragment,
-                node: right,
-                receive_mapping: Box::from([(right_source_value, right_value)]),
-            },
-            partitioning: EdgePartitioning {
-                source: Distribution::Hash {
-                    keys: Box::from([right_source_value]),
-                    scheme: scheme.clone(),
-                },
-                source_multiplicity: RowMultiplicity::SingleCopy,
-                destination: Distribution::Hash {
-                    keys: Box::from([right_value]),
-                    scheme,
-                },
-                destination_multiplicity: RowMultiplicity::SingleCopy,
-            },
-        })
-        .unwrap();
-        plan.add_runtime_filter(filter).unwrap();
-        plan.set_result_port(ResultPort {
-            scalar_schema: None,
-            fragment: join_fragment,
-            output: OutputPort {
-                node: join,
-                columns: Box::from([left_value, right_value]),
-            },
-            fields: Box::from([
-                ResultField {
-                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
-                    name: "left".into(),
-                    alias: None,
-                    value: left_value,
-                    ty: ty.clone(),
-                },
-                ResultField {
-                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
-                    name: "right".into(),
-                    alias: None,
-                    value: right_value,
-                    ty,
-                },
-            ]),
-        })
-        .unwrap();
-        plan.finish_observed(&CodecTestControl).unwrap()
-    }
 
     #[test]
     fn writer_projection_consumes_repeated_value_occurrences_left_to_right() {

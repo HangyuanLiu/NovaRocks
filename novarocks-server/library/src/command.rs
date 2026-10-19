@@ -432,6 +432,40 @@ mod tests {
     use novarocks_functions::{FunctionKind, FunctionVisibility};
     use std::sync::Arc;
 
+    #[test]
+    fn build_information_reports_the_production_pure_support_boundary() {
+        let build = crate::build_information::BuildInformation::fixture();
+        let value = super::build_information_value(&build).expect("build information");
+        let again = super::build_information_value(&build).expect("repeated build information");
+        assert_eq!(value, again, "support reporting is deterministic");
+        let interpreter = &value["static_plan_interpreter"];
+        assert_eq!(interpreter["name"], "compiled_package");
+        let sealed = interpreter["sealed_definition_count"].as_u64().unwrap() as usize;
+        let excluded = interpreter["excluded_definitions"].as_array().unwrap();
+        let functions = compose_process_function_set().expect("function set");
+        assert!(sealed > 0);
+        assert_eq!(
+            sealed + excluded.len(),
+            functions.catalog().definitions().len()
+        );
+        assert!(
+            !excluded.iter().any(|entry| entry["name"] == "rand"),
+            "RAND has pure owners"
+        );
+        assert!(excluded.iter().all(|entry| {
+            entry["name"].as_str().is_some_and(|name| !name.is_empty())
+                && entry["kind"].as_str().is_some_and(|kind| !kind.is_empty())
+                && entry["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty())
+        }));
+        let seal = crate::compiled_composition::seal_pure_catalog(functions.catalog()).unwrap();
+        assert_eq!(
+            interpreter["pure_function_catalog_digest"],
+            hex::encode(seal.catalog.digest())
+        );
+    }
+
     /// One OS process gets one authority, and every role that needs capacity
     /// is handed *that* one.
     ///
@@ -567,10 +601,33 @@ mod tests {
     }
 }
 
+/// Reports the same complete-definition pure seal used by production composition.
+/// No configuration, listener, provider I/O or runtime resource is opened.
+fn build_information_value(
+    build: &crate::build_information::BuildInformation,
+) -> anyhow::Result<serde_json::Value> {
+    let functions = composition::compose_process_function_set()?;
+    let seal = crate::compiled_composition::seal_pure_catalog(functions.catalog())?;
+    let mut value = crate::build_information::value(build);
+    value["static_plan_interpreter"] = serde_json::json!({
+        "name": "compiled_package",
+        "pure_function_catalog_digest": hex::encode(seal.catalog.digest()),
+        "sealed_definition_count": seal.installed_definitions,
+        "excluded_definitions": seal.excluded,
+    });
+    Ok(value)
+}
+
 pub fn main(build: crate::build_information::BuildInformation) {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--build-info"] {
-        println!("{}", crate::build_information::value(&build));
+        match build_information_value(&build) {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                eprintln!("build information composition failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]

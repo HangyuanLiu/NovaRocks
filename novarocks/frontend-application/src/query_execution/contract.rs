@@ -594,6 +594,7 @@ pub struct DistributedQueryError {
     pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
     pre_ready_topology_observation: bool,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    engine_error_code: Option<novarocks_types::EngineErrorCode>,
 }
 
 impl DistributedQueryError {
@@ -605,6 +606,7 @@ impl DistributedQueryError {
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: false,
             compile_control: None,
+            engine_error_code: None,
         }
     }
 
@@ -622,6 +624,7 @@ impl DistributedQueryError {
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
             compile_control: None,
+            engine_error_code: None,
         }
     }
 
@@ -637,6 +640,7 @@ impl DistributedQueryError {
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: true,
             compile_control: None,
+            engine_error_code: None,
         }
     }
 
@@ -655,7 +659,47 @@ impl DistributedQueryError {
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
             compile_control: None,
+            engine_error_code: None,
         }
+    }
+
+    pub(crate) fn with_engine_error_code(
+        mut self,
+        code: Option<novarocks_types::EngineErrorCode>,
+    ) -> Self {
+        self.engine_error_code = code;
+        if code == Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
+            && !self.message.starts_with("[UnsupportedCompiledShape] ")
+        {
+            // The typed fact determines identity; this check only keeps the
+            // existing renderer's prefix idempotent across FE wrappers.
+            self.message =
+                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
+                    self.message,
+                )
+                .to_bracketed_user_message();
+        }
+        self
+    }
+
+    pub(crate) fn with_task_termination(
+        self,
+        detail: &novarocks_execution_contract::TerminationDetail,
+    ) -> Self {
+        use novarocks_execution_contract::{TaskFailureCategory, TerminationDetail};
+        let code = match detail {
+            TerminationDetail::Failed(failure)
+                if failure.category() == TaskFailureCategory::Unsupported =>
+            {
+                Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
+            }
+            _ => None,
+        };
+        self.with_engine_error_code(code)
+    }
+
+    pub(crate) const fn engine_error_code(&self) -> Option<novarocks_types::EngineErrorCode> {
+        self.engine_error_code
     }
 
     pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
@@ -673,10 +717,19 @@ impl DistributedQueryError {
             }
             SqlCompileError::Analyze(error) => match error.control_error() {
                 Some(error) => Self::from_compile_control(error),
-                None => Self::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    error.to_string(),
-                ),
+                None => {
+                    let message = if error.kind()
+                        == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+                    {
+                        // Source admission can discover a metadata-only overload
+                        // after SQL analysis. Preserve its exact SQL descriptor
+                        // through the existing source-less completion error port.
+                        error.to_user_error(None).to_string()
+                    } else {
+                        error.to_string()
+                    };
+                    Self::new(DistributedQueryErrorKind::ContractViolation, message)
+                }
             },
             error @ (SqlCompileError::InvalidRequest(_) | SqlCompileError::Compilation(_)) => {
                 Self::new(
@@ -694,9 +747,16 @@ impl DistributedQueryError {
             novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
                 Self::new(DistributedQueryErrorKind::ContractViolation, error)
             }
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
-                Self::new(DistributedQueryErrorKind::ContractViolation, message)
-            }
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => Self::new(
+                DistributedQueryErrorKind::Failed,
+                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
+                    message,
+                )
+                .to_bracketed_user_message(),
+            )
+            .with_engine_error_code(Some(
+                novarocks_types::EngineErrorCode::UnsupportedCompiledShape,
+            )),
         }
     }
     fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
@@ -725,8 +785,10 @@ impl DistributedQueryError {
             C::ContractViolation => DistributedQueryErrorKind::ContractViolation,
             _ => DistributedQueryErrorKind::Failed,
         };
+        let code = (failure.class() == C::Unsupported)
+            .then_some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape);
         self.root_fetch_failure = Some(failure);
-        self
+        self.with_engine_error_code(code)
     }
     pub(crate) fn root_fetch_failure(
         &self,
@@ -860,6 +922,121 @@ mod tests {
     use super::{completed_plan_dop_domain, reconstruct_runtime_query_options};
     use novarocks_proto_codec::lifecycle::QueryOptions;
     use novarocks_proto_models::novarocks;
+
+    #[test]
+    fn typed_task_and_root_fetch_failures_preserve_engine_identity_without_text_inference() {
+        use novarocks_execution_contract::{
+            SafeDetail, TaskFailure, TaskFailureCategory, TerminationDetail,
+        };
+        use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
+        use novarocks_query_application::coordination::{
+            AttemptFailureClass, RootResultFetchFailure,
+        };
+        use novarocks_types::EngineErrorCode;
+        for category in [
+            TaskFailureCategory::Unsupported,
+            TaskFailureCategory::Protocol,
+        ] {
+            let detail = TerminationDetail::Failed(TaskFailure::new(
+                category,
+                SafeDetail::truncating("unsupported diagnostic"),
+            ));
+            let error = super::DistributedQueryError::new(
+                super::DistributedQueryErrorKind::Failed,
+                "task failed",
+            )
+            .with_task_termination(&detail);
+            assert_eq!(
+                error.engine_error_code(),
+                (category == TaskFailureCategory::Unsupported)
+                    .then_some(EngineErrorCode::UnsupportedCompiledShape)
+            );
+        }
+        for class in [
+            AttemptFailureClass::Unsupported,
+            AttemptFailureClass::ContractViolation,
+        ] {
+            let failure = RootResultFetchFailure::new(
+                class,
+                QueryExecutionError::new(QueryExecutionErrorKind::Failed, "unsupported diagnostic"),
+            );
+            let error = super::DistributedQueryError::new(
+                super::DistributedQueryErrorKind::Failed,
+                "root failed",
+            )
+            .with_root_fetch_failure(failure);
+            assert_eq!(
+                error.engine_error_code(),
+                (class == AttemptFailureClass::Unsupported)
+                    .then_some(EngineErrorCode::UnsupportedCompiledShape)
+            );
+        }
+    }
+
+    #[test]
+    fn completion_missing_pure_implementation_preserves_only_its_sql_descriptor() {
+        use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+        use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+        use novarocks_type_contract::CompileControlError;
+
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/completion/missing-pure").unwrap(),
+        ));
+        let SqlCompileError::Analyze(ref analyze) = compile else {
+            panic!("missing pure implementation must retain SQL analysis identity");
+        };
+        let expected = analyze.to_user_error(None).to_string();
+        let failure = super::DistributedQueryError::from_compile(compile);
+        assert_eq!(failure.to_string(), expected);
+        assert!(
+            failure
+                .to_string()
+                .starts_with("[sql.analyze.unavailable_implementation] ")
+        );
+        assert_eq!(failure.engine_error_code(), None);
+        assert_eq!(failure.compile_control_error(), None);
+
+        let ordinary = super::DistributedQueryError::from_compile(SqlCompileError::Analyze(
+            AnalyzeError::internal("unsupported diagnostic"),
+        ));
+        assert_eq!(ordinary.to_string(), "unsupported diagnostic");
+        assert_eq!(ordinary.engine_error_code(), None);
+        assert_eq!(ordinary.compile_control_error(), None);
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let failure = super::DistributedQueryError::from_compile(SqlCompileError::Analyze(
+                AnalyzeError::control(control),
+            ));
+            assert_eq!(failure.compile_control_error(), Some(control));
+            assert_eq!(failure.engine_error_code(), None);
+        }
+    }
+
+    #[test]
+    fn encode_capability_refusal_is_not_a_contract_violation() {
+        let error = super::DistributedQueryError::from_encode(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("CTE multicast"),
+        );
+        assert_eq!(error.kind(), super::DistributedQueryErrorKind::Failed);
+        assert_eq!(
+            error.engine_error_code(),
+            Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
+        );
+        assert_eq!(
+            error.to_string(),
+            "[UnsupportedCompiledShape] CTE multicast"
+        );
+        let invalid = super::DistributedQueryError::from_encode(
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".to_owned()),
+        );
+        assert_eq!(
+            invalid.kind(),
+            super::DistributedQueryErrorKind::ContractViolation
+        );
+    }
 
     #[test]
     fn synthetic_options_preserve_admitted_root_hints_and_absent_options_defaults() {

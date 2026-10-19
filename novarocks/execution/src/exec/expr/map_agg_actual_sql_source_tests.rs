@@ -49,19 +49,11 @@ use novarocks_sql::compiler::{
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-pub(super) fn map_agg_sql_source(
-    sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    map_agg_sql_source_with_semantics(
-        sql,
-        emission_mode,
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )
+pub(super) fn map_agg_sql_source(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    map_agg_sql_source_with_semantics(sql, novarocks_sql::sql_mode::SqlSemanticSettings::default())
 }
 fn map_agg_sql_source_with_semantics(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
@@ -95,7 +87,6 @@ fn map_agg_sql_source_with_semantics(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -213,10 +204,7 @@ fn map_agg_actual_original_required_sql_full_signature_source() {
     use novarocks_physical_plan::{
         NodeKind, PhysicalCallDefinition, PhysicalCallSite, StaticFunctionArgument,
     };
-    let source = map_agg_sql_source(
-        SQL,
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
+    let source = map_agg_sql_source(SQL);
     let mut calls_seen = 0;
     for fragment in source.plan().fragments().values() {
         for (node_id, node) in fragment.nodes() {
@@ -279,10 +267,7 @@ fn map_agg_actual_original_required_sql_full_signature_source() {
 #[test]
 fn map_agg_actual_original_required_sql_complete_compilation() {
     // Permanent intended equality: actual Missing before, whole-source success after.
-    let source = map_agg_sql_source(
-        SQL,
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
+    let source = map_agg_sql_source(SQL);
     let results = super::filter_conjunction_actual_sql_compiler_tests::compiler_results(
         &source,
         &super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue(),

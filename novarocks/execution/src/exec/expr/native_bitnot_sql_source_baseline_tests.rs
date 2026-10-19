@@ -20,10 +20,10 @@
 use super::*;
 use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use novarocks_physical_plan::{ExprKind, UnaryOperator};
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 fn original_source(sql: &str, dtype: DataType) -> SqlAuthoredPhysicalPlan {
-    sql_source(sql, dtype, SqlPhysicalEmissionMode::OriginalNativeV1)
+    sql_source(sql, dtype)
 }
 fn bitnot_types(owner: &SqlAuthoredPhysicalPlan) -> Vec<FunctionValueType> {
     let mut observed = Vec::new();
@@ -115,12 +115,4 @@ fn native_bitnot_sql_before_original_provider_unsigned_source_has_explicit_provi
             "original provider refusal: {diagnostic}"
         );
     }
-}
-#[test]
-fn native_bitnot_sql_before_original_strict_null_source_stays_explicit_physical_null() {
-    let owner = original_source("SELECT ~NULL", DataType::Int64);
-    assert_eq!(
-        bitnot_types(&owner),
-        vec![FunctionValueType::new(DataType::Null, true)]
-    );
 }

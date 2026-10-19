@@ -19,7 +19,7 @@ use super::filter_conjunction_actual_sql_compiler_tests::compiler_results_with_d
 use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
 use arrow::datatypes::{DataType, Field};
 use novarocks_physical_plan::ExprKind;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 fn fields(nullable: bool) -> Vec<Field> {
     vec![
         Field::new("c0", DataType::Int32, nullable),
@@ -75,11 +75,7 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
     n
 }
 fn compile(sql: &str, fields: &[Field]) {
-    let source = sql_source_with_declared_fields(
-        sql,
-        fields,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = sql_source_with_declared_fields(sql, fields);
     assert_eq!(inspect(&source), 2);
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
@@ -107,11 +103,7 @@ fn by_window_sql_source_required_three_case_full_binding_receipts() {
         (TEXT_KEY, fields(true)),
         (NONNULL_INT, fields(false)),
     ] {
-        let source = sql_source_with_declared_fields(
-            sql,
-            &fields,
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-        );
+        let source = sql_source_with_declared_fields(sql, &fields);
         assert_eq!(inspect(&source), 2);
     }
 }

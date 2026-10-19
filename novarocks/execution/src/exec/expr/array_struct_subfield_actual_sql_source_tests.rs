@@ -19,7 +19,7 @@ use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 const CORPUS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/aggregate/sql/agg_topk_extrema_misc_semantics.sql"
@@ -44,7 +44,6 @@ fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
         .map(|sql| {
             super::hll_hash_actual_sql_source_tests::hll_sql_source(
                 sql.replace("${case_db}", "fixture").trim(),
-                SqlPhysicalEmissionMode::OriginalNativeV1,
                 &[
                     ("id", DataType::Int32),
                     ("grp", DataType::Int32),

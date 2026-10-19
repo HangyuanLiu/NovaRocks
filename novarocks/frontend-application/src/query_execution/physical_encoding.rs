@@ -176,13 +176,6 @@ pub(crate) fn encode_completed_plan(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
-    if let Some(mode) = paired.candidate().sql_emission_mode()
-        && mode != carrier.sql_emission_mode()
-    {
-        return Err(novarocks_plan_codec::PhysicalEncodeError::Invalid(
-            "completed SQL emission mode differs from the process static plan carrier".to_string(),
-        ));
-    }
     let result = match carrier {
         StaticPlanCarrier::PlanTree => encode_completed_plan_tree(
             paired,
@@ -1159,7 +1152,7 @@ mod tests {
     #[test]
     fn native_writer_loan_rejects_foreign_fragment_even_with_the_exact_same_site() {
         use novarocks_sql::compiler::{
-            SqlPhysicalEmissionMode, author_native_writer_preparation, writer_state_source_for_test,
+            author_native_writer_preparation, writer_state_source_for_test,
         };
 
         // Reuse the real writer-statistics planner, branch router and checked
@@ -1179,7 +1172,6 @@ mod tests {
             &[1, 1],
             &[false, false],
             functions.clone(),
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         );
         let control = SqlCompileControl::unbounded();
         let sources = author_native_writer_preparation(
@@ -1377,7 +1369,7 @@ mod tests {
         let completed = runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql,novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration), &scope),
+                    .complete(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"));
         let control = SqlCompileControl::unbounded();
@@ -1497,10 +1489,7 @@ mod tests {
 
     /// Complete one table-free statement with the production Frontend
     /// constant evaluator.
-    fn completed_for(
-        sql: &str,
-        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-    ) -> CompletedPlanWithAccess<FrozenProviderRead> {
+    fn completed_for(sql: &str) -> CompletedPlanWithAccess<FrozenProviderRead> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1509,7 +1498,7 @@ mod tests {
         runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql, emission_mode), &scope),
+                    .complete(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"))
     }
@@ -1521,7 +1510,7 @@ mod tests {
         Arc<PhysicalPlan>,
         Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError>,
     ) {
-        let completed = completed_for(sql, carrier.sql_emission_mode());
+        let completed = completed_for(sql);
         let plan = Arc::clone(completed.candidate().plan());
         let encoded = encode_completed_plan(
             completed,
@@ -2556,7 +2545,7 @@ mod tests {
             .unwrap();
         let (_root, scope) = query_scope();
         let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(
-            request_for("SELECT hll_hash('x') AS h,to_bitmap(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_binary(to_bitmap(1)) AS raw", novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1), &scope,
+            request_for("SELECT hll_hash('x') AS h,to_bitmap(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_binary(to_bitmap(1)) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();
@@ -2585,30 +2574,21 @@ mod tests {
     }
 
     fn request() -> SqlFinalPlanCompileRequest {
-        request_with(
-            "SELECT 1",
-            noop_constant_evaluator(),
-            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-        )
+        request_with("SELECT 1", noop_constant_evaluator())
     }
 
     /// A request folding constants with the production Frontend evaluator,
     /// so the frozen packages are the ones production would freeze.
-    fn request_for(
-        sql: &str,
-        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-    ) -> SqlFinalPlanCompileRequest {
+    fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
         request_with(
             sql,
             crate::query_execution::constant_eval::constant_evaluator(),
-            emission_mode,
         )
     }
 
     fn request_with(
         sql: &str,
         constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
-        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
@@ -2624,7 +2604,6 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             constant_evaluator,
             crate::application::test_constant_policy(),
-            emission_mode,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

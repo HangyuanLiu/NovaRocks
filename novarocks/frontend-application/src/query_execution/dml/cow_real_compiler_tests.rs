@@ -17,8 +17,8 @@
 // publication boundary. Printing/reparsing the query is not a success oracle.
 use novarocks_sql::compiler::{
     RootDistributionRequirement, SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl,
-    SqlCompileIntent, SqlCompiler, SqlOptimizeRequest, SqlPhysicalEmissionMode,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    SqlCompileIntent, SqlCompiler, SqlOptimizeRequest, SqlPlannerTableSnapshot,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
 use novarocks_sql::planning::dml::{
     ConnectorWriteInputBinding, DmlFinalizedProviderReadSet, DmlFinalizedWriteTarget,
@@ -269,7 +269,6 @@ fn compile_signed_cow(
     let snapshot = SqlPlannerTableSnapshot::new(&catalog);
     let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
     let settings = SessionOptimizerSettings::default();
-    let emission = SqlPhysicalEmissionMode::OriginalNativeV1;
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
         SqlStatementInput::materialized_values_query(
             Box::new(query),
@@ -300,7 +299,6 @@ fn compile_signed_cow(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         crate::application::test_constant_policy(),
-        emission,
         control.clone(),
     ))
     .expect("real SQL analysis of signed COW values")
@@ -357,7 +355,6 @@ fn compile_signed_cow(
         &[],
         &settings,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        emission,
     )
     .expect("real optimizer and typed writer preparation");
     assert_eq!(

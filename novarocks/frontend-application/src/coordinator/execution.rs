@@ -1443,21 +1443,23 @@ impl FrontendDistributedQueryCoordinator {
                     last_root_poll,
                     write_completion.as_mut(),
                 );
-                let detail = format!(
+                let message = format!(
                     "task execution terminated: {}; terminal_round={waiting_on}",
                     render_termination_detail(Some(&detail))
                 );
-                break Err(self.fail_task_round_with_root_reader(
-                    &mut relayed_reader,
-                    &mut root_result_polls,
-                    root_task,
-                    query_id,
-                    &mut round,
-                    &split_delivery,
-                    classification,
-                    QueryFailureCause::BackendLocalFailure,
-                    detail,
-                ));
+                break Err(self
+                    .fail_task_round_with_root_reader(
+                        &mut relayed_reader,
+                        &mut root_result_polls,
+                        root_task,
+                        query_id,
+                        &mut round,
+                        &split_delivery,
+                        classification,
+                        QueryFailureCause::BackendLocalFailure,
+                        message,
+                    )
+                    .with_task_termination(&detail));
             }
             // A deliverer that failed will never feed the scans it had left,
             // so the round cannot reach its own exit and would otherwise run
@@ -2209,7 +2211,8 @@ impl FrontendDistributedQueryCoordinator {
                 QueryFailureCause::FrontendExecution,
                 error.message().to_string(),
             );
-            return Err(DistributedQueryError::new(error.kind(), error.message()));
+            return Err(DistributedQueryError::new(error.kind(), error.message())
+                .with_engine_error_code(error.engine_error_code()));
         }
         outcome
     }

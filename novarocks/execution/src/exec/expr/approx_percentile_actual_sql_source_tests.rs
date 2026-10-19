@@ -49,19 +49,11 @@ use novarocks_sql::compiler::{
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-pub(super) fn approx_sql_source(
-    sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    approx_sql_source_with_semantics(
-        sql,
-        emission_mode,
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )
+pub(super) fn approx_sql_source(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    approx_sql_source_with_semantics(sql, novarocks_sql::sql_mode::SqlSemanticSettings::default())
 }
 fn approx_sql_source_with_semantics(
     sql: &str,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
@@ -95,7 +87,6 @@ fn approx_sql_source_with_semantics(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -213,7 +204,7 @@ fn approx_sql_source_with_semantics(
     }
 }
 
-fn check_actual_approx(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
+fn check_actual_approx() {
     use novarocks_physical_plan::{
         FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
         StaticFunctionArgument,
@@ -224,7 +215,7 @@ fn check_actual_approx(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
         "SELECT CAST(percentile_approx_weighted(v, w, 0.5, 2048) AS INT) AS weighted50, CAST(percentile_approx_weighted(v, w, 0.9, 2048) AS INT) AS weighted90, percentile_approx_weighted(v, w, array<double>[0.25, 0.5, 0.75], 2048) AS weighted_quartiles FROM fixture.t_agg_percentile_semantics",
     ];
     for sql in statements {
-        let source = approx_sql_source(sql, mode);
+        let source = approx_sql_source(sql);
         let mut seen = 0;
         for fragment in source.plan().fragments().values() {
             for node in fragment.nodes().values() {
@@ -299,7 +290,7 @@ fn check_actual_approx(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
                         "native statements original authored rates"
                     );
                     eprintln!(
-                        "approximate actual SQL mode={mode:?} source={site:?} phase={:?} logical={:?} rate={rate:?} output={:?} state={:?}",
+                        "approximate actual SQL mode=compiled source={site:?} phase={:?} logical={:?} rate={rate:?} output={:?} state={:?}",
                         call.binding.phase,
                         request.arguments,
                         call.binding.function.result_type,
@@ -315,13 +306,8 @@ fn check_actual_approx(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
         );
     }
 }
-#[test]
-fn approximate_percentile_actual_original_sql_source() {
-    check_actual_approx(novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1)
-}
+
 #[test]
 fn approximate_percentile_actual_candidate_sql_source() {
-    check_actual_approx(
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    )
+    check_actual_approx()
 }

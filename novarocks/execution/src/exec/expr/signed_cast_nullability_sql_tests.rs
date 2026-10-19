@@ -40,9 +40,7 @@ use novarocks_plan_codec::{
     },
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
-use novarocks_sql::compiler::{
-    SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode, author_fragment_package_semantics,
-};
+use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType, PureCompileControl,
 };
@@ -129,12 +127,9 @@ fn check_array_source(
     expected_index_source: FunctionValueType,
     expected_values: &[Option<i8>],
 ) {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         let sql = format!("SELECT [10,20][{index_expression}] AS picked FROM t");
-        let source = sql_source_with_declared_fields(&sql, &[field.clone()], mode);
+        let source = sql_source_with_declared_fields(&sql, &[field.clone()]);
         let declaration = source
             .checked_original_result_declaration_observed(&Control)
             .unwrap()
@@ -424,62 +419,20 @@ fn actual_map_key_keeps_original_exact_binding_and_candidate_named_refusal() {
         analyze_error::AnalyzeErrorKind,
         compiler::{SqlCompileError, SqlCompileProgressError},
     };
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         let result = try_sql_source_with_declared_fields(
             "SELECT map{CAST(1 AS TINYINT):10,CAST(2 AS TINYINT):20}[k] AS picked FROM t",
             &[Field::new("k", DataType::Int64, false)],
-            mode,
         );
-        if mode == SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration {
-            let failure = result.unwrap_err();
-            let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
-                panic!("actual FE named missing implementation refusal: {failure:?}");
-            };
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-            assert_eq!(
-                error.message(),
-                "selected overload `builtin.scalar/map/dynamic-v1` has no installed implementation for the selected carrier"
-            );
-            continue;
-        }
-        let source = result.unwrap();
-        let mut found = false;
-        for fragment in source.plan().fragments().values() {
-            for (definition, expression) in fragment.expressions().iter() {
-                let ExprKind::FunctionCall { function, args } = &expression.kind else {
-                    continue;
-                };
-                if function.function_id.as_str() != "builtin.scalar/__map_element_at/v1" {
-                    continue;
-                }
-                let index = fragment.expressions().get(args[1]).unwrap();
-                let ExprKind::Cast { expr, target, .. } = &index.kind else {
-                    panic!("map implicit key cast");
-                };
-                assert_eq!(
-                    fragment.expressions().get(*expr).unwrap().ty,
-                    FunctionValueType::new(DataType::Int64, false)
-                );
-                assert_eq!(*target, DataType::Int8);
-                assert_eq!(index.ty, FunctionValueType::new(DataType::Int8, true));
-                assert_eq!(
-                    function.argument_types[1],
-                    FunctionArgumentType::Value(index.ty.clone())
-                );
-                let request = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Expression(*definition))
-                    .unwrap();
-                let StaticFunctionArgument::Value { value_type, .. } = &request.arguments[1] else {
-                    panic!("real MAP key request");
-                };
-                assert_eq!(value_type, &index.ty);
-                found = true;
-            }
-        }
-        assert!(found, "actual original MAP key binding");
+
+        let failure = result.unwrap_err();
+        let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
+            panic!("actual FE named missing implementation refusal: {failure:?}");
+        };
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+        assert_eq!(
+            error.message(),
+            "selected overload `builtin.scalar/map/dynamic-v1` has no installed implementation for the selected carrier"
+        );
     }
 }

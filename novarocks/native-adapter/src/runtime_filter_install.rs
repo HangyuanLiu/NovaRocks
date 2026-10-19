@@ -77,27 +77,22 @@ pub struct DecodedRuntimeFilterContribution {
 
 type CodecResult<T> = Result<T, ProtocolError>;
 
-use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_type_decode::{
-    NativeDecodeResources, NativeTypeDecoder, clone_type, resolve_type, table_failure,
-};
-use crate::native_type_construction::{
-    NativeTypeConstruction, NativeTypeConstructionError, NativeTypeFactory,
-};
-use novarocks_plan_codec::execution_type_table::{
-    ExecutionTypeTableLimits, decode_execution_type_table_with_factory_in,
+use crate::native_type_construction::{NativeTypeConstruction, NativeTypeConstructionError};
+use crate::native_type_decode::{
+    NativeTypeDecodeError, NativeTypeDecodeResources, NativeTypeTableDecoder, clone_type,
+    decode_type_owner, resolve_type,
 };
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
 use std::alloc::Layout;
 
-type NativeResult<T> = Result<T, NativeFragmentDecodeError>;
+type NativeResult<T> = Result<T, NativeTypeDecodeError>;
 enum InstallTypeMode<'borrow, 'creator> {
-    Strong(&'borrow mut NativeDecodeResources<'creator>),
+    Strong(&'borrow mut NativeTypeDecodeResources<'creator>),
 }
 
 #[cfg(any(test, novarocks_dev_controls))]
 fn with_fixture_resources<T>(
-    operation: impl FnOnce(&mut NativeDecodeResources<'_>) -> NativeResult<T>,
+    operation: impl FnOnce(&mut NativeTypeDecodeResources<'_>) -> NativeResult<T>,
 ) -> NativeResult<T> {
     struct Control;
     impl novarocks_type_contract::PureCompileControl for Control {
@@ -112,16 +107,16 @@ fn with_fixture_resources<T>(
     let tracker =
         novarocks_execution::runtime::mem_tracker::MemTracker::new_root("runtime-filter fixture");
     let creation = NativeTypeConstruction::try_with_control(tracker, &Control)?;
-    let mut resources = NativeDecodeResources::try_new(&creation)?;
+    let mut resources = NativeTypeDecodeResources::try_new(&creation)?;
     let result = operation(&mut resources)?;
     resources.finish()?;
     Ok(result)
 }
 
 #[cfg(any(test, novarocks_dev_controls))]
-fn fixture_protocol(error: NativeFragmentDecodeError) -> ProtocolError {
+fn fixture_protocol(error: NativeTypeDecodeError) -> ProtocolError {
     match error {
-        NativeFragmentDecodeError::Protocol(error) => error,
+        NativeTypeDecodeError::Protocol(error) => error,
         error => contract_invalid(FieldPath::root("runtime_filter"), error.to_string()),
     }
 }
@@ -158,7 +153,7 @@ pub fn decode_runtime_filter_contribution(
             install: decoded.install,
         })
     })
-    .map_err(|error: NativeFragmentDecodeError| {
+    .map_err(|error: NativeTypeDecodeError| {
         RuntimeFilterContractError::invalid_contract(error.to_string())
     })
 }
@@ -170,7 +165,7 @@ pub(crate) fn decode_runtime_filter_contribution_with_type_creator(
     contribution: &novarocks_proto_models::novarocks::RuntimeFilterContribution,
     creator: &NativeTypeConstruction<'_>,
 ) -> NativeResult<DecodedRuntimeFilterContribution> {
-    let mut resources = NativeDecodeResources::try_new(creator)?;
+    let mut resources = NativeTypeDecodeResources::try_new(creator)?;
     let decoded = decode_participant_parts(
         UniqueId::new(
             execution_id.query_id().high(),
@@ -265,7 +260,7 @@ pub(crate) fn decode_typed_contract_domain(
     wire_contract: &plan::RuntimeFilterContract,
     outer: Option<&common::TypeDesc>,
     path: FieldPath,
-    resources: &mut NativeDecodeResources<'_>,
+    resources: &mut NativeTypeDecodeResources<'_>,
 ) -> NativeResult<RuntimeFilterExecutionContract> {
     let domain_path = path.clone().field("contract").field("logical_domain");
     let domain = wire_contract.logical_domain.as_ref().ok_or_else(|| {
@@ -286,12 +281,12 @@ pub(crate) fn decode_typed_contract_domain(
             "runtime filter complete value reference is required",
         )
     })?;
-    let limits = ExecutionTypeTableLimits::for_validated_root_count(table.value_bindings.len())
-        .map_err(NativeTypeConstructionError::Control)?;
-    let factory = NativeTypeFactory::new(resources.creation);
-    let types =
-        decode_execution_type_table_with_factory_in(table, limits, &factory, &mut resources.work)
-            .map_err(|error| table_failure(error, domain_path.clone().field("execution_types")))?;
+    let owner = decode_type_owner(
+        table,
+        domain_path.clone().field("execution_types"),
+        resources,
+    )?;
+    let types = owner.execution;
     let source = resolve_type(
         &types,
         desc,
@@ -299,9 +294,8 @@ pub(crate) fn decode_typed_contract_domain(
         resources,
     )?;
     // The deployment's redundant reference must resolve in this same owner.
-    let mut decoder = NativeTypeDecoder::Strong {
+    let mut decoder = NativeTypeTableDecoder {
         types: &types,
-        original_requests: None,
         resources,
     };
     if let Some(outer) = outer {
@@ -309,9 +303,7 @@ pub(crate) fn decode_typed_contract_domain(
             &types,
             outer,
             path.clone().field("value_type"),
-            match &mut decoder {
-                NativeTypeDecoder::Strong { resources, .. } => resources,
-            },
+            decoder.resources,
         )?;
         if !decoder.bindings_match(source.typed_binding(), outer_source.typed_binding(), false)? {
             return Err(contract_inconsistent(
@@ -391,17 +383,45 @@ fn decode_runtime_filter_activation(
 fn decode_contract(
     binding_id: u32,
     expression_type: &arrow::datatypes::DataType,
-    wire: Option<&plan::RuntimeFilterContract>,
+    wire_contract: Option<&plan::RuntimeFilterContract>,
     path: FieldPath,
 ) -> CodecResult<RuntimeFilterExecutionContract> {
-    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+    use novarocks_plan_codec::execution_type_table::{
+        ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+    };
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    with_fixture_resources(|resources| {
+        let complete = novarocks_functions::FunctionValueType::new(expression_type.clone(), true);
+        let roots = [ExecutionTypeRoot {
+            id: 0,
+            value: &complete,
+        }];
+        let mut work = CompileCheckpoints::try_new(resources.creation, CompilePhase::Encode)
+            .map_err(NativeTypeConstructionError::Control)?;
+        let limits = ExecutionTypeTableLimits::for_validated_root_count(roots.len())
+            .map_err(NativeTypeConstructionError::Control)?;
+        let wire = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed(
+                limits,
+                &mut |layout| resources.creation.request(layout),
+                &mut work,
+            )
+            .map_err(|cause| crate::native_type_decode::table_failure(cause, path.clone()))?
+            .into_wire();
+        work.finish()
+            .map_err(NativeTypeConstructionError::Control)?;
+        let owner = decode_type_owner(&wire, path.clone(), resources)?;
+        let mut decoder = NativeTypeTableDecoder {
+            types: &owner.execution,
+            resources,
+        };
         decode_contract_with_types(
             binding_id,
             expression_type,
-            &novarocks_functions::FunctionValueType::new(expression_type.clone(), true),
-            wire,
+            &complete,
+            wire_contract,
             path,
-            decoder,
+            &mut decoder,
         )
     })
     .map_err(fixture_protocol)
@@ -413,7 +433,7 @@ fn decode_contract_with_types(
     complete_type: &novarocks_functions::FunctionValueType,
     wire: Option<&plan::RuntimeFilterContract>,
     path: FieldPath,
-    decoder: &mut NativeTypeDecoder<'_, '_, '_>,
+    decoder: &mut NativeTypeTableDecoder<'_, '_, '_>,
 ) -> NativeResult<RuntimeFilterExecutionContract> {
     let wire = wire.ok_or_else(|| {
         contract_missing(
@@ -441,10 +461,10 @@ fn decode_contract_with_types(
                     })?;
             let schema = {
                 let source = complete_type;
-                let NativeTypeDecoder::Strong { resources, .. } = decoder;
+                let resources = &mut *decoder.resources;
                 let source = clone_type(source, resources)?;
                 let scope = resources.creation.begin_scope()?;
-                novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new_value_typed_with_storage_observed::<NativeFragmentDecodeError>(
+                novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new_value_typed_with_storage_observed::<NativeTypeDecodeError>(
                     source, semantics, scope.storage_lifetime(), |layout| scope.request_layout(layout).map_err(Into::into),
                     |units| { for _ in 0..units { resources.work.step().map_err(NativeTypeConstructionError::Control)?; } Ok(()) },
                 )?
@@ -463,7 +483,7 @@ fn decode_contract_with_types(
                 ).into());
             }
             {
-                let NativeTypeDecoder::Strong { resources, .. } = decoder;
+                let resources = &mut *decoder.resources;
                 resources.request(
                     Layout::array::<contribution::RuntimeOrderKey>(ordered.keys.len()).map_err(
                         |_| NativeTypeConstructionError::Resource(LayoutResourceError::Arithmetic),
@@ -569,26 +589,24 @@ fn decode_contract_with_types(
                 &keys,
                 comparator,
                 order_digest,
-                |units| match decoder {
-                    NativeTypeDecoder::Strong { resources, .. } => {
+                |units| {
+                        let resources = &mut *decoder.resources;
                         if units == 0 {
                             resources
                                 .work
                                 .flush()
                                 .map_err(NativeTypeConstructionError::Control)
-                                .map_err(NativeFragmentDecodeError::from)
+                                .map_err(NativeTypeDecodeError::from)
                         } else {
                             for _ in 0..units {
                                 resources
                                     .work
                                     .step()
                                     .map_err(NativeTypeConstructionError::Control)
-                                    .map_err(NativeFragmentDecodeError::from)?;
+                                    .map_err(NativeTypeDecodeError::from)?;
                             }
                             Ok(())
                         }
-                    }
-
                 },
             )
             .map_err(|failure| match failure {
@@ -604,7 +622,7 @@ fn decode_contract_with_types(
                 contribution::RuntimeOrderContractValidationFailure::Work(cause) => cause,
             })?;
             {
-                let NativeTypeDecoder::Strong { resources, .. } = decoder;
+                let resources = &mut *decoder.resources;
                 resources.request(
                     arc_layout(Layout::new::<contribution::RuntimeOrderContract>())
                         .map_err(NativeTypeConstructionError::Resource)?,
@@ -2413,6 +2431,13 @@ mod tests {
 #[cfg(test)]
 mod typed_domain_creation_tests {
     mod canonical_backing_owner_tests {
+        // Keep the historical fixture's local spellings while binding only
+        // the neutral type owner; the fixture has no v1 decoder dependency.
+        use crate::native_type_construction::NativeTypeFactory;
+        use crate::native_type_decode::{
+            NativeTypeDecodeError as NativeFragmentDecodeError,
+            NativeTypeDecodeResources as NativeDecodeResources,
+        };
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/runtime_filter_install/canonical_backing_owner_tests.rs"
@@ -2423,7 +2448,7 @@ mod typed_domain_creation_tests {
     use novarocks_execution::runtime::mem_tracker::MemTracker;
     use novarocks_functions::FunctionValueType;
     use novarocks_plan_codec::execution_type_table::{
-        ExecutionTypeRoot, ExecutionTypeTableBuilder,
+        ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
     };
     use novarocks_spi::connector::ConnectorStopOwner;
     use novarocks_type_contract::{
@@ -2488,7 +2513,7 @@ mod typed_domain_creation_tests {
         tracker.install_limit_once(1024 * 1024).unwrap();
         let stop = ConnectorStopOwner::new();
         let creation = creator(tracker.clone(), &stop);
-        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let decoded = decode_typed_contract_domain(
             7,
             &wire,
@@ -2538,7 +2563,7 @@ mod typed_domain_creation_tests {
             tracker.install_limit_once(1024 * 1024).unwrap();
             let stop = ConnectorStopOwner::new();
             let creation = creator(tracker, &stop);
-            let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+            let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
             let error = decode_typed_contract_domain(
                 1,
                 &wire,
@@ -2624,7 +2649,7 @@ mod typed_domain_creation_tests {
         let tracker = MemTracker::new_root("RF scoped child");
         let stop = ConnectorStopOwner::new();
         let creation = creator(tracker.clone(), &stop);
-        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let contract = decode_typed_contract_domain(
             7,
             &wire,
@@ -2661,7 +2686,7 @@ mod typed_domain_creation_tests {
         let tracker = MemTracker::new_root("RF canonical scope");
         let stop = ConnectorStopOwner::new();
         let creation = creator(tracker.clone(), &stop);
-        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let contract = decode_typed_contract_domain(
             7,
             &wire,

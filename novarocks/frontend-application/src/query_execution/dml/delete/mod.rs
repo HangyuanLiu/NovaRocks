@@ -23,6 +23,7 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::dml::error::DmlExecutionError;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
@@ -111,7 +112,9 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
     /// The plan was encoded when it was prepared, so there is nothing for the
     /// caller to assemble first: a prepared write is already on the wire's
     /// terms.
-    fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
+    fn run(
+        &self,
+    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, DmlExecutionError>;
     /// The admitted request context this statement commits and reconciles
     /// under. It is the statement's own context, never a fresh one: a commit
     /// issued under different credentials is a different request.
@@ -124,7 +127,10 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
 pub trait DeleteEngine: Send + Sync {
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String>;
 
-    fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String>;
+    fn run_delete(
+        &self,
+        prepared: &dyn DeletePrepared,
+    ) -> Result<DeleteWriteReport, DmlExecutionError>;
     fn commit_delete_terminal(
         &self,
         _prepared: &dyn DeletePrepared,
@@ -184,10 +190,16 @@ impl DeleteEngine for DmlExecutionKernel {
         Ok(prepared)
     }
 
-    fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
+    fn run_delete(
+        &self,
+        prepared: &dyn DeletePrepared,
+    ) -> Result<DeleteWriteReport, DmlExecutionError> {
         let prepared = downcast_prepared(prepared)?;
         let result = prepared.execution.run()?;
-        delete_write_report_from_result(result, prepared.execution.terminal_request_context())
+        Ok(delete_write_report_from_result(
+            result,
+            prepared.execution.terminal_request_context(),
+        )?)
     }
 
     fn commit_delete_terminal(

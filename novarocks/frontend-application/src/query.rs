@@ -716,6 +716,19 @@ enum RoutedExecutionError {
     },
 }
 
+impl RoutedExecutionError {
+    fn into_query_service_error(self) -> QueryServiceError {
+        match self {
+            Self::Control(error) => QueryServiceError::from_compile_control(error),
+            Self::Engine(error) => internal_error(error),
+            Self::User(error) => QueryServiceError::from_user_error(error),
+            Self::Publication { message, terminal } => {
+                QueryServiceError::with_publication_terminal(message, terminal)
+            }
+        }
+    }
+}
+
 fn dml_statement_result(
     result: Result<(), crate::dml::DmlError>,
 ) -> Result<StatementResult, RoutedExecutionError> {
@@ -739,15 +752,15 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
             RoutedExecutionError::Control(control)
         } else if let Some(user_error) = error.user_error().cloned() {
             RoutedExecutionError::User(user_error)
-        } else if let Some(engine_error_code) = error.engine_error_code() {
-            RoutedExecutionError::Engine(format!("[{}] {error}", engine_error_code.as_str()))
-        } else if let Some(terminal) = error.publication_terminal().cloned() {
-            RoutedExecutionError::Publication {
-                message: error.to_string(),
-                terminal,
-            }
         } else {
-            RoutedExecutionError::Engine(error.to_string())
+            let message = match error.engine_error_code() {
+                Some(code) => format!("[{}] {error}", code.as_str()),
+                None => error.to_string(),
+            };
+            match error.publication_terminal().cloned() {
+                Some(terminal) => RoutedExecutionError::Publication { message, terminal },
+                None => RoutedExecutionError::Engine(message),
+            }
         }
     })
 }
@@ -2594,19 +2607,9 @@ impl FrontendQuerySession {
                 internal_error("typed statement returned an already-owned protocol result"),
                 statement,
             )),
-            Err(error) => Ok(self.governed_typed_error(
-                match error {
-                    RoutedExecutionError::Control(error) => {
-                        QueryServiceError::from_compile_control(error)
-                    }
-                    RoutedExecutionError::Engine(error) => internal_error(error),
-                    RoutedExecutionError::User(error) => QueryServiceError::from_user_error(error),
-                    RoutedExecutionError::Publication { message, terminal } => {
-                        QueryServiceError::with_publication_terminal(message, terminal)
-                    }
-                },
-                statement,
-            )),
+            Err(error) => {
+                Ok(self.governed_typed_error(error.into_query_service_error(), statement))
+            }
         }
     }
 
@@ -3179,6 +3182,101 @@ fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> Q
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_task_refusal_survives_distributed_dml_and_final_user_projection() {
+        use novarocks_execution_contract::{
+            SafeDetail, TaskFailure, TaskFailureCategory, TerminationDetail,
+        };
+        for category in [
+            TaskFailureCategory::Unsupported,
+            TaskFailureCategory::Protocol,
+        ] {
+            let detail = TerminationDetail::Failed(TaskFailure::new(
+                category,
+                SafeDetail::truncating("unsupported diagnostic"),
+            ));
+            let error = crate::query_execution::contract::DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                "task runtime refusal",
+            )
+            .with_task_termination(&detail);
+            let failure = crate::dml::error::DmlExecutionError::from(error).into_dml_error(None);
+            let error = dml_result::<()>(Err(failure)).unwrap_err();
+            let RoutedExecutionError::Engine(message) = error else {
+                panic!("engine failure expected");
+            };
+            assert_eq!(
+                message.starts_with("[UnsupportedCompiledShape] "),
+                category == TaskFailureCategory::Unsupported
+            );
+            if category == TaskFailureCategory::Unsupported {
+                assert_eq!(
+                    message,
+                    "[UnsupportedCompiledShape] Executor: task runtime refusal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_dml_refusal_preserves_publication_terminal_at_the_client_boundary() {
+        use novarocks_spi::connector::{
+            LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
+            LakePublicationTarget,
+        };
+        let target =
+            LakePublicationTarget::try_new("ice".into(), "db".into(), Some("orders".into()), None)
+                .unwrap();
+        let mut attempt = crate::dml::attempt::DmlPublicationAttempt::new(
+            LakePublicationId::new_v7(),
+            LakePublicationFamily::DataMutation,
+            target,
+            None,
+        );
+        attempt.terminal_known_uncommitted().unwrap();
+        let terminal = attempt.terminal().unwrap().clone();
+        for code in [
+            None,
+            Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape),
+        ] {
+            let mut failure = crate::dml::error::DmlError::executor("post-begin staging failed")
+                .with_publication_terminal(terminal.clone());
+            if let Some(code) = code {
+                failure = failure.with_engine_error_code(code);
+            }
+            let service = dml_result::<()>(Err(failure))
+                .err()
+                .expect("staging must fail")
+                .into_query_service_error();
+            assert_eq!(service.kind(), QueryServiceErrorKind::Internal);
+            assert_eq!(service.publication_terminal(), Some(&terminal));
+            assert_eq!(
+                service.publication_terminal().unwrap().disposition(),
+                LakePublicationDisposition::KnownUncommitted
+            );
+            assert_eq!(
+                service
+                    .message()
+                    .starts_with("[UnsupportedCompiledShape] Executor: post-begin staging failed"),
+                code.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_dml_refusal_survives_outer_executor_message_wrapping() {
+        let failure = crate::dml::error::DmlExecutionError::from_encode(
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "change-stream router",
+            ),
+        )
+        .into_dml_error(None);
+        let error = dml_result::<()>(Err(failure)).unwrap_err();
+        assert!(matches!(error, RoutedExecutionError::Engine(message)
+            if message == "[UnsupportedCompiledShape] Executor: change-stream router"));
+    }
+
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4562,9 +4660,12 @@ mod tests {
             })
         }
 
-        fn run_delete(&self, _prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
+        fn run_delete(
+            &self,
+            _prepared: &dyn DeletePrepared,
+        ) -> Result<DeleteWriteReport, crate::dml::error::DmlExecutionError> {
             self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
-            Err("recording DELETE stops at the native dispatch edge".to_string())
+            Err("recording DELETE stops at the native dispatch edge".into())
         }
 
         fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
@@ -4641,8 +4742,8 @@ mod tests {
         fn run_iceberg_write(
             &self,
             _prepared: &dyn IcebergPreparedInsert,
-        ) -> Result<IcebergWriteReport, String> {
-            Err("unexpected Iceberg INSERT".to_string())
+        ) -> Result<IcebergWriteReport, crate::dml::error::DmlExecutionError> {
+            Err("unexpected Iceberg INSERT".into())
         }
 
         fn finalize_iceberg_write(

@@ -42,9 +42,10 @@ use crate::{
 use novarocks_functions::{
     AggregateBindingSelection, AggregateKernelPhase, AggregateOverloadIdentity,
     AggregatePreparationOptions, AggregateWindowPreparationOptions, CallEffectInput,
-    FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure,
-    PureCallPreparation, PureCallSpecialization, PureEngineFunctionCatalog, PureKernelAbi,
-    ResolvedAggregateSignature, ScopedExpressionEffects, WindowCallOptions,
+    EngineFunctionCatalog, FunctionBindingSelection, FunctionResultType,
+    FunctionSpecializationFailure, PureCallPreparation, PureCallSpecialization,
+    PureEngineFunctionCatalog, PureKernelAbi, ResolvedAggregateSignature, ScopedExpressionEffects,
+    WindowCallOptions,
 };
 use novarocks_local_program::{
     AnalyticOutputColumn, ProgramCallSite, ProgramExprId, ProgramExpressionRootSite,
@@ -53,8 +54,8 @@ use novarocks_local_program::{
     WindowType,
 };
 use novarocks_physical_plan::{
-    AggregatePhase, ExprId, ExprKind, ExpressionRootRole, FragmentPackage, FunctionArgumentType,
-    NodeId, NodeKind, PhysicalCallDefinition, PhysicalCallSite, PhysicalNode,
+    AggregatePhase, BoundFunction, ExprId, ExprKind, ExpressionRootRole, FragmentPackage,
+    FunctionArgumentType, NodeId, NodeKind, PhysicalCallDefinition, PhysicalCallSite, PhysicalNode,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, ExpressionEffects,
@@ -154,24 +155,33 @@ pub(crate) fn admit_window(
             }
         }
         work.flush()?;
-        let declaration = functions.metadata().pure_overload_declaration_observed(
-            &function.function_id,
-            function.kind,
-            &function.overload,
-            work.control(),
-        );
+        let installed = window_function_abi(function, functions.metadata(), work.control());
         work.flush()?;
-        let installed = match declaration {
-            Ok(declaration) => Some(declaration.implementation().abi),
-            Err(FunctionSpecializationFailure::Control(cause)) => return Err(cause.into()),
-            Err(_) => None,
-        };
-        if installed != Some(abi) {
+        if installed? != abi {
             return Err(unsupported(missing));
         }
         work.step()?;
     }
     Ok(())
+}
+
+/// Preserve metadata lookup failures separately from a missing ABI capability.
+/// The production caller supplies metadata from its sealed pure catalog.
+pub(super) fn window_function_abi(
+    function: &BoundFunction,
+    functions: &EngineFunctionCatalog,
+    control: &dyn PureCompileControl,
+) -> Result<PureKernelAbi, FragmentCompileError> {
+    match functions.pure_overload_declaration_observed(
+        &function.function_id,
+        function.kind,
+        &function.overload,
+        control,
+    ) {
+        Ok(declaration) => Ok(declaration.implementation().abi),
+        Err(FunctionSpecializationFailure::Control(cause)) => Err(cause.into()),
+        Err(error) => Err(ExpressionLoweringError::Specialization(error).into()),
+    }
 }
 
 fn has_offset<O>(frame: &WindowFrame<O>) -> bool {

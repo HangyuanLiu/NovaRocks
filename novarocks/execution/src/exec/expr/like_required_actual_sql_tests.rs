@@ -32,7 +32,7 @@ use novarocks_local_program::{
     root_input_layout,
 };
 use novarocks_physical_plan::ExprKind;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{sync::Arc, time::Duration};
 struct Control;
@@ -91,11 +91,7 @@ fn like_sql_source_original_required_name_pattern_full_fvt() {
     ] {
         // Exact original required column declaration; isolated LIKE subtree.
         // This does not claim the multi-column native plan was reproduced.
-        let source = sql_source_with_single_field(
-            sql,
-            Field::new("name", DataType::Utf8, true),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-        );
+        let source = sql_source_with_single_field(sql, Field::new("name", DataType::Utf8, true));
         assert!(inspect(&source) > 0);
     }
 }
@@ -109,11 +105,7 @@ fn evaluate(
 ) {
     // Same original SQL's legitimate optimizer variant, not a claim that
     // the native default producer emitted this exact residual site.
-    let source = sql_source_with_single_field_and_core_residuals(
-        sql,
-        field,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = sql_source_with_single_field_and_core_residuals(sql, field);
     assert!(inspect(&source) > 0);
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();

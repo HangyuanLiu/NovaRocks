@@ -14,11 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Original SQL analysis baseline. No support gate or replacement binding author.
+//! Shared evaluation counter and session facts for SQL capability admission tests.
 use novarocks_sql::compiler::{
-    FoldRequest, SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent,
-    SqlCompiler, SqlConstantEvaluationError, SqlConstantEvaluator, SqlPlannerTableSnapshot,
-    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+    FoldRequest, SessionOptimizerSettings, SqlConstantEvaluationError, SqlConstantEvaluator,
+    SqlSessionContext,
 };
 use novarocks_type_contract::PureCompileControl;
 use std::sync::{
@@ -55,48 +54,4 @@ pub(super) fn session() -> SqlSessionContext {
             ..SessionOptimizerSettings::default()
         },
     }
-}
-
-fn analyze(sql: &str) {
-    let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
-    let catalog = SqlPlannerTableSnapshot::new(&catalog);
-    let request = SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
-        SqlCompileIntent::Query,
-        session(),
-        SqlPlanningEnvironment::Distributed,
-        &catalog,
-        builtin_sql_function_catalog(),
-        &EVALUATOR,
-        None,
-        super::pure_differential::constant_policy(),
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlCompileControl::unbounded(),
-    );
-    SqlCompiler::analyze(request)
-        .unwrap()
-        .into_pending()
-        .unwrap();
-}
-
-#[test]
-fn sql_presence_original_hour_literal_is_bound_without_fold_or_owner_admission() {
-    let _serial = SERIAL.lock().unwrap();
-    reset();
-    analyze("SELECT hour_from_unixtime(CAST(1700000000 AS BIGINT)) AS h");
-    assert_eq!(fold_count(), 0);
-}
-#[test]
-fn sql_presence_original_hour_projected_column_is_bound_without_fold() {
-    let _serial = SERIAL.lock().unwrap();
-    reset();
-    analyze("SELECT hour_from_unixtime(t.k) AS h FROM (SELECT CAST(1700000000 AS BIGINT) AS k) t");
-    assert_eq!(fold_count(), 0);
-}
-#[test]
-fn sql_presence_original_invalid_regexp_literal_is_not_a_binding_error() {
-    let _serial = SERIAL.lock().unwrap();
-    reset();
-    analyze("SELECT regexp_count('x', '[') AS n");
-    assert_eq!(fold_count(), 0);
 }

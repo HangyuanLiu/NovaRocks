@@ -2602,6 +2602,7 @@ fn compiled_package_rejection(
             CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
         )) => TaskFailureCategory::Execution,
         CompiledPackageError::Refused(_) => TaskFailureCategory::Protocol,
+        CompiledPackageError::Unsupported(_) => TaskFailureCategory::Unsupported,
         CompiledPackageError::ProjectMetadata(error) => preparation_memory_refusal_category(error),
         CompiledPackageError::ProjectMetadataRequest(error) => metadata_request_category(error),
         CompiledPackageError::TypeMaterialization(super::TypeMaterializationRefusal::Stopped(
@@ -8807,7 +8808,6 @@ pub(super) mod tests {
                 builtin_sql_function_catalog().snapshot(),
                 noop_constant_evaluator(),
                 constants(),
-                novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {
                     min: 1,

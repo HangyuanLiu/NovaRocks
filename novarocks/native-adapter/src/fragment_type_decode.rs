@@ -25,27 +25,24 @@ use crate::{
 };
 use novarocks_functions::FunctionValueType;
 #[cfg(test)]
-use novarocks_plan_codec::execution_type_table::decode_execution_type_table_observed;
+use novarocks_plan_codec::execution_type_table::{
+    decode_execution_type_table_observed, decode_execution_type_table_with_factory_in,
+};
 use novarocks_plan_codec::{
-    execution_type_table::{
-        DecodedExecutionTypeTable, ExecutionTypeTableLimits,
-        decode_execution_type_table_with_factory_in,
-    },
+    execution_type_table::{DecodedExecutionTypeTable, ExecutionTypeTableLimits},
     host_projection_v2::{AdmissionRefusal, ProjectionFailure},
     value_type_table::LogicalTypeCodecError,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common, plan};
-use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, ValueSchemaCreation, ValueTypeStorageLifetime,
-};
+#[cfg(test)]
+use novarocks_type_contract::CompilePhase;
+use novarocks_type_contract::{CompileCheckpoints, ValueSchemaCreation, ValueTypeStorageLifetime};
 use std::alloc::Layout;
 
-/// No mutable host state resides in the immutable namespace or decode context.
+/// Legacy fragment catalog loan around the shared native type-work owner.
 pub(crate) struct NativeDecodeResources<'a> {
-    pub(crate) creation: &'a NativeTypeConstruction<'a>,
-    pub(crate) work: CompileCheckpoints<'a>,
-    // A preparation-only loan of the actual process catalog; no returned type retains it.
+    shared: crate::native_type_decode::NativeTypeDecodeResources<'a>,
     pub(crate) function_catalog: Option<&'a novarocks_functions::EngineFunctionCatalog>,
 }
 impl<'a> NativeDecodeResources<'a> {
@@ -53,10 +50,8 @@ impl<'a> NativeDecodeResources<'a> {
         creation: &'a NativeTypeConstruction<'a>,
     ) -> Result<Self, NativeFragmentDecodeError> {
         Ok(Self {
-            creation,
+            shared: crate::native_type_decode::NativeTypeDecodeResources::try_new(creation)?,
             function_catalog: None,
-            work: CompileCheckpoints::try_new(creation, CompilePhase::LowerProgram)
-                .map_err(NativeTypeConstructionError::Control)?,
         })
     }
     pub(crate) fn bind_function_catalog(
@@ -66,20 +61,24 @@ impl<'a> NativeDecodeResources<'a> {
         self.function_catalog = Some(catalog);
     }
     pub(crate) fn storage(&self) -> ValueTypeStorageLifetime {
-        self.creation.storage_lifetime()
+        self.shared.storage()
     }
     pub(crate) fn request(&mut self, layout: Layout) -> Result<(), NativeFragmentDecodeError> {
-        self.work
-            .flush()
-            .map_err(NativeTypeConstructionError::Control)?;
-        self.creation.request_layout(layout)?;
-        Ok(())
+        self.shared.request(layout).map_err(Into::into)
     }
     pub(crate) fn finish(self) -> Result<(), NativeFragmentDecodeError> {
-        self.work
-            .finish()
-            .map_err(NativeTypeConstructionError::Control)?;
-        Ok(())
+        self.shared.finish().map_err(Into::into)
+    }
+}
+impl<'a> std::ops::Deref for NativeDecodeResources<'a> {
+    type Target = crate::native_type_decode::NativeTypeDecodeResources<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+impl std::ops::DerefMut for NativeDecodeResources<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shared
     }
 }
 
@@ -87,32 +86,16 @@ pub(crate) fn table_error(
     error: LogicalTypeCodecError,
     path: FieldPath,
 ) -> NativeFragmentDecodeError {
-    match error {
-        LogicalTypeCodecError::Control(error) => NativeTypeConstructionError::Control(error).into(),
-        LogicalTypeCodecError::ResourceSource(_) => NativeTypeConstructionError::Resource(
-            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
-        )
-        .into(),
-        error => NativeFragmentDecodeError::invalid_value(path, error),
-    }
+    crate::native_type_decode::table_error(error, path).into()
 }
 pub(crate) fn table_failure(
     error: ProjectionFailure<LogicalTypeCodecError, NativeTypeConstructionError>,
     path: FieldPath,
 ) -> NativeFragmentDecodeError {
-    match error {
-        ProjectionFailure::Codec(error) => table_error(error, path),
-        ProjectionFailure::Host(error) => error.into(),
-    }
+    crate::native_type_decode::table_failure(error, path).into()
 }
 
-/// The retained source namespace and the successful decoder's actual request
-/// provenance. This upper includes temporary construction requests; it is not
-/// a precise retained size, a capacity grant, or a second memory authority.
-pub(crate) struct NativeFragmentSourceTypes {
-    pub(crate) execution: DecodedExecutionTypeTable,
-    pub(crate) construction_request_bytes_upper_bound: usize,
-}
+pub(crate) use crate::native_type_decode::NativeSourceTypes as NativeFragmentSourceTypes;
 
 pub(crate) fn decode_fragment_type_owner(
     fragment: &plan::PlanFragment,
@@ -129,46 +112,22 @@ pub(crate) fn decode_fragment_type_owner(
             "native fragment requires complete execution type owner",
         )
     })?;
-    // The same finite per-binding grammar as the encoder. No numeric profile
-    // authorizes memory; the actual BE creator admits every request below.
-    let limits = ExecutionTypeTableLimits::for_validated_root_count(table.value_bindings.len())
-        .map_err(NativeTypeConstructionError::Control)?;
-    let factory = NativeTypeFactory::new(resources.creation);
-    let execution =
-        decode_execution_type_table_with_factory_in(table, limits, &factory, &mut resources.work)
-            .map_err(|error| table_failure(error, path))?;
-    let construction_request_bytes_upper_bound = factory.construction_request_bytes_upper_bound();
-    Ok(NativeFragmentSourceTypes {
-        execution,
-        construction_request_bytes_upper_bound,
-    })
+    crate::native_type_decode::decode_type_owner(table, path, resources).map_err(Into::into)
 }
 
-/// Resolve only within this exact owner. The returned binding is borrowed;
-/// copying it is a separate observed operation, never an inline type rebuild.
 pub(crate) fn resolve_type<'a>(
     table: &'a DecodedExecutionTypeTable,
     desc: &common::TypeDesc,
     path: FieldPath,
     resources: &mut NativeDecodeResources<'_>,
 ) -> Result<&'a FunctionValueType, NativeFragmentDecodeError> {
-    table
-        .type_reference_observed(desc, &mut resources.work)
-        .map_err(|error| table_error(error, path))
+    crate::native_type_decode::resolve_type(table, desc, path, resources).map_err(Into::into)
 }
-
 pub(crate) fn clone_type(
     source: &FunctionValueType,
     resources: &mut NativeDecodeResources<'_>,
 ) -> Result<FunctionValueType, NativeFragmentDecodeError> {
-    source
-        .clone_observed(|| {
-            resources
-                .work
-                .step()
-                .map_err(NativeTypeConstructionError::Control)
-        })
-        .map_err(Into::into)
+    crate::native_type_decode::clone_type(source, resources).map_err(Into::into)
 }
 
 pub(crate) fn request_port<'a>(
@@ -894,21 +853,12 @@ impl NativeTypeDecoder<'_, '_, '_> {
         desc: &common::TypeDesc,
         path: FieldPath,
     ) -> Result<arrow::datatypes::DataType, NativeFragmentDecodeError> {
-        {
-            let Self::Strong {
-                types, resources, ..
-            } = self;
-            {
-                let value = resolve_type(types, desc, path, resources)?;
-                // Normalized layouts contain shared children/timezones and no
-                // Dictionary/REE Box, so this projection has no heap request.
-                resources
-                    .work
-                    .step()
-                    .map_err(NativeTypeConstructionError::Control)?;
-                Ok(value.data_type().clone())
-            }
-        }
+        let Self::Strong {
+            types, resources, ..
+        } = self;
+        crate::native_type_decode::NativeTypeTableDecoder { types, resources }
+            .data_type(desc, path)
+            .map_err(Into::into)
     }
 
     pub(crate) fn value_type(
@@ -916,15 +866,12 @@ impl NativeTypeDecoder<'_, '_, '_> {
         desc: &common::TypeDesc,
         path: FieldPath,
     ) -> Result<Option<FunctionValueType>, NativeFragmentDecodeError> {
-        {
-            let Self::Strong {
-                types, resources, ..
-            } = self;
-            {
-                let source = resolve_type(types, desc, path, resources)?;
-                Ok(Some(clone_type(source, resources)?))
-            }
-        }
+        let Self::Strong {
+            types, resources, ..
+        } = self;
+        crate::native_type_decode::NativeTypeTableDecoder { types, resources }
+            .value_type(desc, path)
+            .map_err(Into::into)
     }
 
     pub(crate) fn synthetic_child_binding(
@@ -1103,38 +1050,12 @@ impl NativeTypeDecoder<'_, '_, '_> {
         expected: &novarocks_type_contract::TypedValueBinding,
         ignore_root_nullability: bool,
     ) -> Result<bool, NativeFragmentDecodeError> {
-        {
-            let Self::Strong { resources, .. } = self;
-            {
-                if !ignore_root_nullability {
-                    resources
-                        .work
-                        .step()
-                        .map_err(NativeTypeConstructionError::Control)?;
-                    if actual.nullable() != expected.nullable() {
-                        return Ok(false);
-                    }
-                }
-                let semantics =
-                    FunctionValueType::borrowed_value_domains_equal_observed::<
-                        NativeFragmentDecodeError,
-                    >(actual.value_type(), expected.value_type(), || {
-                        resources
-                            .work
-                            .step()
-                            .map_err(|error| NativeTypeConstructionError::Control(error).into())
-                    })?;
-                if !semantics {
-                    return Ok(false);
-                }
-                actual.layout().equals_observed(expected.layout(), || {
-                    resources
-                        .work
-                        .step()
-                        .map_err(|error| NativeTypeConstructionError::Control(error).into())
-                })
-            }
-        }
+        let Self::Strong {
+            types, resources, ..
+        } = self;
+        crate::native_type_decode::NativeTypeTableDecoder { types, resources }
+            .bindings_match(actual, expected, ignore_root_nullability)
+            .map_err(Into::into)
     }
 
     pub(crate) fn exchange_contracts(

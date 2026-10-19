@@ -1187,9 +1187,9 @@ fn assert_real_sql_optimized_constant_keeps_original_none(sql: &str, expected: O
     use novarocks_physical_plan::ScanReadBudget;
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
-        SqlCompiler, SqlFinalPlanCompileRequest, SqlFunctionCatalog, SqlPhysicalEmissionMode,
-        SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-        build_builtin_engine_function_catalog, noop_constant_evaluator,
+        SqlCompiler, SqlFinalPlanCompileRequest, SqlFunctionCatalog, SqlPlanningEnvironment,
+        SqlSessionContext, SqlStatementInput, build_builtin_engine_function_catalog,
+        noop_constant_evaluator,
     };
 
     let control = SqlCompileControl::unbounded();
@@ -1215,7 +1215,6 @@ fn assert_real_sql_optimized_constant_keeps_original_none(sql: &str, expected: O
         catalog.snapshot(),
         noop_constant_evaluator(),
         policy(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -1476,7 +1475,6 @@ fn default_real_sql_utf8_to_nominal_largeint_keeps_original_i128_null_parse_poli
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -1613,7 +1611,6 @@ fn default_regexp_count_real_sql_disabled_folding_keeps_exact_emitted_source_thr
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -1745,7 +1742,6 @@ fn default_real_sql_nominal_largeint_datetime_uses_original_checked_i64_then_cal
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -1849,9 +1845,9 @@ fn default_real_sql_variant_get_parses_utf8_text_without_signing_variant_input()
     use novarocks_physical_plan::ScanReadBudget;
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
-        SqlCompiler, SqlFinalPlanCompileRequest, SqlFunctionCatalog, SqlPhysicalEmissionMode,
-        SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-        build_builtin_engine_function_catalog, noop_constant_evaluator,
+        SqlCompiler, SqlFinalPlanCompileRequest, SqlFunctionCatalog, SqlPlanningEnvironment,
+        SqlSessionContext, SqlStatementInput, build_builtin_engine_function_catalog,
+        noop_constant_evaluator,
     };
     let cases = [
         (
@@ -1901,7 +1897,6 @@ fn default_real_sql_variant_get_parses_utf8_text_without_signing_variant_input()
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2053,7 +2048,6 @@ fn default_real_sql_variant_typeof_keeps_declared_json_and_original_variant_prof
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2190,7 +2184,6 @@ fn default_real_sql_union_of_json_and_typed_variant_null_completes() {
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2244,7 +2237,6 @@ fn default_real_sql_map_null_values_keep_valid_null_storage() {
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,
@@ -2358,7 +2350,6 @@ fn default_real_sql_largeint_to_decimal_keeps_exact_numeric_admission() {
             catalog.snapshot(),
             noop_constant_evaluator(),
             policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             control.clone(),
             PipelineDopDomain {
                 min: 1,

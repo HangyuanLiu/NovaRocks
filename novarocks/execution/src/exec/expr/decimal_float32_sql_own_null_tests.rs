@@ -26,7 +26,7 @@ use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_physical_plan::ExprKind;
 use novarocks_query_application::api::QueryExecutionKind;
 use novarocks_query_application::preparation::{CompletedPhysicalPlanCandidate, OutputContract};
-use novarocks_sql::compiler::{SqlCompileControl, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlCompileControl;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, PureCompileControl,
 };
@@ -57,16 +57,8 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
     };
     let sql = "SELECT CAST(k AS FLOAT) AS original_cast FROM fixture";
     // ColumnDef and Arrow Field are authored false by the existing real connector seam.
-    let before = sql_source(
-        sql,
-        dtype.clone(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
-    let source = sql_source(
-        sql,
-        dtype.clone(),
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let before = sql_source(sql, dtype.clone());
+    let source = sql_source(sql, dtype.clone());
     let original = source
         .checked_original_result_declaration_observed(&Control)
         .unwrap()
@@ -190,11 +182,7 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
             "SELECT CAST({}{literal} AS FLOAT) AS wide_literal",
             if negative { "-" } else { "" }
         );
-        let source = sql_source(
-            &sql,
-            DataType::Int8,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
+        let source = sql_source(&sql, DataType::Int8);
         let mut actual_wide = 0;
         for fragment in source.plan().fragments().values() {
             for node in fragment.nodes().values() {
