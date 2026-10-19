@@ -2797,6 +2797,9 @@ pub trait ServerHandle: Send {
     fn residual_process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+    /// Preserve original runtime and process diagnostics when the caller's
+    /// outcome has failed, even if subsequent process cleanup succeeds.
+    fn retain_runtime_artifacts(&mut self) {}
     fn shutdown(&mut self) -> Result<()> {
         Ok(())
     }
@@ -4773,6 +4776,10 @@ impl CrossProcessServerHandle {
 }
 
 impl ServerHandle for CrossProcessServerHandle {
+    fn retain_runtime_artifacts(&mut self) {
+        CrossProcessServerHandle::retain_runtime_artifacts(self);
+    }
+
     fn actual_build_information_evidence(&self) -> Result<Option<serde_json::Value>> {
         self.build_information_evidence().map(Some)
     }

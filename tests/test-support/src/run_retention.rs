@@ -486,8 +486,7 @@ fn bootstrap_guard(context: &RunContext, deadline: Instant) -> io::Result<()> {
             }
         })?;
     let absolute = unix::absolute_deadline(deadline)?;
-    let mut command =
-        Command::new(option_env!("NOVAROCKS_TEST_MONITOR").expect("library monitor build path"));
+    let mut command = Command::new(env!("NOVAROCKS_TEST_MONITOR"));
     command
         .arg("retention-guard")
         .arg(&context.root)
@@ -641,12 +640,75 @@ fn same_directory(path: &Path, original: &File) -> io::Result<bool> {
     Ok(path.is_dir() && path.dev() == original.dev() && path.ino() == original.ino())
 }
 
+fn trash_owner(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".owner");
+    PathBuf::from(name)
+}
+
+fn trash_identity(metadata: &fs::Metadata) -> String {
+    format!("schema=1\ndev={}\nino={}\n", metadata.dev(), metadata.ino())
+}
+
+fn read_trash_identity(path: &Path, device: u64) -> io::Result<Option<String>> {
+    let mut owner = match OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | unix::NONBLOCK)
+        .open(trash_owner(path))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let facts = owner.metadata()?;
+    if !facts.is_file() || facts.dev() != device || facts.len() > 128 {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    Read::by_ref(&mut owner)
+        .take(129)
+        .read_to_string(&mut text)?;
+    let mut lines = text.lines();
+    let schema = lines.next();
+    let dev = lines
+        .next()
+        .and_then(|line| line.strip_prefix("dev="))
+        .and_then(|value| value.parse::<u64>().ok());
+    let ino = lines
+        .next()
+        .and_then(|line| line.strip_prefix("ino="))
+        .and_then(|value| value.parse::<u64>().ok());
+    if schema != Some("schema=1")
+        || dev != Some(device)
+        || ino.is_none()
+        || lines.next().is_some()
+        || !text.ends_with('\n')
+    {
+        return Ok(None);
+    }
+    Ok(Some(text))
+}
+
+fn verified_trash_owner(path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
+    Ok(read_trash_identity(path, metadata.dev())?
+        .is_some_and(|text| text == trash_identity(metadata)))
+}
+
+fn remove_owned_trash(path: &Path) -> io::Result<()> {
+    // Ownership lives beside the tree: a failed recursive deletion may already
+    // have removed every in-tree marker and lock. Keep the exact inode receipt
+    // until the entire tree has actually gone.
+    fs::remove_dir_all(path)?;
+    fs::remove_file(trash_owner(path))
+}
+
 pub fn collect(base: &Path, retain: usize) -> io::Result<()> {
     let lock = open_lock(&base.join(".gc"))?;
     if lock.try_lock().is_err() {
         return Ok(());
     }
     let deadline = Instant::now() + Duration::from_millis(100);
+    let device = fs::metadata(base)?.dev();
     // Interrupted removals remain private owned trees and are retried. Never
     // descend through an external symlink or a formal evidence root.
     for entry in fs::read_dir(base)?.take(128) {
@@ -654,20 +716,40 @@ pub fn collect(base: &Path, retain: usize) -> io::Result<()> {
             return Ok(());
         }
         let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| name.starts_with(".trash-")) else {
+            continue;
+        };
+        if entry.file_type()?.is_file() {
+            if let Some(tree_name) = name.strip_suffix(".owner") {
+                let tree = base.join(tree_name);
+                match fs::symlink_metadata(&tree) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        if read_trash_identity(&tree, device)?.is_some() {
+                            fs::remove_file(entry.path())?;
+                        }
+                    }
+                    Err(error) => return Err(error),
+                    Ok(_) => {} // An existing or replaced tree is never guessed absent.
+                }
+            }
+            continue;
+        }
         if !entry.file_name().to_string_lossy().starts_with(".trash-")
             || !entry.file_type()?.is_dir()
         {
             continue;
         }
         let path = entry.path();
-        if !path.join(".ordinary").is_file() || path.join(".formal").exists() {
+        let directory = File::open(&path)?;
+        unix::validate_local_fs(&directory)?;
+        if !verified_trash_owner(&path, &directory.metadata()?)?
+            || path.join(".formal").exists()
+            || !same_directory(&path, &directory)?
+        {
             continue;
         }
-        let pin = open_lock(&path.join(".pin"))?;
-        if pin.try_lock().is_err() {
-            continue;
-        }
-        if let Err(error) = fs::remove_dir_all(&path) {
+        if let Err(error) = remove_owned_trash(&path) {
             eprintln!(
                 "retry retained test material deletion {}: {error}",
                 path.display()
@@ -739,10 +821,17 @@ pub fn collect(base: &Path, retain: usize) -> io::Result<()> {
             continue;
         }
         let trash = base.join(format!(".trash-{}", unique()));
+        write_new(
+            &trash_owner(&trash),
+            trash_identity(&directory.metadata()?).as_bytes(),
+        )?;
         let result = fs::rename(&root, &trash);
         drop(namespace);
-        result?;
-        if let Err(error) = fs::remove_dir_all(&trash) {
+        if let Err(error) = result {
+            let _ = fs::remove_file(trash_owner(&trash));
+            return Err(error);
+        }
+        if let Err(error) = remove_owned_trash(&trash) {
             eprintln!(
                 "retain failed test material deletion {}: {error}",
                 trash.display()
@@ -755,6 +844,46 @@ pub fn collect(base: &Path, retain: usize) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_trash_deletion_is_retried_without_in_tree_markers() {
+        let base = std::env::temp_dir().join(format!("nr-trash-retry-{}", unique()));
+        fs::create_dir(&base).unwrap();
+        let trash = base.join(format!(".trash-{}", unique()));
+        fs::create_dir(&trash).unwrap();
+        write_new(&trash.join(".ordinary"), b"ordinary\n").unwrap();
+        write_new(&trash.join("original-stderr"), b"retained remainder\n").unwrap();
+        write_new(
+            &trash_owner(&trash),
+            trash_identity(&fs::metadata(&trash).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        // Reproduce the durable state after recursive deletion removed its
+        // markers before encountering an error on remaining original output.
+        fs::remove_file(trash.join(".ordinary")).unwrap();
+        collect(&base, 3).unwrap();
+        assert!(!trash.exists());
+        assert!(!trash_owner(&trash).exists());
+
+        // The tree may already be gone when removing its receipt failed, or a
+        // collector may have exited between receipt creation and rename.
+        let orphan = base.join(format!(".trash-{}", unique()));
+        write_new(
+            &trash_owner(&orphan),
+            trash_identity(&fs::metadata(&base).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        collect(&base, 3).unwrap();
+        assert!(!trash_owner(&orphan).exists());
+
+        let foreign = base.join(format!(".trash-{}", unique()));
+        fs::create_dir(&foreign).unwrap();
+        write_new(&foreign.join("unowned"), b"preserve\n").unwrap();
+        write_new(&trash_owner(&foreign), b"schema=1\ndev=0\nino=0\n").unwrap();
+        collect(&base, 3).unwrap();
+        assert!(foreign.join("unowned").is_file());
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn expired_deadline_cannot_acquire_an_available_registration_lock() {

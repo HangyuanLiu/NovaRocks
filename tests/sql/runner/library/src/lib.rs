@@ -4883,10 +4883,16 @@ pub fn run_correctness(build: build_information::BuildInformation) -> Result<()>
     Ok(())
 }
 
-fn shutdown_server_handle(server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>) -> Result<()> {
+fn shutdown_server_handle(
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    retain_runtime_artifacts: bool,
+) -> Result<()> {
     let mut errors = Vec::new();
     match server_handle.lock() {
         Ok(mut handle) => {
+            if retain_runtime_artifacts {
+                handle.retain_runtime_artifacts();
+            }
             if let Err(error) = handle.shutdown() {
                 errors.push(format!("shutdown failed: {error:#}"));
             }
@@ -4927,7 +4933,12 @@ fn finish_run_with_server_cleanup(
         Ok(None)
     };
     report_preserved_failure_artifacts(&preserve_result);
-    let cleanup_result = shutdown_server_handle(&server_handle);
+    // A successful stop proves process cleanup, not that the SQL run passed.
+    // Keep the originals if execution or its already-attempted preservation
+    // failed; bounded failure snapshots do not replace those original files.
+    let retain_runtime_artifacts =
+        primary_failed || preserve_result.is_err() || shutdown_failure_candidate.is_err();
+    let cleanup_result = shutdown_server_handle(&server_handle, retain_runtime_artifacts);
     if let Err(error) = &cleanup_result {
         failure_artifacts.record_provenance(
             "server-cleanup".to_string(),
@@ -7310,6 +7321,119 @@ mod tests {
                 max_history_tail_bytes,
             )))
         }
+    }
+
+    struct RetentionTrackingServer {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail_snapshot: bool,
+    }
+
+    impl crate::cluster::ServerHandle for RetentionTrackingServer {
+        fn target_host(&self) -> Option<&str> {
+            None
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            None
+        }
+
+        fn failure_log_sources(
+            &self,
+            max_backend_logs: usize,
+            max_history_tail_bytes: usize,
+        ) -> anyhow::Result<Option<crate::cluster::ServerFailureLogSources>> {
+            if self.fail_snapshot {
+                anyhow::bail!("injected original snapshot failure");
+            }
+            crate::cluster::ServerHandle::failure_log_sources(
+                &ArtifactCapableServer,
+                max_backend_logs,
+                max_history_tail_bytes,
+            )
+        }
+
+        fn retain_runtime_artifacts(&mut self) {
+            self.events.lock().unwrap().push("retain");
+        }
+
+        fn shutdown(&mut self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("shutdown");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_run_retains_original_diagnostics_before_server_cleanup() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(RetentionTrackingServer {
+                events: Arc::clone(&events),
+                fail_snapshot: false,
+            })));
+        let artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: directory.path().join("failures"),
+                lane: "correctness".into(),
+                suites: vec!["analytic".into()],
+            },
+        );
+        assert_eq!(
+            super::finish_run_with_server_cleanup(server, Ok(1), &artifacts).unwrap(),
+            1
+        );
+        assert_eq!(*events.lock().unwrap(), ["retain", "shutdown"]);
+    }
+
+    #[test]
+    fn successful_run_does_not_retain_original_diagnostics_during_cleanup() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(RetentionTrackingServer {
+                events: Arc::clone(&events),
+                fail_snapshot: false,
+            })));
+        let root = directory.path().join("must-not-exist");
+        let artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: root.clone(),
+                lane: "correctness".into(),
+                suites: vec!["analytic".into()],
+            },
+        );
+        assert_eq!(
+            super::finish_run_with_server_cleanup(server, Ok(0), &artifacts).unwrap(),
+            0
+        );
+        assert_eq!(*events.lock().unwrap(), ["shutdown"]);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn failed_terminal_candidate_retains_original_diagnostics_before_cleanup() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(RetentionTrackingServer {
+                events: Arc::clone(&events),
+                fail_snapshot: true,
+            })));
+        let artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: directory.path().join("failures"),
+                lane: "correctness".into(),
+                suites: vec!["analytic".into()],
+            },
+        );
+        // The staged candidate is consumed only if shutdown fails. Preserve
+        // the existing successful-run verdict, while keeping its uncaptured
+        // originals instead of releasing them during normal process cleanup.
+        assert_eq!(
+            super::finish_run_with_server_cleanup(server, Ok(0), &artifacts).unwrap(),
+            0
+        );
+        assert_eq!(*events.lock().unwrap(), ["retain", "shutdown"]);
     }
 
     #[test]

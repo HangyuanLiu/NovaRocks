@@ -37,6 +37,7 @@ fn main() {
     }
     let mut command = Command::new(std::env::var_os("RUSTC").expect("Cargo rustc"));
     command
+        .env("NOVAROCKS_TEST_MONITOR", &output)
         .args([
             "src/monitor/main.rs",
             "--edition=2024",
