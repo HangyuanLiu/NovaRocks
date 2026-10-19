@@ -43,6 +43,7 @@ struct TableParentCatalog {
     outcome: Outcome,
     calls: Arc<AtomicUsize>,
     sources: Arc<Mutex<Vec<FunctionBindingSelection>>>,
+    parent: Arc<Mutex<Option<novarocks_functions::ResolvedFunctionBinding>>>,
 }
 impl SqlFunctionCatalog for TableParentCatalog {
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
@@ -53,22 +54,10 @@ impl SqlFunctionCatalog for TableParentCatalog {
         binding: &SqlFunctionBinding,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        if binding.kind != FunctionKind::Table {
-            return self
-                .inner
-                .admit_authored_environment_observed(binding, control);
-        }
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        self.sources.lock().unwrap().push(binding.selected.clone());
-        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
-        match self.outcome {
-            Outcome::Allow => Ok(()),
-            Outcome::Unavailable => Err(FunctionBindingError::UnavailableImplementation(
-                binding.selected.overload.clone(),
-            )),
-            Outcome::Control(cause) => Err(FunctionBindingError::Control(cause)),
-        }
+        self.inner
+            .admit_authored_environment_observed(binding, control)
     }
+
     fn select_exact_overload_observed(
         &self,
         function_id: &novarocks_functions::FunctionId,
@@ -93,9 +82,42 @@ impl SqlFunctionCatalog for TableParentCatalog {
         novarocks_functions::PureOverloadDeclaration<'a>,
         novarocks_functions::FunctionSpecializationFailure,
     > {
+        if kind == FunctionKind::Table {
+            let parent = self
+                .parent
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the actual Table resolver supplied this admission's parent")
+                .clone();
+            assert_eq!(&parent.function_id, function_id);
+            assert_eq!(parent.kind, kind);
+            assert_eq!(&parent.selected.overload, overload);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.sources.lock().unwrap().push(parent.selected);
+            control
+                .checkpoint(CompilePhase::FunctionSpecialization, 0)
+                .map_err(novarocks_functions::FunctionSpecializationFailure::Control)?;
+            match self.outcome {
+                Outcome::Allow => {}
+                Outcome::Unavailable => {
+                    return Err(
+                        novarocks_functions::FunctionSpecializationFailure::MissingPureImplementation(
+                            overload.clone(),
+                        ),
+                    );
+                }
+                Outcome::Control(cause) => {
+                    return Err(novarocks_functions::FunctionSpecializationFailure::Control(
+                        cause,
+                    ));
+                }
+            }
+        }
         self.inner
             .pure_overload_declaration_observed(function_id, kind, overload, control)
     }
+
     fn prepare_fresh_selected(
         &self,
         input: novarocks_functions::CallEffectInput<'_>,
@@ -177,7 +199,9 @@ impl SqlFunctionCatalog for TableParentCatalog {
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
-        self.inner.resolve_table_binding(name, arguments, control)
+        let binding = self.inner.resolve_table_binding(name, arguments, control)?;
+        *self.parent.lock().unwrap() = Some(binding.clone());
+        Ok(binding)
     }
     fn contains_aggregate(&self, name: &str) -> bool {
         self.inner.contains_aggregate(name)
@@ -264,6 +288,7 @@ fn source(outcome: Outcome) -> TableParentCatalog {
         outcome,
         calls: Arc::new(AtomicUsize::new(0)),
         sources: Arc::new(Mutex::new(Vec::new())),
+        parent: Arc::new(Mutex::new(None)),
     }
 }
 fn optimize(catalog: &TableParentCatalog) -> Result<(), SqlCompileError> {

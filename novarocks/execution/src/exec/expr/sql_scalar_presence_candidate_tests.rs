@@ -60,7 +60,7 @@ fn unavailable(error: SqlCompileError, expected: &str) {
     assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
     assert_eq!(
         error.code(),
-        AnalyzeErrorKind::UnsupportedExpression.descriptor().code
+        AnalyzeErrorKind::UnavailableImplementation.descriptor().code
     );
     assert!(
         error.span().is_some(),

@@ -22,7 +22,7 @@
 //! different installed support cannot share an island. Nothing per task or
 //! per statement selects an interpreter.
 
-// Design: ADR-0184 (docs/adr/ADR-0184-compiled-packages-are-the-sole-static-plan-path.md)
+// Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
 
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_native_adapter::backend_application::CompiledStaticPlan;

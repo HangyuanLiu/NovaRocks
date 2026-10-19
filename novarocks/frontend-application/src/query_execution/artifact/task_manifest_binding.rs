@@ -1501,12 +1501,13 @@ mod tests {
             .expect("the exact original Int64 payload completes from SQL");
         let plan = paired.candidate().plan();
         assert_eq!(plan.version(), version);
-        assert_eq!(plan.fragments().len(), 1);
+        assert_eq!(plan.fragments().len(), 2, "distributed producer and gather");
         let result = paired
             .candidate()
             .original_public_result_port()
             .expect("the original SQL public result declaration");
-        assert_eq!(result.fragment, novarocks_physical_plan::FragmentId::new(1));
+        let root_fragment = u32::from(result.fragment.get());
+        assert!(plan.fragments().contains_key(&result.fragment));
         assert_eq!(result.fields.len(), 1);
         assert_eq!(result.fields[0].name.as_ref(), "payload");
         assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));
@@ -1531,16 +1532,23 @@ mod tests {
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("production physical-to-native encoding");
-        assert_eq!(encoded.native.fragment_ids().count(), 1);
+        assert_eq!(encoded.native.fragment_ids().count(), 2);
         assert_eq!(encoded.access.iter().count(), 0);
         assert!(encoded.plan_facts.scans().is_empty());
-        assert!(encoded.plan_facts.edges().is_empty());
+        assert_eq!(encoded.plan_facts.edges().len(), 1);
+        assert_eq!(encoded.plan_facts.scheduling().anchor, root_fragment);
         let template = encoded.into_attempt_template(version);
         let scheduling = template
             .attempt_scheduling_facts()
             .expect("original scheduling facts");
-        assert_eq!(scheduling.fragments.len(), 1);
-        assert!(scheduling.fragments[0].scans.is_empty());
+        assert_eq!(scheduling.fragments.len(), 2);
+        assert_eq!(scheduling.edges.len(), 1);
+        assert!(
+            scheduling
+                .fragments
+                .iter()
+                .all(|fragment| fragment.scans.is_empty())
+        );
 
         // Finite component-only request-bound fixture. All static Native facts
         // and template affinity above came from the real encoder; no provider,
@@ -1570,21 +1578,112 @@ mod tests {
     fn full_bind_schedule(
         execution: QueryExecutionId,
         backend: BackendProcessId,
+        template: &super::super::RequestBoundNativeTemplate,
     ) -> super::ScheduleFacts {
-        let (root, context) = task(execution, 1, 1, backend);
+        let prepared = super::PreparedManifestFacts::from_template(&template.template)
+            .expect("the actual frozen Native graph supplies every manifest fact");
+        let scheduling = template
+            .template
+            .attempt_scheduling_facts()
+            .expect("the same actual attempt scheduling facts");
+        assert_eq!(prepared.fragments.len(), 2);
+        assert_eq!(prepared.edges.len(), 1);
+        assert_eq!(scheduling.fragments.len(), 2);
+        assert_eq!(scheduling.edges.len(), 1);
+        assert_eq!(
+            scheduling.execution_anchor_fragment_id,
+            prepared.execution_anchor
+        );
+        assert!(
+            scheduling
+                .fragments
+                .iter()
+                .all(|fragment| fragment.scans.is_empty())
+        );
+        assert_eq!(
+            scheduling
+                .fragments
+                .iter()
+                .map(|fragment| fragment.fragment_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            prepared.fragments,
+        );
+        // This existing component seam projects one task per real fragment at
+        // the fixture's original DOP=1 and exact selected backend. It does not
+        // construct QA's move-only AttemptSchedule or alter the compiled graph.
+        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        let mut identities = std::collections::BTreeMap::new();
+        let fragments = prepared
+            .fragments
+            .iter()
+            .enumerate()
+            .map(|(index, &fragment_id)| {
+                let ordinal = u32::try_from(index + 1).expect("finite fixture task ordinal");
+                let stage_id = StageId::new(ordinal).expect("one nonzero stage per real fragment");
+                let identity = TaskIdentity::new(
+                    execution,
+                    stage_id,
+                    TaskId::new(ordinal).expect("one nonzero task per real fragment"),
+                    backend,
+                );
+                identities.insert(fragment_id, identity);
+                super::ProjectedFragment {
+                    fragment_id,
+                    stage_id,
+                    tasks: vec![ProjectedTask {
+                        identity,
+                        context,
+                        instance_index: 0,
+                        scan_work: Vec::new(),
+                    }],
+                }
+            })
+            .collect();
+        let root = identities[&prepared.execution_anchor];
+        let edges = prepared
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(index, (&(source, target, exchange), &partition))| {
+                assert_eq!(partition, super::BoundManifestPartitionKind::Unpartitioned);
+                let original = scheduling
+                    .edges
+                    .iter()
+                    .find(|edge| {
+                        (
+                            edge.source_fragment_id,
+                            edge.target_fragment_id,
+                            edge.target_exchange_node_id,
+                        ) == (source, target, exchange)
+                    })
+                    .expect("the actual scheduling edge and frozen edge agree");
+                assert_eq!(
+                    original.stream_kind,
+                    novarocks_query_application::api::SchedulingStreamKind::Gather
+                );
+                assert!(!original.hash_partitioned);
+                assert_eq!(
+                    identities[&target], root,
+                    "the real gather terminates at the public root"
+                );
+                super::ProjectedEdge {
+                    edge_id: ExchangeEdgeId::new(
+                        u32::try_from(index + 1).expect("finite fixture edge ordinal"),
+                    )
+                    .expect("one nonzero edge per real edge"),
+                    source_fragment_id: source,
+                    target_fragment_id: target,
+                    target_exchange_node_id: exchange,
+                    producers: vec![(identities[&source], 0)],
+                    destinations: vec![identities[&target]],
+                    sender_count: NonZeroU32::new(1).expect("one actual producer task"),
+                }
+            })
+            .collect();
         super::ScheduleFacts {
             execution,
-            fragments: vec![super::ProjectedFragment {
-                fragment_id: 1,
-                stage_id: StageId::new(1).expect("one nonzero stage"),
-                tasks: vec![ProjectedTask {
-                    identity: root,
-                    context,
-                    instance_index: 0,
-                    scan_work: Vec::new(),
-                }],
-            }],
-            edges: Vec::new(),
+            fragments,
+            edges,
             contexts: vec![context],
             root,
         }
@@ -1603,12 +1702,10 @@ mod tests {
             let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
                 .expect("legacy descriptors are representable before selected-root use")
                 .into_parts();
+            let template = full_bind_native_template(execution, purpose);
+            let schedule = full_bind_schedule(execution, process, &template);
             let error = super::TaskManifestBinding::bind_facts(
-                full_bind_native_template(execution, purpose),
-                execution,
-                full_bind_schedule(execution, process),
-                revision,
-                backends,
+                template, execution, schedule, revision, backends,
             )
             .expect_err("the production bind call must refuse the exact unsupported root");
             assert_eq!(
@@ -1637,22 +1734,60 @@ mod tests {
             let frozen = FrozenAttemptTopology::capture(snapshot).expect("original snapshot");
             assert!(frozen.eligible_backends().contains(&legacy_process));
             let (revision, backends) = frozen.into_parts();
-            let schedule = full_bind_schedule(execution, process);
+            let template = full_bind_native_template(execution, purpose);
+            let schedule = full_bind_schedule(execution, process, &template);
             let root = schedule.root;
+            let expected_edge = &schedule.edges[0];
+            let expected_key = (
+                expected_edge.source_fragment_id,
+                expected_edge.target_fragment_id,
+                expected_edge.target_exchange_node_id,
+            );
+            let producer = expected_edge.producers[0].0;
+            assert_ne!(producer, root);
             let manifest = super::TaskManifestBinding::bind_facts(
-                full_bind_native_template(execution, purpose),
-                execution,
-                schedule,
-                revision,
-                backends,
+                template, execution, schedule, revision, backends,
             )
             .expect("production full binding reaches a valid manifest");
             assert_eq!(manifest.execution(), execution);
             assert_eq!(manifest.root(), root);
             assert_eq!(manifest.topology_revision(), 84);
-            assert_eq!(manifest.tasks().len(), 1);
+            assert_eq!(manifest.tasks().len(), 2);
             assert_eq!(manifest.contexts().len(), 1);
-            assert!(manifest.edges().is_empty());
+            assert_eq!(manifest.edges().len(), 1);
+            assert_eq!(
+                manifest
+                    .tasks()
+                    .iter()
+                    .map(|task| task.identity())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [producer, root].into_iter().collect()
+            );
+            assert!(
+                manifest
+                    .tasks()
+                    .iter()
+                    .all(|task| task.identity().backend_process_id() == process
+                        && task.context() == manifest.contexts()[0].context())
+            );
+            let edge = &manifest.edges()[0];
+            assert_eq!(
+                (
+                    edge.source_fragment_id(),
+                    edge.target_fragment_id(),
+                    edge.target_exchange_node_id()
+                ),
+                expected_key
+            );
+            assert_eq!(
+                edge.partition_kind(),
+                super::BoundManifestPartitionKind::Unpartitioned
+            );
+            assert_eq!(edge.producers().len(), 1);
+            assert_eq!(edge.producers()[0].task(), producer);
+            assert_eq!(edge.producers()[0].sender_ordinal(), 0);
+            assert_eq!(edge.destinations(), &[root]);
+            assert_eq!(edge.sender_count().get(), 1);
             assert_eq!(manifest.contexts()[0].backend().process_id(), process);
             assert!(
                 manifest.contexts()[0]
@@ -1674,19 +1809,21 @@ mod tests {
         let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
-        let mut schedule = full_bind_schedule(execution, process);
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let mut schedule = full_bind_schedule(execution, process, &template);
         let foreign = QueryExecutionId::new(
             execution.query_id(),
             AttemptId::new(2).expect("another nonzero attempt"),
         )
         .expect("foreign attempt");
-        schedule.root = task(foreign, 1, 1, process).0;
+        schedule.root = TaskIdentity::new(
+            foreign,
+            schedule.root.stage_id(),
+            schedule.root.task_id(),
+            process,
+        );
         let error = super::TaskManifestBinding::bind_facts(
-            full_bind_native_template(execution, FullBindPurpose::ClientRows),
-            execution,
-            schedule,
-            revision,
-            backends,
+            template, execution, schedule, revision, backends,
         )
         .expect_err("same supported backend cannot replace the complete scheduled task identity");
         assert!(
