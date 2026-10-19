@@ -144,7 +144,9 @@ pub(crate) struct OwnedMonitor {
     pub material: Arc<Material>,
     pub stdout: File,
     pub stderr: File,
-    liveness_generation: Mutex<u64>,
+    // None means a Q write had an ambiguous outcome. Cleanup controls remain
+    // usable, but a later query must never reuse a possibly stale generation.
+    liveness_generation: Mutex<Option<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +163,28 @@ fn hex(value: &OsStr) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn write_liveness_query(
+    generation: &mut Option<u64>,
+    write: impl FnOnce() -> Result<()>,
+) -> Result<u64> {
+    let current = generation
+        .context("monitor liveness generation is unusable after a query write failure")?;
+    if let Err(error) = write() {
+        // A frame can have reached the monitor even when its caller observes
+        // an error, including expiry at the post-write deadline check.
+        *generation = None;
+        return Err(
+            error.context("monitor liveness generation is unusable after a query write failure")
+        );
+    }
+    let Some(next) = current.checked_add(1) else {
+        *generation = None;
+        bail!("monitor liveness generation overflow");
+    };
+    *generation = Some(next);
+    Ok(next)
 }
 
 struct PendingRecord {
@@ -345,7 +369,7 @@ impl OwnedMonitor {
             material,
             stdout,
             stderr,
-            liveness_generation: Mutex::new(0),
+            liveness_generation: Mutex::new(Some(0)),
         };
         loop {
             ensure!(
@@ -462,6 +486,10 @@ impl OwnedMonitor {
                 }
             }
         };
+        ensure!(
+            generation.is_some(),
+            "monitor liveness generation is unusable after a query write failure"
+        );
         let finished = self.final_record()?.is_some();
         ensure!(
             Instant::now() < deadline,
@@ -470,10 +498,8 @@ impl OwnedMonitor {
         if finished {
             return Ok(false);
         }
-        self.write_frame(b'Q', deadline)?;
-        *generation = generation
-            .checked_add(1)
-            .context("monitor liveness generation overflow")?;
+        let expected_generation =
+            write_liveness_query(&mut generation, || self.write_frame(b'Q', deadline))?;
         loop {
             ensure!(
                 Instant::now() < deadline,
@@ -493,7 +519,8 @@ impl OwnedMonitor {
                     );
                     return Ok(false);
                 }
-                if value["event"] == "Liveness" && value["generation"].as_u64() == Some(*generation)
+                if value["event"] == "Liveness"
+                    && value["generation"].as_u64() == Some(expected_generation)
                 {
                     active = value["running"]
                         .as_bool()
@@ -659,5 +686,74 @@ impl Drop for OwnedMonitor {
         // on panic. Never write inherited stdout/stderr while holding it.
         // The already-created waiter retains the actual monitor Child.
         self.close_control();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::{Seek, SeekFrom};
+
+    #[test]
+    fn post_write_query_error_prevents_another_query_but_preserves_cleanup_control() {
+        let path = std::env::temp_dir().join(format!("nr-query-write-{}", run_retention::unique()));
+        let mut control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut generation = Some(0);
+        let deadline = 987654321u64;
+        assert_eq!(
+            write_liveness_query(&mut generation, || {
+                control.write_all(&unix::control_frame(b'Q', deadline))?;
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+
+        // The second real frame was written. Inject only the caller's failing
+        // post-write deadline verdict, without waiting for a scheduler race.
+        let error = write_liveness_query(&mut generation, || {
+            control.write_all(&unix::control_frame(b'Q', deadline))?;
+            bail!("original monitor control completed after original deadline");
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("completed after original deadline"));
+        assert_eq!(generation, None);
+        let sent_again = Cell::new(false);
+        let error = write_liveness_query(&mut generation, || {
+            sent_again.set(true);
+            control.write_all(&unix::control_frame(b'Q', deadline))?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("generation is unusable"));
+        assert!(
+            !sent_again.get(),
+            "an ambiguous generation must never emit another Q or reuse its stale response"
+        );
+
+        // Lifecycle commands use the same writer independently of Q state.
+        control
+            .write_all(&unix::control_frame(b'K', deadline))
+            .unwrap();
+        control.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        control.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), 3 * 16);
+        let operations = bytes
+            .chunks_exact(16)
+            .map(|frame| unix::decode_control(frame).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            vec![(b'Q', deadline), (b'Q', deadline), (b'K', deadline)]
+        );
+        drop(control);
+        fs::remove_file(path).unwrap();
     }
 }
