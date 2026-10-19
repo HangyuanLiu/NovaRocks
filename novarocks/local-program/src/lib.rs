@@ -107,7 +107,8 @@ pub use runtime_filter::{
     FilterMembershipSchema, FilterMembershipSchemaError, FilterNullOrder, FilterNullSemantics,
     FilterOrderKey, FilterOrderKeys, FilterProducerKind, FilterReduction, FilterSortDirection,
     ScanFilterConsumers, StaticFilterConsumer, StaticFilterContract, StaticFilterError,
-    StaticFilterProducer, encode_filter_key_type, is_ordered_filter_flat_payload_type,
+    StaticFilterProducer, encode_filter_key_type, is_aggregate_topn_key_carrier,
+    is_aggregate_topn_key_type, is_ordered_filter_flat_payload_type,
     single_key_ordered_filter_digests_observed, visit_filter_key_type,
 };
 pub use sink::{

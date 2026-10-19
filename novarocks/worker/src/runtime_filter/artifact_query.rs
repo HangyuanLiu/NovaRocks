@@ -29,6 +29,7 @@ use novarocks_execution::runtime_filter::{
         ControlledOrderedTupleError, OrderedScalar, OrderedScalarRef, OrderedTuple,
         OrderedTupleRef, RuntimeOrderContract,
     },
+    is_aggregate_topn_key_carrier,
 };
 use novarocks_spi::connector::ConnectorScalarValue;
 
@@ -238,11 +239,10 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
 
     fn controlled_scalar_query(&self) -> Option<&dyn RuntimeFilterControlledScalarQuery> {
         match self {
-            Self::Membership { .. }
-            | Self::Ordered {
-                data_type: DataType::Utf8,
-                ..
-            } => Some(self),
+            Self::Membership { .. } => Some(self),
+            Self::Ordered { data_type, .. } if is_aggregate_topn_key_carrier(data_type) => {
+                Some(self)
+            }
             _ => None,
         }
     }
@@ -341,10 +341,9 @@ impl RuntimeFilterControlledScalarQuery for BackendRuntimeFilterArtifactQuery {
                 null_semantics,
                 ..
             } => Ok(membership_matches_null(artifact, *null_semantics)),
-            Self::Ordered {
-                data_type: DataType::Utf8,
-                ..
-            } => self.ordered_matches_scalar(None, ScalarQueryMode::Controlled(control)),
+            Self::Ordered { data_type, .. } if is_aggregate_topn_key_carrier(data_type) => {
+                self.ordered_matches_scalar(None, ScalarQueryMode::Controlled(control))
+            }
             _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
         }
     }
@@ -366,12 +365,9 @@ impl RuntimeFilterControlledScalarQuery for BackendRuntimeFilterArtifactQuery {
                 value,
                 ScalarQueryMode::Controlled(control),
             ),
-            Self::Ordered {
-                data_type: DataType::Utf8,
-                ..
-            } => {
+            Self::Ordered { data_type, .. } if is_aggregate_topn_key_carrier(data_type) => {
                 self.ordered_range()?;
-                let scalar = ordered_scalar_ref(value, &DataType::Utf8)?;
+                let scalar = ordered_scalar_ref(value, data_type)?;
                 self.ordered_matches_scalar(Some(scalar), ScalarQueryMode::Controlled(control))
             }
             _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
@@ -780,11 +776,199 @@ mod tests {
             RuntimeOrderNullOrder::Last,
             Some(OrderedScalar::Int64(7)),
         );
-        assert!(query.controlled_scalar_query().is_none());
+        assert_eq!(
+            query
+                .controlled_scalar_query()
+                .unwrap()
+                .non_null_value_may_match_controlled(RuntimeFilterScalarRef::Int64(7), &NoControl),
+            Ok(true)
+        );
         assert_eq!(
             query.non_null_value_may_match(RuntimeFilterScalarRef::Int64(7)),
             Ok(true)
         );
+    }
+
+    // Existing numeric legacy queries are an additional comparison, while
+    // expected inclusive/NULL order comes from std integers and declared order.
+    // No service/transport is created; this Worker owner tests its real adapter.
+    #[test]
+    fn ordered_query_controlled_numeric_matches_literal_order_and_typed_refusals() {
+        type Make = fn(i64) -> (OrderedScalar, RuntimeFilterScalarRef<'static>);
+        let cases: Vec<(DataType, Make)> = vec![
+            (DataType::Int8, |v| {
+                (
+                    OrderedScalar::Int8(v as i8),
+                    RuntimeFilterScalarRef::Int8(v as i8),
+                )
+            }),
+            (DataType::Int16, |v| {
+                (
+                    OrderedScalar::Int16(v as i16),
+                    RuntimeFilterScalarRef::Int16(v as i16),
+                )
+            }),
+            (DataType::Int32, |v| {
+                (
+                    OrderedScalar::Int32(v as i32),
+                    RuntimeFilterScalarRef::Int32(v as i32),
+                )
+            }),
+            (DataType::Int64, |v| {
+                (OrderedScalar::Int64(v), RuntimeFilterScalarRef::Int64(v))
+            }),
+            (DataType::FixedSizeBinary(16), |v| {
+                (
+                    OrderedScalar::LargeInt(v.into()),
+                    RuntimeFilterScalarRef::LargeInt(v.into()),
+                )
+            }),
+            (DataType::Date32, |v| {
+                (
+                    OrderedScalar::Date32(v as i32),
+                    RuntimeFilterScalarRef::Date32(v as i32),
+                )
+            }),
+            (DataType::Decimal128(18, 3), |v| {
+                (
+                    OrderedScalar::Decimal128(v.into()),
+                    RuntimeFilterScalarRef::Decimal128(v.into()),
+                )
+            }),
+            (
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+                |v| {
+                    (
+                        OrderedScalar::Timestamp(v),
+                        RuntimeFilterScalarRef::TimestampSecond(v),
+                    )
+                },
+            ),
+            (
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                |v| {
+                    (
+                        OrderedScalar::Timestamp(v),
+                        RuntimeFilterScalarRef::TimestampMillisecond(v),
+                    )
+                },
+            ),
+            (
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                |v| {
+                    (
+                        OrderedScalar::Timestamp(v),
+                        RuntimeFilterScalarRef::TimestampMicrosecond(v),
+                    )
+                },
+            ),
+            (
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                |v| {
+                    (
+                        OrderedScalar::Timestamp(v),
+                        RuntimeFilterScalarRef::TimestampNanosecond(v),
+                    )
+                },
+            ),
+        ];
+        struct Refuse(novarocks_execution::runtime_filter::KernelFailure);
+        impl KernelEvaluationControl for Refuse {
+            fn checkpoint(
+                &self,
+                _: u32,
+            ) -> Result<(), novarocks_execution::runtime_filter::KernelFailure> {
+                Err(self.0.clone())
+            }
+            fn wait(
+                &self,
+                _: std::time::Duration,
+            ) -> Result<(), novarocks_execution::runtime_filter::KernelFailure> {
+                panic!("scalar query never waits")
+            }
+        }
+        for (ty, make) in cases {
+            for direction in [
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderSortDirection::Descending,
+            ] {
+                for nulls in [RuntimeOrderNullOrder::First, RuntimeOrderNullOrder::Last] {
+                    for bound in [None, Some(7i64)] {
+                        let query =
+                            ordered_query(ty.clone(), direction, nulls, bound.map(|v| make(v).0));
+                        let port = query
+                            .controlled_scalar_query()
+                            .expect("numeric controlled port installed");
+                        for value in [None, Some(-7i64), Some(7), Some(99)] {
+                            let order = match (value, bound) {
+                                (None, None) => std::cmp::Ordering::Equal,
+                                (None, Some(_)) => {
+                                    if nulls == RuntimeOrderNullOrder::First {
+                                        std::cmp::Ordering::Less
+                                    } else {
+                                        std::cmp::Ordering::Greater
+                                    }
+                                }
+                                (Some(_), None) => {
+                                    if nulls == RuntimeOrderNullOrder::First {
+                                        std::cmp::Ordering::Greater
+                                    } else {
+                                        std::cmp::Ordering::Less
+                                    }
+                                }
+                                (Some(a), Some(b)) => {
+                                    if direction == RuntimeOrderSortDirection::Ascending {
+                                        a.cmp(&b)
+                                    } else {
+                                        b.cmp(&a)
+                                    }
+                                }
+                            };
+                            let expected = order != std::cmp::Ordering::Greater;
+                            match value {
+                                None => {
+                                    assert_eq!(
+                                        port.matches_null_controlled(&NoControl),
+                                        Ok(expected)
+                                    );
+                                    assert_eq!(query.matches_null(), Ok(expected));
+                                }
+                                Some(v) => {
+                                    assert_eq!(
+                                        port.non_null_value_may_match_controlled(
+                                            make(v).1,
+                                            &NoControl
+                                        ),
+                                        Ok(expected)
+                                    );
+                                    assert_eq!(
+                                        query.non_null_value_may_match(make(v).1),
+                                        Ok(order != std::cmp::Ordering::Greater)
+                                    );
+                                }
+                            }
+                        }
+                        for cause in [
+                            novarocks_execution::runtime_filter::KernelFailure::Cancelled,
+                            novarocks_execution::runtime_filter::KernelFailure::DeadlineExceeded,
+                            novarocks_execution::runtime_filter::KernelFailure::ResourceExhausted,
+                        ] {
+                            assert_eq!(
+                                port.matches_null_controlled(&Refuse(cause.clone())),
+                                Err(RuntimeFilterControlledQueryError::Kernel(cause.clone()))
+                            );
+                            assert_eq!(
+                                port.non_null_value_may_match_controlled(
+                                    make(7).1,
+                                    &Refuse(cause.clone())
+                                ),
+                                Err(RuntimeFilterControlledQueryError::Kernel(cause))
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Existing control port, deterministic units, no wall-clock or private

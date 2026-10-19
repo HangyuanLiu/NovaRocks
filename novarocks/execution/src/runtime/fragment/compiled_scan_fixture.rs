@@ -172,6 +172,10 @@ fn typed_frozen_read_with_distribution(
                     match ty.data_type() {
                         DataType::Int64 => ConnectorValueType::BigInt,
                         DataType::Utf8 => ConnectorValueType::Varchar,
+                        _ if novarocks_local_program::is_aggregate_topn_key_type(ty) => {
+                            novarocks_connector_contract::connector_type_for_value_type(ty)
+                                .expect("declared ordered fixture connector assignment")
+                        }
                         other => panic!("undeclared fixture scan type: {other:?}"),
                     },
                 )

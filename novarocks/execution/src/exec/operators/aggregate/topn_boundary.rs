@@ -30,10 +30,10 @@ use std::sync::Arc;
 
 use crate::exec::expr::agg::AggregateVec;
 use crate::runtime_filter::contribution::{
-    ControlledOrderedTupleError, OrderedScalar, OrderedTuple, OrderedTupleError,
+    ControlledOrderedTupleError, OrderedScalarRef, OrderedTuple, OrderedTupleError,
     RuntimeOrderContract,
 };
-use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedUtf8OrderKey};
+use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedOrderKey};
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
     Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -41,6 +41,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+
+#[cfg(test)]
+use crate::runtime_filter::contribution::OrderedScalar;
 
 use crate::exec::hash_table::key_table::KeyLookup;
 use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
@@ -236,9 +239,9 @@ impl From<ControlledOrderedTupleError> for OwnedTopNBoundaryError {
 }
 
 #[derive(Debug)]
-pub(crate) struct OwnedTopNBoundaryStorage(AggregateVec<AggregateTopNCandidate<OwnedUtf8OrderKey>>);
+pub(crate) struct OwnedTopNBoundaryStorage(AggregateVec<AggregateTopNCandidate<OwnedOrderKey>>);
 impl TopNBoundaryStorage for OwnedTopNBoundaryStorage {
-    type Key = OwnedUtf8OrderKey;
+    type Key = OwnedOrderKey;
     type Error = OwnedTopNBoundaryError;
     fn candidates(&self) -> &[AggregateTopNCandidate<Self::Key>] {
         &self.0
@@ -471,7 +474,7 @@ impl OwnedAggregateTopNBoundaryState {
     ) -> Result<Self, OwnedTopNBoundaryError> {
         validate_topn_boundary_contract(&contract)?;
         let data_type = contract.keys()[0].data_type();
-        if data_type != &DataType::Utf8 {
+        if !novarocks_local_program::is_aggregate_topn_key_carrier(data_type) {
             return Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
                 actual: data_type.clone(),
             }
@@ -489,7 +492,7 @@ impl OwnedAggregateTopNBoundaryState {
     pub(crate) fn observe_owned_group(
         &mut self,
         group_id: usize,
-        tuple: OwnedUtf8OrderKey,
+        tuple: OwnedOrderKey,
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), OwnedTopNBoundaryError> {
         self.observe_controlled(group_id, tuple, control)
@@ -497,7 +500,7 @@ impl OwnedAggregateTopNBoundaryState {
     pub(crate) fn snapshot_owned(
         &self,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Option<OwnedUtf8OrderKey>, OwnedTopNBoundaryError> {
+    ) -> Result<Option<OwnedOrderKey>, OwnedTopNBoundaryError> {
         self.snapshot_controlled(control)
     }
 }
@@ -621,6 +624,18 @@ fn tuple_from_group_array(
     array: &ArrayRef,
     row: usize,
 ) -> Result<OrderedTuple, AggregateTopNBoundaryError> {
+    let value =
+        borrowed_key_from_group_array(contract, array, row)?.map(OrderedScalarRef::into_owned);
+    OrderedTuple::try_new(contract, [value]).map_err(Into::into)
+}
+
+/// One extraction leaf for the legacy tuple and controlled owned-key shells.
+/// Preserve the original bounds, UTF8 dictionary, NULL and physical-error order.
+pub(crate) fn borrowed_key_from_group_array<'a>(
+    contract: &RuntimeOrderContract,
+    array: &'a ArrayRef,
+    row: usize,
+) -> Result<Option<OrderedScalarRef<'a>>, AggregateTopNBoundaryError> {
     if row >= array.len() {
         return Err(AggregateTopNBoundaryError::CandidateRowOutOfBounds {
             row,
@@ -633,24 +648,24 @@ fn tuple_from_group_array(
         .expect("aggregate TopN state validates one order key")
         .data_type();
     let value = if expected == &DataType::Utf8 {
-        utf8_value(array, row)?.map(|value| OrderedScalar::Utf8(value.to_owned()))
+        utf8_value(array, row)?.map(OrderedScalarRef::Utf8)
     } else if array.is_null(row) {
         None
     } else {
         Some(scalar_from_group_array(expected, array, row)?)
     };
-    OrderedTuple::try_new(contract, [value]).map_err(Into::into)
+    Ok(value)
 }
 
 fn scalar_from_group_array(
     expected: &DataType,
     array: &ArrayRef,
     row: usize,
-) -> Result<OrderedScalar, AggregateTopNBoundaryError> {
+) -> Result<OrderedScalarRef<'static>, AggregateTopNBoundaryError> {
     macro_rules! primitive {
         ($array:ty, $variant:ident) => {{
             require_exact_array_type(expected, array)?;
-            OrderedScalar::$variant(
+            OrderedScalarRef::$variant(
                 array
                     .as_any()
                     .downcast_ref::<$array>()
@@ -687,7 +702,7 @@ fn scalar_from_group_array(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .expect("matching Arrow FixedSizeBinary type");
-            OrderedScalar::LargeInt(
+            OrderedScalarRef::LargeInt(
                 novarocks_types::largeint::value_at(array, row)
                     .map_err(AggregateTopNBoundaryError::InvalidCandidateValue)?,
             )

@@ -102,13 +102,16 @@ pub fn single_key_ordered_filter_digests_observed<E>(
     Ok((comparator, order.finalize().into()))
 }
 
-/// Static payload domain of a direct-scan ordered filter. This admits no
+/// Static payload domain of an ordered Scan filter. This admits no
 /// array provenance, allocation capacity, or interpretation of nominal values.
 /// Preparation and optional planner placement must use this same contract.
 pub fn is_ordered_filter_flat_payload_type(
     value_type: &novarocks_type_contract::FunctionValueType,
 ) -> bool {
     use novarocks_type_contract::ValueKind;
+    if value_type.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt {
+        return matches!(value_type.data_type(), DataType::FixedSizeBinary(16));
+    }
     matches!(
         value_type.value_type().kind(),
         ValueKind::Scalar(_) | ValueKind::String | ValueKind::Binary
@@ -128,6 +131,39 @@ pub fn is_ordered_filter_flat_payload_type(
             | DataType::Timestamp(_, _)
             | DataType::Decimal128(_, _)
     )
+}
+
+/// Physical encodings understood by the existing ordered scalar projection.
+/// This predicate grants no nominal identity or source/storage authority.
+pub fn is_aggregate_topn_key_carrier(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Timestamp(_, None)
+            | DataType::Decimal128(_, _)
+            | DataType::FixedSizeBinary(16)
+    )
+}
+
+/// Installed single-key Aggregate TopN domain. A 16-byte carrier alone never
+/// establishes LARGEINT; the complete declared semantic identity is required.
+pub fn is_aggregate_topn_key_type(value_type: &novarocks_type_contract::FunctionValueType) -> bool {
+    use novarocks_type_contract::ValueLogicalType;
+    match value_type.logical_type() {
+        ValueLogicalType::Physical => {
+            is_aggregate_topn_key_carrier(value_type.data_type())
+                && !matches!(value_type.data_type(), DataType::FixedSizeBinary(_))
+        }
+        ValueLogicalType::LargeInt => {
+            matches!(value_type.data_type(), DataType::FixedSizeBinary(16))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -827,12 +863,18 @@ mod tests {
             }
             for (data_type, logical) in [
                 (DataType::Utf8, ValueLogicalType::Json),
-                (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
                 (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
             ] {
                 let ty = V::try_with_logical_type(data_type, nullable, logical).unwrap();
                 assert!(!is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
             }
+            let largeint = V::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                nullable,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap();
+            assert!(is_ordered_filter_flat_payload_type(&largeint));
         }
     }
 
@@ -1043,5 +1085,53 @@ mod typed_creation_tests {
         );
         assert_eq!(result.unwrap_err(), Refusal::Observer(7));
         assert_eq!(calls, 0);
+    }
+}
+
+// Owner-local installed-domain qualification, distinct from physical payload
+// copying. Literal semantic identities catch width-based nominal inference.
+#[cfg(test)]
+mod aggregate_topn_key_tests {
+    use super::*;
+    use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType as L};
+    #[test]
+    fn typed_channels_aggregate_topn_key_preserves_nominal_and_timestamp_domains() {
+        for nullable in [false, true] {
+            for ty in [
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
+                DataType::Utf8,
+                DataType::Date32,
+                DataType::Decimal128(18, 3),
+                DataType::Timestamp(TimeUnit::Second, None),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ] {
+                assert!(is_aggregate_topn_key_type(&V::new(ty, nullable)));
+            }
+            for ty in [
+                DataType::Boolean,
+                DataType::Float64,
+                DataType::Binary,
+                DataType::FixedSizeBinary(16),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ] {
+                assert!(!is_aggregate_topn_key_type(&V::new(ty, nullable)));
+            }
+            assert!(is_aggregate_topn_key_type(
+                &V::try_with_logical_type(DataType::FixedSizeBinary(16), nullable, L::LargeInt)
+                    .unwrap()
+            ));
+            assert!(!is_aggregate_topn_key_type(
+                &V::try_with_logical_type(DataType::FixedSizeBinary(16), nullable, L::Uuid)
+                    .unwrap()
+            ));
+            assert!(!is_aggregate_topn_key_type(
+                &V::try_with_logical_type(DataType::Utf8, nullable, L::Json).unwrap()
+            ));
+        }
     }
 }

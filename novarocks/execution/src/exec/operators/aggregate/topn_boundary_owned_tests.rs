@@ -38,7 +38,7 @@ impl KernelEvaluationControl for Pass {
         panic!("boundary never waits")
     }
 }
-fn key_value(key: &OwnedUtf8OrderKey) -> Option<&str> {
+fn key_value(key: &OwnedOrderKey) -> Option<&str> {
     match key.borrowed() {
         OrderedTupleRef::Single(None) => None,
         OrderedTupleRef::Single(Some(OrderedScalarRef::Utf8(s))) => Some(s),
@@ -309,6 +309,364 @@ fn ordered_topn_owned_long_comparison_preserves_control_and_original_sequence_er
         ))
     );
     assert_eq!(state.observed_group_count, 2);
+    drop(state);
+    drop(host);
+    assert_eq!(tracker.current(), 0);
+}
+
+// The old owned-key oracle only covered strings. This owner-local matrix uses
+// std integer order over literal inputs, across every numeric encoding. It
+// also replays the unchanged legacy tuple shell; neither supplies the expected
+// nth value. Each isolated tracker is empty after the real state/key drops.
+#[test]
+fn topn_boundary_owned_numeric_matches_independent_sort_and_legacy() {
+    type Make = fn(i128) -> OrderedScalar;
+    let mut cases: Vec<(DataType, i128, i128, Make)> = vec![
+        (DataType::Int8, i8::MIN.into(), i8::MAX.into(), |v| {
+            OrderedScalar::Int8(v as i8)
+        }),
+        (DataType::Int16, i16::MIN.into(), i16::MAX.into(), |v| {
+            OrderedScalar::Int16(v as i16)
+        }),
+        (DataType::Int32, i32::MIN.into(), i32::MAX.into(), |v| {
+            OrderedScalar::Int32(v as i32)
+        }),
+        (DataType::Int64, i64::MIN.into(), i64::MAX.into(), |v| {
+            OrderedScalar::Int64(v as i64)
+        }),
+        (DataType::Date32, -1000, 1000, |v| {
+            OrderedScalar::Date32(v as i32)
+        }),
+        (
+            DataType::Decimal128(18, 3),
+            -999999999999999999,
+            999999999999999999,
+            OrderedScalar::Decimal128,
+        ),
+        (
+            DataType::FixedSizeBinary(16),
+            i128::MIN,
+            i128::MAX,
+            OrderedScalar::LargeInt,
+        ),
+    ];
+    cases.extend(
+        [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ]
+        .into_iter()
+        .map(|unit| {
+            (
+                DataType::Timestamp(unit, None),
+                i64::MIN.into(),
+                i64::MAX.into(),
+                (|v| OrderedScalar::Timestamp(v as i64)) as Make,
+            )
+        }),
+    );
+    for (ty, low, high, make) in cases {
+        for direction in [
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderSortDirection::Descending,
+        ] {
+            for nulls in [RuntimeOrderNullOrder::First, RuntimeOrderNullOrder::Last] {
+                let tracker = MemTracker::new_root("numeric-owned-boundary-oracle");
+                let host = OrderedTopNAllocationHost::new(tracker.clone());
+                let order: crate::runtime_filter::RuntimeOrderContractRef =
+                    Arc::new(RuntimeOrderContract::from_frozen(
+                        [RuntimeOrderKey::with_order(ty.clone(), direction, nulls)],
+                        [2; 32],
+                        [3; 32],
+                    ))
+                    .into();
+                let mut owned = OwnedAggregateTopNBoundaryState::try_new_owned(
+                    NonZeroU32::new(3).unwrap(),
+                    order.clone(),
+                    &host,
+                )
+                .unwrap();
+                let mut legacy =
+                    AggregateTopNBoundaryState::try_new(NonZeroU32::new(3).unwrap(), order)
+                        .unwrap();
+                let mut all = Vec::new();
+                for (id, value) in [Some(high), None, Some(low), Some(0), Some(7), Some(low)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let scalar = value.map(make);
+                    owned
+                        .observe_owned_group(
+                            id,
+                            host.copy_scalar(
+                                scalar.as_ref().map(OrderedScalar::as_borrowed),
+                                &Pass,
+                            )
+                            .unwrap(),
+                            &Pass,
+                        )
+                        .unwrap();
+                    legacy
+                        .observe_new_group(id, OrderedTuple::new([scalar]))
+                        .unwrap();
+                    all.push(value);
+                    all.sort_by(|a, b| match (a, b) {
+                        (None, None) => Ordering::Equal,
+                        (None, Some(_)) => {
+                            if nulls == RuntimeOrderNullOrder::First {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
+                        }
+                        (Some(_), None) => {
+                            if nulls == RuntimeOrderNullOrder::First {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            }
+                        }
+                        (Some(a), Some(b)) => {
+                            if direction == RuntimeOrderSortDirection::Ascending {
+                                a.cmp(b)
+                            } else {
+                                b.cmp(a)
+                            }
+                        }
+                    });
+                    let snapshot = owned.snapshot_owned(&Pass).unwrap();
+                    if id < 2 {
+                        assert!(snapshot.is_none());
+                        continue;
+                    }
+                    let expected = all[2].map(make);
+                    let OrderedTupleRef::Single(actual) = snapshot.as_ref().unwrap().borrowed()
+                    else {
+                        panic!("one order key")
+                    };
+                    assert_eq!(
+                        actual,
+                        expected.as_ref().map(OrderedScalar::as_borrowed),
+                        "{ty:?}"
+                    );
+                    assert_eq!(
+                        legacy.snapshot(),
+                        AggregateTopNBoundarySnapshot::Ready {
+                            nth_best_inclusive: OrderedTuple::new([expected])
+                        }
+                    );
+                }
+                drop(owned);
+                drop(legacy);
+                drop(host);
+                assert_eq!(tracker.current(), 0);
+            }
+        }
+    }
+}
+
+// Frozen literal Arrow values protect extraction independently of ranking and
+// retain the legacy NULL-before-numeric-type-error order. The production pure
+// shell and original tuple shell both consume this one borrowed leaf.
+#[test]
+fn topn_boundary_shared_numeric_projection_keeps_exact_carriers_and_null_order() {
+    let largeint = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [
+            None,
+            Some(i128::MIN.to_be_bytes()),
+            Some(i128::MAX.to_be_bytes()),
+        ]
+        .into_iter(),
+        16,
+    )
+    .unwrap();
+    let cases: Vec<(DataType, ArrayRef, Vec<Option<OrderedScalar>>)> = vec![
+        (
+            DataType::FixedSizeBinary(16),
+            Arc::new(largeint),
+            vec![
+                None,
+                Some(OrderedScalar::LargeInt(i128::MIN)),
+                Some(OrderedScalar::LargeInt(i128::MAX)),
+            ],
+        ),
+        (
+            DataType::Int8,
+            Arc::new(Int8Array::from(vec![None, Some(i8::MIN), Some(i8::MAX)])),
+            vec![
+                None,
+                Some(OrderedScalar::Int8(i8::MIN)),
+                Some(OrderedScalar::Int8(i8::MAX)),
+            ],
+        ),
+        (
+            DataType::Int16,
+            Arc::new(Int16Array::from(vec![None, Some(i16::MIN), Some(i16::MAX)])),
+            vec![
+                None,
+                Some(OrderedScalar::Int16(i16::MIN)),
+                Some(OrderedScalar::Int16(i16::MAX)),
+            ],
+        ),
+        (
+            DataType::Int32,
+            Arc::new(Int32Array::from(vec![None, Some(i32::MIN), Some(i32::MAX)])),
+            vec![
+                None,
+                Some(OrderedScalar::Int32(i32::MIN)),
+                Some(OrderedScalar::Int32(i32::MAX)),
+            ],
+        ),
+        (
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![None, Some(i64::MIN), Some(i64::MAX)])),
+            vec![
+                None,
+                Some(OrderedScalar::Int64(i64::MIN)),
+                Some(OrderedScalar::Int64(i64::MAX)),
+            ],
+        ),
+        (
+            DataType::Date32,
+            Arc::new(Date32Array::from(vec![None, Some(-1), Some(20000)])),
+            vec![
+                None,
+                Some(OrderedScalar::Date32(-1)),
+                Some(OrderedScalar::Date32(20000)),
+            ],
+        ),
+        (
+            DataType::Decimal128(12, 3),
+            Arc::new(
+                Decimal128Array::from(vec![None, Some(-1001), Some(999)])
+                    .with_precision_and_scale(12, 3)
+                    .unwrap(),
+            ),
+            vec![
+                None,
+                Some(OrderedScalar::Decimal128(-1001)),
+                Some(OrderedScalar::Decimal128(999)),
+            ],
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Second, None),
+            Arc::new(TimestampSecondArray::from(vec![None, Some(-1), Some(7)])),
+            vec![
+                None,
+                Some(OrderedScalar::Timestamp(-1)),
+                Some(OrderedScalar::Timestamp(7)),
+            ],
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                None,
+                Some(-1),
+                Some(7),
+            ])),
+            vec![
+                None,
+                Some(OrderedScalar::Timestamp(-1)),
+                Some(OrderedScalar::Timestamp(7)),
+            ],
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                None,
+                Some(-1),
+                Some(7),
+            ])),
+            vec![
+                None,
+                Some(OrderedScalar::Timestamp(-1)),
+                Some(OrderedScalar::Timestamp(7)),
+            ],
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                None,
+                Some(-1),
+                Some(7),
+            ])),
+            vec![
+                None,
+                Some(OrderedScalar::Timestamp(-1)),
+                Some(OrderedScalar::Timestamp(7)),
+            ],
+        ),
+    ];
+    for (ty, array, expected) in cases {
+        let order = RuntimeOrderContract::from_frozen([RuntimeOrderKey::new(ty)], [2; 32], [3; 32]);
+        for (row, value) in expected.into_iter().enumerate() {
+            assert_eq!(
+                borrowed_key_from_group_array(&order, &array, row).unwrap(),
+                value.as_ref().map(OrderedScalar::as_borrowed)
+            );
+            assert_eq!(
+                tuple_from_group_array(&order, &array, row).unwrap(),
+                OrderedTuple::new([value])
+            );
+        }
+        assert_eq!(
+            borrowed_key_from_group_array(&order, &array, array.len()),
+            Err(AggregateTopNBoundaryError::CandidateRowOutOfBounds {
+                row: array.len(),
+                len: array.len()
+            })
+        );
+    }
+    let order = RuntimeOrderContract::from_frozen(
+        [RuntimeOrderKey::new(DataType::Int64)],
+        [2; 32],
+        [3; 32],
+    );
+    let wrong: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(1)]));
+    assert_eq!(
+        tuple_from_group_array(&order, &wrong, 0).unwrap(),
+        OrderedTuple::new([None])
+    );
+    assert_eq!(
+        tuple_from_group_array(&order, &wrong, 1),
+        Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
+            expected: DataType::Int64,
+            actual: DataType::Int32
+        })
+    );
+}
+
+// Inline keys still require real paid candidate storage. A positive budget
+// smaller than one candidate must refuse the first insertion and keep the
+// original group sequence unchanged, without a dummy payload reservation.
+#[test]
+fn topn_boundary_owned_numeric_candidate_refuses_actual_container_growth() {
+    let tracker = MemTracker::new_root("numeric-boundary-candidate-budget");
+    tracker.install_limit_once(1).unwrap();
+    let host = OrderedTopNAllocationHost::new(tracker.clone());
+    let order = Arc::new(RuntimeOrderContract::from_frozen(
+        [RuntimeOrderKey::new(DataType::Int64)],
+        [2; 32],
+        [3; 32],
+    ))
+    .into();
+    let mut state =
+        OwnedAggregateTopNBoundaryState::try_new_owned(NonZeroU32::new(1).unwrap(), order, &host)
+            .unwrap();
+    let key = host
+        .copy_scalar(Some(OrderedScalarRef::Int64(7)), &Pass)
+        .unwrap();
+    assert_eq!(tracker.current(), 0);
+    assert_eq!(
+        state.observe_owned_group(0, key, &Pass),
+        Err(OwnedTopNBoundaryError::Kernel(
+            KernelFailure::ResourceExhausted
+        ))
+    );
+    assert_eq!(state.observed_group_count, 0);
+    assert_eq!(tracker.current(), 0);
     drop(state);
     drop(host);
     assert_eq!(tracker.current(), 0);

@@ -253,8 +253,11 @@ impl rf::RuntimeFilterSession for Session {
     }
 }
 fn session(f: &Fixture) -> Arc<Session> {
+    session_for(&f.program, f.partial)
+}
+fn session_for(program: &LocalProgram, producer: ProgramNodeId) -> Arc<Session> {
     let ProgramNodeKind::Aggregate { topn_filters, .. } =
-        f.program.graph().nodes()[f.partial.index()].kind()
+        program.graph().nodes()[producer.index()].kind()
     else {
         unreachable!()
     };

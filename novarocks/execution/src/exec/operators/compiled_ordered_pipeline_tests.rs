@@ -230,3 +230,6 @@ fn compiled_ordered_pipeline_direct_checked_scan_runs_the_actual_two_partition_c
     std::thread::spawn(move || drop(last)).join().unwrap();
     assert_eq!(tracker.current(), 0);
 }
+
+#[path = "compiled_complete_ordered_tests.rs"]
+mod complete_tests;

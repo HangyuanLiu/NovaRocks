@@ -380,7 +380,7 @@ fn ordered_topn_owned_frozen_key_slots_share_last_owner_and_preserve_legacy_cont
                 unreachable!()
             };
             let (comparator_digest, contract_digest) = (*comparator_digest, *contract_digest);
-            let contract = host.utf8_order_contract(&frozen, &Control::pass()).unwrap();
+            let contract = host.order_contract(&frozen, &Control::pass()).unwrap();
             let expected = RuntimeOrderContract::from_frozen(
                 [RuntimeOrderKey::with_value_type(
                     novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
@@ -447,7 +447,7 @@ fn ordered_topn_owned_frozen_keys_preserve_complete_nullability() {
         *keys = replacement.into();
         let tracker = MemTracker::new_root("ordered-frozen-complete-binding");
         let host = OrderedTopNAllocationHost::new(tracker.clone());
-        let order = host.utf8_order_contract(&frozen, &Control::pass()).unwrap();
+        let order = host.order_contract(&frozen, &Control::pass()).unwrap();
         assert_eq!(order.keys()[0].value_type(), Some(&value_type));
         assert_eq!(order.keys()[0].value_type().unwrap().nullable(), nullable);
         let shared = order.clone();
@@ -471,7 +471,7 @@ fn ordered_topn_owned_frozen_key_slots_refuse_real_prefix_vector_and_holder_limi
         let host = OrderedTopNAllocationHost::new(tracker.clone());
         let control = Control::pass();
         assert!(matches!(
-            host.utf8_order_contract(&contract, &control),
+            host.order_contract(&contract, &control),
             Err(e) if e.cause() == &crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
         ));
         assert_eq!(tracker.current(), 0);
@@ -493,7 +493,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
     let host = OrderedTopNAllocationHost::new(tracker.clone());
     let contract = static_utf8_order(FilterSortDirection::Descending, FilterNullOrder::Last);
     let control = Control::pass();
-    drop(host.utf8_order_contract(&contract, &control).unwrap());
+    drop(host.order_contract(&contract, &control).unwrap());
     assert_eq!(tracker.current(), 0);
     for cause in [
         KernelFailure::Cancelled,
@@ -507,7 +507,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
                 ..Control::pass()
             };
             assert!(
-                matches!(host.utf8_order_contract(&contract, &refusal), Err(e) if e.cause() == &crate::runtime::fragment::ExecutionFailureCause::Kernel(cause.clone()))
+                matches!(host.order_contract(&contract, &refusal), Err(e) if e.cause() == &crate::runtime::fragment::ExecutionFailureCause::Kernel(cause.clone()))
             );
             assert_eq!(
                 tracker.current(),
@@ -522,7 +522,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
     let wrong_type = StaticFilterContract::Ordered {
         keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
             novarocks_local_program::FilterOrderKey {
-                value_type: novarocks_functions::FunctionValueType::new(DataType::Int64, true),
+                value_type: novarocks_functions::FunctionValueType::new(DataType::Boolean, true),
                 ..keys[0].clone()
             },
         ])),
@@ -545,7 +545,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
     for (shape, detail) in [
         (
             wrong_type,
-            "pure Aggregate TopN runtime filter order key type other than Utf8 is not installed",
+            "pure Aggregate TopN runtime filter order key type is not installed",
         ),
         (
             wrong_arity,
@@ -558,7 +558,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
     ] {
         let control = Control::pass();
         assert!(
-            matches!(host.utf8_order_contract(&shape, &control), Err(e) if matches!(e.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(d)) if d.message() == detail))
+            matches!(host.order_contract(&shape, &control), Err(e) if matches!(e.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(d)) if d.message() == detail))
         );
         assert_eq!(control.calls.load(Ordering::SeqCst), 0);
         assert_eq!(tracker.current(), 0);
@@ -627,8 +627,7 @@ fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_type
                 let tracker = MemTracker::new_root("ordered-frozen-digest-refusal");
                 let host = OrderedTopNAllocationHost::new(tracker.clone());
                 let actual = ExecutionFailure::from(
-                    host.utf8_order_contract(&changed, &Control::pass())
-                        .unwrap_err(),
+                    host.order_contract(&changed, &Control::pass()).unwrap_err(),
                 );
                 assert_eq!(
                     actual.cause(),
@@ -641,5 +640,135 @@ fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_type
                 assert_eq!(tracker.current(), 0);
             }
         }
+    }
+}
+
+// Numeric payloads have no backing allocation. The real candidate Vec pays
+// their complete Layout later; a zero-byte pseudo grant would hide this fact.
+#[test]
+fn ordered_topn_owned_numeric_inline_copy_has_no_payload_grant_and_keeps_first_cause() {
+    let tracker = MemTracker::new_root("inline-order-key");
+    tracker.install_limit_once(1).unwrap();
+    let host = OrderedTopNAllocationHost::new(tracker.clone());
+    let key = host
+        .copy_scalar(
+            Some(OrderedScalarRef::LargeInt(i128::MIN)),
+            &Control::pass(),
+        )
+        .unwrap();
+    assert!(matches!(
+        key.borrowed(),
+        OrderedTupleRef::Single(Some(OrderedScalarRef::LargeInt(i128::MIN)))
+    ));
+    assert_eq!(tracker.current(), 0);
+    for cause in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+    ] {
+        let control = Control {
+            refuse_at: Some(0),
+            cause: cause.clone(),
+            ..Control::pass()
+        };
+        assert_eq!(
+            host.copy_scalar(Some(OrderedScalarRef::Int64(7)), &control),
+            Err(cause)
+        );
+        assert_eq!(tracker.current(), 0);
+    }
+    drop(key);
+    drop(host);
+    assert_eq!(tracker.current(), 0);
+}
+
+// The original strict constructor supplies an independent binding/codec
+// oracle for the paid adapter. These literal complete declarations protect
+// precision, scale, unit and nominal identity, not merely the Arrow width.
+#[test]
+fn ordered_topn_owned_numeric_contract_retains_complete_binding_and_last_alias() {
+    use novarocks_functions::{FunctionValueType as V, ValueLogicalType};
+    use novarocks_local_program::{
+        FilterNullOrder, FilterOrderKey, FilterOrderKeys, FilterSortDirection, StaticFilterContract,
+    };
+    let mut types = vec![
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Date32,
+        DataType::Decimal128(28, 7),
+    ]
+    .into_iter()
+    .map(|ty| V::new(ty, true))
+    .collect::<Vec<_>>();
+    for unit in [
+        arrow::datatypes::TimeUnit::Second,
+        arrow::datatypes::TimeUnit::Millisecond,
+        arrow::datatypes::TimeUnit::Microsecond,
+        arrow::datatypes::TimeUnit::Nanosecond,
+    ] {
+        types.push(V::new(DataType::Timestamp(unit, None), false));
+    }
+    types.push(
+        V::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap(),
+    );
+    for ty in types {
+        // Existing canonical author creates an input; the old strict runtime
+        // author independently validates it before the paid adapter is called.
+        let (comparator_digest, contract_digest) =
+            novarocks_local_program::single_key_ordered_filter_digests_observed(
+                FilterSortDirection::Descending,
+                FilterNullOrder::First,
+                |emit| novarocks_local_program::visit_filter_key_type(ty.data_type(), emit),
+                || Ok::<_, novarocks_local_program::FilterMembershipSchemaError>(()),
+            )
+            .unwrap();
+        let expected = RuntimeOrderContract::from_fragment_contract(
+            [RuntimeOrderKey::with_value_type(
+                ty.clone(),
+                RuntimeOrderSortDirection::Descending,
+                RuntimeOrderNullOrder::First,
+            )],
+            comparator_digest,
+            contract_digest,
+        )
+        .unwrap();
+        let frozen = StaticFilterContract::Ordered {
+            keys: FilterOrderKeys::from_legacy(Arc::from([FilterOrderKey {
+                value_type: ty.clone(),
+                direction: FilterSortDirection::Descending,
+                null_order: FilterNullOrder::First,
+            }])),
+            comparator_digest,
+            contract_digest,
+        };
+        let tracker = MemTracker::new_root("numeric-order-contract-custody");
+        let host = OrderedTopNAllocationHost::new(tracker.clone());
+        let actual = host
+            .shared_order_contract(&frozen, &Control::pass())
+            .unwrap();
+        assert_eq!(actual.as_ref(), &expected);
+        assert_eq!(actual.keys()[0].value_type(), Some(&ty));
+        let last = actual.clone();
+        assert_eq!(actual.keys().as_ptr(), last.keys().as_ptr());
+        let held = tracker.current();
+        assert!(held > 0);
+        drop(actual);
+        drop(host);
+        assert_eq!(tracker.current(), held);
+        std::thread::spawn(move || {
+            assert_eq!(last.as_ref(), &expected);
+            assert_eq!(last.keys()[0].value_type(), Some(&ty));
+            drop(last);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(tracker.current(), 0);
     }
 }

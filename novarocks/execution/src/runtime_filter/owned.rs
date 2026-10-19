@@ -28,9 +28,10 @@ use novarocks_functions::{
 };
 
 use super::contribution::{
-    ControlledContributionCodecError, OrderedScalarRef, OrderedTupleRef, RuntimeOrderContract,
-    RuntimeOrderContractValidationFailure, RuntimeOrderKey, RuntimeOrderNullOrder,
-    RuntimeOrderSortDirection, borrowed_ordered_bound_encoded_len, visit_borrowed_ordered_bound,
+    ControlledContributionCodecError, OrderedScalar, OrderedScalarRef, OrderedTupleRef,
+    RuntimeOrderContract, RuntimeOrderContractValidationFailure, RuntimeOrderKey,
+    RuntimeOrderNullOrder, RuntimeOrderSortDirection, borrowed_ordered_bound_encoded_len,
+    visit_borrowed_ordered_bound,
 };
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::operators::compiled_aggregate::expression_allocation_host;
@@ -136,31 +137,42 @@ impl PartialEq for CanonicalContributionBytes {
 }
 impl Eq for CanonicalContributionBytes {}
 
-/// A NULL key has no payload, and is distinct from an owned empty UTF8 key.
+/// Inline values occupy the actual candidate container Layout; UTF8 retains
+/// its complete original paid backing. No borrowed array pointer can escape.
 #[derive(Clone)]
-pub(crate) struct OwnedUtf8OrderKey(Option<SourceBackingOwner<ByteBacking>>);
-impl fmt::Debug for OwnedUtf8OrderKey {
+pub(crate) struct OwnedOrderKey(OrderKeyStorage);
+#[derive(Clone)]
+enum OrderKeyStorage {
+    Null,
+    Inline(OrderedScalar),
+    Utf8(SourceBackingOwner<ByteBacking>),
+}
+impl fmt::Debug for OwnedOrderKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.borrowed().fmt(f)
     }
 }
-impl PartialEq for OwnedUtf8OrderKey {
+impl PartialEq for OwnedOrderKey {
     fn eq(&self, other: &Self) -> bool {
         match (self.borrowed(), other.borrowed()) {
             (OrderedTupleRef::Single(a), OrderedTupleRef::Single(b)) => a == b,
-            _ => unreachable!("owned UTF8 keys always have exactly one borrowed scalar"),
+            _ => unreachable!("owned order keys always have exactly one borrowed scalar"),
         }
     }
 }
-impl Eq for OwnedUtf8OrderKey {}
-impl OwnedUtf8OrderKey {
+impl Eq for OwnedOrderKey {}
+impl OwnedOrderKey {
     pub(crate) fn borrowed(&self) -> OrderedTupleRef<'_> {
-        OrderedTupleRef::Single(self.0.as_ref().map(|owner| {
-            // SAFETY: this private backing is only made by copy_utf8 below,
-            // which copies an entire valid str without mutation after publish.
-            let text = unsafe { std::str::from_utf8_unchecked(&owner.borrowed().bytes) };
-            OrderedScalarRef::Utf8(text)
-        }))
+        OrderedTupleRef::Single(match &self.0 {
+            OrderKeyStorage::Null => None,
+            OrderKeyStorage::Inline(value) => Some(value.as_borrowed()),
+            OrderKeyStorage::Utf8(owner) => {
+                // SAFETY: only copy_utf8 creates this private immutable backing
+                // from one complete valid str, retaining its whole paid owner.
+                let text = unsafe { std::str::from_utf8_unchecked(&owner.borrowed().bytes) };
+                Some(OrderedScalarRef::Utf8(text))
+            }
+        })
     }
 }
 
@@ -208,19 +220,19 @@ impl OrderedTopNAllocationHost {
     }
 
     /// Retain the complete validated order, not only its shared key inventory.
-    pub(crate) fn utf8_shared_order_contract(
+    pub(crate) fn shared_order_contract(
         &self,
         contract: &novarocks_local_program::StaticFilterContract,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<super::RuntimeOrderContractRef> {
-        let order = self.utf8_order_contract(contract, control)?;
+        let order = self.order_contract(contract, control)?;
         let owner = self.retain_shared(order, control)?;
         Ok(super::RuntimeOrderContractRef::from_owned(owner))
     }
 
     /// Reconstruct the already frozen, first installed static order once on
     /// the actual creating host. No driver deep-copies these inner key slots.
-    pub(crate) fn utf8_order_contract(
+    pub(crate) fn order_contract(
         &self,
         contract: &novarocks_local_program::StaticFilterContract,
         control: &dyn KernelEvaluationControl,
@@ -243,12 +255,11 @@ impl OrderedTopNAllocationHost {
             ))
             .into());
         };
-        if key.value_type.data_type() != &arrow::datatypes::DataType::Utf8
-            || key.value_type.logical_type() != novarocks_functions::ValueLogicalType::Physical
-        {
+        if !novarocks_local_program::is_aggregate_topn_key_type(&key.value_type) {
             return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-                "pure Aggregate TopN runtime filter order key type other than Utf8 is not installed",
-            )).into());
+                "pure Aggregate TopN runtime filter order key type is not installed",
+            ))
+            .into());
         }
         let _prefix = self.reserve_prefix()?;
         let mut work = EvaluationCheckpoints::new(control);
@@ -334,11 +345,11 @@ impl OrderedTopNAllocationHost {
         &self,
         text: Option<&str>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<OwnedUtf8OrderKey, KernelFailure> {
+    ) -> Result<OwnedOrderKey, KernelFailure> {
         let Some(text) = text else {
             let _prefix = self.reserve_prefix()?;
             control.checkpoint(0)?;
-            return Ok(OwnedUtf8OrderKey(None));
+            return Ok(OwnedOrderKey(OrderKeyStorage::Null));
         };
         let owner = self.retain_bytes(control, |allocator, work| {
             work.flush()?;
@@ -353,7 +364,22 @@ impl OrderedTopNAllocationHost {
             work.flush()?;
             Ok::<_, KernelFailure>(bytes)
         })?;
-        Ok(OwnedUtf8OrderKey(Some(owner)))
+        Ok(OwnedOrderKey(OrderKeyStorage::Utf8(owner)))
+    }
+
+    pub(crate) fn copy_scalar(
+        &self,
+        value: Option<OrderedScalarRef<'_>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<OwnedOrderKey, KernelFailure> {
+        match value {
+            None => self.copy_utf8(None, control),
+            Some(OrderedScalarRef::Utf8(text)) => self.copy_utf8(Some(text), control),
+            Some(value) => {
+                control.checkpoint(0)?;
+                Ok(OwnedOrderKey(OrderKeyStorage::Inline(value.into_owned())))
+            }
+        }
     }
 
     pub(crate) fn encode_ordered_bound(

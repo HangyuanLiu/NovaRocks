@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! First ordered installation: exact Utf8, direct Scan to original Partial.
+//! Install validated ordered endpoints without reconstructing remote graphs.
 
 use super::*;
 use novarocks_local_program::{
     AggregateTopNFilter, FilterLateApplyGranularity, FilterNullOrder, FilterOrderKey,
-    FilterOrderKeys, FilterSortDirection, is_ordered_filter_flat_payload_type,
-    single_key_ordered_filter_digests_observed, visit_filter_key_type,
+    FilterOrderKeys, FilterSortDirection, is_aggregate_topn_key_type,
+    is_ordered_filter_flat_payload_type, single_key_ordered_filter_digests_observed,
+    visit_filter_key_type,
 };
 use novarocks_physical_plan::{
     AggregateGrouping, LateApplyGranularity, NullOrdering, SortDirection,
@@ -57,10 +58,9 @@ fn contract<H, F: ValueSchemaCreationFactory<H>>(
         return Err(unsupported(node, "inclusive ordered runtime-filter domain").into());
     };
     if *comparator != OrderedComparisonAlgorithm::NativeScalarOrderV1
-        || !matches!(key.ty.data_type(), arrow_schema::DataType::Utf8)
-        || !is_ordered_filter_flat_payload_type(&key.ty)
+        || !is_aggregate_topn_key_type(&key.ty)
     {
-        return Err(unsupported(node, "Aggregate TopN runtime-filter Utf8 order key").into());
+        return Err(unsupported(node, "Aggregate TopN runtime-filter order key type").into());
     }
     if filter.lifecycle != RuntimeFilterLifecycle::MonotonicUpdates
         || filter.reduction != RuntimeFilterReduction::TightenOrderedBound
@@ -123,65 +123,78 @@ fn contract<H, F: ValueSchemaCreationFactory<H>>(
 
 /// The package already checked parent/order/state witnesses. This is the
 /// narrower installed route, not another physical proof or lineage decoder.
-fn route<'a, H>(
-    package: &'a FragmentPackage,
+fn route<H>(
+    package: &FragmentPackage,
     producer: &novarocks_physical_plan::RuntimeFilterProducer,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(&'a novarocks_physical_plan::PhysicalNode, usize, NonZeroU32), FragmentCreationError<H>>
-{
+) -> Result<(usize, NonZeroU32), FragmentCreationError<H>> {
     let node = producer.endpoint.node;
     let fragment = package.fragment();
     let aggregate = &fragment.nodes()[&node];
     let NodeKind::Aggregate {
         group_by,
         calls,
-        grouping: AggregateGrouping::Partial,
+        grouping,
     } = &aggregate.kind
     else {
-        // Preserve the original Complete/no-calls refusal before inspecting types.
         return Err(unsupported(node, "Aggregate TopN runtime-filter producer").into());
     };
-    if calls.is_empty() {
+    if *grouping == AggregateGrouping::Partial && calls.is_empty() {
         return Err(unsupported(node, "Aggregate TopN runtime-filter producer phase").into());
     }
     for call in calls.iter() {
         work.step()?;
-        if call.distinct {
+        if *grouping == AggregateGrouping::Partial && call.distinct {
             return Err(
                 unsupported(node, "Aggregate TopN runtime-filter DISTINCT producer").into(),
             );
         }
-        if !call.binding.phase.consumes_logical_arguments() {
+        if *grouping == AggregateGrouping::Partial
+            && !call.binding.phase.consumes_logical_arguments()
+        {
             return Err(unsupported(node, "Aggregate TopN runtime-filter producer phase").into());
         }
     }
     let RuntimeFilterProducerTarget::AggregateTopNKey {
         group_key_ordinal,
         topn,
-        phase: novarocks_physical_plan::TopNPhase::Partial { .. },
+        phase,
         limit,
         offset: 0,
         ..
     } = producer.target
     else {
-        return Err(unsupported(
-            node,
-            "Aggregate TopN runtime-filter Partial phase, limit or offset",
-        )
-        .into());
+        return Err(
+            unsupported(node, "Aggregate TopN runtime-filter phase, limit or offset").into(),
+        );
     };
     work.step()?;
-    if !matches!(
-        fragment.nodes().get(&topn).map(|node| &node.kind),
-        Some(NodeKind::TopN {
-            phase: novarocks_physical_plan::TopNPhase::Partial { .. },
-            reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
-            ..
-        })
-    ) {
+    let installed_parent = match (grouping, fragment.nodes().get(&topn).map(|node| &node.kind)) {
+        (
+            AggregateGrouping::Partial,
+            Some(NodeKind::TopN {
+                phase: novarocks_physical_plan::TopNPhase::Partial { .. },
+                reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
+                ..
+            }),
+        ) => true,
+        (
+            AggregateGrouping::Complete,
+            Some(NodeKind::TopN {
+                reduction: novarocks_physical_plan::TopNReduction::Rows,
+                ..
+            }),
+        ) => matches!(
+            phase,
+            novarocks_physical_plan::TopNPhase::Partial { .. }
+                | novarocks_physical_plan::TopNPhase::Single
+        ),
+        _ => false,
+    };
+    if !installed_parent {
         return Err(unsupported(
             node,
-            "Aggregate TopN runtime-filter Partial GroupedStates parent",
+            "Aggregate TopN runtime-filter aggregate and TopN phases",
         )
         .into());
     }
@@ -194,41 +207,6 @@ fn route<'a, H>(
     let (key, _) = group_by.get(ordinal).ok_or(FragmentCompileError::Invalid(
         "missing Aggregate TopN group key",
     ))?;
-    let scan = aggregate
-        .inputs
-        .first()
-        .and_then(|id| fragment.nodes().get(id))
-        .ok_or(FragmentCompileError::Invalid(
-            "missing Aggregate TopN direct scan",
-        ))?;
-    if !matches!(scan.kind, NodeKind::Scan { .. }) || !scan.inputs.is_empty() {
-        return Err(unsupported(node, "Aggregate TopN runtime-filter direct Scan input").into());
-    }
-    let mut parents = 0usize;
-    for candidate in fragment.nodes().values() {
-        work.step()?;
-        for input in candidate.inputs.iter() {
-            work.step()?;
-            if *input == scan.id {
-                parents += 1;
-            }
-        }
-    }
-    if parents != 1 {
-        return Err(unsupported(
-            node,
-            "Aggregate TopN runtime-filter exclusive direct Scan recipient",
-        )
-        .into());
-    }
-    for output in scan.output.columns.iter() {
-        work.step()?;
-        if !is_ordered_filter_flat_payload_type(&fragment.values()[output].ty) {
-            return Err(
-                unsupported(node, "Aggregate TopN runtime-filter flat Scan payload").into(),
-            );
-        }
-    }
     let key_type = &fragment
         .expressions()
         .get(*key)
@@ -236,12 +214,10 @@ fn route<'a, H>(
             "missing Aggregate TopN key definition",
         ))?
         .ty;
-    if !matches!(key_type.data_type(), arrow_schema::DataType::Utf8)
-        || !is_ordered_filter_flat_payload_type(key_type)
-    {
-        return Err(unsupported(node, "Aggregate TopN runtime-filter Utf8 order key").into());
+    if !is_aggregate_topn_key_type(key_type) {
+        return Err(unsupported(node, "Aggregate TopN runtime-filter order key type").into());
     }
-    Ok((scan, ordinal, limit))
+    Ok((ordinal, limit))
 }
 
 pub(super) fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
@@ -256,7 +232,7 @@ pub(super) fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
 ) -> Result<(), FragmentCreationError<H>> {
     let producer = &filter.producers[index];
     let node = producer.endpoint.node;
-    let (_, key_ordinal, limit) = route(package, producer, work)?;
+    let (key_ordinal, limit) = route(package, producer, work)?;
     if producer.contribution_kinds.as_ref()
         != [
             RuntimeFilterContributionKind::OrderedBoundUpdate,
@@ -280,7 +256,7 @@ pub(super) fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
     };
     if !keys[0]
         .value_type
-        .exactly_equals_observed::<FragmentCreationError<H>>(
+        .same_value_domain_observed::<FragmentCreationError<H>>(
             &package.fragment().expressions().get(key).unwrap().ty,
             || work.step().map_err(Into::into),
         )?
@@ -352,15 +328,26 @@ pub(super) fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     let producer = producer.ok_or(FragmentCompileError::Invalid(
         "missing ordered consumer producer witness",
     ))?;
-    if producer.endpoint.fragment != package.fragment().id() {
-        return Err(unsupported(
-            node,
-            "Aggregate TopN runtime-filter same-fragment direct producer",
+    // Full-graph and local-cut validation already checked this witness and
+    // its lineage. A remote producer is deliberately absent from this graph.
+    if !matches!(
+        producer.target,
+        RuntimeFilterProducerTarget::AggregateTopNKey { .. }
+    ) {
+        return Err(FragmentCompileError::Invalid(
+            "ordered consumer witness is not Aggregate TopN",
         )
         .into());
     }
-    let (scan, _, _) = route(package, producer, work)?;
-    if scan.id != node
+    let scan = package
+        .fragment()
+        .nodes()
+        .get(&node)
+        .ok_or(FragmentCompileError::Invalid(
+            "missing ordered scan consumer",
+        ))?;
+    if !matches!(scan.kind, NodeKind::Scan { .. })
+        || !scan.inputs.is_empty()
         || consumer.apply_point != RuntimeFilterApplyPoint::ScanSource
         || consumer.activation
             != (RuntimeFilterConsumerActivation::NonBlockingLive {
@@ -370,9 +357,17 @@ pub(super) fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     {
         return Err(unsupported(
             node,
-            "Aggregate TopN runtime-filter direct live Batch scan consumer",
+            "Aggregate TopN runtime-filter live Batch scan consumer",
         )
         .into());
+    }
+    for output in scan.output.columns.iter() {
+        work.step()?;
+        if !is_ordered_filter_flat_payload_type(&package.fragment().values()[output].ty) {
+            return Err(
+                unsupported(node, "Aggregate TopN runtime-filter flat Scan payload").into(),
+            );
+        }
     }
     let [value] = consumer.endpoint.values.as_ref() else {
         return Err(FragmentCompileError::Invalid("ordered scan consumer is not one value").into());
@@ -395,7 +390,7 @@ pub(super) fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     let StaticFilterContract::Ordered { keys, .. } = &contract else {
         unreachable!()
     };
-    if !ty.exactly_equals_observed::<FragmentCreationError<H>>(&keys[0].value_type, || {
+    if !ty.same_value_domain_observed::<FragmentCreationError<H>>(&keys[0].value_type, || {
         work.step().map_err(Into::into)
     })? {
         return Err(

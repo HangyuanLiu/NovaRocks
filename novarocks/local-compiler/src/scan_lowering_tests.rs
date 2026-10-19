@@ -191,18 +191,27 @@ pub(super) fn typed_public_schema(
     kind: Option<ConnectorReadMetadataKind>,
     schema: Schema,
 ) -> ConnectorReadPublicFacts {
-    use novarocks_connector_contract::{
-        ConnectorReadExecutionSchema, ConnectorSourceFieldFacts, ConnectorSourceSchemaFacts,
-        ConnectorSourceSchemaShape,
-    };
-    use novarocks_type_contract::ValueTypeStorageLifetime;
-    let storage = ValueTypeStorageLifetime::pure();
     let types = schema
         .fields()
         .iter()
         .map(|field| FunctionValueType::new(field.data_type().clone(), field.is_nullable()))
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    typed_public_schema_with_types(source, kind, schema, types)
+}
+
+pub(super) fn typed_public_schema_with_types(
+    source: ConnectorReadStaticFacts<ScanColumnId>,
+    kind: Option<ConnectorReadMetadataKind>,
+    schema: Schema,
+    types: Box<[FunctionValueType]>,
+) -> ConnectorReadPublicFacts {
+    use novarocks_connector_contract::{
+        ConnectorReadExecutionSchema, ConnectorSourceFieldFacts, ConnectorSourceSchemaFacts,
+        ConnectorSourceSchemaShape,
+    };
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    let storage = ValueTypeStorageLifetime::pure();
     let width = schema.fields().len();
     let schema = Arc::new(schema);
     let execution =

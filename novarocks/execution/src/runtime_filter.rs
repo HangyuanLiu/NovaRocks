@@ -26,6 +26,7 @@ use novarocks_local_program::{
 };
 
 pub use novarocks_functions::FunctionValueType;
+pub use novarocks_local_program::is_aggregate_topn_key_carrier;
 
 pub mod contribution;
 pub mod evaluator;
@@ -38,7 +39,7 @@ pub mod row_group_domain;
 pub use crate::exec::operators::AggregateTopNBoundaryError;
 pub use failure::RuntimeFilterFailure;
 pub use owned::CanonicalContributionBytes;
-pub(crate) use owned::{OrderedTopNAllocationHost, OwnedUtf8OrderKey};
+pub(crate) use owned::{OrderedTopNAllocationHost, OwnedOrderKey};
 
 // These are the original Functions control/cause types used by the neutral
 // controlled artifact-query port, not a second Worker control vocabulary.
