@@ -1452,7 +1452,7 @@ mod tests {
         let version = PlanVersionId::try_new([83; 16]).expect("finite component plan version");
         let request = SqlFinalPlanCompileRequest::new(
             version,
-            SqlStatementInput::sql("SELECT CAST(7 AS BIGINT) AS payload"),
+            SqlStatementInput::sql("SELECT 7 AS payload"),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -1509,13 +1509,16 @@ mod tests {
         let root_fragment = u32::from(result.fragment.get());
         assert!(plan.fragments().contains_key(&result.fragment));
         assert_eq!(result.fields.len(), 1);
-        assert_eq!(result.fields[0].name.as_ref(), "payload");
         assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));
+        // ResultField retains the expression label separately from the SQL
+        // alias. Public rendering owns the column name seen by the client.
+        let render = novarocks_sql::compiler::client_render_schema_from_port(Some(result), 0)
+            .expect("render schema from the original SQL public result declaration");
+        assert_eq!(render.columns().len(), 1);
+        assert_eq!(render.columns()[0].name, "payload");
+        assert_eq!(render.columns()[0].source_ordinal, 0);
         let output = match purpose {
-            FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(
-                novarocks_sql::compiler::client_render_schema(plan, 0)
-                    .expect("render schema from the original completed SQL plan"),
-            ),
+            FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(render),
             FullBindPurpose::CountOnly => FrozenRootOutput::CountOnly,
         };
         let paired = paired
