@@ -6,9 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0184
+  - id: ADR-0185
     scope: "Compatibility material additionally includes the sole compiled-package interpreter and its exact sealed pure catalogue digest; exact-island admission, ingress ownership and no negotiation remain active"
-    link: "ADR-0184-compiled-packages-are-the-sole-static-plan-path.md"
+    link: "ADR-0185-compiled-packages-are-the-sole-static-plan-path.md"
 date: 2026-08-28
 provenance:
   - "discussion: 2026-08-28 native compatibility identity and rolling execution"

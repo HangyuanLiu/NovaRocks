@@ -230,7 +230,7 @@ SQL client
 
 生产静态计划只有 package → LocalCompiler → compiled pipeline 一条路径。generated DTO
 投影留在 adapter，纯降级留在 LocalCompiler，Task 生命周期留在 Worker。
-修改前阅读 [ADR-0184](docs/adr/ADR-0184-compiled-packages-are-the-sole-static-plan-path.md)。
+修改前阅读 [ADR-0185](docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)。
 
 F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力补齐或 CI 全绿。只有准确具名的
 能力拒绝可临时登记，错误结果、崩溃、非预期超时与未覆盖项不能白名单化。整个 UEA-5E 的 Z
@@ -901,7 +901,7 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
   与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、
   `compiled_writer_binding.rs`、`compiled_runtime_filter.rs`，pipeline 见 Execution
-  `exec/pipeline/builder/compiled.rs`。先读 ADR-0184，禁止恢复 v1 decoder/构造桥。
+  `exec/pipeline/builder/compiled.rs`。先读 ADR-0185，禁止恢复 v1 decoder/构造桥。
 - **MySQL protocol behavior**: inspect `novarocks/mysql-adapter/src/listener.rs`,
   `result_encoding.rs`, `relay_result_writer.rs` and `local_result_writer.rs`.
 - **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for

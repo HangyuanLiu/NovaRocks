@@ -1414,130 +1414,112 @@ mod tests {
         execution: QueryExecutionId,
         purpose: FullBindPurpose,
     ) -> super::super::RequestBoundNativeTemplate {
-        use arrow::array::{Array, Int64Array};
-        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
-            ConstantPoolId, ConstantPools, ConstantReference, Distribution, ExprKind,
-            FragmentBuilder, FragmentSink, NodeKind, OutputPort, PhysicalNode, PhysicalProperties,
-            PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField, ResultPort,
-            ResultValueDomain, RowMultiplicity, ValueOrigin, ValueType,
+            MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
+            ScanReadBudget, ValueType,
         };
         use novarocks_query_application::preparation::{
-            CompletedPhysicalPlanCandidate, CompletedPlanWithAccess, FinalPlanRuntimeAccess,
+            FinalPlanCompletionDriver, ReadAccessSink, SqlCompletionFactSource,
         };
         use novarocks_result_contract::FrozenRootOutput;
+        use novarocks_sql::compiler::{
+            DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
+            SqlCompileIntent, SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch,
+            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+            builtin_sql_function_catalog,
+        };
+        use novarocks_workload_control::{
+            ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        };
+
+        struct NoFacts;
+        #[async_trait::async_trait]
+        impl SqlCompletionFactSource for NoFacts {
+            type Access = crate::query_execution::provider_read_facts::FrozenProviderRead;
+
+            async fn resolve(
+                &self,
+                _: &SqlNeedBatch,
+                _: &ReadAccessSink<Self::Access>,
+            ) -> Result<SqlFactBatch, String> {
+                panic!("the literal SQL fixture must not request provider facts")
+            }
+        }
 
         let version = PlanVersionId::try_new([83; 16]).expect("finite component plan version");
-        let fragment_id = novarocks_physical_plan::FragmentId::new(1);
-        let mut fragment = FragmentBuilder::new(fragment_id);
-        let node = fragment.reserve_node_id().expect("one node");
-        let ty = ValueType::new(DataType::Int64, false);
-        let pool_id = ConstantPoolId::new(0);
-        let pool = novarocks_physical_plan::ConstantPool::try_new(
-            std::sync::Arc::new(Field::new("payload", DataType::Int64, false)),
-            ty.clone(),
-            Int64Array::from(vec![7]).to_data(),
+        let request = SqlFinalPlanCompileRequest::new(
+            version,
+            SqlStatementInput::sql("SELECT CAST(7 AS BIGINT) AS payload"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: Some("iceberg".to_string()),
+                current_database: "db".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            crate::query_execution::constant_eval::constant_evaluator(),
             crate::application::test_constant_policy(),
-            novarocks_type_contract::CompilePhase::Encode,
-            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            SqlCompileControl::unbounded(),
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
         )
-        .expect("one checked original Int64 constant");
-        let mut constants = ConstantPools::empty();
-        constants.insert(pool_id, pool).expect("one constant pool");
-        let literal = fragment
-            .add_expression(
-                node,
-                ty.clone(),
-                ExprKind::Constant(ConstantReference {
-                    pool: pool_id,
-                    ordinal: 0,
-                }),
-            )
-            .expect("one exact checked Int64 constant reference");
-        let value = fragment
-            .add_value(
-                ty.clone(),
-                ValueOrigin::NodeOutput {
-                    node,
-                    output_ordinal: 0,
-                },
-            )
-            .expect("one original node output");
-        let port = OutputPort {
-            node,
-            columns: Box::from([value]),
-        };
-        fragment
-            .insert_node_unchecked(PhysicalNode {
-                id: node,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: PhysicalProperties {
-                    distribution: Distribution::Singleton,
-                    row_multiplicity: RowMultiplicity::SingleCopy,
-                    ordering: Box::default(),
-                },
-                output: port.clone(),
-                kind: NodeKind::Values {
-                    rows: Box::from([Box::from([literal])]),
-                },
-            })
-            .expect("one complete Values node");
-        let fragment = fragment
-            .finish_definition(
-                node,
-                FragmentSink::Result,
-                PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: false,
-                },
-            )
-            .expect("one singleton result fragment");
-        let mut plan = PlanBuilder::new(version).with_constant_pools(constants);
-        plan.add_fragment(fragment).expect("one fragment");
-        plan.set_result_port(ResultPort {
-            scalar_schema: None,
-            fragment: fragment_id,
-            output: port,
-            fields: Box::from([ResultField {
-                domain: ResultValueDomain::Plain,
-                name: "payload".into(),
-                alias: None,
-                value,
-                ty,
-            }]),
-        })
-        .expect("one original result occurrence");
-        let plan = plan
-            .finish_observed(&novarocks_sql::compiler::SqlCompileControl::unbounded())
-            .expect("production caller-observed whole-plan validation");
+        .expect("workload control");
+        workload.mark_ready().expect("workload control ready");
+        let root = workload
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("query root");
+        let scope = root.owner.scope();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("completion runtime");
+        // SQL completion keeps the real immutable call-source journal even
+        // when constant folding leaves only a literal Values expression.
+        let paired = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request, &scope))
+            .expect("the exact original Int64 payload completes from SQL");
+        let plan = paired.candidate().plan();
+        assert_eq!(plan.version(), version);
+        assert_eq!(plan.fragments().len(), 1);
+        let result = paired
+            .candidate()
+            .original_public_result_port()
+            .expect("the original SQL public result declaration");
+        assert_eq!(result.fragment, novarocks_physical_plan::FragmentId::new(1));
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(result.fields[0].name.as_ref(), "payload");
+        assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));
         let output = match purpose {
             FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(
-                novarocks_sql::compiler::client_render_schema(&plan, 0)
-                    .expect("render schema from the original completed plan"),
+                novarocks_sql::compiler::client_render_schema(plan, 0)
+                    .expect("render schema from the original completed SQL plan"),
             ),
             FullBindPurpose::CountOnly => FrozenRootOutput::CountOnly,
         };
-        let candidate = CompletedPhysicalPlanCandidate::for_program(
-            plan,
-            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("production completed program validation")
-        .freeze_root_output(output)
-        .expect("freeze the original root purpose");
-        let paired =
-            CompletedPlanWithAccess::try_pair(
-                candidate,
-                FinalPlanRuntimeAccess::<
-                    crate::query_execution::provider_read_facts::FrozenProviderRead,
-                >::new(),
-            )
-            .unwrap_or_else(|(error, _access)| {
-                panic!("literal plan has no read capability: {error}")
-            });
-        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog()
-            .expect("original builtin engine function catalog");
+        let paired = paired
+            .freeze_root_output(output)
+            .unwrap_or_else(|(error, _access)| panic!("freeze the original root purpose: {error}"));
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             paired,
             &crate::query_execution::package_freeze::CompiledPackageCarrier::new(
@@ -1643,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn full_manifest_bind_accepts_supported_root_and_retains_legacy_candidate() {
+    fn full_manifest_bind_accepts_supported_root_and_retains_unsupported_non_root_candidate() {
         for purpose in [FullBindPurpose::ClientRows, FullBindPurpose::CountOnly] {
             let execution = execution();
             let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));

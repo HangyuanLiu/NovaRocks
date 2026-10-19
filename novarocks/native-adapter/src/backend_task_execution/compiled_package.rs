@@ -23,7 +23,7 @@
 //! the plan-tree decoder is never consulted. The host-owned decode model,
 //! limits and catalogs are built once at composition, never per task.
 
-// Design: ADR-0184 (docs/adr/ADR-0184-compiled-packages-are-the-sole-static-plan-path.md)
+// Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
 
 use std::error::Error;
 use std::fmt;

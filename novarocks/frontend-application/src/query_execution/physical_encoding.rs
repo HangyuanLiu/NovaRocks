@@ -28,7 +28,7 @@
 //! pairing the plan was published with, so a miss here is a defect rather than
 //! a case to handle.
 
-// Design: ADR-0184 (docs/adr/ADR-0184-compiled-packages-are-the-sole-static-plan-path.md)
+// Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
