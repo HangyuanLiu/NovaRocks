@@ -1502,25 +1502,11 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
     let subscription = ControlledSubscription::new();
     let session = || Some(FakeSession::consumers(&[(7, &subscription)]));
 
-    let ordered = StaticFilterConsumer::try_new(
-        7,
-        7,
-        FilterConsumerActivation::NonBlockingLive {
-            late_apply: FilterLateApplyGranularity::Batch,
-        },
-        ordered_int64_contract(),
-        FilterReduction::TightenOrderedBound,
-    )
-    .unwrap();
-    let program = scan_with_consumers(1, vec![(ordered, V0_OUTPUT)]).unwrap();
-    let message = scan_refusal(&program, session());
-    assert!(
-        message.contains(
-            "compiled scan at local node 0 runtime-filter binding_id=7 with an ordered-domain contract is not executable yet"
-        ),
-        "{message}"
-    );
-
+    // Ordered Batch live consumers are supported by the dedicated compiled
+    // owner. Their positive pipeline and exact subscription/digest failures
+    // live in compiled_ordered_pipeline_tests, compiled_complete_ordered_tests
+    // and compiled_ordered_scan_tests. This fixture returns Blocking handles,
+    // so it cannot author a negative capability claim about that live owner.
     let live = StaticFilterConsumer::try_new(
         7,
         7,

@@ -2861,6 +2861,50 @@ pub(crate) mod tests {
         .map(|installed| installed.facts())
     }
 
+    /// A direct-host test's real Context pin for a bounded CountOnly root.
+    /// The registry normally owns this pin and marks it during the creation
+    /// commit, after reserving the runnable and before drivers start.
+    struct FixtureRootContext {
+        root: Arc<novarocks_worker::root_result_channel::RootResultChannel>,
+    }
+
+    impl FixtureRootContext {
+        fn commit(&self) {
+            self.root
+                .mark_context_owned()
+                .expect("the fixture Context takes its exact root");
+        }
+    }
+
+    impl Drop for FixtureRootContext {
+        fn drop(&mut self) {
+            self.root.close(
+                novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextReleased,
+            );
+        }
+    }
+
+    fn install_context_root(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+    ) -> Result<FixtureRootContext, HostRejection> {
+        establish_fixture_context(host, descriptor.identity());
+        let dop = u32::try_from(descriptor.pipeline_dop().get()).expect("small dop");
+        let installation = host.install_receiver(
+            descriptor,
+            Body::values(dop).input(descriptor),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )?;
+        let (_, root) = installation.into_parts();
+        let root = root.expect("the bounded fixture returns its provisional root");
+        assert_eq!(root.spec().task, descriptor.identity());
+        assert_eq!(
+            root.spec().contract.kind(),
+            novarocks_result_contract::RootOutputKind::CountOnly
+        );
+        Ok(FixtureRootContext { root })
+    }
+
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
         ExchangeTopology::try_new(
             Vec::new(),
@@ -4062,7 +4106,7 @@ pub(crate) mod tests {
         );
         let first_descriptor = consistent_descriptor(first, UniqueId::new(523, 524));
         let sibling_descriptor = consistent_descriptor(sibling, UniqueId::new(525, 526));
-        install(&host, &first_descriptor).expect("first prepares");
+        let context_root = install_context_root(&host, &first_descriptor).expect("first prepares");
         let (owner, reporter) = reporter_for(first);
         // Submission retains the registration in PreparedNativeStart. No
         // commit has occurred, so this test cannot accidentally run drivers.
@@ -4088,6 +4132,7 @@ pub(crate) mod tests {
             1,
             "the submitted start owns its registration independently of receiver removal"
         );
+        context_root.commit();
         runnable.commit_creation();
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4499,6 +4544,20 @@ pub(crate) mod tests {
         runnable
     }
 
+    fn submit_committed_in_context(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+        reporter: TaskStatusReporter,
+        context: &FixtureRootContext,
+    ) -> Arc<dyn RunnableTask> {
+        let runnable = host
+            .submit_runnable(descriptor, reporter)
+            .expect("a prepared fragment starts");
+        context.commit();
+        runnable.commit_creation();
+        runnable
+    }
+
     #[test]
     fn submitted_runnable_stays_dormant_until_creation_commit() {
         let facts = Arc::new(StubContextFacts::default());
@@ -4507,7 +4566,7 @@ pub(crate) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(189, 190));
         let (owner, reporter) = planned_reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
         let runnable = host
@@ -4524,6 +4583,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(owner.state(), TaskState::Planned);
         assert!(!owner.convergence().actual_stopped());
+        context_root.commit();
         runnable.commit_creation();
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         await_runtime_convergence(&owner);
@@ -4577,10 +4637,10 @@ pub(crate) mod tests {
         let descriptor = consistent_descriptor(task, kernel_key);
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        let runnable = submit_committed(&host, &descriptor, reporter);
+        let runnable = submit_committed_in_context(&host, &descriptor, reporter, &context_root);
 
         // CountOnly hands output responsibility to its context without a
         // client read. The completion owner must still publish FINISHED;
@@ -4620,10 +4680,10 @@ pub(crate) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(213, 214));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        submit_committed(&host, &descriptor, reporter);
+        submit_committed_in_context(&host, &descriptor, reporter, &context_root);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         assert_eq!(
@@ -5868,8 +5928,9 @@ pub(crate) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(211, 212));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
-        let _runnable = submit_committed(&host, &descriptor, reporter.clone());
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
+        let _runnable =
+            submit_committed_in_context(&host, &descriptor, reporter.clone(), &context_root);
 
         // The dormant handle is taken exactly once. A second submit must not
         // start a second execution over the same pipeline.
@@ -6018,8 +6079,8 @@ pub(crate) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(271, 272));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
-        let _runnable = submit_committed(&host, &descriptor, reporter);
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
+        let _runnable = submit_committed_in_context(&host, &descriptor, reporter, &context_root);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");
@@ -6049,8 +6110,8 @@ pub(crate) mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(281, 282));
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
-        let _runnable = submit_committed(&host, &descriptor, reporter);
+        let context_root = install_context_root(&host, &descriptor).expect("prepares");
+        let _runnable = submit_committed_in_context(&host, &descriptor, reporter, &context_root);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");

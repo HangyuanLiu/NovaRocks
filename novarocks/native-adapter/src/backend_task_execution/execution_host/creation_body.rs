@@ -180,6 +180,11 @@ fn finish(
                         novarocks_result_contract::FrozenRootOutput::ClientRows(schema) => {
                             schema.columns()[ordinal].name.clone()
                         }
+                        novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                            novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+                        ) => {
+                            ["input_fields", "blob_type", "body", "properties"][ordinal].to_owned()
+                        }
                         _ => format!("result-{ordinal}"),
                     },
                     _ => format!("result-{ordinal}"),
