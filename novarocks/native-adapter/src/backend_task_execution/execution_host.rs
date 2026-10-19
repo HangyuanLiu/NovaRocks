@@ -2801,13 +2801,13 @@ pub(crate) mod tests {
             identity,
             kernel_key,
             NonZeroUsize::new(pipeline_dop).expect("nonzero dop"),
-            vec![PlanNodeId::new(10).expect("nonnegative node")],
+            Vec::new(),
             topology,
         )
         .expect("a legal descriptor")
     }
 
-    /// A single-driver descriptor with no exchange topology.
+    /// A single-driver Values descriptor with no scans or exchange topology.
     fn consistent_descriptor(identity: TaskIdentity, kernel_key: UniqueId) -> TaskDescriptor {
         descriptor_with(identity, kernel_key, 1, ExchangeTopology::default())
     }
@@ -3800,9 +3800,43 @@ pub(crate) mod tests {
             )
             .expect_err("a parallelism outside the frozen domain is not this fragment");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
-        assert!(
-            rejection.detail().as_str().contains("DOP domain"),
-            "{rejection}"
+        assert_eq!(
+            rejection.detail().as_str(),
+            format!(
+                "task {} package could not be compiled: package does not compile: invalid local lowering: DOP is outside physical domain",
+                descriptor.identity(),
+            ),
+        );
+        assert_nothing_prepared(&host, &facts);
+    }
+
+    #[test]
+    fn a_values_task_cannot_declare_a_split_driven_scan_node() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let descriptor = TaskDescriptor::try_new(
+            identity(47_001, 1, 1),
+            UniqueId::new(47_001, 1),
+            NonZeroUsize::new(1).unwrap(),
+            vec![PlanNodeId::new(10).unwrap()],
+            ExchangeTopology::default(),
+        )
+        .unwrap();
+        establish_fixture_context(&host, descriptor.identity());
+        let rejection = host
+            .install_receiver(
+                &descriptor,
+                Body::values(1).input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
+            .expect_err("a Values node cannot stand in for a split-driven scan");
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+        assert_eq!(
+            rejection.detail().as_str(),
+            format!(
+                "task {} names split-driven nodes [10], but its compiled scans are []",
+                descriptor.identity()
+            ),
         );
         assert_nothing_prepared(&host, &facts);
     }
@@ -3828,19 +3862,12 @@ pub(crate) mod tests {
             )
             .expect_err("a scan assignment must name a scan node of the static plan");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
-        assert!(
-            rejection
-                .detail()
-                .as_str()
-                .contains("scan ranges assigned to unknown scan node 99"),
-            "{rejection}"
-        );
-        assert!(
-            rejection
-                .detail()
-                .as_str()
-                .contains("creation_metadata.assignment.initial_scan_ranges"),
-            "the refusal names the field the frontend actually sent: {rejection}"
+        assert_eq!(
+            rejection.detail().as_str(),
+            format!(
+                "task {} assigns scan ranges to node 99, which is not a compiled scan",
+                descriptor.identity(),
+            ),
         );
         assert_nothing_prepared(&host, &facts);
     }
@@ -4555,13 +4582,13 @@ pub(crate) mod tests {
             .expect("installs");
         let runnable = submit_committed(&host, &descriptor, reporter);
 
-        // A NOOP sink owes nothing further, so the completion owner is the
-        // only thing that may publish FINISHED. If it never reported, this
-        // would hang at PLANNED and the poll would fail.
+        // CountOnly hands output responsibility to its context without a
+        // client read. The completion owner must still publish FINISHED;
+        // otherwise this would hang at PLANNED and the poll would fail.
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         assert!(
             owner.output_released(),
-            "a finished non-root task has released its output responsibility"
+            "the finished CountOnly task handed its output responsibility to its context"
         );
         await_runtime_convergence(&owner);
         let convergence = owner.convergence();
@@ -6333,8 +6360,19 @@ pub(crate) mod tests {
     fn a_winning_round_prepares_once_and_a_replay_reuses_the_prepared_task() {
         let fixture = OwnerFixture::new(61);
         let identity = fixture.identity(1);
-        let descriptor = consistent_descriptor(identity, UniqueId::new(611, 1));
-        let accepted = fixture.create(&descriptor, &Body::values(1));
+        let edge = ExchangeEdgeId::new(1).expect("nonzero edge");
+        let descriptor = descriptor_with(
+            identity,
+            UniqueId::new(611, 1),
+            1,
+            outbound_topology(edge, self::identity(61, 2, 1)),
+        );
+        let winner = Body::with_sink(
+            1,
+            BodySink::Stream(DataStreamPartitionType::Unpartitioned),
+            vec![edge.get()],
+        );
+        let accepted = fixture.create(&descriptor, &winner);
         assert_eq!(
             accepted.outcome(),
             OperationOutcome::Accepted,
@@ -6360,8 +6398,8 @@ pub(crate) mod tests {
             1,
             "the host interpreted the winner's body and never the replay's"
         );
-        // The NOOP sink the winner proved still governs the task, live or
-        // retired: the replay's result sink promoted nothing.
+        // The genuine Stream sink the winner proved still governs the task,
+        // live or retired: the replay's result sink promoted nothing.
         let route = fixture.registry.root_result_route(identity);
         assert!(
             !matches!(
@@ -6370,6 +6408,26 @@ pub(crate) mod tests {
                     | novarocks_worker::RootResultRoute::TerminalResultOwner(_)
             ),
             "{route:?}"
+        );
+        // This real Stream waits behind its frozen Closed edge. End that
+        // wait through the owner and retain actual-stop evidence before exit.
+        fixture.registry.abort_query_context(
+            &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                AbortCause::QueryFailed,
+            ),
+        );
+        let source = fixture.registry.status_source(fixture.context).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while source.latest_task_convergence(identity).is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            source.latest_task_convergence(identity).is_some(),
+            "the Stream winner must actually stop"
         );
     }
 
@@ -6393,11 +6451,12 @@ pub(crate) mod tests {
             OperationOutcome::InvalidStateOrRequest,
             "{refused:?}"
         );
-        assert!(
-            refused
-                .detail()
-                .is_some_and(|detail| detail.as_str().contains("DOP domain")),
-            "{refused:?}"
+        assert_eq!(
+            refused.detail().map(|detail| detail.as_str()),
+            Some(format!(
+                "task {} package could not be compiled: package does not compile: invalid local lowering: DOP is outside physical domain",
+                descriptor.identity(),
+            ).as_str()),
         );
         assert_eq!(fixture.host.installs.load(Ordering::SeqCst), 1);
         assert!(
@@ -6521,7 +6580,7 @@ pub(crate) mod tests {
                 &descriptor,
                 &Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]),
             );
-            assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+            assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
             let channel = fixture
                 .host
                 .inner
@@ -6612,7 +6671,7 @@ pub(crate) mod tests {
             &descriptor,
             &Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]),
         );
-        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         let channel = fixture
             .host
             .inner
@@ -7109,7 +7168,7 @@ pub(crate) mod tests {
         let descriptor = consistent_descriptor(root, UniqueId::new(90_503, 1));
         let body = Body::with_sink(1, BodySink::Result, Vec::new());
         let receipt = fixture.create(&descriptor, &body);
-        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         assert!(
             matches!(
                 fixture.registry.root_result_route(root),

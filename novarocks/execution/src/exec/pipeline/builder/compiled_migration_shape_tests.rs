@@ -306,12 +306,12 @@ fn compiled_mixed_update_and_merge_calls_keep_their_own_phase_and_exact_result()
         "the mixed node cannot classify every call as merging"
     );
     assert_eq!(functions.len(), 2);
-    assert_eq!(functions[0].name.as_ref(), "count");
+    assert_eq!(functions[0].name.as_ref(), "builtin.aggregate/count/v1");
     assert!(
         !functions[0].input_is_intermediate,
         "COUNT updates from its logical argument"
     );
-    assert_eq!(functions[1].name.as_ref(), "sum");
+    assert_eq!(functions[1].name.as_ref(), "builtin.aggregate/sum/v1");
     assert!(
         functions[1].input_is_intermediate,
         "SUM reads the exact state of its original logical INT64 binding"

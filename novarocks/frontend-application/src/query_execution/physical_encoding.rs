@@ -1305,17 +1305,24 @@ mod tests {
     #[test]
     fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CompletedTailControl {
             encode_checkpoints: AtomicUsize,
+            checkpoints: Mutex<Vec<(CompilePhase, u32)>>,
             /// The Encode checkpoint that refuses; `None` only observes.
             tail_at: Option<usize>,
             tail_error: CompileControlError,
             earlier_error: Option<CompileControlError>,
         }
         impl PureCompileControl for CompletedTailControl {
-            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                self.checkpoints.lock().unwrap().push((phase, units));
                 // The last Encode checkpoint is the FE exit, after the actual
                 // native fragment freezes and attempt-fact projection.
                 if phase == CompilePhase::Encode
@@ -1351,6 +1358,7 @@ mod tests {
             // refusal lands on its true tail rather than a counted guess.
             let observed = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                checkpoints: Mutex::new(Vec::new()),
                 tail_at: None,
                 tail_error: error,
                 earlier_error: None,
@@ -1365,6 +1373,24 @@ mod tests {
             .expect("the observed encoding succeeds");
             let encode_checkpoints = observed.encode_checkpoints.load(Ordering::SeqCst);
             assert!(encode_checkpoints >= 4, "FE and codec entry/exit at least");
+            let observed_checkpoints = observed.checkpoints.into_inner().unwrap();
+            assert_eq!(
+                observed_checkpoints.first(),
+                Some(&(CompilePhase::Encode, 0))
+            );
+            let first_validate = observed_checkpoints
+                .iter()
+                .position(|(phase, _)| *phase == CompilePhase::Validate)
+                .expect("the actual package author validates its semantic facts");
+            // Package read authoring has its own completed Encode scope before
+            // semantic validation. Keep that legitimate prefix, rather than
+            // assuming validation immediately follows the outer FE entry.
+            let before_validate = &observed_checkpoints[..first_validate];
+            assert!(
+                before_validate
+                    .iter()
+                    .all(|(phase, _)| *phase == CompilePhase::Encode)
+            );
             let completed = runtime
                 .block_on(
                     FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
@@ -1373,6 +1399,7 @@ mod tests {
             let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
             let control = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                checkpoints: Mutex::new(Vec::new()),
                 tail_at: Some(encode_checkpoints - 1),
                 tail_error: error,
                 earlier_error: None,
@@ -1406,8 +1433,13 @@ mod tests {
                 crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
             let first_failure = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                checkpoints: Mutex::new(Vec::new()),
                 tail_at: Some(encode_checkpoints - 1),
-                tail_error: CompileControlError::ResourceExhausted,
+                tail_error: if error == CompileControlError::ResourceExhausted {
+                    CompileControlError::Cancelled
+                } else {
+                    CompileControlError::ResourceExhausted
+                },
                 earlier_error: Some(error),
             };
             assert!(matches!(
@@ -1422,8 +1454,13 @@ mod tests {
             ));
             assert_eq!(
                 first_failure.encode_checkpoints.load(Ordering::SeqCst),
-                1,
-                "the first Validate refusal preserves the original Encode entry without a footer",
+                before_validate.len(),
+                "the first Validate refusal preserves completed author scopes without an outer Encode footer",
+            );
+            assert_eq!(
+                first_failure.checkpoints.lock().unwrap().as_slice(),
+                &observed_checkpoints[..=first_validate],
+                "the first Validate refusal stops at its exact checkpoint with no subsequent checkpoint",
             );
             assert_eq!(
                 crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),

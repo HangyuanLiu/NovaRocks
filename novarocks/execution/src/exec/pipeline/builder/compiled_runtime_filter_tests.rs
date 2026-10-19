@@ -514,6 +514,43 @@ fn membership(data_type: &DataType, null_semantics: FilterNullSemantics) -> Stat
     StaticFilterContract::membership(&declared, null_semantics).expect("membership contract")
 }
 
+// Canonical vector for an ascending nullable INT64 key with NULLs first.
+// Validate it before testing shape admission, so digest corruption cannot
+// replace the specific unsupported-shape refusal the caller intends to pin.
+fn ordered_int64_contract() -> StaticFilterContract {
+    use execution::contribution::{
+        RuntimeOrderContract, RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
+    };
+    const COMPARATOR: [u8; 32] = [
+        158, 44, 110, 71, 60, 4, 201, 17, 60, 183, 191, 230, 197, 165, 217, 97, 252, 8, 107, 193,
+        30, 11, 64, 71, 100, 226, 118, 121, 250, 188, 138, 254,
+    ];
+    const ORDER: [u8; 32] = [
+        96, 52, 127, 179, 84, 179, 212, 155, 42, 163, 147, 170, 172, 113, 186, 152, 247, 217, 123,
+        253, 151, 126, 100, 10, 137, 217, 226, 211, 239, 1, 50, 184,
+    ];
+    let declared = FunctionValueType::new(DataType::Int64, true);
+    RuntimeOrderContract::from_fragment_contract(
+        [RuntimeOrderKey::with_value_type(
+            declared.clone(),
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderNullOrder::First,
+        )],
+        COMPARATOR,
+        ORDER,
+    )
+    .expect("the shape fixture carries the independently frozen canonical order");
+    StaticFilterContract::Ordered {
+        keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([FilterOrderKey {
+            value_type: declared,
+            direction: FilterSortDirection::Ascending,
+            null_order: FilterNullOrder::First,
+        }])),
+        comparator_digest: COMPARATOR,
+        contract_digest: ORDER,
+    }
+}
+
 // Independent installed declaration: this author precedes the LocalProgram
 // projection and never derives expected types from an operator's request.
 fn declared_membership_contract(
@@ -1471,17 +1508,7 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
         FilterConsumerActivation::NonBlockingLive {
             late_apply: FilterLateApplyGranularity::Batch,
         },
-        StaticFilterContract::Ordered {
-            keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
-                FilterOrderKey {
-                    value_type: FunctionValueType::new(DataType::Int64, true),
-                    direction: FilterSortDirection::Ascending,
-                    null_order: FilterNullOrder::First,
-                },
-            ])),
-            comparator_digest: [1; 32],
-            contract_digest: [2; 32],
-        },
+        ordered_int64_contract(),
         FilterReduction::TightenOrderedBound,
     )
     .unwrap();
@@ -1923,17 +1950,7 @@ fn compiled_hash_join_producer_shapes_outside_m1_are_refused_by_name() {
                 11,
                 11,
                 FilterProducerKind::TopKSummary,
-                StaticFilterContract::Ordered {
-                    keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
-                        FilterOrderKey {
-                            value_type: FunctionValueType::new(DataType::Int64, true),
-                            direction: FilterSortDirection::Ascending,
-                            null_order: FilterNullOrder::First,
-                        },
-                    ])),
-                    comparator_digest: [1; 32],
-                    contract_digest: [2; 32],
-                },
+                ordered_int64_contract(),
                 FilterReduction::MergeTopKSummary {
                     k: NonZeroU32::new(3).unwrap(),
                 },
