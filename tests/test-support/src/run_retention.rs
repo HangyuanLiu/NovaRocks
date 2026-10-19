@@ -45,11 +45,12 @@ pub fn unique() -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
+const NOFOLLOW: i32 = 0x100;
+#[cfg(target_os = "linux")]
+const NOFOLLOW: i32 = 0x20000;
+
 pub fn open_lock(path: &Path) -> io::Result<File> {
-    #[cfg(target_os = "macos")]
-    const NOFOLLOW: i32 = 0x100;
-    #[cfg(target_os = "linux")]
-    const NOFOLLOW: i32 = 0x20000;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -317,10 +318,14 @@ pub fn ensure_run_retention(deadline: Instant) -> io::Result<Arc<RunContext>> {
                     _ => io::ErrorKind::WouldBlock.into(),
                 })?;
                 write_new(&root.join("Initializing"), b"schema=1\n")?;
-                let count = std::env::var("NOVAROCKS_TEST_RUN_RETENTION_COUNT")
-                    .unwrap_or_else(|_| "3".into())
-                    .parse::<usize>()
-                    .map_err(unix::error)?;
+                let count = match std::env::var_os("NOVAROCKS_TEST_RUN_RETENTION_COUNT") {
+                    None => 3,
+                    Some(value) => value
+                        .to_str()
+                        .ok_or_else(|| unix::error("test run retention count must be UTF-8"))?
+                        .parse::<usize>()
+                        .map_err(unix::error)?,
+                };
                 if count == 0 {
                     return Err(unix::error("test run retention count must be positive"));
                 }
@@ -369,8 +374,18 @@ pub fn ensure_run_retention(deadline: Instant) -> io::Result<Arc<RunContext>> {
             verify_ready(&context)?;
         }
     }
-    drop(initialize); // Never unlock an inherited open-file description.
+    if native.is_none() && !created && !process_ready(&context.root, &context.directory)? {
+        return Err(unix::error(
+            "ordinary process run initialization did not complete; failed roots are never adopted",
+        ));
+    }
     drop(context.gate(deadline)?);
+    if native.is_none() && created {
+        // Commit only after all ordinary metadata and registration checks pass.
+        // Native Ready remains exclusively owned by the retention guard.
+        write_new(&context.root.join(".process-ready"), b"schema=1\n")?;
+    }
+    drop(initialize); // Never unlock an inherited open-file description.
     runs.insert(root, Arc::clone(&context));
     // Collection is bounded and opportunistic; it never blocks registration.
     if let Ok(count) = fs::read_to_string(context.root.join(".ordinary")).and_then(|s| {
@@ -390,6 +405,30 @@ pub fn ensure_run_retention(deadline: Instant) -> io::Result<Arc<RunContext>> {
             });
     }
     Ok(context)
+}
+
+fn process_ready(root: &Path, directory: &File) -> io::Result<bool> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | unix::NONBLOCK)
+        .open(root.join(".process-ready"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != 9 {
+        return Ok(false);
+    }
+    if metadata.dev() != directory.metadata()?.dev() {
+        return Err(unix::error(
+            "process initialization marker crossed the approved filesystem",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(10).read_to_end(&mut bytes)?;
+    Ok(bytes == b"schema=1\n")
 }
 
 fn process_id() -> &'static str {
@@ -657,6 +696,9 @@ pub fn collect(base: &Path, retain: usize) -> io::Result<()> {
             }
             let directory = File::open(&root)?;
             unix::validate_local_fs(&directory)?;
+            if kind == "process" && !process_ready(&root, &directory)? {
+                continue;
+            }
             let pin = open_lock(&root.join(".pin"))?;
             if pin.metadata()?.dev() != directory.metadata()?.dev() || pin.try_lock().is_err() {
                 continue;

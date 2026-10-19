@@ -45,6 +45,10 @@ pub const KILL: i32 = 9;
 pub const INTERRUPT: i32 = 2;
 pub const POLL: Duration = Duration::from_millis(10);
 #[cfg(target_os = "macos")]
+pub const NONBLOCK: i32 = 0x4;
+#[cfg(target_os = "linux")]
+pub const NONBLOCK: i32 = 0x800;
+#[cfg(target_os = "macos")]
 pub const CLOCK_KIND: u8 = 2;
 #[cfg(target_os = "linux")]
 pub const CLOCK_KIND: u8 = 1;
@@ -158,10 +162,6 @@ pub fn fifo_pair(path: &Path) -> io::Result<(File, File)> {
     let name = CString::new(path.as_os_str().as_bytes()).map_err(error)?;
     // SAFETY: valid terminated pathname, private parent directory.
     checked(unsafe { mkfifo(name.as_ptr(), 0o600) })?;
-    #[cfg(target_os = "macos")]
-    const NONBLOCK: i32 = 0x4;
-    #[cfg(target_os = "linux")]
-    const NONBLOCK: i32 = 0x800;
     // std OpenOptions atomically includes O_CLOEXEC on both supported targets.
     let read = OpenOptions::new()
         .read(true)

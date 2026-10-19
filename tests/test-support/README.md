@@ -89,7 +89,7 @@ fn run_nested_runner(program: &Path) -> io::Result<()> {
 }
 ```
 
-这里的 raw runner `Child` 由外层 `Command::status` 实际 wait；其后创建的受管 payload 仍归 monitor。不要伪造 nextest 字段、清除继承上下文，或在嵌套子进程中接管失败/已关闭的租约。并发首用、重复 ensure 和同一原生调用中的 stress 复用同一个 Ready root。没有 nextest 身份的直接 Cargo/IDE/SQL/System 调用按调用进程归属，不自动取得 nextest 逐测试隔离或正式阶段汇总。
+这里的 raw runner `Child` 由外层 `Command::status` 实际 wait；其后创建的受管 payload 仍归 monitor。不要伪造 nextest 字段、清除继承上下文，或在嵌套子进程中接管失败/已关闭的租约。并发首用、重复 ensure 和同一原生调用中的 stress 复用同一个 Ready root。没有 nextest 身份的直接 Cargo/IDE/SQL/System 调用按调用进程归属，不自动取得 nextest 逐测试隔离或正式阶段汇总。普通进程 root 只有完成全部初始化和登记检查后才发布库拥有的 `.process-ready`；失败或半写的根不被后续调用接纳或当作已收束材料回收。
 
 成功消费退出和所有日志断言后，持句柄的 consumer 调用 `release_diagnostics()`；最后一个输出 pin 退出后可删除普通成功材料。未释放、异常退出或失败材料在同一原生调用结束、登记封闭且所有相关监护记录完整后，进入最近调用窗口；默认保留 **3 次**，`NOVAROCKS_TEST_RUN_RETENTION_COUNT` 仅可设正数。这是调用数量窗口，不是磁盘硬上限。同次 nextest 的后续测试不能提前淘汰早期失败；活动 pin、缺 Final、未完成清理或未知结束的材料不为达标删除。需要长期引用的失败先按[测试治理](../../docs/guides/development/test-governance.md#保留共享交接与清理)交接保存。
 

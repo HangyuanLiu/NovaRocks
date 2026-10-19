@@ -80,6 +80,10 @@ impl Evidence {
         if let Some(formal) = formal {
             command.env("NOVAROCKS_TEST_RUN_ROOT", formal);
         }
+        let retention_count = (mode == "failed-initialization").then_some("0");
+        if let Some(count) = retention_count {
+            command.env("NOVAROCKS_TEST_RUN_RETENTION_COUNT", count);
+        }
         fs::write(
             directory.join("command.json"),
             serde_json::to_vec_pretty(&json!({
@@ -92,6 +96,7 @@ impl Evidence {
                     "RETENTION_HELPER_DIRECTORY": directory,
                     "RETENTION_HELPER_MODE": mode,
                     "NOVAROCKS_TEST_RUN_ROOT": formal,
+                    "NOVAROCKS_TEST_RUN_RETENTION_COUNT": retention_count,
                 },
             }))
             .unwrap(),
@@ -372,6 +377,39 @@ fn incomplete_record_parser_excludes_original_material_from_collection() {
 }
 
 #[test]
+fn failed_process_initialization_stays_rejected_on_same_process_retry() {
+    let mut evidence = Evidence::new("failed-initialization");
+    let mut helper = evidence.spawn("failed-initialization", None);
+    let root = helper.run_root();
+    assert!(
+        root.is_dir(),
+        "the original failed initialization root was not retained"
+    );
+    assert!(!root.join(".process-ready").exists());
+    assert!(
+        !root.join("monitor").exists(),
+        "rejected initialization registered a launch"
+    );
+    assert!(!helper.directory.join("payload-born").exists());
+    let errors = &helper.ready["initialization_errors"];
+    assert!(
+        errors["first"]
+            .as_str()
+            .unwrap()
+            .contains("must be positive")
+    );
+    assert!(!errors["second"].as_str().unwrap().is_empty());
+    assert!(!errors["spawn"].as_str().unwrap().is_empty());
+    helper.finish();
+    assert!(
+        root.is_dir(),
+        "failed initialization evidence disappeared after actual helper wait"
+    );
+    assert!(!root.join(".process-ready").exists());
+    assert!(!root.join("monitor").exists());
+}
+
+#[test]
 #[ignore = "internal helper; the outer test supplies private state and owns its actual Child"]
 fn retention_process_helper() {
     let directory = PathBuf::from(
@@ -382,7 +420,59 @@ fn retention_process_helper() {
         std::env::var_os("NEXTEST_RUN_ID").is_none(),
         "ordinary helper must not inherit a native run identity"
     );
-    let (root, launch) = if mode == "ensure" {
+    let mut initialization_errors = None;
+    let (root, launch) = if mode == "failed-initialization" {
+        assert_eq!(
+            std::env::var("NOVAROCKS_TEST_RUN_RETENTION_COUNT").unwrap(),
+            "0"
+        );
+        let first = ensure_run_retention(Instant::now() + WATCHDOG)
+            .expect_err("zero retention count must reject original initialization");
+        assert!(first.to_string().contains("must be positive"), "{first}");
+        let second = ensure_run_retention(Instant::now() + WATCHDOG)
+            .expect_err("same-process retry must not adopt the partial failed root");
+        let born = directory.join("payload-born");
+        let mut command = ManagedCommand::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf born > \"$1\"; trap 'exit 0' TERM; printf 'REJECTED_READY\\n'; while :; do sleep 1; done",
+            "sh",
+        ]).arg(&born);
+        let spawn = match ManagedProcess::spawn(
+            "must remain rejected after failed initialization".into(),
+            command,
+            ReadyMarker::StdoutContains("REJECTED_READY".into()),
+            WATCHDOG,
+            directory.join("rejected-output.locator"),
+        ) {
+            Err(error) => format!("{error:#}"),
+            Ok(mut process) => {
+                let cleanup = process.stop();
+                panic!("failed initialization admitted a payload; actual cleanup={cleanup:?}");
+            }
+        };
+        assert!(
+            !born.exists(),
+            "rejected initialization executed the payload"
+        );
+        let parent = PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap())
+            .join("novarocks/test-runs/process");
+        let roots = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roots.len(),
+            1,
+            "failed retry must preserve the same single process root"
+        );
+        let root = roots.into_iter().next().unwrap();
+        assert!(!root.join(".process-ready").exists());
+        assert!(!root.join("monitor").exists());
+        initialization_errors =
+            Some(json!({"first":first.to_string(),"second":second.to_string(),"spawn":spawn}));
+        (root, None)
+    } else if mode == "ensure" {
         ensure_run_retention(Instant::now() + WATCHDOG).unwrap();
         let parent = PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap())
             .join("novarocks/test-runs/process");
@@ -435,7 +525,7 @@ fn retention_process_helper() {
     };
     fs::write(
         directory.join("ready.json"),
-        serde_json::to_vec_pretty(&json!({"run_root": root, "launch": launch, "mode": mode}))
+        serde_json::to_vec_pretty(&json!({"run_root": root, "launch": launch, "mode": mode, "initialization_errors": initialization_errors}))
             .unwrap(),
     )
     .unwrap();
