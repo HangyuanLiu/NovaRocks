@@ -408,6 +408,25 @@ pub enum OrderedScalarRef<'a> {
     Decimal128(i128),
 }
 
+impl OrderedScalarRef<'_> {
+    /// Legacy owned tuples and inline numeric keys share this representation
+    /// conversion. The controlled UTF8 host handles strings before this call.
+    pub(crate) fn into_owned(self) -> OrderedScalar {
+        match self {
+            Self::Boolean(value) => OrderedScalar::Boolean(value),
+            Self::Int8(value) => OrderedScalar::Int8(value),
+            Self::Int16(value) => OrderedScalar::Int16(value),
+            Self::Int32(value) => OrderedScalar::Int32(value),
+            Self::Int64(value) => OrderedScalar::Int64(value),
+            Self::LargeInt(value) => OrderedScalar::LargeInt(value),
+            Self::Utf8(value) => OrderedScalar::Utf8(value.to_owned()),
+            Self::Date32(value) => OrderedScalar::Date32(value),
+            Self::Timestamp(value) => OrderedScalar::Timestamp(value),
+            Self::Decimal128(value) => OrderedScalar::Decimal128(value),
+        }
+    }
+}
+
 impl OrderedScalar {
     pub fn as_borrowed(&self) -> OrderedScalarRef<'_> {
         match self {

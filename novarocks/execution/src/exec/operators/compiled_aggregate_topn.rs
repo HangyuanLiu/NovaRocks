@@ -17,11 +17,10 @@
 
 //! Driver-local ordered RF state for the original compiled aggregate.
 //! Group identity and expression evaluation remain with that processor. The
-//! helper only copies a newly inserted group's already evaluated UTF8 key
+//! helper only copies a newly inserted group's already evaluated key
 //! onto its creating host and uses the existing neutral producer lifecycle.
 
-use arrow::array::{Array, ArrayRef, StringArray};
-use arrow::datatypes::DataType;
+use arrow::array::ArrayRef;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure};
 use novarocks_local_program::{AggregateTopNFilter, LocalProgram, ProgramNodeId, ProgramNodeKind};
 
@@ -30,7 +29,7 @@ use super::aggregate::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
 };
 use super::aggregate::topn_boundary::{
-    AggregateTopNBoundaryError, OwnedAggregateTopNBoundaryState,
+    AggregateTopNBoundaryError, OwnedAggregateTopNBoundaryState, borrowed_key_from_group_array,
 };
 use super::compiled_expression::RuntimeKernelControl;
 use crate::exec::expr::agg::AggregateVec;
@@ -170,28 +169,8 @@ impl CompiledAggregateTopN {
                     actual: keys.len(),
                 },
             )?;
-            if row >= array.len() {
-                return Err(AggregateTopNBoundaryError::CandidateRowOutOfBounds {
-                    row,
-                    len: array.len(),
-                }
-                .into());
-            }
-            if array.data_type() != &DataType::Utf8 {
-                return Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
-                    expected: DataType::Utf8,
-                    actual: array.data_type().clone(),
-                }
-                .into());
-            }
-            let strings = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    invalid("compiled aggregate TopN Utf8 key has an unsupported array carrier")
-                })?;
-            let value = (!strings.is_null(row)).then(|| strings.value(row));
-            let key = self.host.copy_utf8(value, &self.control)?;
+            let value = borrowed_key_from_group_array(boundary.contract(), array, row)?;
+            let key = self.host.copy_scalar(value, &self.control)?;
             boundary.observe_owned_group(group_id, key, &self.control)?;
         }
         Ok(())

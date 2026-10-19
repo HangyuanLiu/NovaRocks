@@ -161,7 +161,7 @@ impl CompiledOrderedScanFactory {
                     binding: binding_ordinal,
                 },
             };
-            let order = host.utf8_shared_order_contract(binding.consumer.contract(), control)?;
+            let order = host.shared_order_contract(binding.consumer.contract(), control)?;
             let key = root_value_type(&program, site)?;
             if order.keys().len() != 1 || order.keys()[0].value_type() != Some(&key) {
                 return Err(invalid(

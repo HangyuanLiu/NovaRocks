@@ -28,7 +28,7 @@ use crate::exec::operators::aggregate::topn_boundary::{
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter as execution;
 use crate::runtime_filter::contribution::{ContributionCodecError, OrderedTuple};
-use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedUtf8OrderKey};
+use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedOrderKey};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, SourceBackingOwner};
 
 #[derive(Default)]
@@ -228,7 +228,7 @@ impl AggregateTopNProducerSessionFactory {
                 )
                 .into());
             }
-            let order = host.utf8_shared_order_contract(spec.producer.contract(), control)?;
+            let order = host.shared_order_contract(spec.producer.contract(), control)?;
             let contract = execution::RuntimeFilterProducerContract::ordered_bound(
                 execution::RuntimeFilterBindingId::new(spec.producer.binding_id()),
                 execution::RuntimeFilterChannelId::new(spec.producer.channel_id()),
@@ -494,7 +494,7 @@ impl AggregateTopNProducerSession {
                 }
                 .map_err(|cause| SessionFailure::Execution(cause.into()))
             },
-            |contract, key: OwnedUtf8OrderKey, cap| {
+            |contract, key: OwnedOrderKey, cap| {
                 let RuntimeFilterExecutionContract::Ordered(order) = contract.contract() else {
                     return Err(SessionFailure::Codec {
                         binding: contract.binding_id().get(),

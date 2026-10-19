@@ -185,13 +185,13 @@ mod tests {
 
         let tracker = MemTracker::new_root("ordered-contract-ref-last-alias");
         let host = OrderedTopNAllocationHost::new(tracker.clone());
-        let inner = host.utf8_order_contract(&frozen, &Control::pass()).unwrap();
+        let inner = host.order_contract(&frozen, &Control::pass()).unwrap();
         let inner_stock = tracker.current();
         assert!(inner_stock > 0);
         drop(inner);
         assert_eq!(tracker.current(), 0);
         let owned = host
-            .utf8_shared_order_contract(&frozen, &Control::pass())
+            .shared_order_contract(&frozen, &Control::pass())
             .unwrap();
         assert_eq!(owned, legacy);
         assert_eq!(format!("{owned:?}"), format!("{legacy:?}"));
@@ -229,9 +229,7 @@ mod tests {
             tracker.install_limit_once(limit as i64).unwrap();
             let host = OrderedTopNAllocationHost::new(tracker.clone());
             let control = Control::pass();
-            let error = host
-                .utf8_shared_order_contract(&frozen, &control)
-                .unwrap_err();
+            let error = host.shared_order_contract(&frozen, &control).unwrap_err();
             assert_eq!(
                 error.cause(),
                 &ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
@@ -246,7 +244,7 @@ mod tests {
 
         let tracker = MemTracker::new_root("ordered-contract-ref-outer-refusal");
         let host = OrderedTopNAllocationHost::new(tracker.clone());
-        let inner = host.utf8_order_contract(&frozen, &Control::pass()).unwrap();
+        let inner = host.order_contract(&frozen, &Control::pass()).unwrap();
         let inner_stock = tracker.current();
         tracker
             .install_limit_once(inner_stock + i64::try_from(prefix).unwrap())
@@ -271,13 +269,10 @@ mod tests {
         let tracker = MemTracker::new_root("ordered-contract-ref-control-refusal");
         let host = OrderedTopNAllocationHost::new(tracker.clone());
         let inner_control = Control::pass();
-        drop(host.utf8_order_contract(&frozen, &inner_control).unwrap());
+        drop(host.order_contract(&frozen, &inner_control).unwrap());
         let first_outer = inner_control.calls.load(Ordering::SeqCst);
         let full_control = Control::pass();
-        drop(
-            host.utf8_shared_order_contract(&frozen, &full_control)
-                .unwrap(),
-        );
+        drop(host.shared_order_contract(&frozen, &full_control).unwrap());
         let all_calls = full_control.calls.load(Ordering::SeqCst);
         assert!(all_calls > first_outer);
         assert_eq!(tracker.current(), 0);
@@ -292,9 +287,7 @@ mod tests {
                     cause: cause.clone(),
                     ..Control::pass()
                 };
-                let error = host
-                    .utf8_shared_order_contract(&frozen, &control)
-                    .unwrap_err();
+                let error = host.shared_order_contract(&frozen, &control).unwrap_err();
                 assert_eq!(error.cause(), &ExecutionFailureCause::Kernel(cause.clone()));
                 assert_eq!(control.calls.load(Ordering::SeqCst), ordinal + 1);
                 assert_eq!(tracker.current(), 0);
