@@ -3268,7 +3268,7 @@ mod tests {
     fn compiled_dml_refusal_survives_outer_executor_message_wrapping() {
         let failure = crate::dml::error::DmlExecutionError::from_encode(
             novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-                "change-stream router",
+                "change-stream router".into(),
             ),
         )
         .into_dml_error(None);

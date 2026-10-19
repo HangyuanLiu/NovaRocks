@@ -17,9 +17,9 @@
 
 -- @tags=optimizer,topn,aggregate,session_rule_disable
 -- Test Objective:
--- Rows TopN budgets consume complete Global groups. The native physical
--- contract checks their exact sequence and input; these EXPLAIN assertions
--- cover the planner's ordered-bound publication without unstable node IDs.
+-- Default pre-aggregate pruning keeps Partial grouped states distinct from
+-- complete Global groups. Preserve that shape and the admitted ordered-bound
+-- publication when only the pruning rule is disabled, without unstable IDs.
 
 DROP TABLE IF EXISTS ${case_db}.t_pushdown_topn_preagg;
 CREATE TABLE ${case_db}.t_pushdown_topn_preagg (city INT, sales INT);
@@ -30,7 +30,30 @@ ANALYZE TABLE ${case_db}.t_pushdown_topn_preagg;
 
 SET disable_optimizer_rules = '';
 
--- Normal SplitTopN ranks complete Global groups and publishes a live bound.
+-- Default pruning adds a lower budget over Partial grouped states. Its
+-- Int32/UNION input has no admitted Partial scan filter, and the Global probe
+-- trace does not cross that lower TopN. Final ranking still uses Global groups.
+-- @skip_result_check=true
+-- @result_contains=LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST]
+-- @result_contains=HASH AGGREGATE (GLOBAL, group by: [city])
+-- @result_contains=HASH AGGREGATE (LOCAL, group by: [city])
+-- @result_not_contains=domain = OrderedBound
+-- @result_not_contains=activation = NonBlockingLive(Batch)
+EXPLAIN VERBOSE
+SELECT city, SUM(sales)
+FROM (
+    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
+    UNION ALL
+    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg
+) o
+GROUP BY city
+ORDER BY city
+LIMIT 10;
+
+SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
+
+-- Disable only pre-aggregate pruning. SplitTopN still ranks complete Global
+-- groups and retains the original Int32 ordered-bound publication contract.
 -- @skip_result_check=true
 -- @result_contains=LOCAL TOP-N
 -- @result_contains=HASH AGGREGATE (GLOBAL, group by: [city])

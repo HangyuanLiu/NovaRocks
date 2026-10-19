@@ -311,7 +311,7 @@ mod capability_identity_tests {
     fn mv_encode_capability_refusal_keeps_the_client_identity() {
         let error = super::encode_compile_error(
             novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-                "change-stream router",
+                "change-stream router".into(),
             ),
         );
         assert!(

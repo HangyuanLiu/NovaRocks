@@ -273,12 +273,16 @@ fn refuse_uncompiled_plan_shapes(
     // lower yet is refused by the backend's compiler, by name.
     for fragment in plan.fragments().values() {
         if let Some(reason) = compiled_sink_refusal(fragment.sink()) {
-            return Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason));
+            return Err(
+                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason.into()),
+            );
         }
     }
     for edge in plan.edges().values() {
         if let Some(reason) = compiled_edge_refusal(edge.kind) {
-            return Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason));
+            return Err(
+                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason.into()),
+            );
         }
     }
     Ok(())

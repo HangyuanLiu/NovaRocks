@@ -390,7 +390,7 @@ mod compile_control_tests {
     fn encode_capability_refusal_keeps_its_identity_through_dml_projection() {
         let error = DmlExecutionError::from_encode(
             novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-                "change-stream router",
+                "change-stream router".into(),
             ),
         )
         .into_dml_error(None);

@@ -105,6 +105,9 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
     fn from(error: PackageFreezeError) -> Self {
         match error {
             PackageFreezeError::Control(cause) => Self::Control(cause),
+            PackageFreezeError::Semantics(
+                novarocks_sql::compiler::PackageSemanticsError::UnsupportedCapability(detail),
+            ) => Self::UnsupportedCapability(format!("compiled package carrier: {detail}")),
             other => Self::Invalid(format!("compiled package carrier: {other}")),
         }
     }
@@ -198,4 +201,39 @@ pub(crate) fn encode_checked_package(
         other => PackageFreezeError::Encode(other),
     })?;
     Ok(wire.encode_to_vec())
+}
+
+#[cfg(test)]
+mod error_projection_tests {
+    use super::*;
+    use novarocks_plan_codec::PhysicalEncodeError;
+    use novarocks_sql::compiler::PackageSemanticsError;
+
+    #[test]
+    fn package_freeze_preserves_only_typed_semantic_capability_refusals() {
+        let detail = "cast List<Int8> to List<Int64>";
+        let error = PhysicalEncodeError::from(PackageFreezeError::Semantics(
+            PackageSemanticsError::UnsupportedCapability(detail.into()),
+        ));
+        assert_eq!(
+            error,
+            PhysicalEncodeError::UnsupportedCapability(format!(
+                "compiled package carrier: {detail}"
+            ))
+        );
+        let invalid = PhysicalEncodeError::from(PackageFreezeError::Semantics(
+            PackageSemanticsError::Effects("UnsupportedCast diagnostic".into()),
+        ));
+        assert!(matches!(invalid, PhysicalEncodeError::Invalid(_)));
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            assert_eq!(
+                PhysicalEncodeError::from(PackageFreezeError::Control(cause)),
+                PhysicalEncodeError::Control(cause)
+            );
+        }
+    }
 }

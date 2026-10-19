@@ -1018,7 +1018,9 @@ mod tests {
     #[test]
     fn encode_capability_refusal_is_not_a_contract_violation() {
         let error = super::DistributedQueryError::from_encode(
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("CTE multicast"),
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "CTE multicast".into(),
+            ),
         );
         assert_eq!(error.kind(), super::DistributedQueryErrorKind::Failed);
         assert_eq!(

@@ -22,7 +22,7 @@
 pub enum PhysicalEncodeError {
     Control(novarocks_type_contract::CompileControlError),
     Invalid(String),
-    UnsupportedCapability(&'static str),
+    UnsupportedCapability(String),
 }
 impl std::fmt::Display for PhysicalEncodeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

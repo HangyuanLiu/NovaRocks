@@ -1158,7 +1158,9 @@ mod compile_control_tests {
     #[test]
     fn encode_capability_refusal_preserves_the_client_engine_code() {
         let error = FrontendQueryCompilerError::from_encode(
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("CTE multicast"),
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "CTE multicast".into(),
+            ),
         );
         assert!(matches!(error, FrontendQueryCompilerError::Engine(message)
             if message == "[UnsupportedCompiledShape] CTE multicast"));
