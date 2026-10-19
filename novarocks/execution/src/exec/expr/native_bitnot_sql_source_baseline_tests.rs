@@ -108,7 +108,9 @@ fn native_bitnot_sql_original_unsigned_source_has_typed_intrinsic_refusal_before
         DataType::UInt64,
     ] {
         let source = FunctionValueType::new(dtype.clone(), false);
-        assert!(!novarocks_functions::native_bitnot_source_supported(&source));
+        assert!(!novarocks_functions::native_bitnot_source_supported(
+            &source
+        ));
         let failure = try_sql_source_with_declared_fields(
             "SELECT ~k FROM fixture.source",
             &[Field::new("k", dtype.clone(), false)],
@@ -119,7 +121,10 @@ fn native_bitnot_sql_original_unsigned_source_has_typed_intrinsic_refusal_before
             panic!("expected typed intrinsic source refusal for {dtype:?}: {failure:?}");
         };
         assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
-        assert_eq!(error.code(), AnalyzeErrorKind::TypeMismatch.descriptor().code);
+        assert_eq!(
+            error.code(),
+            AnalyzeErrorKind::TypeMismatch.descriptor().code
+        );
         assert_eq!(error.span(), Some(novarocks_parser::Span::new(7, 9)));
         assert!(error.control_error().is_none());
         assert!(
@@ -130,7 +135,9 @@ fn native_bitnot_sql_original_unsigned_source_has_typed_intrinsic_refusal_before
             error.message()
         );
         assert!(
-            error.message().contains(&format!("kind: Scalar({dtype:?})")),
+            error
+                .message()
+                .contains(&format!("kind: Scalar({dtype:?})")),
             "intrinsic must retain the exact unsigned source kind: {}",
             error.message()
         );
