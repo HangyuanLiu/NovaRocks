@@ -19,21 +19,6 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use novarocks_types::SlotId;
 
-use super::ExecNode;
-
-#[derive(Clone, Debug)]
-pub struct UnpivotNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub passthrough_columns: Vec<UnpivotPassthroughColumn>,
-    pub value_output_slot_id: SlotId,
-    pub literal_output_slot_ids: Vec<SlotId>,
-    pub value_mappings: Vec<UnpivotValueMapping>,
-    pub output_chunk_schema: ChunkSchemaRef,
-    pub max_output_rows: usize,
-    pub max_output_bytes: usize,
-}
-
 #[derive(Clone, Debug)]
 pub struct UnpivotPassthroughColumn {
     pub input_slot_id: SlotId,

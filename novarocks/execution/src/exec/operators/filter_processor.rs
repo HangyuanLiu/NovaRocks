@@ -21,7 +21,7 @@
 //! - Produces filtered chunks while preserving schema and nullability semantics.
 //!
 //! Key exported interfaces:
-//! - Types: `FilterProcessorFactory`.
+//! - Types: `FilterFixtureFactory`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -44,14 +44,16 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for predicate processors that apply row-level filter masks to input chunks.
-pub struct FilterProcessorFactory {
+#[cfg(test)]
+pub(crate) struct FilterFixtureFactory {
     name: String,
     arena: Arc<ExprArena>,
     predicate: ExprId,
     encoding_policy: FilterEncodingPolicy,
 }
 
-impl FilterProcessorFactory {
+#[cfg(test)]
+impl FilterFixtureFactory {
     pub fn new(node_id: i32, arena: Arc<ExprArena>, predicate: ExprId) -> Self {
         let name = if node_id >= 0 {
             format!("FILTER (id={node_id})")
@@ -68,13 +70,14 @@ impl FilterProcessorFactory {
     }
 }
 
-impl OperatorFactory for FilterProcessorFactory {
+#[cfg(test)]
+impl OperatorFactory for FilterFixtureFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(FilterProcessorOperator {
+        Box::new(FilterFixtureOperator {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             predicate: self.predicate,
@@ -88,11 +91,13 @@ impl OperatorFactory for FilterProcessorFactory {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 pub(crate) struct FilterEncodingPolicy {
     predicate_slots: HashSet<SlotId>,
     unsupported_predicate_slots: HashSet<SlotId>,
 }
 
+#[cfg(test)]
 impl FilterEncodingPolicy {
     pub(crate) fn from_predicate(arena: &ExprArena, predicate: ExprId) -> Self {
         let mut policy = Self::default();
@@ -194,6 +199,7 @@ impl FilterEncodingPolicy {
     }
 }
 
+#[cfg(test)]
 fn is_supported_literal_expr(arena: &ExprArena, expr: ExprId) -> bool {
     matches!(
         arena.node(expr),
@@ -201,6 +207,7 @@ fn is_supported_literal_expr(arena: &ExprArena, expr: ExprId) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_low_cardinality_string_dictionary(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -210,6 +217,7 @@ fn is_low_cardinality_string_dictionary(data_type: &DataType) -> bool {
     )
 }
 
+#[cfg(test)]
 fn direct_slot(arena: &ExprArena, expr: ExprId) -> Option<SlotId> {
     match arena.node(expr) {
         Some(ExprNode::SlotId(slot_id)) => Some(*slot_id),
@@ -217,12 +225,14 @@ fn direct_slot(arena: &ExprArena, expr: ExprId) -> Option<SlotId> {
     }
 }
 
+#[cfg(test)]
 fn expr_contains_slot(arena: &ExprArena, expr: ExprId) -> bool {
     let mut slots = HashSet::new();
     collect_slot_ids(arena, expr, &mut slots);
     !slots.is_empty()
 }
 
+#[cfg(test)]
 fn collect_slot_ids(arena: &ExprArena, expr: ExprId, out: &mut HashSet<SlotId>) {
     let Some(node) = arena.node(expr) else {
         return;
@@ -296,7 +306,8 @@ fn collect_slot_ids(arena: &ExprArena, expr: ExprId, out: &mut HashSet<SlotId>) 
     }
 }
 
-struct FilterProcessorOperator {
+#[cfg(test)]
+struct FilterFixtureOperator {
     name: String,
     arena: Arc<ExprArena>,
     predicate: ExprId,
@@ -307,7 +318,8 @@ struct FilterProcessorOperator {
     finished: bool,
 }
 
-impl Operator for FilterProcessorOperator {
+#[cfg(test)]
+impl Operator for FilterFixtureOperator {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -334,7 +346,8 @@ impl Operator for FilterProcessorOperator {
     }
 }
 
-impl ProcessorOperator for FilterProcessorOperator {
+#[cfg(test)]
+impl ProcessorOperator for FilterFixtureOperator {
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.pending_output.is_none()
     }
@@ -519,7 +532,7 @@ mod tests {
         let predicate = arena.push_typed(ExprNode::Eq(status, absent), DataType::Boolean);
         let amount = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
         let arena = Arc::new(arena);
-        let factory = FilterProcessorFactory::new(7, Arc::clone(&arena), predicate);
+        let factory = FilterFixtureFactory::new(7, Arc::clone(&arena), predicate);
         let state = RuntimeState::default();
         for input in [empty, original] {
             let mut first = factory.create(1, 0);
@@ -658,7 +671,7 @@ mod tests {
         let paid = utf8_literal(&mut arena, "PAID");
         let predicate = arena.push_typed(ExprNode::Eq(status, paid), DataType::Boolean);
         let arena = Arc::new(arena);
-        let factory = FilterProcessorFactory::new(7, Arc::clone(&arena), predicate);
+        let factory = FilterFixtureFactory::new(7, Arc::clone(&arena), predicate);
         let mut op = factory.create(1, 0);
         install_fixture_creator(op.as_mut());
         let processor = op.as_processor_mut().expect("processor");
@@ -735,7 +748,7 @@ mod tests {
             DataType::Utf8,
         );
         let predicate = arena.push_typed(ExprNode::Eq(status, paid), DataType::Boolean);
-        let factory = FilterProcessorFactory::new(8, Arc::new(arena), predicate);
+        let factory = FilterFixtureFactory::new(8, Arc::new(arena), predicate);
         let mut op = factory.create(1, 0);
         install_fixture_creator(op.as_mut());
         let processor = op.as_processor_mut().expect("processor");

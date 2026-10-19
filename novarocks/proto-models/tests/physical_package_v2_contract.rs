@@ -326,8 +326,6 @@ fn intrinsic_allow_throw_references_use_dedicated_v2_messages_and_presence() {
     for (name, number) in [
         ("novarocks.physical_package_v2.BinaryExpression", 5),
         ("novarocks.physical_package_v2.CastExpression", 4),
-        ("novarocks.expr.BinaryOpExpr", 5),
-        ("novarocks.expr.CastExpr", 4),
     ] {
         let descriptor = pool.get_message_by_name(name).unwrap();
         let field = descriptor
@@ -544,4 +542,24 @@ fn original_request_definition_does_not_alias_expression_occurrence_namespace() 
     assert_ne!(definition, occurrence);
     assert_eq!(definition.encode_to_vec(), [0x08, 0]);
     assert_eq!(occurrence.encode_to_vec(), [0x12, 2, 0x08, 0]);
+}
+
+#[test]
+fn original_call_requests_retire_the_request_identity_field() {
+    let pool = pool();
+    let request = pool
+        .get_message_by_name("novarocks.call_request.OriginalCallRequest")
+        .unwrap();
+    assert!(request.get_field_by_name("request_id").is_none());
+    assert!(request.reserved_ranges().any(|range| range.contains(&6)));
+    assert!(request.reserved_names().any(|name| name == "request_id"));
+    for (name, number) in [
+        ("definition", 1),
+        ("arguments", 2),
+        ("logical_argument_count", 3),
+        ("expected_result_value_type_id", 4),
+        ("constant_policy", 5),
+    ] {
+        assert_eq!(request.get_field_by_name(name).unwrap().number(), number);
+    }
 }

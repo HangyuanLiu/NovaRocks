@@ -57,11 +57,8 @@ const STATIC_PLAN_INTERPRETER_DOMAIN: &[u8] = b"novarocks.static-plan-interprete
 /// Production composes the compiled package carrier and its exact sealed pure
 /// catalogue. The component retains that catalogue digest so different pure
 /// support remains incompatible even when all other process inputs agree.
-/// The legacy tree vocabulary remains only until its wire is retired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticPlanInterpreter {
-    /// Legacy plan-tree component, retained while its wire callers are removed.
-    PlanTree,
     /// Reads the physical package carrier and compiles it with the sealed
     /// pure function catalogue this digest identifies.
     CompiledPackage {
@@ -76,7 +73,6 @@ impl StaticPlanInterpreter {
         let mut hasher = Sha256::new();
         hasher.update(STATIC_PLAN_INTERPRETER_DOMAIN);
         match self {
-            Self::PlanTree => hasher.update([1]),
             Self::CompiledPackage {
                 pure_function_catalog_digest,
             } => {
@@ -425,7 +421,9 @@ mod tests {
         StaticPlanInterpreter, derive_native_compatibility_material,
     };
 
-    const PLAN_TREE: StaticPlanInterpreter = StaticPlanInterpreter::PlanTree;
+    const COMPILED: StaticPlanInterpreter = StaticPlanInterpreter::CompiledPackage {
+        pure_function_catalog_digest: [0x51; 32],
+    };
 
     fn carriers() -> [NativeCarrierDeclaration; 2] {
         [
@@ -442,14 +440,14 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("valid material");
 
         assert_eq!(
             material.id().to_string(),
-            "ad892639393a541593b57ae066813530c2bd23725ab2a9535baac75dc52322a2"
+            "75500bcc71f4993afd30d08e60cd09da95ad15aa0e8b6817951b641d17cd5d2f"
         );
         assert_eq!(material.function_catalog_digest(), [0x31; 32]);
         assert_eq!(
@@ -477,7 +475,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("original material");
@@ -487,7 +485,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("descriptor material");
@@ -500,7 +498,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("provider revision material");
@@ -518,7 +516,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("private descriptor material");
@@ -528,7 +526,7 @@ mod tests {
             [0x32; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("catalog-only material");
@@ -538,7 +536,7 @@ mod tests {
             [0x31; 32],
             [0x42; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("implementation-only material");
@@ -548,7 +546,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             2,
         )
         .expect("epoch material");
@@ -558,7 +556,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             2,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect("plan contract material");
@@ -599,7 +597,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             0,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect_err("a plan contract revision must be explicit and nonzero");
@@ -616,7 +614,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect_err("duplicate provider ids must fail");
@@ -634,7 +632,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
             1,
         )
         .expect_err("reordered provider ids must fail");
@@ -659,7 +657,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
-                PLAN_TREE,
+                COMPILED,
                 epoch,
             )
             .expect("valid material")
@@ -685,7 +683,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
-                PLAN_TREE,
+                COMPILED,
                 epoch,
             )
             .expect("valid material")
@@ -712,7 +710,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
-                PLAN_TREE,
+                COMPILED,
                 epoch,
             )
             .unwrap()
@@ -729,7 +727,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
-                PLAN_TREE,
+                COMPILED,
                 epoch,
             )
             .unwrap()
@@ -773,7 +771,6 @@ mod tests {
     /// only input that tells their islands apart, and it alone must.
     #[test]
     fn the_static_plan_interpreter_alone_separates_islands_built_from_one_tree() {
-        let plan_tree = with_interpreter(StaticPlanInterpreter::PlanTree);
         let compiled = with_interpreter(StaticPlanInterpreter::CompiledPackage {
             pure_function_catalog_digest: [0x51; 32],
         });
@@ -781,29 +778,27 @@ mod tests {
             pure_function_catalog_digest: [0x52; 32],
         });
 
-        assert_ne!(plan_tree.id(), compiled.id());
         assert_ne!(compiled.id(), other_catalog.id());
-        assert_ne!(plan_tree.id(), other_catalog.id());
         assert_ne!(
-            plan_tree.static_plan_interpreter_digest(),
-            compiled.static_plan_interpreter_digest()
+            compiled.static_plan_interpreter_digest(),
+            other_catalog.static_plan_interpreter_digest()
         );
-        for material in [&compiled, &other_catalog] {
-            assert_eq!(material.descriptor_digest(), plan_tree.descriptor_digest());
+        for material in [&other_catalog] {
+            assert_eq!(material.descriptor_digest(), compiled.descriptor_digest());
             assert_eq!(
                 material.function_catalog_digest(),
-                plan_tree.function_catalog_digest()
+                compiled.function_catalog_digest()
             );
             assert_eq!(
                 material.execution_implementation_manifest_digest(),
-                plan_tree.execution_implementation_manifest_digest()
+                compiled.execution_implementation_manifest_digest()
             );
             assert_eq!(
                 material.plan_contract_digest(),
-                plan_tree.plan_contract_digest()
+                compiled.plan_contract_digest()
             );
-            assert_eq!(material.epoch(), plan_tree.epoch());
-            assert_eq!(material.carriers(), plan_tree.carriers());
+            assert_eq!(material.epoch(), compiled.epoch());
+            assert_eq!(material.carriers(), compiled.carriers());
         }
     }
 

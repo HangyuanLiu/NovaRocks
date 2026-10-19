@@ -122,7 +122,7 @@ fn instance(
     )
 }
 
-fn sql_gather_receiver_program() -> Arc<LocalProgram> {
+pub(in crate::runtime::fragment) fn sql_gather_receiver_program() -> Arc<LocalProgram> {
     use novarocks_connector_contract::PureProviderProgramCatalog;
     use novarocks_functions::ConstantPolicy;
     use novarocks_local_compiler::{

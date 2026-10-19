@@ -2431,13 +2431,7 @@ mod tests {
 #[cfg(test)]
 mod typed_domain_creation_tests {
     mod canonical_backing_owner_tests {
-        // Keep the historical fixture's local spellings while binding only
-        // the neutral type owner; the fixture has no v1 decoder dependency.
         use crate::native_type_construction::NativeTypeFactory;
-        use crate::native_type_decode::{
-            NativeTypeDecodeError as NativeFragmentDecodeError,
-            NativeTypeDecodeResources as NativeDecodeResources,
-        };
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/runtime_filter_install/canonical_backing_owner_tests.rs"

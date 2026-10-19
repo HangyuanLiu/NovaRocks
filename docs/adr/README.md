@@ -112,6 +112,7 @@ code-anchors:
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
+- [ADR-0184](ADR-0184-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
 
 ### low-cardinality
@@ -209,6 +210,7 @@ code-anchors:
 不得以 all-in-one 便利、feature-specific flow 或共享 runtime state 绕过边界。协议必须正面处理重复、延迟、乱序、
 丢失、过期 ownership 与进程失败，使分布式生命周期可测试、可观察并可独立演进。
 
+- [ADR-0184](ADR-0184-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
@@ -217,7 +219,7 @@ code-anchors:
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
-- ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
+- [ADR-0124](ADR-0124-native-compatibility-islands-and-ingress-admission.md) — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active；兼容材料由 ADR-0184 部分替代，exact-island 与 ingress 规则保留）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149；取得路径的含义由 ADR-0175 部分替代：两条路径都携带 FE 冻结的公开路由上下文、执行节点不建会话、vended 读取准入要求 BE 首次取得；消费侧续期与材料不跨进程仍有效）
 - [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
 
@@ -249,6 +251,7 @@ code-anchors:
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、view rewrite、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
 
+- [ADR-0184](ADR-0184-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
 - ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0161 的一次激活与固定版本恢复替换，其余仍有效）
@@ -293,7 +296,7 @@ StarRocks 已废弃且没有 active read capability。
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0121 — FE serving lifecycle 为何用单向 admission drain、而不是 connection shutdown 或远程 management mutation（active）
-- ADR-0124 — Native compatibility island 与 ingress admission 为何保持 role-local、无 all-in-one 旁路（active）
+- [ADR-0124](ADR-0124-native-compatibility-islands-and-ingress-admission.md) — Native compatibility island 与 ingress admission 为何保持 role-local、无 all-in-one 旁路（active；兼容材料由 ADR-0184 部分替代，其余规则保留）
 - ADR-0147 — 进程本地工作治理为何分离责任、准入、资源与结果信用，并由 Application Host 持有唯一 owner（active）
 - ADR-0152 — 后端如何告诉前端它还记得哪些准入决定：凭据为何是账本下界而不是一个要相等匹配的当前值（active）
 - ADR-0156 — Connector 操作控制与执行资源为何分离，并在 BE 准入后绑定（active）
@@ -331,7 +334,7 @@ fencing/takeover 仍须单独裁决。
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0111 — Backend 为何以自注册、精确 heartbeat 与 pre-ready 完整重规划取代 durable membership（active）
-- ADR-0124 — Backend compatibility island 为何以 exact identity 派生 eligibility，而不持久化升级 membership（active）
+- [ADR-0124](ADR-0124-native-compatibility-islands-and-ingress-admission.md) — Backend compatibility island 为何以 exact identity 派生 eligibility，而不持久化升级 membership（active；兼容材料由 ADR-0184 部分替代，eligibility 规则保留）
 
 #### 历史
 

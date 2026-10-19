@@ -43,7 +43,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::local::{runtime_filter_consumer_contract, runtime_filter_producer};
+use super::runtime_filter::{runtime_filter_consumer_contract, runtime_filter_producer};
 use super::*;
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
@@ -536,7 +536,6 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
         operator_buffer_chunks: 1,
         local_exchange_buffer_mem_limit_per_driver: 1,
         local_exchange_max_buffered_rows: 0,
-        precomputed_keyed_assert_keys: std::collections::HashMap::new(),
     };
     let mut build = build_node(program, graph.root(), &mut ctx, &error, ordered)?;
     // Statistics owns its specific original bounded materializer. Other root
@@ -1243,3 +1242,7 @@ mod compiled_window_tests;
 #[cfg(test)]
 #[path = "compiled_window_metadata_tests.rs"]
 mod compiled_window_metadata_tests;
+
+#[cfg(test)]
+#[path = "compiled_migration_shape_tests.rs"]
+mod migration_shape_tests;

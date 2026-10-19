@@ -127,7 +127,7 @@ fn runtime_filter_canonical_late_owner_keeps_timezone_without_layout_cache_or_ma
         tracker.install_limit_once(1024 * 1024).unwrap();
         let stop = ConnectorStopOwner::new();
         let creation = creator(tracker.clone(), &stop);
-        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let main_layout = Layout::array::<u8>(unrelated_main_bytes).unwrap();
         creation.request_layout(main_layout).unwrap();
         let unrelated_main = vec![23u8; unrelated_main_bytes];
@@ -162,7 +162,7 @@ fn runtime_filter_canonical_late_owner_keeps_timezone_without_layout_cache_or_ma
         let own = creation.begin_scope().unwrap();
         let mut canonical_requests = Vec::new();
         let contract = RuntimeFilterMembershipSchema::new_value_typed_with_storage_observed::<
-            NativeFragmentDecodeError,
+            NativeTypeDecodeError,
         >(
             source,
             RuntimeFilterNullSemantics::NeverMatches,

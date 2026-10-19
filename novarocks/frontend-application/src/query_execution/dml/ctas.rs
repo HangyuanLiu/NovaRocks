@@ -758,10 +758,7 @@ fn prepare_planned_ctas_connector_write(
             novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
-    let field_names = std::collections::BTreeMap::from([(
-        write_target_ordinal,
-        sink.accepted_field_names().into_iter().collect(),
-    )]);
+
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_ctas_connector_write_plan(
         &planned.source,
         sink,
@@ -836,17 +833,13 @@ fn prepare_planned_ctas_connector_write(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        state.function_catalog().as_ref(),
         state.static_plan_carrier(),
         state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
-                sealed: &sealed,
-                field_names,
                 session: session.as_ref(),
             },
         ),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(

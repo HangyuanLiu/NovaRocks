@@ -18,8 +18,7 @@
 //! Frontend-owned native submission mapping.
 //!
 //! A fragment's static plan is a property of the plan alone, so it is frozen
-//! once per completed plan, by [`freeze_completed_fragments`] or, for the
-//! compiled carrier, [`freeze_completed_packages`], before anything is placed:
+//! once per completed plan by [`freeze_completed_packages`], before anything is placed:
 //! every placement of every attempt of that plan -- a recovery included -- is
 //! created from those same bytes.
 //!
@@ -36,7 +35,6 @@ use std::sync::Arc;
 use novarocks_physical_plan::{FragmentPackage, PhysicalPlan};
 use novarocks_plan_codec::PhysicalEncodeError;
 use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
-use novarocks_proto_models::plan;
 use novarocks_type_contract::PureCompileControl;
 
 use crate::query_execution::artifact::FragmentId;
@@ -47,103 +45,16 @@ use crate::query_execution::artifact::{
 };
 use crate::query_execution::assembly;
 
-use super::frozen::{FragmentArtifact, StaticFragmentHeader};
+use super::frozen::FragmentArtifact;
 use super::instance::select_fragment_pipeline_dop;
-
-/// Freezes every fragment of one completed plan, once, for every attempt.
-///
-/// Which consumers a CTE feeds and which exchange each router branch reaches
-/// are read from the plan's own edges, never from where its tasks are placed,
-/// so each static sink is completed here and the plan frozen with it. The
-/// generated messages are consumed: what survives is bytes and facts.
-#[expect(
-    clippy::type_complexity,
-    reason = "The CTE exchange payload follows the frozen native fragment contract."
-)]
-pub(crate) fn freeze_completed_fragments(
-    fragments: Vec<plan::PlanFragment>,
-    plan: &SubmissionPlanFacts,
-    root_fragment_id: FragmentId,
-) -> Result<BTreeMap<FragmentId, Arc<FragmentArtifact>>, String> {
-    let router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<_>)> =
-        assembly::group_router_edges_by_source(plan.router_edges())
-            .into_iter()
-            .map(|((source_fragment_id, router_group_id), branch_edges)| {
-                (source_fragment_id, (router_group_id, branch_edges))
-            })
-            .collect();
-    let cte_consumers = plan.cte_consumers();
-
-    let mut frozen = BTreeMap::new();
-    for mut native_fragment in fragments {
-        let fragment_id = native_fragment.fragment_id;
-        let facts = plan
-            .fragment(fragment_id)
-            .ok_or_else(|| format!("encoded fragment {fragment_id} is absent from the plan"))?;
-        let is_root = fragment_id == root_fragment_id;
-        let has_stream_edge = plan.has_stream_edge_from(fragment_id);
-        let router_edges = router_edges_by_source.get(&fragment_id);
-        let is_producer = has_stream_edge || router_edges.is_some() || facts.cte_id().is_some();
-        validate_fragment_output_kind(fragment_id, is_root, is_producer, facts.role())?;
-        assembly::ensure_native_fragment_sink_supported(
-            fragment_id,
-            is_root,
-            has_stream_edge,
-            router_edges.is_some(),
-            facts.cte_id().is_some(),
-        )?;
-        if !is_root && !has_stream_edge {
-            if let Some((router_group_id, branch_edges)) = router_edges {
-                assembly::patch_native_change_stream_router_sink(
-                    &mut native_fragment,
-                    fragment_id,
-                    *router_group_id,
-                    branch_edges,
-                )?;
-            } else if let Some(cte_id) = facts.cte_id() {
-                let consumers = cte_consumers.get(&cte_id).map(Vec::as_slice).unwrap_or(&[]);
-                assembly::validate_native_cte_multicast_sink(
-                    &native_fragment,
-                    fragment_id,
-                    cte_id,
-                    consumers,
-                )?;
-            }
-        }
-        let artifact = FragmentArtifact::freeze(
-            native_fragment,
-            StaticFragmentHeader {
-                plan_version: plan.version(),
-                plan_contract_revision: plan.contract_revision(),
-                dop_domain: facts.dop_domain(),
-            },
-        )?;
-        if frozen.insert(fragment_id, artifact).is_some() {
-            return Err(format!(
-                "completed plan encoded duplicate fragment id={fragment_id}"
-            ));
-        }
-    }
-    let expected = plan.fragment_ids();
-    let actual = frozen.keys().copied().collect::<BTreeSet<_>>();
-    if actual != expected {
-        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
-        let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
-        return Err(format!(
-            "completed plan froze fragments {actual:?} for plan fragments {expected:?}: \
-             missing={missing:?} unknown={unknown:?}"
-        ));
-    }
-    Ok(frozen)
-}
 
 /// Freezes every fragment of one completed plan, once, as a compiled package
 /// carrier.
 ///
 /// A package states its own sink: a stream sink addresses its consumer by the
 /// plan edge it feeds, so nothing is patched into it. The packages are the
-/// plan's own, keyed by the fragment each was extracted from, and the same
-/// output-kind and static-sink rules as the plan-tree freeze apply.
+/// plan's own, keyed by the fragment each was extracted from. Submission
+/// checks their result role and stream ownership before freezing.
 pub(crate) fn freeze_completed_packages(
     packages: BTreeMap<novarocks_physical_plan::FragmentId, FragmentPackage>,
     physical: &PhysicalPlan,
@@ -168,13 +79,7 @@ pub(crate) fn freeze_completed_packages(
         let is_root = fragment_id == root_fragment_id;
         let has_stream_edge = plan.has_stream_edge_from(fragment_id);
         validate_fragment_output_kind(fragment_id, is_root, has_stream_edge, facts.role())?;
-        assembly::ensure_native_fragment_sink_supported(
-            fragment_id,
-            is_root,
-            has_stream_edge,
-            false,
-            false,
-        )?;
+        assembly::ensure_native_fragment_sink_supported(fragment_id, is_root, has_stream_edge)?;
         let artifact =
             FragmentArtifact::freeze_package(package, physical.edges(), limits, control)?;
         if frozen.insert(fragment_id, artifact).is_some() {

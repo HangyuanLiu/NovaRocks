@@ -130,33 +130,23 @@ pub(crate) fn native_fragment_attachment_for_test(
 
 #[cfg(test)]
 mod tests {
-    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
-    use novarocks_proto_models::plan;
+    use novarocks_physical_plan::PipelineDopDomain;
 
     use super::*;
-    use crate::native::fragment_encoder::frozen::StaticFragmentHeader;
 
     fn fragment(fragment_id: FragmentId) -> Arc<FragmentArtifact> {
-        FragmentArtifact::freeze(
-            plan::PlanFragment {
-                fragment_id,
-                root: Some(plan::DistributedNode::default()),
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
+        crate::native::fragment_encoder::frozen::tests::frozen_package(
+            fragment_id,
+            0,
+            [3; 16],
+            PipelineDopDomain {
+                min: 1,
+                max: 4,
+                requires_power_of_two: false,
             },
-            StaticFragmentHeader {
-                plan_version: PlanVersionId::try_new([3; 16]).expect("nonzero version"),
-                plan_contract_revision: 1,
-                dop_domain: PipelineDopDomain {
-                    min: 1,
-                    max: 4,
-                    requires_power_of_two: false,
-                },
-            },
+            None,
+            0,
         )
-        .expect("a frozen fragment")
     }
 
     #[test]

@@ -145,12 +145,7 @@ pub(crate) fn prepare_completed_mv_write(
     bindings: &QueryTableBindingStore,
     connector_context: &ConnectorRequestContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    sealed: novarocks_plan_codec::SealedWriteTargets,
     needs: Box<[novarocks_sql::compiler::ProviderReadNeed]>,
-    field_names: std::collections::BTreeMap<
-        novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-        std::collections::BTreeMap<[u8; 32], Box<str>>,
-    >,
     finish: impl FnOnce(
         novarocks_physical_plan::PlanVersionId,
         novarocks_physical_plan::PipelineDopDomain,
@@ -225,17 +220,13 @@ pub(crate) fn prepare_completed_mv_write(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        kernel.function_catalog().as_ref(),
         kernel.static_plan_carrier(),
         kernel.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
-                sealed: &sealed,
-                field_names,
                 session: write_session.as_ref(),
             },
         ),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         control,
     )
     .map_err(encode_compile_error)?;

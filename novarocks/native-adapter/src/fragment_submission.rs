@@ -15,260 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native fragment envelope and static execution-contract projections.
-//!
-//! This module validates only protobuf shape and projects immutable wire
-//! values into Execution contracts.  It has no Backend context lookup, task
-//! state, Connector I/O, or fragment lifecycle authority.
+//! Native static sink projection against the task's frozen outbound edges.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use novarocks_execution::exec::fragment::program::{
-    FragmentNodeId, ScanAssignmentKind, ScanSourceContract,
-};
+use crate::fragment_instance::task_sink_edge_ids_path;
 use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
 use novarocks_execution_contract::task_execution::descriptor::{
     DataStreamPartitionType, ExchangeEdge, ExchangeTopology,
 };
-use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_proto_models::plan;
 use novarocks_types::UniqueId;
-
-use crate::fragment_instance::task_sink_edge_ids_path;
-
-pub fn require_root(
-    fragment: &plan::PlanFragment,
-) -> Result<&plan::DistributedNode, ProtocolError> {
-    fragment.root.as_ref().ok_or_else(|| {
-        error(
-            FieldPath::root("plan_fragment").field("root"),
-            ProtocolErrorKind::MissingField,
-            "native PlanFragment requires root",
-        )
-    })
-}
-
-pub fn require_sink(fragment: &plan::PlanFragment) -> Result<&plan::DataSink, ProtocolError> {
-    fragment.sink.as_ref().ok_or_else(|| {
-        error(
-            FieldPath::root("plan_fragment").field("sink"),
-            ProtocolErrorKind::MissingField,
-            "native PlanFragment requires sink",
-        )
-    })
-}
-
-pub fn decode_scan_source_contracts(
-    root: &plan::DistributedNode,
-    path: FieldPath,
-) -> Result<BTreeMap<FragmentNodeId, ScanSourceContract>, ProtocolError> {
-    let mut assignments = BTreeMap::new();
-    visit_scan_contracts(root, path, &mut assignments)?;
-    Ok(assignments)
-}
-
-/// Refuse scan ranges that do not name a scan source frozen by the plan.
-///
-/// Both inputs are immutable native-wire projections, so this check belongs
-/// beside their decoding rather than in Backend plan lowering.
-pub fn validate_scan_range_nodes(
-    contracts: &BTreeMap<FragmentNodeId, ScanSourceContract>,
-    raw_ranges: &BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    for node_id in raw_ranges.keys() {
-        if !contracts.contains_key(node_id) {
-            return Err(error(
-                path.clone().map_key(node_id.get().to_string()),
-                ProtocolErrorKind::InconsistentFields,
-                format!(
-                    "scan ranges assigned to unknown scan node {}",
-                    node_id.get()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn visit_scan_contracts(
-    node: &plan::DistributedNode,
-    path: FieldPath,
-    assignments: &mut BTreeMap<FragmentNodeId, ScanSourceContract>,
-) -> Result<(), ProtocolError> {
-    if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
-        && let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref()
-    {
-        let scan_path = path
-            .clone()
-            .field("payload")
-            .field("physical")
-            .field("scan");
-        let table = scan.table.as_ref().ok_or_else(|| {
-            error(
-                scan_path.clone().field("table"),
-                ProtocolErrorKind::MissingField,
-                format!("native ScanNode node_id={} requires table", node.node_id),
-            )
-        })?;
-        let source = table.source.as_ref().ok_or_else(|| {
-            error(
-                scan_path.clone().field("table").field("source"),
-                ProtocolErrorKind::MissingField,
-                format!("native ScanNode node_id={} requires source", node.node_id),
-            )
-        })?;
-        let source = source.kind.as_ref().ok_or_else(|| {
-            error(
-                scan_path
-                    .clone()
-                    .field("table")
-                    .field("source")
-                    .field("kind"),
-                ProtocolErrorKind::MissingField,
-                format!(
-                    "native ScanNode node_id={} requires source kind",
-                    node.node_id
-                ),
-            )
-        })?;
-        let _ = source;
-        if assignments
-            .insert(
-                FragmentNodeId::new(node.node_id),
-                ScanSourceContract::new(ScanAssignmentKind::File),
-            )
-            .is_some()
-        {
-            return Err(error(
-                path.clone().field("node_id"),
-                ProtocolErrorKind::InconsistentFields,
-                format!("native plan has duplicate scan node_id={}", node.node_id),
-            ));
-        }
-    }
-    for (index, child) in node.children.iter().enumerate() {
-        visit_scan_contracts(
-            child,
-            path.clone().field("children").index(index),
-            assignments,
-        )?;
-    }
-    Ok(())
-}
-
-/// Binds a fragment's static sink to the task's frozen outbound edges.
-///
-/// `sink_edge_ids` is the task assignment's ordered binding: entry `i` names
-/// the outbound topology edge serving static sink branch `i`. Every branch
-/// must be bound exactly once, to an edge that targets the branch's exchange
-/// node with the branch's partitioning; a mismatch is refused rather than
-/// resolved by guessing an edge from its node. `source` is this task's own
-/// kernel key, which every destination counts the frames it sends under.
-pub fn decode_fragment_sink_assignment(
-    sink: &plan::DataSink,
-    sink_edge_ids: &[u32],
-    source: UniqueId,
-    topology: &ExchangeTopology,
-) -> Result<FragmentSinkAssignment, ProtocolError> {
-    let path = FieldPath::root("plan_fragment").field("sink");
-    let kind = sink.kind.as_ref().ok_or_else(|| {
-        error(
-            path.clone().field("kind"),
-            ProtocolErrorKind::MissingField,
-            "native PlanFragment sink requires kind",
-        )
-    })?;
-    let expected = match kind {
-        plan::data_sink::Kind::DataStream(stream) => vec![(
-            stream.dest_node_id,
-            decode_stream_partition(stream, path.clone().field("data_stream"))?,
-        )],
-        plan::data_sink::Kind::MultiCastDataStream(grouped) => grouped
-            .sinks
-            .iter()
-            .enumerate()
-            .map(|(index, stream)| {
-                Ok((
-                    stream.dest_node_id,
-                    decode_stream_partition(
-                        stream,
-                        path.clone()
-                            .field("multi_cast_data_stream")
-                            .field("sinks")
-                            .index(index),
-                    )?,
-                ))
-            })
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-        plan::data_sink::Kind::ChangeStreamRouter(router) => router
-            .routes
-            .iter()
-            .enumerate()
-            .map(|(index, route)| {
-                let branch_path = path
-                    .clone()
-                    .field("change_stream_router")
-                    .field("routes")
-                    .index(index);
-                let kind = route
-                    .output_partition
-                    .as_ref()
-                    .map(|partition| partition.kind)
-                    .unwrap_or_else(|| {
-                        if route.output_partition_ordinals.is_empty() {
-                            plan::PartitionKind::Unpartitioned as i32
-                        } else {
-                            plan::PartitionKind::Hash as i32
-                        }
-                    });
-                Ok((
-                    route.target_exchange_node_id,
-                    decode_partition_kind(
-                        kind,
-                        branch_path.field("output_partition").field("kind"),
-                    )?,
-                ))
-            })
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-        plan::data_sink::Kind::Result(_)
-        | plan::data_sink::Kind::RootResult(_)
-        | plan::data_sink::Kind::Noop(_) => Vec::new(),
-    };
-    let edges = decode_sink_edges(&expected, sink_edge_ids, topology, path.clone())?;
-    let mut groups = edges
-        .into_iter()
-        .map(|edge| decode_edge_destinations(edge, source))
-        .collect::<Result<Vec<_>, _>>()?;
-    match kind {
-        plan::data_sink::Kind::DataStream(_) => Ok(FragmentSinkAssignment::StreamDestinations {
-            destinations: groups.pop().expect("one stream edge was validated"),
-            sender_id: None,
-        }),
-        plan::data_sink::Kind::MultiCastDataStream(grouped) => {
-            debug_assert_eq!(groups.len(), grouped.sinks.len());
-            Ok(FragmentSinkAssignment::DestinationGroups {
-                groups,
-                sender_id: None,
-            })
-        }
-        plan::data_sink::Kind::ChangeStreamRouter(router) => {
-            debug_assert_eq!(groups.len(), router.routes.len());
-            Ok(FragmentSinkAssignment::DestinationGroups {
-                groups,
-                sender_id: None,
-            })
-        }
-        plan::data_sink::Kind::Result(_)
-        | plan::data_sink::Kind::RootResult(_)
-        | plan::data_sink::Kind::Noop(_) => Ok(FragmentSinkAssignment::None),
-    }
-}
+use std::collections::BTreeSet;
 
 /// Binds a compiled program's static sink to the task's frozen outbound
-/// edges, with the same edge law as [`decode_fragment_sink_assignment`]: each
+/// edges, with the exact frozen edge law: each
 /// branch's destination node and partitioning come from the compiled static
 /// sink, never from a legacy plan tree.
 pub fn compiled_fragment_sink_assignment(
@@ -367,36 +127,6 @@ fn decode_sink_edges<'a>(
         .collect()
 }
 
-fn decode_stream_partition(
-    stream: &plan::DataStreamSink,
-    path: FieldPath,
-) -> Result<DataStreamPartitionType, ProtocolError> {
-    let partition = stream.output_partition.as_ref().ok_or_else(|| {
-        error(
-            path.clone().field("output_partition"),
-            ProtocolErrorKind::MissingField,
-            "native data stream sink requires output partitioning",
-        )
-    })?;
-    decode_partition_kind(partition.kind, path.field("output_partition").field("kind"))
-}
-
-fn decode_partition_kind(
-    kind: i32,
-    path: FieldPath,
-) -> Result<DataStreamPartitionType, ProtocolError> {
-    match plan::PartitionKind::try_from(kind) {
-        Ok(plan::PartitionKind::Unpartitioned) => Ok(DataStreamPartitionType::Unpartitioned),
-        Ok(plan::PartitionKind::Random) => Ok(DataStreamPartitionType::Random),
-        Ok(plan::PartitionKind::Hash) => Ok(DataStreamPartitionType::HashPartitioned),
-        Ok(plan::PartitionKind::Unspecified) | Err(_) => Err(error(
-            path,
-            ProtocolErrorKind::InvalidEnum,
-            "native sink partitioning must be a known non-default value",
-        )),
-    }
-}
-
 /// Projects one outbound edge onto the kernel's destination list.
 ///
 /// The producer's sender position belongs to the edge, not to any one
@@ -436,176 +166,18 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compiled_fragment_sink_assignment, decode_fragment_sink_assignment,
-        decode_scan_source_contracts, require_root, require_sink, validate_scan_range_nodes,
-    };
-    use std::collections::BTreeMap;
-    use std::num::NonZeroU32;
-
-    use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-    use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
+    use super::*;
+    use novarocks_execution_contract::FragmentNodeId;
     use novarocks_execution_contract::task_execution::descriptor::{
-        DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeTopology,
-        RuntimeEndpoint,
+        ExchangeDestination, RuntimeEndpoint,
     };
     use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
-    use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_models::plan;
-    use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
-
-    #[test]
-    fn preserves_missing_fragment_envelope_errors() {
-        let root = require_root(&plan::PlanFragment::default()).expect_err("root is required");
-        assert_eq!(
-            root.to_string(),
-            "native protocol error at plan_fragment.root (missing field): native PlanFragment requires root"
-        );
-        let sink = require_sink(&plan::PlanFragment::default()).expect_err("sink is required");
-        assert_eq!(
-            sink.to_string(),
-            "native protocol error at plan_fragment.sink (missing field): native PlanFragment requires sink"
-        );
-    }
-
-    #[expect(
-        clippy::needless_update,
-        reason = "The fixture keeps explicit defaulted proto fields for wire-contract readability."
-    )]
-    #[test]
-    fn classifies_typed_connector_read_as_file_assignment() {
-        let root = plan::DistributedNode {
-            node_id: 17,
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
-                    table: Some(plan::TableDef {
-                        source: Some(plan::ScanSource {
-                            kind: Some(plan::scan_source::Kind::TypedConnectorRead(
-                                Default::default(),
-                            )),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        let contracts =
-            decode_scan_source_contracts(&root, FieldPath::root("plan_fragment").field("root"))
-                .expect("decode scan contract");
-        assert_eq!(
-            contracts
-                .get(&FragmentNodeId::new(17))
-                .map(|contract| contract.assignment_kind()),
-            Some(ScanAssignmentKind::File)
-        );
-    }
-
-    #[test]
-    fn preserves_missing_scan_source_path() {
-        let root = plan::DistributedNode {
-            node_id: 17,
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
-                    table: Some(plan::TableDef::default()),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        let error =
-            decode_scan_source_contracts(&root, FieldPath::root("plan_fragment").field("root"))
-                .expect_err("missing source must fail");
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at plan_fragment.root.payload.physical.scan.table.source (missing field): native ScanNode node_id=17 requires source"
-        );
-    }
-
-    #[test]
-    fn rejects_scan_ranges_for_unknown_scan_node() {
-        let mut contracts = BTreeMap::new();
-        contracts.insert(
-            FragmentNodeId::new(17),
-            novarocks_execution::exec::fragment::program::ScanSourceContract::new(
-                ScanAssignmentKind::File,
-            ),
-        );
-        let mut ranges = BTreeMap::new();
-        ranges.insert(FragmentNodeId::new(19), Vec::new());
-
-        let error = validate_scan_range_nodes(
-            &contracts,
-            &ranges,
-            crate::fragment_instance::task_scan_ranges_path(),
-        )
-        .expect_err("unknown scan range node must fail");
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at creation_metadata.assignment.initial_scan_ranges[\"19\"] (inconsistent fields): scan ranges assigned to unknown scan node 19"
-        );
-    }
-
+    use std::num::NonZeroU32;
     const SOURCE: UniqueId = UniqueId::new(5, 6);
-
-    #[test]
-    fn stream_sink_requires_exactly_one_assigned_edge() {
-        let error = decode_fragment_sink_assignment(
-            &plan::DataSink {
-                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                    output_partition: Some(plan::DataPartition {
-                        kind: plan::PartitionKind::Unpartitioned as i32,
-                        exprs: Vec::new(),
-                    }),
-                    ..Default::default()
-                })),
-            },
-            &[],
-            SOURCE,
-            &novarocks_execution_contract::task_execution::descriptor::ExchangeTopology::default(),
-        )
-        .expect_err("edge assignment is required");
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at creation_metadata.assignment.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
-        );
-    }
-
-    #[test]
-    fn multicast_sink_requires_one_edge_per_branch() {
-        let error = decode_fragment_sink_assignment(
-            &plan::DataSink {
-                kind: Some(plan::data_sink::Kind::MultiCastDataStream(
-                    plan::MultiCastDataStreamSink {
-                        sinks: vec![plan::DataStreamSink {
-                            output_partition: Some(plan::DataPartition {
-                                kind: plan::PartitionKind::Unpartitioned as i32,
-                                exprs: Vec::new(),
-                            }),
-                            ..Default::default()
-                        }],
-                    },
-                )),
-            },
-            &[],
-            SOURCE,
-            &novarocks_execution_contract::task_execution::descriptor::ExchangeTopology::default(),
-        )
-        .expect_err("the multicast branch needs an edge");
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at creation_metadata.assignment.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
-        );
-    }
-
     fn task(execution: QueryExecutionId, task: u32) -> TaskIdentity {
         TaskIdentity::new(
             execution,
@@ -623,21 +195,6 @@ mod tests {
         .expect("execution id")
     }
 
-    fn unpartitioned_stream(dest_node_id: i32) -> plan::DataStreamSink {
-        plan::DataStreamSink {
-            dest_node_id,
-            output_partition: Some(plan::DataPartition {
-                kind: plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// The producer's sender position is one fact of its edge. Every
-    /// destination the edge fans out to must count this producer at that one
-    /// position, out of the target node's complete producer union -- which
-    /// here is larger than this edge's own single producer.
     #[test]
     fn every_destination_of_an_edge_counts_the_producer_at_the_edges_position() {
         let execution = execution();
@@ -660,10 +217,8 @@ mod tests {
         )
         .expect("edge");
         let topology = ExchangeTopology::try_new(vec![edge], vec![]).expect("topology");
-        let assignment = decode_fragment_sink_assignment(
-            &plan::DataSink {
-                kind: Some(plan::data_sink::Kind::DataStream(unpartitioned_stream(9))),
-            },
+        let assignment = compiled_fragment_sink_assignment(
+            &compiled_stream(9, DataStreamPartitionType::Unpartitioned),
             &[3],
             SOURCE,
             &topology,
@@ -802,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn multicast_sink_uses_explicit_edge_ids_even_when_branch_nodes_match() {
+    fn sink_branch_allocation_uses_explicit_edge_ids_even_when_nodes_match() {
         let execution = execution();
         let destination = |edge_id: u32, kernel_id: i64| {
             ExchangeEdge::try_new(
@@ -823,47 +378,65 @@ mod tests {
         let topology =
             ExchangeTopology::try_new(vec![destination(1, 11), destination(2, 22)], vec![])
                 .expect("topology");
-        let sink = plan::DataSink {
-            kind: Some(plan::data_sink::Kind::MultiCastDataStream(
-                plan::MultiCastDataStreamSink {
-                    sinks: vec![unpartitioned_stream(9), unpartitioned_stream(9)],
-                },
-            )),
-        };
-        let assignment = decode_fragment_sink_assignment(&sink, &[2, 1], SOURCE, &topology)
-            .expect("explicit edge ids disambiguate the groups");
-        let FragmentSinkAssignment::DestinationGroups { groups, .. } = assignment else {
-            panic!("multicast requires grouped destinations");
-        };
+        let expected = [
+            (9, DataStreamPartitionType::Unpartitioned),
+            (9, DataStreamPartitionType::Unpartitioned),
+        ];
+        let edges = decode_sink_edges(
+            &expected,
+            &[2, 1],
+            &topology,
+            FieldPath::root("fragment_package").field("sink"),
+        )
+        .expect("explicit ids disambiguate equal branch nodes");
+        let groups = edges
+            .into_iter()
+            .map(|edge| decode_edge_destinations(edge, SOURCE).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(*groups[0][0].finst_id(), UniqueId::new(22, 1));
         assert_eq!(*groups[1][0].finst_id(), UniqueId::new(11, 1));
-        assert_eq!(groups[0][0].source_finst_id(), UniqueId::new(5, 6));
-
-        let error = decode_fragment_sink_assignment(&sink, &[1, 1], SOURCE, &topology)
-            .expect_err("one edge cannot serve two branches");
+        assert_eq!(groups[0][0].source_finst_id(), SOURCE);
+        let error = decode_sink_edges(
+            &expected,
+            &[1, 1],
+            &topology,
+            FieldPath::root("fragment_package").field("sink"),
+        )
+        .expect_err("one edge cannot serve two branches");
         assert!(
             error
                 .to_string()
                 .contains("sink edge id must be nonzero and used only once")
         );
-
-        let mut wrong_partition = sink;
-        let Some(plan::data_sink::Kind::MultiCastDataStream(grouped)) =
-            wrong_partition.kind.as_mut()
-        else {
-            unreachable!("test sink is multicast");
-        };
-        grouped.sinks[0]
-            .output_partition
-            .as_mut()
-            .expect("partition")
-            .kind = plan::PartitionKind::Hash as i32;
-        let error = decode_fragment_sink_assignment(&wrong_partition, &[2, 1], SOURCE, &topology)
-            .expect_err("static partition must agree with assigned edge");
+        let wrong = [
+            (9, DataStreamPartitionType::HashPartitioned),
+            (9, DataStreamPartitionType::Unpartitioned),
+        ];
+        let error = decode_sink_edges(
+            &wrong,
+            &[2, 1],
+            &topology,
+            FieldPath::root("fragment_package").field("sink"),
+        )
+        .expect_err("partitioning must agree with the exact edge");
         assert!(
             error
                 .to_string()
                 .contains("partitioning disagrees with its assigned edge")
         );
+    }
+    #[test]
+    fn compiled_stream_requires_exactly_one_assigned_edge() {
+        for ids in [vec![], vec![3, 3], vec![0], vec![7]] {
+            assert!(
+                compiled_fragment_sink_assignment(
+                    &compiled_stream(9, DataStreamPartitionType::Unpartitioned),
+                    &ids,
+                    SOURCE,
+                    &one_edge_topology(DataStreamPartitionType::Unpartitioned)
+                )
+                .is_err()
+            );
+        }
     }
 }

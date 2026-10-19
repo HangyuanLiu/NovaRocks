@@ -1540,11 +1540,12 @@ mod tests {
             .expect("original builtin engine function catalog");
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             paired,
-            &functions,
-            &crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+            &crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            ),
             crate::application::test_constant_policy(),
             None,
-            false,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("production physical-to-native encoding");

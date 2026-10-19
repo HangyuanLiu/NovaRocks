@@ -115,21 +115,11 @@ fn incremental_change_stream_routes(
     target: &crate::catalog_application::resolver::TargetBackend,
     target_bindings: &QueryTableBindingStore,
     planning_lease: &ConnectorControlPlanningLease,
-) -> Result<
-    (
-        Vec<novarocks_sql::planning::dml::DmlChangeStreamRoute>,
-        std::collections::BTreeMap<
-            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-            std::collections::BTreeMap<[u8; 32], Box<str>>,
-        >,
-    ),
-    String,
-> {
+) -> Result<Vec<novarocks_sql::planning::dml::DmlChangeStreamRoute>, String> {
     use novarocks_spi::connector::ConnectorWriteInputShape;
 
     let routed_targets = change_stream_routed_targets(write_session.targets())?;
     let mut routes = Vec::with_capacity(routed_targets.len());
-    let mut field_names = std::collections::BTreeMap::new();
     for (write_target, route) in routed_targets {
         let target_binding = admit_session_connector_write_target(
             target_bindings,
@@ -164,10 +154,7 @@ fn incremental_change_stream_routes(
             mode,
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
-        field_names.insert(
-            write_target.ordinal(),
-            sink.accepted_field_names().into_iter().collect(),
-        );
+
         routes.push(novarocks_sql::planning::dml::DmlChangeStreamRoute {
             route_id: route.route_id(),
             // The branch's identity is its sealed ordinal, never its position
@@ -179,7 +166,7 @@ fn incremental_change_stream_routes(
             sink,
         });
     }
-    Ok((routes, field_names))
+    Ok(routes)
 }
 
 fn incremental_change_stream_statistics_targets(
@@ -307,10 +294,10 @@ fn bind_incremental_write_dataflow(
     // The recipes are sealed once, here, and travel with the plan they were
     // sealed for, so an encode can never pair one round's plan with another's
     // session.
-    let sealed_write_targets = write_session
+    let _sealed_write_targets = write_session
         .seal_write_targets()
         .map_err(|error| format!("seal MV incremental write targets: {error}"))?;
-    let (sealed_change_stream_routes, field_names) = incremental_change_stream_routes(
+    let sealed_change_stream_routes = incremental_change_stream_routes(
         write_session,
         &target,
         target_bindings.as_ref(),
@@ -398,9 +385,7 @@ fn bind_incremental_write_dataflow(
                 target_bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
-                sealed_write_targets,
                 needs,
-                field_names,
                 |version, dop, reads, targets| {
                     completion
                         .finish(
@@ -496,9 +481,7 @@ fn bind_incremental_write_dataflow(
                 target_bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
-                sealed_write_targets,
                 needs,
-                field_names,
                 |version, dop, reads, targets| {
                     completion
                         .finish(

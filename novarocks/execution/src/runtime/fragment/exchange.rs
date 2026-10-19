@@ -16,50 +16,17 @@
 // under the License.
 
 use crate::exec::pipeline::binding::{ExchangeBinding, ExchangeBindings};
-use crate::runtime::fragment::instance::{ExchangeInputAssignments, FragmentInstanceSpec};
+use crate::runtime::fragment::instance::ExchangeInputAssignments;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::exec::fragment::program::{FragmentNodeId, FragmentProgram};
+use crate::exec::fragment::program::FragmentNodeId;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
 use crate::runtime::exchange::{ExchangeColumnBinding, ExchangeKey};
 use crate::runtime::fragment::io::{
     ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
 };
 use novarocks_types::UniqueId;
-
-/// Materialize per-node exchange bindings from the validated instance spec.
-/// Program exchange contracts (schema) were already cross-checked by
-/// `FragmentSubmission::try_new`; here we only project the dynamic parts
-/// (sender count + this instance's `ExchangeKey`) into an exec-level carrier.
-pub(crate) fn materialize_exchange_bindings(
-    program: &FragmentProgram,
-    instance: &FragmentInstanceSpec,
-    receiver_port: Arc<dyn ExchangeReceiverPort>,
-) -> ExchangeBindings {
-    let finst = instance.fragment_instance_id().get();
-    let mut bindings = ExchangeBindings::default();
-    for node_id in program.exchange_inputs().keys() {
-        let assignment = instance
-            .exchange_inputs()
-            .get(node_id)
-            .expect("submission validation guarantees an exchange assignment per contract");
-        let key = ExchangeKey {
-            finst_id_hi: finst.high(),
-            finst_id_lo: finst.low(),
-            node_id: node_id.get(),
-        };
-        bindings.insert(
-            node_id.get(),
-            ExchangeBinding {
-                key,
-                expected_senders: assignment.sender_count().get(),
-                receiver_port: Arc::clone(&receiver_port),
-            },
-        );
-    }
-    bindings
-}
 
 /// The receivers one compiled fragment instance registers before it runs,
 /// and the pipeline bindings its exchange sources pull from.
@@ -180,110 +147,60 @@ pub(crate) fn materialize_compiled_exchange_receivers(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
-    use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::fragment::program::{
-        ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-        FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract,
-    };
-    use crate::exec::fragment::sink::FragmentSinkProgram;
-    use crate::exec::node::values::ValuesNode;
-    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use super::{materialize_compiled_exchange_receivers, test_receiver_creation_factory};
+    use crate::exec::fragment::program::FragmentNodeId;
     use crate::runtime::exchange::ExchangeKey;
-    use crate::runtime::fragment::instance::{
-        BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
-        FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
-    };
-    use crate::runtime::query_options::QueryOptions;
-    use novarocks_types::QueryId;
+    use crate::runtime::fragment::handle::compiled_prepare::tests::sql_gather_receiver_program;
+    use crate::runtime::fragment::instance::{ExchangeInputAssignment, ExchangeInputAssignments};
+    use crate::runtime::fragment::io::UnavailableExchangeReceiverPort;
     use novarocks_types::UniqueId;
-
-    use super::materialize_exchange_bindings;
-
-    fn values_program(
-        exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
-    ) -> FragmentProgram {
-        let plan = ExecPlan {
-            arena: ExprArena::default(),
-            root: ExecNode {
-                kind: ExecNodeKind::Values(ValuesNode {
-                    chunk: crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0),
-                    node_id: 1,
-                }),
-            },
-        };
-        let profile =
-            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
-        let (local, runtime) = crate::exec::chunk::typed_fixture::try_lower_with_scans(
-            plan,
-            profile,
-            BTreeMap::new(),
-            Vec::new(),
-            novarocks_local_program::StaticSinkProgram::Noop,
-        )
-        .unwrap();
-        assert_eq!(runtime.scan_count(), 0);
-        FragmentProgram::try_new(
-            Arc::new(local),
-            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-            BTreeMap::new(),
-            exchange_inputs,
-            RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
-        )
-        .unwrap()
-    }
-
-    fn instance_with_exchange(
-        exchange_inputs: ExchangeInputAssignments,
-        fragment_instance_id: UniqueId,
-    ) -> FragmentInstanceSpec {
-        FragmentInstanceSpec::new_native(
-            FragmentContractVersion::CURRENT,
-            QueryId::new(1, 2),
-            FragmentInstanceId::new(fragment_instance_id),
-            ScanAssignments::default(),
-            exchange_inputs,
-            FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), false),
-            NonZeroUsize::new(1).expect("non-zero DOP"),
-            BackendNum::try_new(1).expect("backend number"),
-        )
-    }
 
     #[test]
     fn exchange_binding_takes_sender_count_from_instance_and_key_from_finst_id() {
-        let node_id = FragmentNodeId::new(5);
-        let program = values_program(BTreeMap::from([(
+        let program = sql_gather_receiver_program();
+        let receiver = program
+            .exchange_inputs()
+            .values()
+            .next()
+            .unwrap()
+            .receiver_node;
+        assert_eq!(program.exchange_inputs().len(), 1);
+        let node_id = FragmentNodeId::new(i32::try_from(receiver).unwrap());
+        let assignments = ExchangeInputAssignments::new(BTreeMap::from([(
             node_id,
-            ExchangeInputContract::new(Arc::new(ChunkSchema::empty())),
+            ExchangeInputAssignment::new(NonZeroUsize::new(3).unwrap()),
         )]));
-        let instance = instance_with_exchange(
-            ExchangeInputAssignments::new(BTreeMap::from([(
-                node_id,
-                ExchangeInputAssignment::new(NonZeroUsize::new(3).expect("non-zero sender count")),
-            )])),
-            UniqueId::new(11, 22),
-        );
-
-        let bindings = materialize_exchange_bindings(
+        let creation = test_receiver_creation_factory();
+        let receivers = materialize_compiled_exchange_receivers(
             &program,
-            &instance,
-            Arc::new(crate::runtime::fragment::io::UnavailableExchangeReceiverPort),
-        );
-
-        let binding = bindings.get(5).expect("binding for exchange node 5");
+            UniqueId::new(11, 22),
+            &assignments,
+            Arc::new(UnavailableExchangeReceiverPort),
+            Some(&creation),
+        )
+        .unwrap();
+        let binding = receivers
+            .bindings
+            .get(node_id.get())
+            .expect("receiver binding");
         assert_eq!(binding.expected_senders, 3);
         assert_eq!(
             binding.key,
             ExchangeKey {
                 finst_id_hi: 11,
                 finst_id_lo: 22,
-                node_id: 5,
+                node_id: node_id.get(),
             }
         );
+        let [registration] = receivers.registrations.as_slice() else {
+            panic!("one compiled input has exactly one receiver registration")
+        };
+        assert_eq!(registration.expected_senders, 3);
+        assert_eq!(registration.key.fragment_instance_id, UniqueId::new(11, 22));
+        assert_eq!(registration.key.node_id, node_id.get());
     }
 }

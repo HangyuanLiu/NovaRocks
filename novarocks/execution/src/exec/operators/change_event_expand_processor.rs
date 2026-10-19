@@ -37,8 +37,9 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::SlotId;
 
-/// Factory for runtime ChangeEventExpand processors.
-pub struct ChangeEventExpandProcessorFactory {
+/// F3 array/expression oracle over explicit event facts; unavailable to product composition.
+#[cfg(test)]
+pub(crate) struct ChangeEventExpandFixtureFactory {
     name: String,
     arena: Arc<ExprArena>,
     events: Vec<ChangeEventRuntimeSpec>,
@@ -47,7 +48,8 @@ pub struct ChangeEventExpandProcessorFactory {
     effect_slot_id: SlotId,
 }
 
-impl ChangeEventExpandProcessorFactory {
+#[cfg(test)]
+impl ChangeEventExpandFixtureFactory {
     pub fn new(
         node_id: i32,
         arena: Arc<ExprArena>,
@@ -73,13 +75,14 @@ impl ChangeEventExpandProcessorFactory {
     }
 }
 
-impl OperatorFactory for ChangeEventExpandProcessorFactory {
+#[cfg(test)]
+impl OperatorFactory for ChangeEventExpandFixtureFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(ChangeEventExpandProcessorOperator {
+        Box::new(ChangeEventExpandFixtureOperator {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             events: self.events.clone(),
@@ -94,7 +97,8 @@ impl OperatorFactory for ChangeEventExpandProcessorFactory {
     }
 }
 
-struct ChangeEventExpandProcessorOperator {
+#[cfg(test)]
+struct ChangeEventExpandFixtureOperator {
     name: String,
     arena: Arc<ExprArena>,
     events: Vec<ChangeEventRuntimeSpec>,
@@ -107,7 +111,8 @@ struct ChangeEventExpandProcessorOperator {
     finished: bool,
 }
 
-impl Operator for ChangeEventExpandProcessorOperator {
+#[cfg(test)]
+impl Operator for ChangeEventExpandFixtureOperator {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -143,7 +148,8 @@ impl Operator for ChangeEventExpandProcessorOperator {
     }
 }
 
-impl ProcessorOperator for ChangeEventExpandProcessorOperator {
+#[cfg(test)]
+impl ProcessorOperator for ChangeEventExpandFixtureOperator {
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.pending_output.is_none()
     }
@@ -193,7 +199,8 @@ impl ProcessorOperator for ChangeEventExpandProcessorOperator {
     }
 }
 
-impl ChangeEventExpandProcessorOperator {
+#[cfg(test)]
+impl ChangeEventExpandFixtureOperator {
     fn process_one(
         &self,
         chunk: &Chunk,
@@ -432,12 +439,14 @@ impl ChangeEventExpandProcessorOperator {
     }
 }
 
+#[cfg(test)]
 fn selected_row_count(mask: &BooleanArray) -> usize {
     mask.iter()
         .filter(|value| matches!(value, Some(true)))
         .count()
 }
 
+#[cfg(test)]
 fn filter_selected_rows(
     array: ArrayRef,
     mask: &BooleanArray,
@@ -449,6 +458,7 @@ fn filter_selected_rows(
     filter(array.as_ref(), mask).map_err(|err| format!("filter selected rows failed: {err}"))
 }
 
+#[cfg(test)]
 fn effect_value_array(
     value: i8,
     target_type: &arrow::datatypes::DataType,
@@ -458,6 +468,7 @@ fn effect_value_array(
     cast_array_to_target(&array, target_type)
 }
 
+#[cfg(test)]
 fn validate_output_schema(
     output_chunk_schema: &ChunkSchemaRef,
     output_slot_ids: &[SlotId],
@@ -586,7 +597,7 @@ mod tests {
     fn change_event_expand_materializes_logical_effects() {
         let mut arena = ExprArena::default();
         let value = slot_expr(&mut arena);
-        let factory = ChangeEventExpandProcessorFactory::new(
+        let factory = ChangeEventExpandFixtureFactory::new(
             7,
             Arc::new(arena),
             vec![
@@ -638,7 +649,7 @@ mod tests {
             ExprNode::Literal(LiteralValue::Bool(false)),
             DataType::Boolean,
         );
-        let factory = ChangeEventExpandProcessorFactory::new(
+        let factory = ChangeEventExpandFixtureFactory::new(
             8,
             Arc::new(arena),
             vec![ChangeEventRuntimeSpec {
@@ -666,7 +677,7 @@ mod tests {
 
     #[test]
     fn change_event_expand_rejects_non_int8_effect_slot() {
-        let err = match ChangeEventExpandProcessorFactory::new(
+        let err = match ChangeEventExpandFixtureFactory::new(
             9,
             Arc::new(ExprArena::default()),
             Vec::new(),
@@ -724,7 +735,7 @@ mod tests {
             },
             DataType::Int64,
         );
-        let factory = ChangeEventExpandProcessorFactory::new(
+        let factory = ChangeEventExpandFixtureFactory::new(
             10,
             Arc::new(arena),
             vec![ChangeEventRuntimeSpec {
@@ -781,7 +792,7 @@ mod tests {
         for original in causes {
             let mut arena = ExprArena::default();
             let source = slot_expr(&mut arena);
-            let factory = ChangeEventExpandProcessorFactory::new(
+            let factory = ChangeEventExpandFixtureFactory::new(
                 11,
                 Arc::new(arena),
                 vec![ChangeEventRuntimeSpec {

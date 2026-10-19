@@ -122,7 +122,7 @@ fn source_fixture(json_result: bool) -> Source {
     }
 }
 fn make_operator(source: &Source) -> Box<dyn Operator> {
-    let factory = TableFunctionProcessorFactory::new_typed(
+    let factory = TableFunctionFixtureFactory::new_typed(
         3,
         "unnest".into(),
         vec![SlotId::new(1)],
@@ -219,7 +219,7 @@ fn native_table_function_rejects_same_carrier_wrong_domain_and_missing_owner() {
     drop(operator);
     drop(source);
     let source = source_fixture(true);
-    let factory = TableFunctionProcessorFactory::new_typed(
+    let factory = TableFunctionFixtureFactory::new_typed(
         3,
         "unnest".into(),
         vec![SlotId::new(1)],

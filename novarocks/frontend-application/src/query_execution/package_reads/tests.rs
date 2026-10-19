@@ -71,9 +71,7 @@ use crate::catalog_application::query_catalog::{QueryCatalogService, new_query_c
 use crate::catalog_application::query_materializer::{
     CatalogServiceMaterializer, iceberg_table_binding_loader,
 };
-use crate::query_execution::package_freeze::{
-    CompiledPackageCarrier, PackageFreezeError, StaticPlanCarrier,
-};
+use crate::query_execution::package_freeze::{CompiledPackageCarrier, PackageFreezeError};
 use crate::query_execution::physical_encoding::{EncodedCompletedPlan, encode_completed_plan};
 use crate::query_execution::provider_read_facts::{
     FrontendProviderReadFacts, FrozenProviderRead, FrozenReadEncoding,
@@ -366,7 +364,7 @@ impl PaimonFixture {
     fn complete(
         &self,
         sql: &str,
-        _carrier: StaticPlanCarrier,
+        _carrier: CompiledPackageCarrier,
     ) -> CompletedPlanWithAccess<FrozenProviderRead> {
         self.complete_statement(sql)
     }
@@ -416,8 +414,8 @@ impl PaimonFixture {
 
 /// Package admission within the test encode limits' envelope. This is not a
 /// production sizing.
-fn compiled_carrier() -> StaticPlanCarrier {
-    StaticPlanCarrier::CompiledPackage(CompiledPackageCarrier::new(
+fn compiled_carrier() -> CompiledPackageCarrier {
+    CompiledPackageCarrier::new(
         novarocks_physical_plan::FragmentPackageAdmission {
             plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
             source_retained_bytes: 64 << 20,
@@ -428,21 +426,18 @@ fn compiled_carrier() -> StaticPlanCarrier {
             },
         },
         novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
-    ))
+    )
 }
 
 fn encode(
     completed: CompletedPlanWithAccess<FrozenProviderRead>,
-    carrier: &StaticPlanCarrier,
+    carrier: &CompiledPackageCarrier,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     encode_completed_plan(
         completed,
-        &novarocks_sql::compiler::build_builtin_engine_function_catalog()
-            .expect("builtin engine function catalog"),
         carrier,
         crate::application::test_constant_policy(),
         None,
-        false,
         &SqlCompileControl::unbounded(),
     )
 }
@@ -669,45 +664,6 @@ fn a_paimon_scan_freezes_a_compiled_package_the_provider_and_local_compilers_acc
         }
     }
     assert_eq!(validated_reads, 1, "the provider compiled exactly one read");
-}
-
-/// The same statement still freezes into the plan tree, with the same attempt
-/// scan facts: the compiled author reads the freeze, it does not change it.
-// Retained while Paimon-specific tests are suspended.
-#[cfg(any())]
-#[test]
-fn a_paimon_scan_still_freezes_into_the_plan_tree() {
-    let fixture = paimon_fixture();
-    let tree = encode(
-        fixture.complete_statement(SCAN_SQL),
-        &StaticPlanCarrier::PlanTree,
-    )
-    .unwrap_or_else(|error| panic!("{SCAN_SQL}: the plan tree encodes: {error}"));
-    let packaged = encode(
-        fixture.complete(SCAN_SQL, compiled_carrier()),
-        &compiled_carrier(),
-    )
-    .unwrap_or_else(|error| panic!("{SCAN_SQL}: the compiled carrier encodes: {error}"));
-    assert_eq!(tree.access.iter().count(), 1);
-    let ([tree_scan], [packaged_scan]) = (tree.plan_facts.scans(), packaged.plan_facts.scans())
-    else {
-        panic!("{SCAN_SQL}: each carrier states one attempt scan");
-    };
-    assert_eq!(tree_scan.fragment_id, packaged_scan.fragment_id);
-    assert_eq!(tree_scan.plan_node_id, packaged_scan.plan_node_id);
-    assert_eq!(
-        tree_scan
-            .assignments
-            .iter()
-            .map(|assignment| (assignment.variable().to_owned(), assignment.value_type()))
-            .collect::<Vec<_>>(),
-        packaged_scan
-            .assignments
-            .iter()
-            .map(|assignment| (assignment.variable().to_owned(), assignment.value_type()))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(tree.topology, packaged.topology);
 }
 
 /// Every fact of the authored read comes from the plan or the freeze; one

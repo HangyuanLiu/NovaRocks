@@ -212,12 +212,11 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
-    use novarocks_proto_models::plan;
+    use novarocks_physical_plan::PipelineDopDomain;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
 
-    use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticFragmentHeader};
+    use crate::native::fragment_encoder::frozen::FragmentArtifact;
     use crate::query_execution::artifact::NativePlacementAssignment;
     use crate::query_execution::schedule::FragmentInstancePlacement;
 
@@ -265,26 +264,18 @@ mod tests {
     }
 
     fn artifact(fragment_id: FragmentId) -> Arc<FragmentArtifact> {
-        FragmentArtifact::freeze(
-            plan::PlanFragment {
-                fragment_id,
-                root: Some(plan::DistributedNode::default()),
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
+        crate::native::fragment_encoder::frozen::tests::frozen_package(
+            fragment_id,
+            0,
+            [1; 16],
+            PipelineDopDomain {
+                min: 1,
+                max: 16,
+                requires_power_of_two: false,
             },
-            StaticFragmentHeader {
-                plan_version: PlanVersionId::try_new([1; 16]).expect("nonzero version"),
-                plan_contract_revision: 1,
-                dop_domain: PipelineDopDomain {
-                    min: 1,
-                    max: 16,
-                    requires_power_of_two: false,
-                },
-            },
+            None,
+            0,
         )
-        .expect("a frozen fragment")
     }
 
     fn submission_of(

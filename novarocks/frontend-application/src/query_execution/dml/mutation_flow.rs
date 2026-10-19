@@ -392,13 +392,12 @@ fn compile_dml_change_stream_write(
     // The recipes are sealed before the plan is compiled because the plan's
     // writer nodes carry them: a plan and the session that sealed it must not be
     // separable.
-    let sealed_write_targets = write_session
+    let _sealed_write_targets = write_session
         .seal_write_targets()
         .map_err(|error| format!("seal row-mutation write targets: {error}"))?;
     let routed_targets = change_stream_routed_targets(write_session)?;
     let mut routes = Vec::with_capacity(routed_targets.len());
     let mut statistics_targets = Vec::with_capacity(routed_targets.len());
-    let mut field_names = std::collections::BTreeMap::new();
     for (write_target, route) in routed_targets {
         let target_binding = admit_session_connector_write_target(
             table_bindings.as_ref(),
@@ -424,10 +423,7 @@ fn compile_dml_change_stream_write(
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )
         .map_err(|error| format!("build row-mutation route sink: {error}"))?;
-        field_names.insert(
-            write_target.ordinal(),
-            sink.accepted_field_names().into_iter().collect(),
-        );
+
         routes.push(DmlChangeStreamRoute {
             route_id: route.route_id(),
             // The branch's identity is its sealed ordinal, never its position
@@ -566,17 +562,13 @@ fn compile_dml_change_stream_write(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        state.function_catalog().as_ref(),
         state.static_plan_carrier(),
         state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
-                sealed: &sealed_write_targets,
-                field_names,
                 session: write_session.as_ref(),
             },
         ),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(
@@ -3546,11 +3538,9 @@ fn execute_exact_cow_match_query(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        state.function_catalog().as_ref(),
         state.static_plan_carrier(),
         state.constant_policy(),
         None,
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
@@ -5043,7 +5033,10 @@ mod tests {
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 crate::application::test_constant_policy(),
-                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+                crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                    novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                    novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                ),
             ),
             None,
             Arc::clone(&connector_control),
@@ -6726,7 +6719,10 @@ mod tests {
                             crate::catalog_application::query_catalog::new_query_catalog_service(),
                         ),
                         crate::application::test_constant_policy(),
-                        crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+                        crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                            novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                        ),
                     ),
                     None,
                     registry,

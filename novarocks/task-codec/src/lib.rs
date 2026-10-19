@@ -69,7 +69,7 @@ pub(crate) fn duplicate(path: FieldPath, detail: impl Into<String>) -> ProtocolE
 
 #[cfg(test)]
 mod tests {
-    use super::creation::{decode_static_fragment, encode_creation_metadata, take_task_assignment};
+    use super::creation::{decode_static_package, encode_creation_metadata, take_task_assignment};
     use super::descriptor::{decode_task_descriptor, decode_topology, encode_topology};
     use super::identity::{
         decode_query_context_ref, decode_task_identity, encode_admission_ticket_id,
@@ -109,7 +109,7 @@ mod tests {
     };
     use novarocks_execution_contract::task_execution::transition::QueryContextState;
     use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
-    use novarocks_proto_models::{catalog, common, filter, novarocks, plan};
+    use novarocks_proto_models::{catalog, common, filter, novarocks};
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -191,24 +191,9 @@ mod tests {
         }
     }
 
-    fn frozen_fragment(dop: u32) -> novarocks::FrozenFragment {
+    fn frozen_fragment(_dop: u32) -> novarocks::FrozenFragment {
         novarocks::FrozenFragment {
-            package: Default::default(),
-            plan_version: vec![1; 16],
-            plan_contract_revision: 1,
-            fragment_contract_version: 1,
-            pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
-                min: dop,
-                max: dop,
-                requires_power_of_two: false,
-            }),
-            plan: Some(plan::PlanFragment {
-                fragment_id: 4,
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
-            }),
+            package: prost::bytes::Bytes::from_static(b"opaque fragment package"),
         }
     }
 
@@ -296,7 +281,7 @@ mod tests {
             "the creation input detaches the bounded field from its ingress backing"
         );
         assert!(
-            decode_static_fragment(input.static_fragment(), FieldPath::root("fragment")).is_err(),
+            decode_static_package(input.static_fragment(), FieldPath::root("fragment")).is_err(),
             "the winner refuses the bytes ingress never read"
         );
     }
@@ -2322,9 +2307,9 @@ mod tests {
                     "the static carrier arrives exactly as it was frozen"
                 );
                 let fragment =
-                    decode_static_fragment(create.input().static_fragment(), FieldPath::root("f"))
+                    decode_static_package(create.input().static_fragment(), FieldPath::root("f"))
                         .expect("the winner decodes the frozen fragment");
-                assert_eq!(fragment.plan().fragment_id, 4);
+                assert_eq!(fragment.package().as_ref(), b"opaque fragment package");
             }
             other => panic!("expected a create, got {other:?}"),
         }

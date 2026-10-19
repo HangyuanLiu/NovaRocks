@@ -22,8 +22,10 @@
 //! different installed support cannot share an island. Nothing per task or
 //! per statement selects an interpreter.
 
+// Design: ADR-0184 (docs/adr/ADR-0184-compiled-packages-are-the-sole-static-plan-path.md)
+
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
-use novarocks_native_adapter::backend_application::BackendStaticPlanInterpreter;
+use novarocks_native_adapter::backend_application::CompiledStaticPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use novarocks_version::StaticPlanInterpreter;
 
@@ -33,15 +35,6 @@ use crate::provider_manifest::ServerProviderManifest;
 /// Composed once before compatibility material and before either role starts.
 pub struct ServerStaticPlan {
     compiled: CompiledPackage,
-}
-
-/// The carrier this process's frontend freezes under the backend admission.
-#[derive(Clone, Copy, Debug)]
-pub enum FrontendStaticPlanCarrier {
-    CompiledPackage {
-        admission: novarocks_physical_plan::FragmentPackageAdmission,
-        limits: novarocks_plan_codec::physical_package_v2::PackageEncodeLimits,
-    },
 }
 
 impl ServerStaticPlan {
@@ -61,11 +54,11 @@ impl ServerStaticPlan {
         }
     }
 
-    pub fn backend_interpreter(&self) -> anyhow::Result<BackendStaticPlanInterpreter> {
+    pub fn backend_interpreter(&self) -> anyhow::Result<CompiledStaticPlan> {
         self.compiled.backend_interpreter()
     }
 
-    pub fn frontend_carrier(&self) -> FrontendStaticPlanCarrier {
+    pub fn frontend_carrier(&self) -> novarocks_frontend_application::CompiledPackageCarrier {
         self.compiled.frontend_carrier()
     }
 }
@@ -97,12 +90,10 @@ mod tests {
                 pure_function_catalog_digest: seal.catalog.digest(),
             }
         );
-        assert!(matches!(
-            plan.backend_interpreter().expect("backend interpreter"),
-            BackendStaticPlanInterpreter::CompiledPackage(_)
-        ));
-        let FrontendStaticPlanCarrier::CompiledPackage { admission, limits } =
-            plan.frontend_carrier();
+        plan.backend_interpreter().expect("backend interpreter");
+        let carrier = plan.frontend_carrier();
+        let admission = carrier.admission();
+        let limits = carrier.limits();
         let receiver = novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN;
         assert_eq!(admission.plan_limits, receiver.admission.plan_limits);
         assert_eq!(

@@ -252,7 +252,7 @@ fn bind_first_refresh_write_dataflow(
     // The recipes are sealed once, here, and travel with the plan they were
     // sealed for, so an encode can never pair one round's plan with another's
     // session.
-    let sealed_write_targets = write_session
+    let _sealed_write_targets = write_session
         .seal_write_targets()
         .map_err(|error| format!("seal MV first-refresh write target: {error}"))?;
     match prepared.into_execution_artifact() {
@@ -274,10 +274,7 @@ fn bind_first_refresh_write_dataflow(
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
                 novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
-            let field_names = std::collections::BTreeMap::from([(
-                write_target_ordinal,
-                sink.accepted_field_names().into_iter().collect(),
-            )]);
+
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
             let materializer =
                 crate::catalog_application::query_materializer::CatalogServiceMaterializer::new(
@@ -328,9 +325,7 @@ fn bind_first_refresh_write_dataflow(
                 bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
-                sealed_write_targets,
                 needs,
-                field_names,
                 |version, dop, reads, targets| {
                     completion.finish(version, dop, reads, targets, &finish_control)
                 },
@@ -378,10 +373,7 @@ fn bind_first_refresh_write_dataflow(
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
                 novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
-            let field_names = std::collections::BTreeMap::from([(
-                write_target_ordinal,
-                sink.accepted_field_names().into_iter().collect(),
-            )]);
+
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
             let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
@@ -433,9 +425,7 @@ fn bind_first_refresh_write_dataflow(
                 bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
-                sealed_write_targets,
                 needs,
-                field_names,
                 |version, dop, reads, targets| {
                     completion.finish(version, dop, reads, targets, &finish_control)
                 },

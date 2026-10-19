@@ -1686,7 +1686,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    static_plan_carrier: &crate::query_execution::package_freeze::StaticPlanCarrier,
+    static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
@@ -1822,7 +1822,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     // as the payload a plan carries rather than as the wire form the encoder
     // stamps. Both come from this session's own handle encoder, so a plan
     // cannot name a target the commit does not.
-    let sealed_write_targets = write_session
+    let _sealed_write_targets = write_session
         .seal_write_targets()
         .map_err(|error| format!("seal distributed rewrite write targets: {error}"))?;
     let write_handle = write_session
@@ -1832,21 +1832,6 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     // the provider matches its own schema by name, so the names travel beside
     // the sealed handle -- from the very bindings the tokens came from.
     let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
-        sealed: &sealed_write_targets,
-        field_names: std::collections::BTreeMap::from([(
-            write_target.ordinal(),
-            write_target
-                .input()
-                .fields()
-                .iter()
-                .map(|binding| {
-                    (
-                        binding.token().to_bytes(),
-                        Box::<str>::from(binding.field().name().as_str()),
-                    )
-                })
-                .collect(),
-        )]),
         session: write_session.as_ref(),
     };
 
@@ -1902,11 +1887,9 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        function_catalog.as_ref(),
         static_plan_carrier,
         constant_policy,
         Some(&write_target_facts),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         control,
     )
     .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;

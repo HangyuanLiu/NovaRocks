@@ -39,7 +39,7 @@ use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory, BackgroundMaintenanceEngine,
     TableMaintenanceEngine, TableMaintenanceService,
 };
-use crate::query_execution::package_freeze::StaticPlanCarrier;
+use crate::query_execution::package_freeze::CompiledPackageCarrier;
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_query_application::api::BackendTopologyService;
@@ -63,7 +63,7 @@ use crate::query::compiler::FrontendQueryCompiler;
 pub(crate) struct QueryCompilerPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -99,7 +99,7 @@ impl QueryCompilerPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             functions,
@@ -174,7 +174,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
 pub struct DmlEnginePorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -203,7 +203,7 @@ impl DmlEnginePorts {
         connector_runtime: tokio::runtime::Handle,
         lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             functions,
@@ -371,7 +371,7 @@ pub fn iceberg_ref_command_executor(
 pub struct MaintenanceCommandPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -397,7 +397,7 @@ impl MaintenanceCommandPorts {
         service: Arc<dyn TableMaintenanceService>,
         runtime: Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             constant_policy,
@@ -646,7 +646,7 @@ pub fn bind_catalog_runtime_projection(
 pub(crate) struct MvRefreshProviderActivationPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     /// A durable MV refresh resolves an externally attached target while it
     /// recreates its write binding.  Unlike generic SQL kernels, this product
@@ -680,7 +680,7 @@ impl MvRefreshProviderActivationPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             functions,
@@ -746,7 +746,7 @@ pub(crate) fn mv_refresh_provider_activation(
 #[derive(Clone)]
 pub struct StatisticsAttemptExecutorPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
@@ -768,7 +768,7 @@ impl StatisticsAttemptExecutorPorts {
         attempt_timeout: Duration,
         runtime: tokio::runtime::Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             constant_policy,

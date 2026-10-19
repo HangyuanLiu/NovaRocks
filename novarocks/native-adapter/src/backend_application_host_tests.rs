@@ -2,7 +2,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{BackendApplicationHost, BackendServerConfig, BackendStaticPlanInterpreter};
+use super::{BackendApplicationHost, BackendServerConfig};
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
 use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
 use novarocks_native_trust::{
@@ -111,7 +111,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         scan_stream_runtime:
             novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
         execution_role_binding_factories: Vec::new(),
-        static_plan_interpreter: BackendStaticPlanInterpreter::PlanTree,
+        static_plan_interpreter: crate::backend_application::test_compiled_static_plan(),
         process_memory: novarocks_native_adapter::backend_test_support::test_process_memory(),
     }
 }

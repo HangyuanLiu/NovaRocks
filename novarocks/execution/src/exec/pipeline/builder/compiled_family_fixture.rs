@@ -440,3 +440,91 @@ pub(super) fn int64_rows(chunks: &[Chunk]) -> Vec<Vec<Option<i64>>> {
     }
     rows
 }
+
+/// Compile the fixture's complete declared columns as constant Values. This
+/// authors a checked package; lifecycle tests do not retain a decoder bridge.
+pub(crate) fn values_chunk_program(chunk: &Chunk, sink: FragmentSink) -> Arc<LocalProgram> {
+    use novarocks_functions::ConstantPool;
+    use novarocks_physical_plan::{ConstantPoolId, ConstantReference};
+    let mut builder = FragmentBuilder::new(FragmentId::new(19));
+    let node = novarocks_physical_plan::NodeId::new(19);
+    let mut constants = ConstantPools::empty();
+    let types = chunk
+        .chunk_schema()
+        .slots()
+        .iter()
+        .map(|slot| {
+            FunctionValueType::try_from_typed_binding(slot.typed_binding().clone()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    for (ordinal, (column, ty)) in chunk
+        .record_batch()
+        .columns()
+        .iter()
+        .zip(&types)
+        .enumerate()
+    {
+        let pool = ConstantPool::try_new(
+            Arc::clone(chunk.chunk_schema().slots()[ordinal].field_ref()),
+            ty.clone(),
+            column.to_data(),
+            constant_policy(),
+            CompilePhase::Validate,
+            &FixtureControl,
+        )
+        .unwrap();
+        constants
+            .insert(ConstantPoolId::new(ordinal as u32), pool)
+            .unwrap();
+    }
+    let columns = types
+        .iter()
+        .enumerate()
+        .map(|(ordinal, ty)| {
+            builder
+                .add_value(
+                    ty.clone(),
+                    ValueOrigin::NodeOutput {
+                        node,
+                        output_ordinal: ordinal as u32,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let rows = (0..chunk.len())
+        .map(|row| {
+            types
+                .iter()
+                .enumerate()
+                .map(|(ordinal, ty)| {
+                    builder
+                        .add_expression(
+                            node,
+                            ty.clone(),
+                            ExprKind::Constant(ConstantReference {
+                                pool: ConstantPoolId::new(ordinal as u32),
+                                ordinal: row as u32,
+                            }),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .add_values(node, rows.into_boxed_slice(), columns.into_boxed_slice())
+        .unwrap();
+    let names = chunk
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect::<Vec<_>>();
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    compile(
+        package_with_sink_and_names(builder, node, constants, 1, sink, Some(&names)),
+        1,
+    )
+}

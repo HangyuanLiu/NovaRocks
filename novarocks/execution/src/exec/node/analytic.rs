@@ -19,7 +19,6 @@ use novarocks_functions::ResolvedAggregateSignature;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
-use crate::exec::node::ExecNode;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
@@ -117,17 +116,4 @@ pub struct WindowAggregateBinding {
 pub enum AnalyticOutputColumn {
     InputSlotId(SlotId),
     Window(usize),
-}
-
-#[derive(Clone, Debug)]
-pub struct AnalyticNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub partition_exprs: Vec<ExprId>,
-    pub order_by_exprs: Vec<ExprId>,
-    pub functions: Vec<WindowFunctionSpec>,
-    pub window: Option<WindowFrame>,
-    /// Output column plan in final physical column order.
-    pub output_columns: Vec<AnalyticOutputColumn>,
-    pub output_chunk_schema: ChunkSchemaRef,
 }

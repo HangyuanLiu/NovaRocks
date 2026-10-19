@@ -110,7 +110,9 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy;
     /// The static carrier the kernel's composition chose for every plan.
-    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier;
+    fn static_plan_carrier(
+        &self,
+    ) -> &crate::query_execution::package_freeze::CompiledPackageCarrier;
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
@@ -135,7 +137,9 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
         self.constant_policy()
     }
 
-    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+    fn static_plan_carrier(
+        &self,
+    ) -> &crate::query_execution::package_freeze::CompiledPackageCarrier {
         self.static_plan_carrier()
     }
 
@@ -179,7 +183,9 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
         self.constant_policy()
     }
 
-    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+    fn static_plan_carrier(
+        &self,
+    ) -> &crate::query_execution::package_freeze::CompiledPackageCarrier {
         self.static_plan_carrier()
     }
 
@@ -1551,11 +1557,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         .encode_writer_handle_payload(write_target.handle())
         .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
     let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
-        sealed: &sealed_write_targets,
-        field_names: std::collections::BTreeMap::from([(
-            ordinal,
-            sink.accepted_field_names().into_iter().collect(),
-        )]),
         session: write_session.as_ref(),
     };
 
@@ -1624,11 +1625,9 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        DmlQueryExecutionKernel::function_catalog(state),
         DmlQueryExecutionKernel::static_plan_carrier(state),
         DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(PreparedDmlWriteAssembly::new(

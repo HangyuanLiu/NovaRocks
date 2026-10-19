@@ -15,18 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::node::ExecNode;
 
 #[derive(Clone, Debug)]
 pub enum SetOpKind {
     Intersect,
     Except,
-}
-
-#[derive(Clone, Debug)]
-pub struct SetOpNode {
-    pub kind: SetOpKind,
-    pub inputs: Vec<ExecNode>,
-    pub node_id: i32,
-    pub output_chunk_schema: ChunkSchemaRef,
 }

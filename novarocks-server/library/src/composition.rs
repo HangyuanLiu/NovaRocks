@@ -70,7 +70,7 @@ use novarocks_workload_control::WorkloadConfig;
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
-use crate::static_plan::{FrontendStaticPlanCarrier, ServerStaticPlan};
+use crate::static_plan::ServerStaticPlan;
 use novarocks_execution::exec::expr::agg::{
     ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     contribute_builtin_aggregate_implementations,
@@ -647,13 +647,7 @@ pub fn compose_frontend_role_config(
     ));
     // The frontend freezes the one carrier its island's backends interpret,
     // under the same structural package admission as their receiver.
-    let FrontendStaticPlanCarrier::CompiledPackage { admission, limits } =
-        static_plan.frontend_carrier();
-    execution = execution.with_static_plan_carrier(
-        novarocks_frontend_application::StaticPlanCarrier::CompiledPackage(
-            novarocks_frontend_application::CompiledPackageCarrier::new(admission, limits),
-        ),
-    );
+    execution = execution.with_static_plan_carrier(static_plan.frontend_carrier());
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =

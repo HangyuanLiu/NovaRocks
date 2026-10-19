@@ -21,7 +21,7 @@
 //! - Builds expanded chunks while preserving slot mapping contracts from plan lowering.
 //!
 //! Key exported interfaces:
-//! - Types: `TableFunctionProcessorFactory`.
+//! - Types: `TableFunctionFixtureFactory`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -60,6 +60,7 @@ const MAX_TABLE_FUNCTION_OUTPUT_ROWS: usize =
     novarocks_functions::generate_series_core::MAX_TABLE_FUNCTION_OUTPUT_ROWS;
 
 #[derive(Clone)]
+#[cfg(test)]
 enum TableFunctionSchemaSource {
     Legacy(ChunkSchemaRef),
     Typed {
@@ -67,6 +68,7 @@ enum TableFunctionSchemaSource {
         output: StaticLayout,
     },
 }
+#[cfg(test)]
 struct GeneratedColumns {
     columns: Vec<ArrayRef>,
     rows: usize,
@@ -74,6 +76,7 @@ struct GeneratedColumns {
 
 /// Actual constructor sites in the unchanged payload algorithm. The typed
 /// caller assigns temporary scratch and retained wrapper responsibilities.
+#[cfg(test)]
 enum TableFunctionConstructionStep<'a> {
     Scratch(Layout),
     OuterMap(usize),
@@ -100,9 +103,11 @@ enum TableFunctionConstructionStep<'a> {
     Empty(usize),
     EmptyOuter(SlotId),
 }
+#[cfg(test)]
 struct TableFunctionConstruction<'a, E> {
     observe: Option<&'a mut dyn FnMut(TableFunctionConstructionStep<'_>) -> Result<(), E>>,
 }
+#[cfg(test)]
 impl<E> TableFunctionConstruction<'_, E> {
     fn step(&mut self, step: TableFunctionConstructionStep<'_>) -> Result<(), E> {
         match self.observe.as_mut() {
@@ -112,8 +117,9 @@ impl<E> TableFunctionConstruction<'_, E> {
     }
 }
 
-/// Factory for table-function processors that expand each input row to variable output rows.
-pub struct TableFunctionProcessorFactory {
+/// F3 table-function array oracle; no plan node or product dispatch is accepted.
+#[cfg(test)]
+pub(crate) struct TableFunctionFixtureFactory {
     name: String,
     function_name: String,
     param_slots: Vec<SlotId>,
@@ -127,7 +133,8 @@ pub struct TableFunctionProcessorFactory {
     output_slot_sources: Vec<TableFunctionOutputSlot>,
 }
 
-impl TableFunctionProcessorFactory {
+#[cfg(test)]
+impl TableFunctionFixtureFactory {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: i32,
@@ -203,13 +210,14 @@ impl TableFunctionProcessorFactory {
     }
 }
 
-impl OperatorFactory for TableFunctionProcessorFactory {
+#[cfg(test)]
+impl OperatorFactory for TableFunctionFixtureFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(TableFunctionProcessorOperator {
+        Box::new(TableFunctionFixtureOperator {
             name: self.name.clone(),
             function_name: self.function_name.clone(),
             param_slots: self.param_slots.clone(),
@@ -235,7 +243,8 @@ impl OperatorFactory for TableFunctionProcessorFactory {
     }
 }
 
-struct TableFunctionProcessorOperator {
+#[cfg(test)]
+struct TableFunctionFixtureOperator {
     name: String,
     function_name: String,
     param_slots: Vec<SlotId>,
@@ -256,7 +265,8 @@ struct TableFunctionProcessorOperator {
     finished: bool,
 }
 
-impl Operator for TableFunctionProcessorOperator {
+#[cfg(test)]
+impl Operator for TableFunctionFixtureOperator {
     fn creates_typed_storage(&self) -> bool {
         matches!(self.schema_source, TableFunctionSchemaSource::Typed { .. })
     }
@@ -294,7 +304,8 @@ impl Operator for TableFunctionProcessorOperator {
     }
 }
 
-impl ProcessorOperator for TableFunctionProcessorOperator {
+#[cfg(test)]
+impl ProcessorOperator for TableFunctionFixtureOperator {
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.output_chunk.is_none() && !self.emit_empty_once
     }
@@ -413,7 +424,8 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
     }
 }
 
-impl TableFunctionProcessorOperator {
+#[cfg(test)]
+impl TableFunctionFixtureOperator {
     fn schema(&self) -> Result<&ChunkSchemaRef, String> {
         self.output_chunk_schema
             .as_ref()
@@ -1199,6 +1211,7 @@ impl TableFunctionProcessorOperator {
     }
 }
 
+#[cfg(test)]
 fn build_row_indices(counts: &[usize]) -> Result<Vec<u32>, String> {
     let total: usize = counts.iter().sum();
     let mut indices = Vec::with_capacity(total);
@@ -1212,11 +1225,13 @@ fn build_row_indices(counts: &[usize]) -> Result<Vec<u32>, String> {
     Ok(indices)
 }
 
+#[cfg(test)]
 fn encode_bitmap_chunk(values: &[u64]) -> Result<Vec<u8>, String> {
     let set: std::collections::BTreeSet<u64> = values.iter().copied().collect();
     bitmap::encode_internal_bitmap(&set)
 }
 
+#[cfg(test)]
 fn split_bitmap_values(values: &[u64], batch_size: usize) -> Vec<Vec<u64>> {
     if batch_size == 0 {
         return Vec::new();
@@ -1273,6 +1288,7 @@ mod generate_series_original_baseline_tests;
 #[path = "generate_series_shared_differential_tests.rs"]
 mod generate_series_shared_differential_tests;
 
+#[cfg(test)]
 #[path = "typed_table_function.rs"]
 mod typed_table_function;
 
@@ -1280,5 +1296,6 @@ mod typed_table_function;
 #[path = "typed_table_function_tests.rs"]
 mod typed_table_function_tests;
 
+#[cfg(test)]
 #[path = "typed_table_function_construction.rs"]
 mod typed_table_function_construction;

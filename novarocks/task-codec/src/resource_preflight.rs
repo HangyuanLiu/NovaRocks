@@ -17,7 +17,7 @@
 //! Small, allocation-free resource checks before prost builds Native task objects.
 //!
 //! This scanner recognizes only fields needed to bound repeated object expansion
-//! and the native plan tree. It does not decide protobuf encoding legality or
+//! and task metadata. It does not decide protobuf encoding legality or
 //! business semantics. A malformed cursor is left to prost, which remains the
 //! sole protobuf interpreter; unknown fields and noncanonical varints are not
 //! rejected here. The typed codec still validates every semantic relationship.
@@ -31,13 +31,6 @@ use crate::descriptor::{
 };
 use crate::domain::{MAX_DOMAIN_UPDATES, MAX_OPEN_EDGES};
 
-// Keep in sync with plan-codec's NATIVE_V1_MAX_TREE_DEPTH. Task codec must not
-// depend on the plan encoder crate across the native wire boundary.
-const MAX_PLAN_TREE_DEPTH: usize = 64;
-// A 16 MiB carrier can encode millions of empty nested messages. This bound
-// limits object expansion before prost allocation while leaving ample room for
-// any useful executable fragment, independently of the fragment's byte cap.
-const MAX_PLAN_TREE_NODES: usize = 65_536;
 const MAX_STATUS_CURSORS: usize = 4096;
 // Three distinct repeated target projections may legitimately name the same
 // 4096 tasks. The typed decoder checks the exact identity union after prost.
@@ -491,7 +484,7 @@ pub fn check_frozen_fragment(raw: &[u8]) -> Result<(), ResourcePreflightError> {
     if raw.len() > TransportBudget::DEFAULT.max_descriptor_encoded_bytes() {
         return Err(ResourcePreflightError("frozen fragment exceeds 16 MiB"));
     }
-    finish(scan_frozen_fragment(raw))
+    Ok(())
 }
 
 /// Checks the task-local carrier and the two carriers' combined plan bytes
@@ -651,57 +644,6 @@ fn scan_credential_domain(raw: &[u8], count: &mut usize) -> ScanResult {
                 crate::domain::MAX_CREDENTIAL_DESCRIPTORS,
                 "query credential domain exceeds 64 descriptors",
             )?;
-        }
-        Ok(())
-    })
-}
-
-fn scan_frozen_fragment(raw: &[u8]) -> ScanResult {
-    let mut nodes = 0;
-    let mut schema = RenderSchemaScan::new();
-    for_fields(raw, |field, value| {
-        if field == 5
-            && let Value::Bytes(plan) = value
-        {
-            scan_plan_fragment(plan, &mut nodes, &mut schema)?;
-        }
-        Ok(())
-    })
-}
-
-fn scan_plan_fragment(raw: &[u8], nodes: &mut usize, schema: &mut RenderSchemaScan) -> ScanResult {
-    for_fields(raw, |field, value| {
-        if field == 2
-            && let Value::Bytes(root) = value
-        {
-            scan_plan_node(root, 1, nodes)?;
-        }
-        if let (5, Value::Bytes(sink)) = (field, value) {
-            for_fields(sink, |field, value| {
-                if let (9, Value::Bytes(root)) = (field, value) {
-                    schema.scan_root(root)?;
-                }
-                Ok(())
-            })?;
-        }
-        Ok(())
-    })
-}
-
-fn scan_plan_node(raw: &[u8], depth: usize, nodes: &mut usize) -> ScanResult {
-    if depth > MAX_PLAN_TREE_DEPTH {
-        return Err(limit("native plan tree exceeds 64 nodes on one path"));
-    }
-    checked_increment(
-        nodes,
-        MAX_PLAN_TREE_NODES,
-        "native plan tree exceeds 65536 nodes",
-    )?;
-    for_fields(raw, |field, value| {
-        if field == 8
-            && let Value::Bytes(child) = value
-        {
-            scan_plan_node(child, depth + 1, nodes)?;
         }
         Ok(())
     })
@@ -977,8 +919,19 @@ fn for_fields(raw: &[u8], mut visit: impl FnMut(u32, Value<'_>) -> ScanResult) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_proto_models::{novarocks, plan};
+    use novarocks_proto_models::novarocks;
     use prost::Message;
+
+    #[test]
+    fn frozen_package_outer_carrier_keeps_the_transport_byte_bound() {
+        let maximum = TransportBudget::DEFAULT.max_descriptor_encoded_bytes();
+        let raw = vec![0_u8; maximum + 1];
+        assert!(check_frozen_fragment(&raw[..maximum]).is_ok());
+        assert_eq!(
+            check_frozen_fragment(&raw).unwrap_err().to_string(),
+            "frozen fragment exceeds 16 MiB"
+        );
+    }
 
     #[test]
     fn batch_rejects_33_operations_before_decode() {
@@ -1112,40 +1065,6 @@ mod tests {
         write_bytes_field(&mut metadata, 3, &[0x5a, 0x00]);
         let max = TransportBudget::DEFAULT.max_descriptor_encoded_bytes();
         assert!(check_creation_metadata(&metadata, max).is_ok());
-    }
-
-    #[test]
-    fn frozen_fragment_bounds_plan_tree_before_prost() {
-        let mut node = plan::DistributedNode::default().encode_to_vec();
-        for _ in 1..=MAX_PLAN_TREE_DEPTH {
-            let mut parent = Vec::new();
-            write_bytes_field(&mut parent, 8, &node);
-            node = parent;
-        }
-        let mut fragment = Vec::new();
-        write_bytes_field(&mut fragment, 2, &node);
-        let mut frozen = Vec::new();
-        write_bytes_field(&mut frozen, 5, &fragment);
-        assert_eq!(
-            check_frozen_fragment(&frozen).unwrap_err().to_string(),
-            "native plan tree exceeds 64 nodes on one path"
-        );
-    }
-
-    #[test]
-    fn frozen_fragment_bounds_many_shallow_plan_nodes() {
-        let mut root = Vec::with_capacity(MAX_PLAN_TREE_NODES * 2);
-        for _ in 0..MAX_PLAN_TREE_NODES {
-            write_bytes_field(&mut root, 8, &[]);
-        }
-        let mut fragment = Vec::new();
-        write_bytes_field(&mut fragment, 2, &root);
-        let mut frozen = Vec::new();
-        write_bytes_field(&mut frozen, 5, &fragment);
-        assert_eq!(
-            check_frozen_fragment(&frozen).unwrap_err().to_string(),
-            "native plan tree exceeds 65536 nodes"
-        );
     }
 
     #[test]
@@ -1428,46 +1347,7 @@ mod root_preflight_tests {
             assert!(finish(scan_batch(&batch(129), control)).is_err());
         }
     }
-    #[test]
-    fn frozen_root_schema_preflight_follows_every_merged_plan_wrapper() {
-        let columns = |count| {
-            let mut schema = Vec::new();
-            for _ in 0..count {
-                bytes_field(&mut schema, 1, &[]);
-            }
-            schema
-        };
-        let root = |schema: &[u8]| {
-            let mut root = Vec::new();
-            bytes_field(&mut root, 3, schema);
-            root
-        };
-        let frozen = |root: &[u8]| {
-            let mut sink = Vec::new();
-            bytes_field(&mut sink, 9, root);
-            let mut plan = Vec::new();
-            bytes_field(&mut plan, 5, &sink);
-            let mut frozen = Vec::new();
-            bytes_field(&mut frozen, 5, &plan);
-            frozen
-        };
-        let mut merged_schema = Vec::new();
-        bytes_field(&mut merged_schema, 3, &columns(2048));
-        bytes_field(&mut merged_schema, 3, &columns(2048));
-        assert!(check_frozen_fragment(&frozen(&merged_schema)).is_ok());
-        merged_schema.clear();
-        bytes_field(&mut merged_schema, 3, &columns(2048));
-        bytes_field(&mut merged_schema, 3, &columns(2049));
-        assert!(check_frozen_fragment(&frozen(&merged_schema)).is_err());
-        let mut merged_plans = frozen(&root(&columns(2048)));
-        merged_plans.extend(frozen(&root(&columns(2049))));
-        assert!(check_frozen_fragment(&merged_plans).is_err());
-        let mut nodes = Vec::new();
-        for _ in 0..=RootProfileV1::SCHEMA_TYPE_NODES {
-            bytes_field(&mut nodes, 2, &[]);
-        }
-        assert!(check_frozen_fragment(&frozen(&root(&nodes))).is_err());
-    }
+
     #[test]
     fn empty_children_and_repeated_merged_types_are_bounded_before_prost() {
         let mut ty = Vec::new();
@@ -1533,20 +1413,14 @@ mod root_preflight_tests {
         assert!(check_scalar_schema(&schema).is_err());
     }
     #[test]
-    fn scalar_schema_raw_preflight_follows_every_actual_frozen_root_wrapper() {
+    fn scalar_schema_raw_preflight_bounds_repeated_root_schema_messages() {
         let mut schema = Vec::new();
         for _ in 0..=RootProfileV1::SCHEMA_TYPE_NODES {
             bytes_field(&mut schema, 3, &[]);
         }
         let mut root = Vec::new();
         bytes_field(&mut root, 4, &schema);
-        let mut sink = Vec::new();
-        bytes_field(&mut sink, 9, &root);
-        let mut plan = Vec::new();
-        bytes_field(&mut plan, 5, &sink);
-        let mut frozen = Vec::new();
-        bytes_field(&mut frozen, 5, &plan);
-        assert!(check_frozen_fragment(&frozen).is_err());
+        assert!(RenderSchemaScan::new().scan_root(&root).is_err());
         // Duplicate singular schema messages merge their field-node Vec.
         // Counts must survive the wrapper boundary as well as one scan call.
         schema.clear();

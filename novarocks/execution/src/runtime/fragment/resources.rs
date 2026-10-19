@@ -19,12 +19,11 @@ use std::sync::Arc;
 
 use crate::exec::pipeline::operator::input_construction::ReceiverInputConstructionStopOwner;
 
-use crate::exec::fragment::program::{FragmentProgram, FragmentSinkKind};
+#[cfg(test)]
 use crate::runtime::exchange::ExchangeColumnBinding;
 use crate::runtime::fragment::error::{
     FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
 };
-use crate::runtime::fragment::instance::FragmentInstanceSpec;
 use crate::runtime::fragment::io::{
     ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration, FragmentCommitLease,
     FragmentCommitPort,
@@ -224,59 +223,8 @@ pub(crate) struct ExchangeRegistration {
 }
 
 impl ExchangeRegistration {
-    pub(crate) fn acquire(
-        port: Arc<dyn ExchangeReceiverPort>,
-        program: &FragmentProgram,
-        instance: &FragmentInstanceSpec,
-        cleanup_should_fail: bool,
-        creation_factory: Option<
-            Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-        >,
-        construction_stop: Option<ReceiverInputConstructionStopOwner>,
-    ) -> Result<Option<Self>, FragmentLaunchError> {
-        if program.exchange_inputs().is_empty() {
-            return Ok(None);
-        }
-        let mut registration = Self {
-            port,
-            keys: Vec::with_capacity(program.exchange_inputs().len()),
-            active: true,
-            cleanup_should_fail,
-            construction_stop,
-        };
-        for (node_id, contract) in program.exchange_inputs() {
-            let assignment = instance
-                .exchange_inputs()
-                .get(node_id)
-                .expect("validated submission has every exchange assignment");
-            let key = ExchangeReceiverKey {
-                fragment_instance_id: instance.fragment_instance_id().get(),
-                node_id: node_id.get(),
-            };
-            if let Err(error) = registration.port.register(ExchangeReceiverRegistration {
-                key,
-                expected_senders: assignment.sender_count().get(),
-                expected_chunk_schema: Arc::clone(contract.expected_schema()),
-                // Legacy fragments share one slot namespace across the edge.
-                column_binding: ExchangeColumnBinding::BySlotId,
-                creation_factory: creation_factory.as_ref().cloned().ok_or_else(|| {
-                    FragmentLaunchError::from_failure(
-                        crate::runtime::fragment::FragmentLaunchStage::Register,
-                        crate::runtime::fragment::FragmentLaunchErrorKind::ResourceUnavailable,
-                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
-                    )
-                })?,
-            }) {
-                let diagnostics = registration.rollback().err().into_iter().collect();
-                return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));
-            }
-            registration.keys.push(key);
-        }
-        Ok(Some(registration))
-    }
-
-    /// Register a compiled program's receivers, already projected for this
-    /// instance, under the same rollback and cleanup owner as legacy ones.
+    /// Register the program's receivers, already projected for this instance,
+    /// under their rollback and terminal-cleanup owner.
     pub(crate) fn acquire_registrations(
         port: Arc<dyn ExchangeReceiverPort>,
         registrations: Vec<ExchangeReceiverRegistration>,
@@ -443,15 +391,6 @@ impl FragmentResources {
         Ok(())
     }
 
-    pub(crate) fn acquire_result(
-        &mut self,
-        program: &FragmentProgram,
-        writer: &Arc<dyn FragmentResultWriter>,
-        spec: ResultWriteSpec,
-    ) -> Result<(), FragmentLaunchError> {
-        self.acquire_result_for_static(program.local_program().sink(), writer, spec)
-    }
-
     pub(crate) fn acquire_result_for_static(
         &mut self,
         sink: Option<&novarocks_local_program::StaticSinkProgram>,
@@ -470,15 +409,6 @@ impl FragmentResources {
             self.cleanup_faults.should_fail(ResourceKind::Result),
         )?);
         Ok(())
-    }
-
-    pub(crate) fn acquire_root_result(
-        &mut self,
-        program: &FragmentProgram,
-        session: Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>>,
-        identity: Option<novarocks_execution_contract::TaskIdentity>,
-    ) -> Result<(), FragmentLaunchError> {
-        self.acquire_root_result_for_static(program.local_program().sink(), session, identity)
     }
 
     pub(crate) fn acquire_root_result_for_static(
@@ -539,26 +469,6 @@ impl FragmentResources {
         if let Some(result) = self.result.as_mut() {
             result.abort_for_cancellation(reason.to_string());
         }
-    }
-
-    pub(crate) fn acquire_exchange(
-        &mut self,
-        program: &FragmentProgram,
-        instance: &FragmentInstanceSpec,
-        creation_factory: Option<
-            Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-        >,
-        construction_stop: Option<ReceiverInputConstructionStopOwner>,
-    ) -> Result<(), FragmentLaunchError> {
-        self.exchange = ExchangeRegistration::acquire(
-            Arc::clone(&self.exchange_receiver_port),
-            program,
-            instance,
-            self.cleanup_faults.should_fail(ResourceKind::Exchange),
-            creation_factory,
-            construction_stop,
-        )?;
-        Ok(())
     }
 
     pub(crate) fn acquire_compiled_exchange(

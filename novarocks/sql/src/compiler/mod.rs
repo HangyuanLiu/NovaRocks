@@ -42,8 +42,7 @@ pub use crate::planner::distributed::build::{
     SqlSourceJournalError,
 };
 pub use crate::planner::distributed::build::{
-    FragmentPackageSemantics, NativeWriterPreparation, PackageSemanticsError,
-    author_fragment_package_semantics, author_native_writer_preparation,
+    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
     check_pure_call_definitions_observed,
 };
 #[cfg(test)]

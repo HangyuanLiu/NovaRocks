@@ -38,14 +38,13 @@ mod read;
 mod signature_copy;
 pub use materialize::{
     MaterializedFunctionBinding, MaterializedFunctionBindings,
-    PreparedFunctionBindingsMaterialization, materialize_execution_binding_with_creator_in,
-    materialize_function_bindings, materialize_function_bindings_in,
-    materialize_function_bindings_with_creator_in, prepare_function_bindings_materialization,
-    prepare_function_bindings_materialization_in,
+    PreparedFunctionBindingsMaterialization, materialize_function_bindings,
+    materialize_function_bindings_in, materialize_function_bindings_with_creator_in,
+    prepare_function_bindings_materialization, prepare_function_bindings_materialization_in,
 };
 pub use read::{
-    PreparedFunctionBindingHeaders, preflight_execution_binding_header_input_derived_in,
-    prepare_function_binding_headers, prepare_function_binding_headers_in,
+    PreparedFunctionBindingHeaders, prepare_function_binding_headers,
+    prepare_function_binding_headers_in,
 };
 pub(crate) use signature_copy::{
     copy_scalar_signature_observed, copy_scalar_signature_with_creator_observed,

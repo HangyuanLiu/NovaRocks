@@ -3529,7 +3529,7 @@ mod tests {
                     false,
                 ),
                 ("blob_type", arrow::datatypes::DataType::Utf8, false),
-                ("body", arrow::datatypes::DataType::Binary, true),
+                ("body", arrow::datatypes::DataType::Binary, false),
                 (
                     "properties",
                     crate::analysis::UnpivotConstant::Utf8Map(Vec::new()).data_type(),

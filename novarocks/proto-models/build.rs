@@ -5,15 +5,13 @@ use std::path::{Path, PathBuf};
 mod resource_layout;
 
 const IDL_DIR: &str = "../../idl/novarocks";
-const PROTO_FILES: [&str; 18] = [
+const PROTO_FILES: [&str; 16] = [
     "catalog.proto",
     "common.proto",
     "connector_common.proto",
     "connector_read.proto",
     "connector_write.proto",
-    "expr.proto",
     "filter.proto",
-    "plan.proto",
     "execution_shared.proto",
     "arrow_type.proto",
     "call_request.proto",

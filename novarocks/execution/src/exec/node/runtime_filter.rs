@@ -26,41 +26,11 @@ pub use execution::RuntimeFilterExecutionContract;
 pub use execution::RuntimeFilterReduction as RuntimeFilterExecutionReduction;
 
 use crate::exec::expr::ExprId;
-use crate::exec::node::ExecNode;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeFilterConsumerBinding {
     pub expr_id: ExprId,
     pub contract: execution::RuntimeFilterConsumerContract,
-}
-
-#[derive(Clone, Debug)]
-pub struct RuntimeFilterConsumerNode {
-    pub input: Box<ExecNode>,
-    pub owner_node_id: i32,
-    pub bindings: Vec<RuntimeFilterConsumerBinding>,
-}
-
-impl RuntimeFilterConsumerNode {
-    pub fn new(
-        input: ExecNode,
-        owner_node_id: i32,
-        bindings: Vec<RuntimeFilterConsumerBinding>,
-    ) -> Self {
-        Self {
-            input: Box::new(input),
-            owner_node_id,
-            bindings,
-        }
-    }
-
-    pub fn input(&self) -> &ExecNode {
-        &self.input
-    }
-
-    pub fn input_mut(&mut self) -> &mut ExecNode {
-        &mut self.input
-    }
 }
 
 impl RuntimeFilterConsumerBinding {

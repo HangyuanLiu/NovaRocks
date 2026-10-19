@@ -49,34 +49,9 @@ pub mod connector_write_test_support;
 pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
 pub mod exchange_transmitter;
-mod final_result_layout;
-pub mod fragment_aggregate;
-pub mod fragment_decode_context;
-pub mod fragment_error;
-pub mod fragment_exchange_receiver;
-pub mod fragment_expression;
-pub mod fragment_hash_join;
-pub mod fragment_ingress_error;
 pub mod fragment_instance;
-pub mod fragment_layout;
-mod fragment_original_requests;
-mod fragment_original_sources;
-pub mod fragment_plan_decode;
-pub(crate) mod fragment_plan_decode_submission;
-pub mod fragment_plan_node;
-pub mod fragment_request;
 pub mod fragment_result_writer;
-pub mod fragment_runtime_filter;
-pub mod fragment_runtime_filter_binding;
-pub mod fragment_scan_decode;
-pub mod fragment_scan_output;
-pub mod fragment_sink;
 pub mod fragment_submission;
-pub(crate) mod fragment_type_decode;
-pub mod fragment_typed_connector_scan;
-pub mod fragment_validation;
-pub mod fragment_variant_path;
-pub mod fragment_window;
 pub mod management_http;
 mod native_channel_cache;
 mod native_channel_identity;
@@ -107,8 +82,6 @@ pub mod native_transport_admission;
 pub mod native_transport_geometry;
 pub(crate) mod native_type_construction;
 pub(crate) mod native_type_decode;
-#[cfg(test)]
-mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;
 pub mod query_options;
 pub mod runtime_filter_feedback;
@@ -439,8 +412,6 @@ pub mod test_observation_controls;
 
 #[cfg(novarocks_dev_controls)]
 pub mod backend_test_session;
-#[cfg(test)]
-mod root_metadata_origin_tests;
 
 // Refuse flags that would make capability reporting disagree with compiled seams.
 #[cfg(any(

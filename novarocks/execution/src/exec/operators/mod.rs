@@ -84,14 +84,17 @@ pub(crate) use aggregate::streaming_state::AggregateStreamingState;
 pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
-pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
+#[cfg(test)]
+pub(crate) use change_event_expand_processor::ChangeEventExpandFixtureFactory;
 pub(crate) use data_stream_sink::CompiledPartitionKeys;
 pub use data_stream_sink::DataStreamSinkFactory;
 #[cfg(test)]
 pub(crate) use data_stream_sink::partition_chunk_by_hash_arrays;
 pub use exchange_source::ExchangeSourceFactory;
+#[cfg(test)]
 pub(crate) use filter_processor::FilterEncodingPolicy;
-pub use filter_processor::FilterProcessorFactory;
+#[cfg(test)]
+pub(crate) use filter_processor::FilterFixtureFactory;
 pub use hashjoin::{
     BroadcastJoinProbeProcessorFactory, HashJoinBuildSinkFactory,
     PartitionedJoinProbeProcessorFactory,
@@ -103,10 +106,12 @@ pub use multi_cast_data_stream_sink::MultiCastDataStreamSinkFactory;
 pub(crate) use nljoin::NlJoinSharedState;
 pub use nljoin::{NlJoinBuildSinkFactory, NlJoinProbeProcessorFactory};
 pub use noop_sink::NoopSinkFactory;
-pub use project_processor::ProjectProcessorFactory;
+#[cfg(test)]
+pub(crate) use project_processor::ProjectFixtureFactory;
 #[cfg(test)]
 pub(crate) use project_processor::materialize_project_output;
-pub use repeat_processor::RepeatProcessorFactory;
+#[cfg(test)]
+pub(crate) use repeat_processor::RepeatFixtureFactory;
 pub(crate) use repeat_processor::{
     repeat_output_chunk_schema, repeat_output_chunk_schema_observed,
 };
@@ -125,9 +130,11 @@ pub use sort::SortProcessorFactory;
 pub use split_data_stream_sink::SplitDataStreamSinkFactory;
 pub(crate) use statistics_materializer::StatisticsMaterializerFactory;
 pub use table_finish::TableFinishOperatorFactory;
-pub use table_function_processor::TableFunctionProcessorFactory;
+#[cfg(test)]
+pub(crate) use table_function_processor::TableFunctionFixtureFactory;
 pub use table_writer::TableWriterOperatorFactory;
-pub use unpivot_processor::UnpivotProcessorFactory;
+#[cfg(test)]
+pub(crate) use unpivot_processor::UnpivotFixtureFactory;
 pub use values_source::ValuesSourceFactory;
 
 #[cfg(novarocks_dev_controls)]

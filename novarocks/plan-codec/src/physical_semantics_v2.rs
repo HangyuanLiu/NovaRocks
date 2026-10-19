@@ -226,14 +226,6 @@ pub fn decode_fragment_semantics(
 #[cfg(test)]
 mod tests;
 
-/// Pure PlanTree writer projection uses the original parameter grammar and work
-/// body; absence of a memory creator here is explicit FE preparation policy.
-pub(crate) fn encode_writer_parameters_pure_in(
-    source: &SemanticParameters,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<wire::SemanticParameters, SemanticsCodecError> {
-    encode_semantic_parameters_pure_in(source, work)
-}
 /// Explicit FE parameter sender using the original parameter projection body.
 /// It borrows its caller's original control/checkpoints and has no creator.
 pub fn encode_semantic_parameters_pure_in(

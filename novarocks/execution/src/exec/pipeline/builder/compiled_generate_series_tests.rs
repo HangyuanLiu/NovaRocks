@@ -179,7 +179,7 @@ fn original_dispatcher(
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::table_function::TableFunctionOutputSlot;
-    use crate::exec::operators::TableFunctionProcessorFactory;
+    use crate::exec::operators::TableFunctionFixtureFactory;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
     let nodes = program.graph().nodes();
@@ -218,7 +218,7 @@ fn original_dispatcher(
             .is_none(),
         "opening evaluates once"
     );
-    let factory = TableFunctionProcessorFactory::new(
+    let factory = TableFunctionFixtureFactory::new(
         43,
         "generate_series".to_owned(),
         input.slots().to_vec(),

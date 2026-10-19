@@ -671,7 +671,6 @@ mod tests {
     }
     #[test]
     fn local_exchange_limit_zero_wakes_source_blocked_remote_driver() {
-        use crate::exec::node::exchange_source::ExchangeSourceNode;
         use crate::exec::operators::exchange_source::ExchangeSourceFactory;
         use crate::exec::operators::limit_processor::LimitProcessorFactory;
         use crate::exec::pipeline::binding::ExchangeBinding;
@@ -693,16 +692,36 @@ mod tests {
             finst_id_lo: 97002,
             node_id: 97003,
         };
-        let remote = ExchangeSourceFactory::new_native(
-            ExchangeSourceNode::new(key.node_id, Duration::from_secs(60), schema),
+        let receiver_port = in_process_test_exchange_receiver_port();
+        let creation_factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("local exchange remote receiver fixture"),
+            state.error_state(),
+        ).unwrap();
+        receiver_port
+            .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
+                key: crate::runtime::fragment::io::ExchangeReceiverKey {
+                    fragment_instance_id: novarocks_types::UniqueId::new(
+                        key.finst_id_hi,
+                        key.finst_id_lo,
+                    ),
+                    node_id: key.node_id,
+                },
+                expected_senders: 1,
+                expected_chunk_schema: schema,
+                column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
+                creation_factory,
+            })
+            .expect("register remote receiver");
+        let remote = ExchangeSourceFactory::new_compiled(
+            key.node_id,
+            Duration::from_secs(60),
             ExchangeBinding {
                 key,
                 expected_senders: 1,
-                receiver_port: in_process_test_exchange_receiver_port(),
+                receiver_port,
             },
-            arena,
-        )
-        .expect("remote source");
+        );
         let mut source = remote.create(1, 0);
         source.prepare().expect("prepare remote source");
         let source_observable = source

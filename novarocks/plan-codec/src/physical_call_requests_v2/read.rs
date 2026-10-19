@@ -39,24 +39,20 @@ use novarocks_type_contract::{
 };
 use std::{alloc::Layout, mem::size_of};
 
-/// Both wire containers borrow their own complete type owner. No package
-/// table, inline Field or shadow semantic tree is synthesized for PlanTree.
+/// The package borrows its own complete type owner.
 #[derive(Clone, Copy)]
 pub enum CallRequestTypeOwner<'a> {
     Package(&'a DecodedTypeTable),
-    PlanTree(&'a crate::execution_type_table::DecodedExecutionTypeTable),
 }
 impl CallRequestTypeOwner<'_> {
     fn len(self) -> usize {
         match self {
             Self::Package(types) => types.value_types().len(),
-            Self::PlanTree(types) => types.len(),
         }
     }
     fn inline_bytes(self) -> usize {
         match self {
             Self::Package(types) => std::mem::size_of_val(types),
-            Self::PlanTree(types) => std::mem::size_of_val(types),
         }
     }
 }
@@ -64,14 +60,10 @@ impl<'a> CallRequestTypeOwner<'a> {
     fn lookup(
         self,
         id: u32,
-        w: &mut CompileCheckpoints<'_>,
+        _w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&'a FunctionValueType>, E> {
         match self {
             Self::Package(types) => Ok(types.value_type(id)),
-            Self::PlanTree(types) => types
-                .get_observed(id, w)
-                .map_err(TypeCodecError::from)
-                .map_err(E::from),
         }
     }
 }
@@ -261,7 +253,6 @@ fn boxed<T>(output: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<Box<[T]>, 
 #[derive(Clone, Copy)]
 enum Profile {
     Receiving(Limits),
-    InputDerived,
 }
 impl From<Limits> for Profile {
     fn from(value: Limits) -> Self {
@@ -276,7 +267,6 @@ impl Profile {
                 .checked_sub(used)
                 .map(Some)
                 .ok_or_else(resource),
-            Self::InputDerived => Ok(None),
         }
     }
 }
@@ -344,7 +334,8 @@ impl Model {
             add(self.source, size_of::<PreparedCallRequestsDecode<'_>>())?,
             self.facts.request_bytes_upper_bound,
         )?;
-        if let Profile::Receiving(limits) = limits {
+        {
+            let Profile::Receiving(limits) = limits;
             gate(self.facts.definition_count, limits.max_definitions)?;
             gate(self.facts.type_reference_count, limits.max_type_references)?;
             gate(
@@ -832,28 +823,6 @@ pub fn prepare_call_requests_decode_with_creator_in<'loan, 'control: 'loan, H>(
         pools,
         original_source_bytes,
         limits.into(),
-        creation,
-        work,
-    )
-}
-
-/// Finite checked construction/work facts are sealed by this input's sole
-/// model. Source provenance and actual BE creator remain mandatory; original
-/// sender policy does not become receiving admission.
-pub fn prepare_call_requests_decode_input_derived_with_creator_in<'loan, 'control: 'loan, H>(
-    source: Option<&'loan wire::FragmentCallRequests>,
-    types: CallRequestTypeOwner<'loan>,
-    pools: &'loan ConstantPools,
-    original_source_bytes: usize,
-    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
-    work: &mut CompileCheckpoints<'control>,
-) -> Result<PreparedCallRequestsDecode<'loan>, crate::host_projection_v2::ProjectionFailure<E, H>> {
-    prepare_with_creator_core(
-        source,
-        types,
-        pools,
-        original_source_bytes,
-        Profile::InputDerived,
         creation,
         work,
     )

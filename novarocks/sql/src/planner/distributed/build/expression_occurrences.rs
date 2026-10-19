@@ -386,72 +386,15 @@ fn append_relational_context_observed<'a>(
     Ok(())
 }
 
-/// Native Writer owns only these real relational and materialized Value uses.
-/// It authors no ordinary expression invocation or complete expression graph.
-pub(crate) struct NativeWriterOccurrences<'a> {
-    fragment: &'a Fragment,
-    domains: Vec<ExpressionEvaluationDomain>,
-    relational_contexts: Vec<(PhysicalCallSite, ExpressionEffectContext)>,
-    writer_values: Vec<WriterValueUse<'a>>,
-}
-pub(crate) fn author_native_writer_occurrences_observed<'a>(
-    fragment: &'a Fragment,
-    control: &dyn PureCompileControl,
-) -> Result<NativeWriterOccurrences<'a>, ExpressionOccurrenceError> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let mut source = NativeWriterOccurrences {
-        fragment,
-        domains: Vec::new(),
-        relational_contexts: Vec::new(),
-        writer_values: Vec::new(),
-    };
-    let mut next_use = 0usize;
-    let result = visit_relational_calls_observed(fragment, &mut work, |site, _, work| {
-        if matches!(
-            site,
-            PhysicalCallSite::WriterPartial { .. } | PhysicalCallSite::WriterFinal { .. }
-        ) {
-            append_relational_context_observed(
-                fragment,
-                site,
-                &mut source.domains,
-                &mut source.relational_contexts,
-                &mut source.writer_values,
-                &mut next_use,
-                work,
-            )?;
-        }
-        Ok(())
-    });
-    if matches!(result, Err(ExpressionOccurrenceError::Control(_))) {
-        return result.map(|_| source);
-    }
-    work.finish()?;
-    result?;
-    Ok(source)
-}
-
 /// A borrowed role-specific context view, not an owning or synthetic graph.
 pub(crate) struct WriterOccurrenceContexts<'a, 'source> {
     fragment: &'source Fragment,
     root_fragment: novarocks_physical_plan::FragmentId,
     pub relational_contexts: &'a [(PhysicalCallSite, ExpressionEffectContext)],
     writer_values: &'a [WriterValueUse<'source>],
-    flow: Option<&'a ExpressionControlFlow<ExprId>>,
-    native_domains: &'a [ExpressionEvaluationDomain],
+    flow: &'a ExpressionControlFlow<ExprId>,
 }
-impl<'a> NativeWriterOccurrences<'a> {
-    pub(crate) fn contexts(&self) -> WriterOccurrenceContexts<'_, 'a> {
-        WriterOccurrenceContexts {
-            fragment: self.fragment,
-            root_fragment: self.fragment.id(),
-            relational_contexts: &self.relational_contexts,
-            writer_values: &self.writer_values,
-            flow: None,
-            native_domains: &self.domains,
-        }
-    }
-}
+
 impl<'a> AuthoredPhysicalOccurrences<'a> {
     pub(crate) fn writer_contexts(&self) -> WriterOccurrenceContexts<'_, 'a> {
         WriterOccurrenceContexts {
@@ -459,8 +402,7 @@ impl<'a> AuthoredPhysicalOccurrences<'a> {
             root_fragment: self.root_uses.roots().fragment(),
             relational_contexts: &self.relational_contexts,
             writer_values: &self.writer_values,
-            flow: Some(self.root_uses.flow()),
-            native_domains: &[],
+            flow: self.root_uses.flow(),
         }
     }
 }
@@ -479,21 +421,15 @@ impl WriterOccurrenceContexts<'_, '_> {
             .map(|entry| (entry.site, entry.value, entry.context))
     }
     pub(crate) fn domain(&self, id: EvaluationDomainId) -> Option<&ExpressionEvaluationDomain> {
-        match self.flow {
-            Some(flow) => flow.domains().get(&id),
-            None => self
-                .native_domains
-                .get(id.get() as usize)
-                .filter(|domain| domain.id == id),
-        }
+        self.flow.domains().get(&id)
     }
     pub(crate) fn contains_expression_use(&self, id: ExpressionUseId) -> bool {
-        self.flow.is_some_and(|flow| flow.uses().contains_key(&id))
+        self.flow.uses().contains_key(&id)
     }
     pub(crate) fn expression_invocations(
         &self,
     ) -> impl Iterator<Item = &ExpressionInvocation<ExprId>> {
-        self.flow.into_iter().flat_map(|flow| flow.uses().values())
+        self.flow.uses().values()
     }
 }
 

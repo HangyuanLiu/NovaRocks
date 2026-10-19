@@ -105,7 +105,9 @@ mod tests {
     };
     use novarocks_version::StaticPlanInterpreter;
 
-    const PLAN_TREE: StaticPlanInterpreter = StaticPlanInterpreter::PlanTree;
+    const COMPILED: StaticPlanInterpreter = StaticPlanInterpreter::CompiledPackage {
+        pure_function_catalog_digest: [0x51; 32],
+    };
 
     fn server_manifest() -> crate::provider_manifest::ServerProviderManifest {
         crate::provider_manifest::ServerProviderManifest::seal().expect("server provider manifest")
@@ -118,7 +120,7 @@ mod tests {
             manifest.contracts(),
             [0x31; 32],
             [0x41; 32],
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         // Catalog declarations and implementation profiles are identical here.
@@ -128,7 +130,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         assert_ne!(
@@ -209,7 +211,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 novarocks_physical_plan::PLAN_CONTRACT_REVISION,
-                PLAN_TREE,
+                COMPILED,
             )
             .unwrap()
         };
@@ -238,14 +240,14 @@ mod tests {
             manifest.contracts(),
             [0x31; 32],
             [0x41; 32],
-            PLAN_TREE,
+            COMPILED,
         )
         .expect("compatibility material");
         let implementation_only_change = resolve_native_compatibility_material(
             manifest.contracts(),
             [0x31; 32],
             [0x42; 32],
-            PLAN_TREE,
+            COMPILED,
         )
         .expect("implementation-only compatibility material");
 
@@ -268,7 +270,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             next_plan_revision,
-            PLAN_TREE,
+            COMPILED,
         )
         .expect("plan-only compatibility material");
         assert_ne!(material.id(), plan_only_change.id());
@@ -361,7 +363,7 @@ mod tests {
             manifest.contracts(),
             [0x31; 32],
             [0x41; 32],
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         // Revision 2 has normalized temporal casts but lacks this exact pair.
@@ -370,7 +372,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             2,
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         assert_ne!(
@@ -391,7 +393,7 @@ mod tests {
             manifest.contracts(),
             [0x31; 32],
             [0x41; 32],
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         // Revision 2 predates intrinsic facts; revision 3 is reserved for the
@@ -403,7 +405,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 revision,
-                PLAN_TREE,
+                COMPILED,
             )
             .unwrap();
             assert!(current.plan_contract_revision() > revision);
@@ -428,7 +430,7 @@ mod tests {
             manifest.contracts(),
             [0x31; 32],
             [0x41; 32],
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         for prior_revision in [4, 5] {
@@ -437,7 +439,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 prior_revision,
-                PLAN_TREE,
+                COMPILED,
             )
             .unwrap();
             assert_eq!(
@@ -525,7 +527,7 @@ mod tests {
             manifest.contracts(),
             [0x31; 32],
             [0x41; 32],
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         let prior = novarocks_version::derive_repository_native_compatibility_material(
@@ -533,7 +535,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             11,
-            PLAN_TREE,
+            COMPILED,
         )
         .unwrap();
         assert!(current.plan_contract_revision() > 11);

@@ -771,11 +771,9 @@ impl FrontendQueryCompiler {
             .any(|annotation| annotation.key.as_ref() == "sql.mv_rewrite_provenance");
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
-            self.functions.as_ref(),
             self.query.static_plan_carrier(),
             self.constant_policy(),
             None,
-            execution.sql_semantics().sql_mode().allow_throw_exception(),
             &encoding_control,
         )
         .map_err(FrontendQueryCompilerError::from_encode)?;
@@ -915,11 +913,9 @@ impl FrontendQueryCompiler {
             .map_err(FrontendQueryCompilerError::Engine)?;
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
-            self.functions.as_ref(),
             self.query.static_plan_carrier(),
             self.constant_policy(),
             None,
-            execution.sql_semantics().sql_mode().allow_throw_exception(),
             &encoding_control,
         )
         .map_err(FrontendQueryCompilerError::from_encode)?;

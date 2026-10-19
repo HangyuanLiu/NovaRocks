@@ -23,10 +23,8 @@
 //! sealed it; the original extraction law publishes the checked packages; the
 //! v2 sender encodes them.
 //!
-//! Which carrier a Frontend freezes its plans into is one composition choice,
-//! [`StaticPlanCarrier`]. Production composes the plan tree; the compiled
-//! package carrier is selected only by a composition that also runs a
-//! compiled-package backend.
+//! The host provides [`CompiledPackageCarrier`] admission and encode limits
+//! once, paired with the compiled-package backend.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -45,23 +43,6 @@ use prost::Message;
 
 use crate::query_execution::package_reads::author_frozen_reads;
 use crate::query_execution::provider_read_facts::FrozenReadEncoding;
-
-/// The static carrier one Frontend process freezes every completed plan into.
-///
-/// A process interprets exactly one carrier: the composition chooses it once,
-/// before any statement is admitted, and every owner that encodes a completed
-/// plan receives the same choice beside its function catalog. A plan the
-/// chosen carrier cannot express is refused; it never falls back to the other
-/// carrier, because a backend interprets only the carrier its own composition
-/// chose.
-#[derive(Clone, Copy, Debug)]
-pub enum StaticPlanCarrier {
-    /// The production native plan tree (`FrozenFragment` fields 1-5).
-    PlanTree,
-    /// One v2 `FragmentPackage` per fragment, carried as
-    /// `FrozenFragment.package` with no plan-tree field beside it.
-    CompiledPackage(CompiledPackageCarrier),
-}
 
 /// Host-owned configuration of the compiled package carrier.
 ///

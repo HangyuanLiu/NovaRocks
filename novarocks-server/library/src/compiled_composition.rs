@@ -29,9 +29,7 @@ use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionDefinition,
     InstalledPureKernel, PureEngineFunctionCatalog,
 };
-use novarocks_native_adapter::backend_application::{
-    BackendStaticPlanInterpreter, CompiledStaticPlan,
-};
+use novarocks_native_adapter::backend_application::CompiledStaticPlan;
 use novarocks_plan_codec::physical_package_v2::{
     FROZEN_CONSTANT_POLICY, PackageDecodeLimits, PackageEncodeLimits,
 };
@@ -74,21 +72,22 @@ impl CompiledPackage {
     }
 
     /// The frontend freezes packages under the receiver's own admission.
-    pub(crate) fn frontend_carrier(&self) -> crate::static_plan::FrontendStaticPlanCarrier {
-        crate::static_plan::FrontendStaticPlanCarrier::CompiledPackage {
-            admission: self.decode_limits.admission,
-            limits: PackageEncodeLimits::FROZEN,
-        }
+    pub(crate) fn frontend_carrier(
+        &self,
+    ) -> novarocks_frontend_application::CompiledPackageCarrier {
+        novarocks_frontend_application::CompiledPackageCarrier::new(
+            self.decode_limits.admission,
+            PackageEncodeLimits::FROZEN,
+        )
     }
 
-    pub(crate) fn backend_interpreter(&self) -> anyhow::Result<BackendStaticPlanInterpreter> {
+    pub(crate) fn backend_interpreter(&self) -> anyhow::Result<CompiledStaticPlan> {
         CompiledStaticPlan::try_new(
             self.decode_limits.clone(),
             Arc::clone(&self.functions),
             Arc::clone(&self.providers),
             self.constants,
         )
-        .map(BackendStaticPlanInterpreter::CompiledPackage)
         .map_err(|error| anyhow::anyhow!("compose the compiled-package interpreter: {error}"))
     }
 }

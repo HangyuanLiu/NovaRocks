@@ -367,7 +367,6 @@ fn original_value_none_typed_null_lambda_constraint_and_all_policy_fields_have_i
     let (actual, facts) = run(&f, &c, limits(), SOURCE, false).unwrap();
     let expected = wire::FragmentCallRequests {
         entries: vec![wire::OriginalCallRequest {
-            request_id: None,
             definition: Some(wire::CallRequestDefinition {
                 kind: Some(wire::call_request_definition::Kind::ExpressionDefinitionId(
                     0,

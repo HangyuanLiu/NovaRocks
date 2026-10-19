@@ -1040,44 +1040,6 @@ fn materialize_definition_in<H>(
     Ok(binding)
 }
 
-/// Project one exact definition from the PlanTree execution type namespace.
-/// The original signature grammar and constructor body are shared with v2.
-/// No installed owner, context, original request or effect is inferred here.
-pub fn materialize_execution_binding_with_creator_in<H>(
-    raw: &wire::FunctionBindingDefinition,
-    types: &crate::execution_type_table::DecodedExecutionTypeTable,
-    creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<MaterializedFunctionBinding, super::creation::Failure<H>> {
-    let mut lookup = |id, work: &mut CompileCheckpoints<'_>| {
-        work.flush()?;
-        let present = types
-            .get_observed(id, work)
-            .map_err(|error| Error::from(crate::physical_type_v2::TypeCodecError::from(error)))?
-            .is_some();
-        work.step()?;
-        work.flush()?;
-        if present {
-            Ok(())
-        } else {
-            Err(shape("binding header value type is absent"))
-        }
-    };
-    super::read::validate_definitions_with_lookup(std::slice::from_ref(raw), &mut lookup, work)?;
-    let mut construction = super::creation::Construction {
-        creator: Some(creation),
-    };
-    materialize_definition_in(raw, &mut construction, work, &mut |id, work| {
-        let source = types
-            .get_observed(id, work)
-            .map_err(|error| Error::from(crate::physical_type_v2::TypeCodecError::from(error)))?
-            .ok_or_else(|| shape("materialized binding value type is absent"))?;
-        source
-            .clone_observed(|| work.step())
-            .map_err(|cause| Error::Control(cause).into())
-    })
-}
-
 /// Original preparation with growing binding facts and no scope entry/footer.
 pub fn prepare_function_bindings_materialization_in<'loan, 'source>(
     headers: &'loan PreparedFunctionBindingHeaders<'source>,

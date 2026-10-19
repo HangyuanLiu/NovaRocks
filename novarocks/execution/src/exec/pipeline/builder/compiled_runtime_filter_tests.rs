@@ -58,9 +58,7 @@ use super::join_tests::{
     overflow_plan, packages, single_plan, sorted,
 };
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
-use crate::exec::node::scan::{ScanNode, ScanOp};
+use crate::exec::node::scan::ScanOp;
 use crate::exec::operators::scan::StreamScanSourceFactory;
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
@@ -533,65 +531,8 @@ fn declared_membership_contract(
     )
 }
 
-/// Exercise the actual default-plan freeze with an independently authored
-/// input. The returned static contract is the graph's original binding, not
-/// one rebuilt from a runtime request or an Arrow field.
-fn freeze_installed_consumer(
-    declared: &FunctionValueType,
-    installed: &execution::RuntimeFilterConsumerContract,
-) -> StaticFilterConsumer {
-    use crate::exec::node::runtime_filter::RuntimeFilterConsumerNode;
-    use crate::exec::node::values::ValuesNode;
-    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-
-    let column: arrow::array::ArrayRef = match declared.data_type() {
-        DataType::Int64 => Arc::new(arrow::array::Int64Array::from(vec![1])),
-        DataType::Utf8 => Arc::new(arrow::array::StringArray::from(vec!["{}"])),
-        other => panic!("this fixture has no declared payload for {other:?}"),
-    };
-    let chunk = crate::exec::chunk::typed_fixture::columns(
-        &["key"],
-        &[SlotId::new(1)],
-        std::slice::from_ref(declared),
-        vec![column],
-        1,
-    );
-    let mut arena = ExprArena::default();
-    let key = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), declared.clone());
-    let plan = ExecPlan {
-        arena,
-        root: ExecNode {
-            kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode::new(
-                ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
-                },
-                2,
-                vec![RuntimeFilterConsumerBinding::new(key, installed.clone())],
-            )),
-        },
-    };
-    let profile = crate::exec::chunk::typed_fixture::profile(
-        &plan,
-        std::num::NonZeroUsize::new(1).unwrap(),
-        None,
-    );
-    let (graph, _bindings) = crate::exec::chunk::typed_fixture::lower(
-        plan,
-        profile,
-        vec![],
-        novarocks_local_program::StaticSinkProgram::Noop,
-    );
-    let ProgramNodeKind::RuntimeFilterConsumer { bindings, .. } =
-        graph.nodes()[graph.root().index()].kind()
-    else {
-        panic!("the original consumer is frozen into the LocalProgram graph");
-    };
-    assert_eq!(bindings.len(), 1);
-    bindings[0].consumer.clone()
-}
-
 #[test]
-fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
+fn checked_filter_contracts_keep_complete_installed_types_and_owned_canonical_storage() {
     use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
     use execution::contribution::{
         RuntimeOrderContract, RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
@@ -599,7 +540,7 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
     use novarocks_local_program::{FilterMembershipSchema, FilterMembershipSchemaError};
 
     // JSON and text share the same artifact bytes, but the original declared
-    // domain and root NULL guarantee must survive every freeze and thaw.
+    // domain and root NULL guarantee survive checked static adoption and thaw.
     for nullable in [false, true] {
         let declared = FunctionValueType::try_with_logical_type(
             DataType::Utf8,
@@ -651,6 +592,18 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
             )
             .unwrap();
         let original_backing = canonical.canonical_bytes().as_ptr();
+        // The neutral static owner adopts the original admitted artifact and
+        // independent complete domain. No execution tree or runtime request
+        // authors these facts; the real runtime projection is checked below.
+        let frozen = StaticFilterConsumer::try_new(
+            7,
+            7,
+            FilterConsumerActivation::BlockingSnapshot,
+            StaticFilterContract::membership_from_canonical(canonical.clone(), declared.clone())
+                .unwrap(),
+            FilterReduction::SetUnion,
+        )
+        .unwrap();
         let installed = execution::RuntimeFilterConsumerContract::membership_blocking(
             execution::RuntimeFilterBindingId::new(7),
             execution::RuntimeFilterChannelId::new(7),
@@ -663,7 +616,6 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
             ),
         )
         .unwrap();
-        let frozen = freeze_installed_consumer(&declared, &installed);
         let StaticFilterContract::Membership {
             canonical,
             value_type,
@@ -716,7 +668,7 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
         );
     }
 
-    // Fixed original v1 vector: one ascending Int64 key, NULLs first. The
+    // Fixed canonical order vector: one ascending Int64 key, NULLs first. The
     // existing strict ordered constructor verifies these bytes and digests.
     const COMPARATOR: [u8; 32] = [
         158, 44, 110, 71, 60, 4, 201, 17, 60, 183, 191, 230, 197, 165, 217, 97, 252, 8, 107, 193,
@@ -738,6 +690,32 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
             ORDER,
         )
         .unwrap();
+        let keys = novarocks_local_program::FilterOrderKeys::try_single_observed::<
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+        >(
+            FilterOrderKey {
+                value_type: declared.clone(),
+                direction: FilterSortDirection::Ascending,
+                null_order: FilterNullOrder::First,
+            },
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let frozen = StaticFilterConsumer::try_new(
+            12,
+            12,
+            FilterConsumerActivation::NonBlockingLive {
+                late_apply: FilterLateApplyGranularity::Batch,
+            },
+            StaticFilterContract::Ordered {
+                keys,
+                comparator_digest: COMPARATOR,
+                contract_digest: ORDER,
+            },
+            FilterReduction::TightenOrderedBound,
+        )
+        .unwrap();
         let installed = execution::RuntimeFilterConsumerContract::ordered_live(
             execution::RuntimeFilterBindingId::new(12),
             execution::RuntimeFilterChannelId::new(12),
@@ -745,7 +723,6 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
             execution::RuntimeFilterExecutionContract::Ordered(Arc::new(order).into()),
         )
         .unwrap();
-        let frozen = freeze_installed_consumer(&declared, &installed);
         let StaticFilterContract::Ordered { keys, .. } = frozen.contract() else {
             panic!("the frozen ordered key keeps its full declaration");
         };
@@ -1441,11 +1418,11 @@ fn first_read_wait(
     (deadline - after, deadline - before)
 }
 
-// The compiled scan source and the v1 scan source take their gate wait from
-// the same runtime state by the same rule, with the scan-specific and the
-// general wait both configured.
+// The scan-specific timeout takes precedence over the general timeout. The
+// independent expected value must remain inside the actual first-read
+// deadline's bracket; agreement with a retired carrier cannot prove it.
 #[test]
-fn a_compiled_scan_gate_waits_exactly_as_long_as_the_v1_scan_gate() {
+fn a_compiled_scan_gate_honors_explicit_scan_specific_precedence() {
     let program = scan_with_consumers(1, vec![(blocking_consumer(7), V0_OUTPUT)])
         .expect("the scan consumer program builds");
     for (wait, scan_wait) in [
@@ -1457,32 +1434,6 @@ fn a_compiled_scan_gate_waits_exactly_as_long_as_the_v1_scan_gate() {
         let session = FakeSession::consumers(&[(7, &subscription)]);
         let state = state(Some(session), wait, scan_wait);
         let op = FixtureScanOp::new(Vec::new(), true);
-
-        let mut arena = ExprArena::default();
-        let key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        let contract = execution::RuntimeFilterConsumerContract::membership_blocking(
-            execution::RuntimeFilterBindingId::new(7),
-            execution::RuntimeFilterChannelId::new(7),
-            execution::RuntimeFilterExecutionContract::Membership(
-                match declared_membership_contract(
-                    FunctionValueType::new(DataType::Int64, true),
-                    execution::RuntimeFilterNullSemantics::NeverMatches,
-                ) {
-                    execution::RuntimeFilterExecutionContract::Membership(schema) => schema,
-                    _ => unreachable!(),
-                },
-            ),
-        )
-        .unwrap();
-        let scan = ScanNode::new_for_test(Arc::clone(&op) as Arc<dyn ScanOp>)
-            .with_node_id(SCAN_NODE)
-            .with_runtime_filter_consumers(vec![RuntimeFilterConsumerBinding::new(key, contract)]);
-        let v1 = StreamScanSourceFactory::new_native(
-            scan,
-            Arc::clone(&op) as Arc<dyn ScanOp>,
-            Arc::new(arena),
-        )
-        .expect("v1 scan source");
 
         let consumers =
             crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers::try_new(
@@ -1499,11 +1450,11 @@ fn a_compiled_scan_gate_waits_exactly_as_long_as_the_v1_scan_gate() {
             Some(Arc::new(consumers)),
         );
 
-        let (v1_low, v1_high) = first_read_wait(&v1, &state);
         let (compiled_low, compiled_high) = first_read_wait(&compiled, &state);
+        let expected = scan_wait.unwrap_or(wait);
         assert!(
-            compiled_low <= v1_high && v1_low <= compiled_high,
-            "wait {wait:?} scan wait {scan_wait:?}: compiled [{compiled_low:?}, {compiled_high:?}] v1 [{v1_low:?}, {v1_high:?}]"
+            compiled_low <= expected && expected <= compiled_high,
+            "wait {wait:?} scan wait {scan_wait:?}: expected {expected:?} inside compiled deadline [{compiled_low:?}, {compiled_high:?}]"
         );
         assert_eq!(op.claims(), 0, "a pending gate claims no stream");
     }
@@ -2304,7 +2255,8 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
     let program = join_with_probe_consumers(&base, vec![blocking_consumer(7)]).unwrap();
     let join = join_node(&program);
     let contract =
-        super::super::local::runtime_filter_consumer_contract(&blocking_consumer(7)).unwrap();
+        super::super::runtime_filter::runtime_filter_consumer_contract(&blocking_consumer(7))
+            .unwrap();
     let consumers = Arc::new(
         CompiledRuntimeFilterConsumers::try_new(
             "Join",

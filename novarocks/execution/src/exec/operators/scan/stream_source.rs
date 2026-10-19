@@ -31,7 +31,6 @@
 
 use crate::runtime::fragment::ExecutionResult;
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -45,11 +44,11 @@ use super::output_filter::{
     record_rows_read, scan_limit_decision,
 };
 use crate::exec::chunk::Chunk;
+#[cfg(test)]
 use crate::exec::expr::ExprArena;
-use crate::exec::node::scan::{ScanNode, ScanOp, ScanOutputStream, ScanStreamSource};
+use crate::exec::node::scan::{ScanOp, ScanOutputStream, ScanStreamSource};
 use crate::exec::operators::runtime_filter::{
-    CompiledRuntimeFilterConsumers, NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet,
-    RuntimeFilterConsumerState, RuntimeFilterGate,
+    CompiledRuntimeFilterConsumers, RuntimeFilterConsumerState, RuntimeFilterGate,
 };
 use crate::exec::pipeline::operator::{
     DriverBlockDeadline, FinishWatch, Operator, ProcessorOperator, forward_observable,
@@ -65,38 +64,6 @@ use crate::runtime::scan_stream_metrics::{ScanStreamPending, observe_scan_stream
 /// CPU budget of one driver turn inside a scan stream, in provider work
 /// units (roughly one decoded batch each).
 pub(crate) const SCAN_STREAM_TURN_BUDGET: u64 = 64;
-
-/// A scan's runtime-filter consumers: blocking membership filters behind one
-/// gate, and live ordered filters.
-fn native_scan_consumers(
-    scan: &ScanNode,
-    arena: &Arc<ExprArena>,
-) -> Result<(RuntimeFilterConsumerSet, NativeOrderedLiveConsumerSet), String> {
-    let mut membership_specs = Vec::new();
-    let mut ordered_live_specs = Vec::new();
-    let mut seen_bindings = HashSet::new();
-    for spec in scan.native_runtime_filter_specs() {
-        if !seen_bindings.insert(spec.binding_id()) {
-            return Err(format!(
-                "duplicate native scan runtime-filter consumer binding_id={}",
-                spec.binding_id()
-            ));
-        }
-        match spec.execution_contract() {
-            crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership(_) => {
-                membership_specs.push(spec.clone())
-            }
-            crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered(_) => {
-                ordered_live_specs.push(spec.clone())
-            }
-        }
-    }
-    let blocking =
-        RuntimeFilterConsumerSet::from_plan("Scan", &membership_specs, Arc::clone(arena))?;
-    let ordered_live =
-        NativeOrderedLiveConsumerSet::from_plan(&ordered_live_specs, Arc::clone(arena))?;
-    Ok((blocking, ordered_live))
-}
 
 /// The operator and profile name of a scan source, always carrying the plan
 /// node id.
@@ -174,25 +141,6 @@ pub(crate) struct StreamScanSourceFactory {
 }
 
 impl StreamScanSourceFactory {
-    pub(crate) fn new_native(
-        scan: ScanNode,
-        op: Arc<dyn ScanOp>,
-        arena: Arc<ExprArena>,
-    ) -> Result<Self, String> {
-        let source = op.stream_source();
-        let (blocking, ordered_live) = native_scan_consumers(&scan, &arena)?;
-        let name = scan_source_name(scan.node_id(), op.as_ref());
-        let filter = ScanOutputFilter::new(&scan, arena, Some(blocking), Some(ordered_live));
-        Ok(Self {
-            name,
-            node_id: scan.node_id(),
-            limit: scan.limit(),
-            op,
-            source,
-            filter,
-        })
-    }
-
     /// The direct ordered lane owns residual/live/membership/limit before
     /// the original whole-chunk handoff; no downstream residual is installed.
     pub(crate) fn new_compiled_ordered(
@@ -380,9 +328,6 @@ impl Operator for StreamScanSourceOperator {
             consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
             consumers.bind(state)?;
         }
-        if let Some(consumers) = self.filter.ordered_live() {
-            consumers.bind(state)?;
-        }
         self.runtime_error = Some(state.error_state());
         self.output_tracker = state
             .mem_tracker()
@@ -527,7 +472,6 @@ impl ProcessorOperator for StreamScanSourceOperator {
                             crate::exec::pipeline::operator::ConstructionFailure::Memory,
                         )?;
                     }
-                    self.filter.poll_live_updates()?;
                     let Some(chunk) =
                         self.filter
                             .apply(chunk, self.profiles.as_ref(), &self.event_sink)?
@@ -613,7 +557,7 @@ mod tests {
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::node::scan::{ScanChunkStream, ScanNode, ScanOp};
+    use crate::exec::node::scan::{ScanChunkStream, ScanOp};
     use crate::exec::operators::local_exchanger::LocalExchanger;
     use crate::exec::operators::{LocalExchangeSinkFactory, LocalExchangeSourceFactory};
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
@@ -869,9 +813,7 @@ mod tests {
             source: Arc::clone(&source),
             backpressure: Arc::clone(&backpressure),
         });
-        let scan = ScanNode::new_for_test(Arc::clone(&op)).with_node_id(7);
-        let factory = StreamScanSourceFactory::new_native(scan, op, Arc::new(ExprArena::default()))
-            .expect("stream scan factory");
+        let factory = StreamScanSourceFactory::new_compiled(7, op, None);
         let mut operator = factory.create(1, 0);
         operator.set_construction_factory(actual_test_factory());
         operator
