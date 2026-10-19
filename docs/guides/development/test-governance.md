@@ -105,7 +105,7 @@ Native build identity 的来源在薄 CLI build.rs 冻结并注入 Version，不
 
 ## 构建选择与控制授权
 
-日常开发只有一个 `dev` 主测试图。规范入口是 [dev-test.sh](../../../tools/ci/dev-test.sh)：`prepare <receipt>` 同次 `cargo build --workspace --tests --bins --profile dev --locked --target-dir "$PWD/target"`，从开始包含 dev-dependencies 和真实程序；`test [filter] -- [libtest options]` 保持 workspace package selection 并交给 Cargo 执行；`doc` 单独运行 doctest。clippy 的 `--all-targets` 是额外静态检查范围，不扩大行为测试到暂停项、bench 或 example。窄 `cargo test -p <owner>` 适合内循环，选包会改变依赖统一和必要链接，不能冒称完整规范图。
+日常开发只有一个 `dev` 主测试图。规范入口是 [dev-test.sh](../../../tools/ci/dev-test.sh)：`prepare <receipt>` 同次 `cargo build --workspace --tests --bins --profile dev --locked --target-dir "$PWD/target"`，从开始包含 dev-dependencies 和真实程序；`test` 使用原生 nextest 逐测试进程执行，`list` 保存/显示原生发现，`doc` 单独运行 Cargo doctest。选择用 `-E 'package(...) & test(...)'` 等原生 filter，不把运行选择翻译成 Cargo 选包或另一份 feature 图。clippy 的 `--all-targets` 是额外静态检查范围，不扩大行为测试到暂停项、bench 或 example。窄 `cargo test -p <owner>` 适合内循环，选包会改变依赖统一和必要链接，甚至暴露窄图缺少的 feature 前置；原始失败保留，不能冒称完整规范图。
 
 标准 `dev` 的 workspace 与非 workspace 普通目标均使用 `opt-level=1`，保留 debug assertions、增量编译、256 codegen units 和关闭 LTO；第一方使用 line tables，非 workspace 依赖不生成 debug symbols。host build-script/proc-macro 按 Cargo profile override 优先级处理：`package."*"` 覆盖非 workspace 成员及其 host 单元，workspace build script 仍遵循默认 build override；实际值以 Cargo 产物记录为准。该集合不能等同语义上的全部第三方。这个唯一默认组合由 G2a 的有界应用成本观察选择；成本观察不替代 native 正确性验收，原失败和未完成项单独保留。
 
@@ -114,6 +114,29 @@ Native build identity 的来源在薄 CLI build.rs 冻结并注入 Version，不
 规范 helper 从 Cargo JSON 的真实 bin artifact 绑定 Server、SQL/System runner 和 error-manifest 的可执行路径与 SHA-256。最后一次相关 Cargo 后重新采集，并在消费前检查内容；缺路径、缺 required bin 或内容变化失败，不能回退旧程序。SQL 列举、执行和 error-manifest 检查直接使用已准备程序，不另起 `cargo run`。自报保存 stdout/stderr/实际退出；capabilities 据实际编译事实保留，`declared_profile=null` 与其它 unknown 不补造。自报不认证依赖最终 profile 或发布资格。
 
 普通 SQL 和有有限控制需求的 SQL/System 使用同一个显式主 Server。SQL 只接受 `NOVAROCKS_BIN`，System 使用 `--binary`。原生 owner 按本次实际选中动作冻结角色会话、statement、目标和授权，启动后控制仍需准确匹配；编入能力、debug/profile、`fault-scenario` 名称、旧环境或裸测试 CALL 均不授予动作权。非破坏观察也不授予 wipe。开发 cfg 使通用控制接缝可见，不会自动启用 HMS/MySQL exact/closing/root 专项；这些模块仍需显式选择各自的 `mem-1-m07-*` feature，运行时还需准确授权及对应 fixture/binding。外部 fixture、私有历史矩阵和 required-but-not-run 仍独立报告，主图单测通过不代替完整原输入。
+
+### 原生 Rust 执行、进程回收与原始结果
+
+```bash
+tools/ci/dev-test.sh list -E 'package(novarocks-memory)'
+tools/ci/dev-test.sh test -E 'package(novarocks-memory) & test(=attribution_reconcile)'
+tools/ci/dev-test.sh test -E 'rdeps(novarocks-test-support)' --test-threads 2
+tools/ci/dev-test.sh doc
+# Formal verification includes its existing governance gates.
+tools/ci/local-full-ci.sh --cargo-only
+```
+
+nextest 日常使用原生最低版本要求 **0.9.148**，兼容新版不因自定义精确版本判断被拒绝；正式工具准备固定 0.9.148。缺工具、无效配置和必要选择为空明确失败，不静默回退旧串行入口。原生配置默认 4 slots、无重试、非 fail-fast、泄漏检测失败；Server smoke/cluster 以及进程机械测试使用各自的原生资源组，不能从 slot 推断整个进程树、内存预算或清理完成。watchdog 防止挂死，不续产品或 helper 的原始 deadline。
+
+日常入口先准备原生 Cargo/nextest metadata，最后联合构建并核对实际 executable/hash，再前台 exec nextest，保留原生 TTY、输入和作业控制。正式批处理使用同一准备/绑定和运行选择，独占保存 nextest/JUnit、Cargo/doctest、源码/产物/配置事实及监护记录；普通断言失败后仍执行独立 doctest，取消、环境或清理失败则保留未运行原因。相关 Cargo 结束后再次联合准备并刷新程序绑定，后续 SQL/System 消费最后 receipt。原始结果和阶段完整性分别表达；消费者通过 [CI 执行材料接口](../../../tools/ci/README.md) 的 `execution-index.json` schema 1 读取，不解析内部人类日志或改写原生报告。
+
+共享 `ManagedCommand` 从构造时就通过独立 monitor 启动 payload；monitor 持真实 Child、准确进程组和实际 wait，控制方失联后继续清理。`ManagedProcess` 的输出定位文件指向 run-owned 原始双流，不能再当 combined log 读取。完整行诊断的 1 MiB 界限只约束 `live_log_line`，原始输出、readiness 与完整 golden capture 保留自身合同。普通调用成功检查退出和日志断言后可显式释放；source clone 继续 pin 材料。生命周期完成不能证明测试断言已通过。
+
+普通 nextest 首次受管操作才懒建原生 run ID 对应的材料租约，纯测试与 list 不建 root/guard。嵌套 runner 的外层测试先 `ensure_run_retention(deadline)`，随后保留原生身份及本地状态上下文；直接 Cargo/IDE/SQL/System 没有 nextest 身份时按调用进程归属。普通路径由 Rust 辅助程序维护，不引入 Python 依赖；这不等于准备阶段也无需 Python。材料默认保留最近 3 次已收束调用，默认窗口可通过正数 `NOVAROCKS_TEST_RUN_RETENTION_COUNT` 调整；活动 pin、未知结束、缺 Final 和未完成清理不被窗口淘汰，数量窗口不是磁盘硬上限。同次调用不能提前淘汰早期失败。
+
+正式材料不受普通 release/GC 影响，继续遵守上文正式保留/交接规则。运行锁及状态目录只支持经实际 FD 检查的本地 APFS/ext/XFS/Btrfs/tmpfs；容器显式 bind-mount 支持的本地状态目录，overlay/网络/未知文件系统不降级。完整范围、嵌套示例、平台验证缺口和 macOS 按需排查入口见 [test-support README](../../../tests/test-support/README.md)。当前 native Linux x86_64 仍缺本轮生命周期/FD及真实消费者证据，文档和 macOS 定向通过不能替代该平台验收。
+
+Hadoop local fencing 保留普通原生测试，内部 child helper 为 ignored 且只能由父测试 `--ignored --exact` 启动；缺输入失败。MinIO、MySQL、FoundationDB 和 Java interop 继续各自专用入口及真实前置，Paimon 暂停边界保留。Loom/Miri 保留专用工具链与 Tree Borrows 等条件。nextest 全量不自动扩展这些矩阵，也不接管 Docker、外部实例或所有 raw spawn 的生命周期。
 
 ### 兼容专项的选择
 
@@ -125,16 +148,23 @@ Compatible 使用主 workspace/tests/bins/dev 图，仅改变薄 Server CLI 的�
 
 ### IDE 与缓存维护
 
-IDE 的规范测试按钮也消费 workspace 流程，保留原生测试选择，不传 package 占位符缩小图。例如 VS Code 用户设置；先将 `/absolute/path/to/NovaRocks` 替换为当前 worktree 的实际绝对路径：
+IDE 默认 Cargo/libtest 单例按钮仍可局部调试，并获得库级 monitor 回收；它不自动提供 nextest 逐测试隔离、规范主图或正式汇总。不要把旧的 Cargo `test.overrideCommand` 参数模板机械转给 nextest。需要规范 workspace 选择时，建立调用绝对 worktree 路径的外部 task，例如 VS Code `tasks.json`；将示例路径替换成实际 worktree：
 
 ```json
 {
-  "rust-analyzer.runnables.test.overrideCommand": ["/absolute/path/to/NovaRocks/tools/ci/dev-test.sh", "test", "--", "${executable_args}", "--nocapture"],
-  "rust-analyzer.cargo.targetDir": true
+  "version": "2.0.0",
+  "tasks": [{
+    "label": "NovaRocks native exact test",
+    "type": "process",
+    "command": "/absolute/path/to/NovaRocks/tools/ci/dev-test.sh",
+    "args": ["test", "-E", "package(novarocks-memory) & test(=attribution_reconcile)"],
+    "options": {"cwd": "/absolute/path/to/NovaRocks"},
+    "problemMatcher": []
+  }]
 }
 ```
 
-测试 override 的工作目录是测试所属 package，而非 workspace 根，因此 helper 必须使用绝对路径。rust-analyzer 将 `${executable_args}` 展开为多个原生参数：单个测试保留 filter、`--exact` 和 `--include-ignored`，模块测试仅保留模块 filter 及额外测试参数，不强制 `--exact`。这些参数放在 `--` 后由 Cargo 交给原生测试程序，保留 workspace 构建范围。[runnable 工作目录与 override](https://github.com/rust-lang/rust-analyzer/blob/bb3bbbd9e4/crates/rust-analyzer/src/lsp/to_proto.rs#L1669-L1692)、[原生参数展开](https://github.com/rust-lang/rust-analyzer/blob/bb3bbbd9e4/crates/rust-analyzer/src/target_spec.rs#L280-L311)。
+原生 `test(=...)` 精确选择及 `package()/binary()/rdeps()` 按 nextest 语义组合。内部 ignored helper 不作为 IDE 全量或 `--run-ignored all` 的普通目标；公开 ignored fixture 测试只有在其真实前置满足后才精确运行。保留 `rust-analyzer.cargo.targetDir=true` 的私有检查缓存设置，不覆盖用户其它编辑器配置。
 
 `cargo.targetDir=true` 为 flycheck/build-script/proc-macro 使用 worktree target 下私有目录，不能让 overrideCommand 强制主 target。若覆盖 check 命令，必须先从编辑器有效命令确认实际目录，并通过 `tools/ci/dev-test.sh check --target-dir <actual-IDE-dir>` 显式透传。规范测试 runner 仍用主 target；IDE check 是独立编译单元，有额外磁盘和重编成本。不要覆盖用户其它编辑器设置。新 worktree 冷缓存和底层库改动的必要重链接是合法成本；历史 18s/32s 不是现机收益，最终 opt 选择只引用实际尝试材料。
 

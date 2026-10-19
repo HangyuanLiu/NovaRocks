@@ -712,8 +712,14 @@ the guide supplies NovaRocks locations and operational responsibilities.
 
 日常构建使用唯一 `dev` 配置和当前 worktree 的 `target/`。规范检查点先执行
 `tools/ci/dev-test.sh prepare logs/<attempt>/artifacts.json`，同次准备 workspace tests 和真实 bins；
-定向运行用 `tools/ci/dev-test.sh test FILTER -- --test-threads=1`，最终按影响面运行
-`tools/ci/dev-test.sh test --no-fail-fast -- --test-threads=1`，doctest 单独 `dev-test.sh doc`。
+常规 Rust 由 nextest 逐测试进程执行；定向选择用
+`tools/ci/dev-test.sh test -E 'package(novarocks-memory) & test(=attribution_reconcile)'`，
+原生列举用 `tools/ci/dev-test.sh list -E 'package(novarocks-memory)'`。
+最终按影响面运行 `tools/ci/dev-test.sh test`；doctest 单独 `tools/ci/dev-test.sh doc`。
+默认 4 slots、无重试、非 fail-fast；原生资源组约束重型进程测试，不机械传全局串行。
+nextest 日常最低 0.9.148，正式工具固定 0.9.148；缺工具、缺必要输入或选择为空时明确失败。
+日常准备后前台 exec nextest 保留 TTY；`local-full-ci.sh --cargo-only` 独立调用批处理，
+保存原始 nextest/JUnit 与 doctest 结果、全部监护记录及 `execution-index.json`。
 release 用于必要的产品接线/发布检查，不再维护第二套日常功能矩阵。
 
 窄 `cargo test -p <owner>` 是允许的快速内循环；它可能改变 feature 统一和重链接集合，不能当完整规范图。
@@ -726,7 +732,16 @@ IDE 测试按钮与私有 target 配置、清理责任见 [测试治理](docs/gu
 - `cargo fmt`
 - `cargo clippy`
 - `cargo build`
-- `cargo test`
+- 按影响面执行 nextest；独立 Cargo doctest，局部调试可用 `cargo test -p <owner>`
+
+共享受管启动从 `ManagedCommand::new(payload)` 构造，monitor 持真实 Child 并负责失联回收；
+成功路径检查 stop/wait 与所需原始日志断言后才释放诊断。普通 nextest 首次受管调用懒建材料租约，
+纯测试不建 root/guard；嵌套 runner 由外层先 `ensure_run_retention(deadline)`。
+完整 UTF-8 行实时诊断上限 1 MiB，原始双流日志和完整 capture 不因此截断。
+容器的运行状态/正式材料根必须显式挂载支持的本地文件系统；overlay 不作锁语义 fallback。
+直接 Cargo/IDE 获得相同库级回收，不自动获得 nextest 隔离或正式汇总。
+范围、保留规则和 Linux 验证状态见 [test-support README](tests/test-support/README.md)，
+原始结果接口见 [CI README](tools/ci/README.md)，修改这些边界前读 ADR-0184。
 
 ### 8.4 SQL Regression Tests
 
@@ -813,8 +828,11 @@ runs belong at milestone convergence, at the final verification before claiming
 completion, and where the blast radius genuinely is the whole repository.
 
 **Rust: choose the affected owner for the narrow edit loop.** Every first-party crate lives
-in the single root workspace, so `cargo test -p <crate>` always works; the
-packages under `vendor/` own separate workspaces and locks and are out of scope
+in the single root workspace. Narrow `cargo test -p <crate>` may change feature
+unification; a missing narrow-graph prerequisite must stay visible and cannot
+be treated as evidence about the complete graph. Use the standard workspace
+nextest entry with native filters for formal graph coverage. The packages
+under `vendor/` own separate workspaces and locks and are out of scope
 unless you edited them.
 
 | Change lands in | Run at least |

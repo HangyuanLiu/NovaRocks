@@ -57,6 +57,7 @@ use novarocks_native_trust::{
     PemTransportMaterial, ValidatedSharedSecret,
 };
 use novarocks_secret::SecretValue;
+use novarocks_test_support::ManagedCommand;
 pub use novarocks_test_support::ManagedProcessLogSource;
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use novarocks_types::NativeEndpoint;
@@ -70,7 +71,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -2255,7 +2255,7 @@ pub struct CapturedServerProcessLog {
 }
 
 enum FailureLogCurrentSource {
-    Managed(ManagedProcessLogSource),
+    Managed([ManagedProcessLogSource; 2]),
     Inline {
         original_bytes: usize,
         bytes: Vec<u8>,
@@ -2317,7 +2317,7 @@ impl ServerFailureLogSource {
     fn managed(
         name: String,
         history: &str,
-        current: ManagedProcessLogSource,
+        current: [ManagedProcessLogSource; 2],
         max_tail_bytes: usize,
         redactions: Arc<[String]>,
     ) -> Self {
@@ -2375,9 +2375,17 @@ impl ServerFailureLogSource {
     fn capture(self, max_tail_bytes: usize) -> Result<CapturedServerProcessLog> {
         let capture_window_bytes = redaction_capture_window_bytes(max_tail_bytes, &self.redactions);
         let (current_bytes, current_tail) = match self.current {
-            FailureLogCurrentSource::Managed(source) => {
-                let tail = source.read_tail(capture_window_bytes)?;
-                (tail.original_bytes, tail.bytes)
+            FailureLogCurrentSource::Managed([stdout, stderr]) => {
+                let stdout = stdout.read_tail(capture_window_bytes)?;
+                let stderr = stderr.read_tail(capture_window_bytes)?;
+                let mut bytes = b"[stdout]\n".to_vec();
+                bytes.extend_from_slice(&stdout.bytes);
+                bytes.extend_from_slice(b"\n[stderr]\n");
+                bytes.extend_from_slice(&stderr.bytes);
+                (
+                    stdout.original_bytes.saturating_add(stderr.original_bytes),
+                    bytes,
+                )
             }
             FailureLogCurrentSource::Inline {
                 original_bytes,
@@ -2789,6 +2797,9 @@ pub trait ServerHandle: Send {
     fn residual_process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+    /// Preserve original runtime and process diagnostics when the caller's
+    /// outcome has failed, even if subsequent process cleanup succeeds.
+    fn retain_runtime_artifacts(&mut self) {}
     fn shutdown(&mut self) -> Result<()> {
         Ok(())
     }
@@ -4589,6 +4600,12 @@ impl CrossProcessServerHandle {
         if failures.iter().any(Option::is_some) {
             Err(ExactMysqlRoleShutdownError { failures }.into())
         } else {
+            if !self.retain_runtime_artifacts {
+                self.fe_process.release_diagnostics()?;
+                for process in &self.be_processes {
+                    process.release_diagnostics()?;
+                }
+            }
             Ok(())
         }
     }
@@ -4640,6 +4657,12 @@ impl CrossProcessServerHandle {
         // diagnosis, but never the generated private key or certificate PEM.
         self.native_trust_fixture.cleanup_sensitive_material();
         if failures.is_empty() {
+            if !self.retain_runtime_artifacts {
+                self.fe_process.release_diagnostics()?;
+                for process in &self.be_processes {
+                    process.release_diagnostics()?;
+                }
+            }
             Ok(())
         } else {
             bail!(failures.join("; "))
@@ -4753,6 +4776,10 @@ impl CrossProcessServerHandle {
 }
 
 impl ServerHandle for CrossProcessServerHandle {
+    fn retain_runtime_artifacts(&mut self) {
+        CrossProcessServerHandle::retain_runtime_artifacts(self);
+    }
+
     fn actual_build_information_evidence(&self) -> Result<Option<serde_json::Value>> {
         self.build_information_evidence().map(Some)
     }
@@ -5326,7 +5353,10 @@ impl ServerHandle for CrossProcessServerHandle {
         logs.push(ServerFailureLogSource::managed(
             "fe.log".to_string(),
             &self.fe_log_history,
-            self.fe_process.log_source(),
+            [
+                self.fe_process.stdout_log_source(),
+                self.fe_process.stderr_log_source(),
+            ],
             max_history_tail_bytes,
             Arc::clone(&self.failure_log_redactions),
         ));
@@ -5334,7 +5364,10 @@ impl ServerHandle for CrossProcessServerHandle {
             logs.push(ServerFailureLogSource::managed(
                 format!("be-{index:03}.log"),
                 &self.be_log_history[index],
-                self.be_processes[index].log_source(),
+                [
+                    self.be_processes[index].stdout_log_source(),
+                    self.be_processes[index].stderr_log_source(),
+                ],
                 max_history_tail_bytes,
                 Arc::clone(&self.failure_log_redactions),
             ));
@@ -5434,6 +5467,7 @@ impl ServerHandle for CrossProcessServerHandle {
         let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
         let (old_process_id, prior_log) = combine_restart_evidence(evidence, exited)?;
         self.be_log_history[index].push_str(&prior_log);
+        self.be_processes[index].release_diagnostics()?;
         self.native_fault_proxies.disconnect_backend(index);
 
         let config_path = self
@@ -5636,6 +5670,7 @@ impl ServerHandle for CrossProcessServerHandle {
         let exited = combine_role_cleanup(stopped, controller_cleanup.map(|_| ()));
         let prior_log = combine_restart_evidence(prior_log, exited)?;
         self.fe_log_history.push_str(&prior_log);
+        self.fe_process.release_diagnostics()?;
         let marker = "NOVAROCKS_READY mysql_port=";
         let binary = self.test_sessions.as_ref().map_or_else(
             || Ok(self.fe_binary.clone()),
@@ -5812,7 +5847,7 @@ fn process_runtime_diagnostics_with_drained_backends(
     Ok(diagnostics)
 }
 
-pub fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) -> Command {
+pub fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) -> ManagedCommand {
     build_novarocks_command_with_profile(binary, role, config_path, LaunchProfile::FaultScenario)
 }
 
@@ -5821,8 +5856,8 @@ fn build_novarocks_command_with_profile(
     role: &str,
     config_path: &Path,
     launch_profile: LaunchProfile,
-) -> Command {
-    let mut command = Command::new(binary);
+) -> ManagedCommand {
+    let mut command = ManagedCommand::new(binary);
     if launch_profile == LaunchProfile::Performance {
         // Formal performance children must not inherit unclassified knobs such
         // as logging, allocator, cloud credential, or runtime tuning variables.
@@ -5834,14 +5869,12 @@ fn build_novarocks_command_with_profile(
         .arg(role)
         .arg("--config")
         .arg(config_path)
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("NO_PROXY", "127.0.0.1,localhost");
     apply_launch_profile(&mut command, launch_profile);
     command
 }
 
-fn apply_launch_profile(command: &mut Command, _launch_profile: LaunchProfile) {
+fn apply_launch_profile(command: &mut ManagedCommand, _launch_profile: LaunchProfile) {
     const TEST_ENVIRONMENT: &[&str] = &[
         "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD",
         "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
@@ -5969,7 +6002,7 @@ fn combine_role_cleanup(product: Result<()>, controller: Result<()>) -> Result<(
     }
 }
 
-fn apply_child_environment(command: &mut Command, environment: &BTreeMap<String, String>) {
+fn apply_child_environment(command: &mut ManagedCommand, environment: &BTreeMap<String, String>) {
     command.envs(environment);
 }
 

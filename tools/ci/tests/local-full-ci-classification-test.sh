@@ -267,7 +267,7 @@ stage_capture="$tmpdir/cargo-gates"
   run_cargo_gates
 )
 grep -Fx 'locked Cargo metadata|cargo-metadata.log|cargo metadata --locked --format-version 1' "$stage_capture" >/dev/null
-grep -Fx 'joint tests and binaries preparation|cargo-prepare.log|ci_prepare_main '"$tmpdir/cargo-gate-run/build-info/artifacts.json" "$stage_capture" >/dev/null
+grep -Fx 'joint tests and binaries preparation|cargo-prepare.log|ci_prepare_main '"$tmpdir/cargo-gate-run/rust/final-prepare/artifacts.json" "$stage_capture" >/dev/null
 [ "$(rg -c '^joint tests and binaries preparation\|' "$stage_capture")" = 1 ]
 if rg 'test-control owner tests|base controls build|cargo build --workspace' "$stage_capture"; then
   echo 'duplicate graph preparation in daily CI' >&2; exit 1
@@ -280,11 +280,28 @@ full_stage_capture="$tmpdir/full-cargo-gates"
   run_fail_fast_stage() { printf '%s|' "$1" >>"$full_stage_capture"; shift 2; printf '%s\n' "$*" >>"$full_stage_capture"; }
   ci_collect_artifacts() { :; }
   ci_capture_main_builds() { :; }
+  run_rust_batch_stage() { printf 'workspace nextest and doctests|python3 tools/ci/test-run.py batch --output %s/rust\n' "$CI_RUN_DIR" >>"$full_stage_capture"; }
   run_cargo_gates
 )
-grep -Fx 'workspace tests|ci_main_cargo test --tests --no-fail-fast -- --test-threads=1' "$full_stage_capture" >/dev/null
-grep -Fx 'workspace doctests|ci_main_cargo test --doc --no-fail-fast -- --test-threads=1' "$full_stage_capture" >/dev/null
-[ "$(rg -c '^joint tests and binaries preparation\|' "$full_stage_capture")" = 1 ]
+grep -Fx 'workspace nextest and doctests|python3 tools/ci/test-run.py batch --output '"$tmpdir/full-cargo-gate-run/rust" "$full_stage_capture" >/dev/null
+if rg 'ci_main_cargo test|test-threads=1|joint tests and binaries preparation' "$full_stage_capture"; then
+  echo 'formal Rust graph and independent doctest must be owned by the batch' >&2; exit 1
+fi
+
+# The formal wrapper already retains raw outputs. Its display must reach the
+# inherited destination instead of being swallowed by ci_run_logged.
+(
+  CI_RUN_DIR="$tmpdir/live-rust-stage"
+  mkdir -p "$CI_RUN_DIR"
+  python3() { printf 'incremental Rust display\n'; }
+  ci_record_stage() { :; }
+  ci_render_summary() { :; }
+  run_rust_batch_stage >"$tmpdir/inherited-rust-display"
+  grep -Fx 'incremental Rust display' "$tmpdir/inherited-rust-display" >/dev/null
+  if grep -F 'incremental Rust display' "$CI_RUN_DIR/rust-batch.log"; then
+    echo 'Rust display was redirected away from its inherited terminal' >&2; exit 1
+  fi
+)
 
 baseline="$tmpdir/known-failures.toml"
 run_dir="$tmpdir/run"

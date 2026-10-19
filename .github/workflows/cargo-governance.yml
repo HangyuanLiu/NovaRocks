@@ -48,6 +48,9 @@ jobs:
       - name: Install pinned cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
 
+      - name: Install pinned nextest
+        run: cargo install cargo-nextest --version 0.9.148 --locked
+
       - name: Run Cargo governance gates
         run: tools/ci/local-full-ci.sh --cargo-only
         env:

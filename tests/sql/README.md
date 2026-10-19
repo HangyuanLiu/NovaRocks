@@ -51,6 +51,16 @@ sql_runner="$(ci_bound_binary novarocks-sql-test)"
 
 LNP-3A/LNP-3D 与 `mv-storage-contract` 保留原 SQL、`.result` 和独立文档图，旧 CALL/directive 禁止扩展。当前 whole-family wipe 必须是显式 FE launch/family 授权、一次认领、隔离串行且 MV owner 停止 admission/实际 join 后台；普通裸 CALL 不授予擦除权。唯一后续迁移责任见 [correctness map](correctness/README.md#mv-受控过渡与后续迁移)，不在本次新增恢复或擦除 API。
 
+## 受管进程与原始双流
+
+cluster-harness 继续拥有 FE/BE 的应用生命周期、原生 1FE+NBE 拓扑、readiness、准确授权与 restart；共享 test-support 的独立 monitor 拥有具体 OS Child、进程组信号与实际 wait。runner、IDE 或外层测试异常退出后，monitor 仍履行失联回收；失联和清理错误继续保留，不因最终未发现残留进程变成通过。普通成功退出、原始断言和日志检查完成后才释放诊断，正式材料仍由外层正式入口保留。
+
+角色的输出定位文件指向 run-owned `stdout.log`、`stderr.log` 和监护记录，不能把 locator 当 combined log。runner/harness 通过原始 source handle 读取，失败材料关联真实位置；实时完整 UTF-8 行诊断上限为 1 MiB，超限明确失败并保留原始字节，不截断完整 SQL golden 输出。snapshot 拒绝替换/截短的日志文件。完整 capture 消费原期限，timeout/复制失败后的原始双流保留在 `diagnostic_root`。
+
+受原查询期限约束的 shell 走 `ManagedCommand`/capture；普通无期限 shell 仍由其原 owner 直接运行。Docker/fixture owner、stdin 协议 helper、listing observer 和专用 fencing helper 也不被这份共享接线自动接管。嵌在 nextest 中首次启动 runner 前，外层测试必须先 `ensure_run_retention(deadline)` 并保留继承上下文；直接运行 SQL CLI 无需伪造 nextest 身份。普通保留默认最近三次已收束调用；活动和未完成材料不淘汰，正式材料不受该窗口影响。
+
+容器运行状态根及正式证据根需 bind-mount 支持的本地文件系统；overlay 不作锁语义 fallback。详细 API、保留/释放责任、macOS 排查与 native Linux x86_64 尚未补齐的验证见 [test-support README](../test-support/README.md)。规范 Rust 的 nextest 与正式原始结果接口见 [CI README](../../tools/ci/README.md)；这些机械验证不替代本 suite 的真实 fixture 和 native 1FE+3BE 验收。
+
 ## SSB/TPC 数据正确性
 
 `ssb`、`tpc-h`、`tpc-ds` 与其他 suite 共用正常 case discovery、suite init/cleanup、结果比对和 server cleanup；分别消费 scale `1`、`1`、`1GB` 的共享 READY 数据。仅以完整 suite manifest 的 `prepared_dataset` 绑定输入，不读取旧测量 scenario/window 定义。

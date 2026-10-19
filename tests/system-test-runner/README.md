@@ -2,9 +2,10 @@
 
 `novarocks-system-tests` is the imperative, process-boundary test frontend.
 It owns scenario discovery, actors, bounded deadlines, oracle composition and
-failure reporting. `novarocks-cluster-harness` remains the only owner of
-1FE+NBE configuration, spawn, readiness, topology, faults, restart, logs and
-cleanup.
+failure reporting. `novarocks-cluster-harness` remains the only application owner of
+1FE+NBE configuration, launch, readiness, topology, faults, restart and cleanup.
+Shared test-support owns the exact OS Child/process-group/wait mechanics through
+its independent payload monitor.
 
 Follow [test governance](../../docs/guides/development/test-governance.md) for
 asset admission, approval snapshots, new exclusive attempt roots, retention and
@@ -35,6 +36,16 @@ CLI package 为 `novarocks-system-test-cli`，原 package `novarocks-system-test
 ## 产物与有限授权
 
 普通与受控步骤使用唯一显式 `--binary` 主 Server，原生 owner 按实际选中动作冻结角色需求、会话和 statement。dev 编入能力但不授予动作，标准 release 排除能力；缺能力/授权在 spawn 前失败。无授权角色也可运行同一 dev Server。兼容变体从实际 Cargo artifact 独立复制，启动及 restart 前保持准确程序与 grants 绑定。路径、identity、runner profile 不代替实际 FE/BE 自报，unknown 保留；原始 stdout/stderr、退出、清理失败和重跑材料分开保留。详见 [构建与授权](../../docs/guides/development/test-governance.md#构建选择与控制授权)。
+
+## 受管角色、诊断与材料
+
+角色从 `ManagedCommand` 构造受管启动，monitor 持真实 Child 并独立于 runner/test 进程完成组信号与实际 wait；harness 继续决定配置、marker、授权、原期限和 restart。收到客户端取消、角色 terminal、monitor 清理、场景断言通过是不同事实。成功路径检查退出和所需日志后释放普通诊断；失败路径保留 primary、cleanup 和原始输出，monitor 的失联回收成功不掩盖失联事实。
+
+角色输出定位信息关联原始 stdout/stderr 和监护记录，不能按路径猜测 combined log。实时完整行观察仅接收完整 UTF-8，并有 1 MiB 诊断缓冲界限；原始双流与完整 capture 不受该界限截断。source clone 在 stop/restart 后继续 pin 原始材料，日志替换或截短显式失败。正常 stop 本身不证明后续场景断言成功，断言所需日志必须在释放前消费。
+
+普通 nextest 首次受管调用懒建 run 级材料租约；外层测试启动嵌套 System CLI 前先 `ensure_run_retention(deadline)`，并继承原生上下文/状态根。直接调用 CLI 按调用进程归属，不自动获得 nextest 的逐测试隔离或正式汇总。普通失败/未释放材料进入默认三次已收束调用窗口，活动 pin 和缺终态的材料不被淘汰；正式 wrapper 材料继续按证据保留合同处理。
+
+本库只接管明确受管的 payload，不宣称 Docker、外部数据库实例、逃离组的后代或所有 raw spawn 已被 containment。容器中的锁/运行材料目录需显式挂载支持的本地 APFS/ext/XFS/Btrfs/tmpfs，overlay 拒绝受管登记。API、raw 调用范围及 native Linux x86_64 未验证状态见 [test-support README](../test-support/README.md)，正式结果的 `execution-index.json` schema 1 和原生报告位置见 [CI README](../../tools/ci/README.md)。
 
 ## 兼容专项与程序需求
 
@@ -212,7 +223,7 @@ range/planning输入准备与校验见保留的 [range fixture](../benchmarks/ue
 
 结果owner相关writer/buffer/ACK/取消/helper改动必跑对应场景；range/delete/planning/DOP由Connector/scan领域按provider/cache/range/admission/fixture改动必跑。高成本显式组每周由维护者手工相关领域轮次，记录缺输入与raw FAIL，不扩默认registry选择。周期调度与共享存储尚未交付；G7a/G7b已取消，不作为未来服务承诺。FE statement observation/auth保留，运行级计时collector退出；实际能力/profile见每次产物自报，未运行范围不能据接口存在宣称通过。
 
-普通 Rust 默认测试保持普通构建；full CI 的显式七 control-owner stage 不选择 Server，与 normal workspace tests 分开 target/feature。HMS/MySQL 旧 feature 专属测试另选 owner，不以七包通过代替。维护命令见 [测试治理](../../docs/guides/development/test-governance.md#构建选择与控制授权)。
+常规 Rust 使用唯一 workspace/tests/bins/dev 主图和 nextest 逐测试进程；不再维护 normal/control 七包串行分图。实际开发 cfg 决定能力是否编入，准确有限授权继续逐角色生效。HMS/MySQL 专用 feature/fixture 仍显式选择，默认主图结果不代替其完整矩阵。维护命令及独立 doctest 见 [测试治理](../../docs/guides/development/test-governance.md#原生-rust-执行进程回收与原始结果)。
 
 MV 旧场景及独立 oracle 保留，禁止扩展旧屏障/CALL/directive。7B3 唯一承接非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交和管理接续；7B4 承接 spine SUM/COUNT、聚合状态、聚合冷恢复与后续刷新；7B5 承接 V/S 身份、发现/CREATE/DROP、REST 路由和实际 materialized S/fallback；7B11 同格式切换承接 `mv_recovery.rs` / `mv_uea7_storage.rs` 的 document graph 与 shared-document-revisions。替代保护实际通过后逐项退出，最后消费者退出再删共享载体；G2 不新建启动期缓存缺失或通用擦除接口。
 

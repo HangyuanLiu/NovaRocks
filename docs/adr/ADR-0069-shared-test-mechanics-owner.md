@@ -5,6 +5,7 @@ domain: [crate-boundary]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0184]
 date: 2026-08-13
 provenance:
   - "discussion: 2026-08-13 shared process and TCP reservation test infrastructure"

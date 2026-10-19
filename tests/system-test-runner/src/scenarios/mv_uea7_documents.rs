@@ -1152,8 +1152,8 @@ fn spark_expire(
     env: &Path,
     table: &str,
 ) -> Result<()> {
+    use novarocks_test_support::ManagedCommand;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::process::Command;
     let dir = artifact(context, "spark-expire-snapshots")?;
     let sql = dir.join("expire.sql");
     fs::write(
@@ -1166,7 +1166,7 @@ fn spark_expire(
         .parent()
         .and_then(Path::parent)
         .context("system runner repository root")?;
-    let mut command = Command::new(repository.join("docker/iceberg-rest/spark-sql.sh"));
+    let mut command = ManagedCommand::new(repository.join("docker/iceberg-rest/spark-sql.sh"));
     command
         .arg(&sql)
         .env("NOVA_ENV_REST_ENV_FILE", env)
@@ -1204,6 +1204,7 @@ fn spark_expire(
         "Spark snapshot expiry failed; retained outputs at {}",
         dir.display()
     );
+    out.release_diagnostics()?;
     Ok(())
 }
 #[cfg(not(unix))]

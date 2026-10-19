@@ -39,7 +39,3 @@ loom = "0.7.2"
 [dev-dependencies]
 hashbrown.workspace = true
 allocator-api2.workspace = true
-
-[[test]]
-name = "attribution_reconcile"
-harness = false

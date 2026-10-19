@@ -75,8 +75,8 @@ pub(crate) fn require_original_fe_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_test_support::ManagedCommand;
     use novarocks_test_support::ReadyMarker;
-    use std::process::Command;
     use std::time::Duration;
 
     fn spawn_original_child(
@@ -84,7 +84,7 @@ mod tests {
         original_deadline: Instant,
     ) -> (tempfile::TempDir, ManagedProcess) {
         let directory = tempfile::tempdir().expect("create original-child component directory");
-        let mut command = Command::new("/bin/sh");
+        let mut command = ManagedCommand::new("/bin/sh");
         // All commands here are shell builtins: no extra child, runtime or service.
         // Install the trap before READY so the gate's signal cannot win that race.
         command.arg("-c").arg(format!(

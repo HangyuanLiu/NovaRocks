@@ -72,7 +72,8 @@ Usage: tools/ci/local-full-ci.sh [options]
 Runs NovaRocks local full CI with local logs under logs/ci-full/<timestamp>/.
 SQL suites are executed with novarocks-sql-test -j 1 because parallel case execution is
 not stable in the current local environment.
-Rust tests are executed with --test-threads=1 for the same reason.
+Rust tests use native nextest's four slots and configured resource groups;
+Cargo doctests run as a separate execution domain.
 Cargo check/clippy/build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev.
 Clippy runs in warning-only mode until the repository has a clean strict-clippy
 baseline.
@@ -489,12 +490,33 @@ run_fail_fast_stage() {
   ci_render_summary "RUNNING"
 }
 
+run_rust_batch_stage() {
+  local log_path="$CI_RUN_DIR/rust-batch.log" start code duration
+  start="$(ci_epoch)"
+  printf '%s\n' "execution_index=$CI_RUN_DIR/rust/execution-index.json" >"$log_path"
+  # test-run.py already owns exclusive raw logs and bounded display writers.
+  # Preserve the inherited terminal here; another redirect/tee would either
+  # swallow its real-time display or introduce a second blocking output owner.
+  python3 tools/ci/test-run.py batch --output "$CI_RUN_DIR/rust"
+  code=$?
+  duration=$(($(ci_epoch) - start))
+  printf 'wrapper_exit=%s\n' "$code" >>"$log_path"
+  if [ "$code" -ne 0 ]; then
+    ci_record_stage "workspace nextest and doctests" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "workspace Rust batch failed; inspect its execution index" "$log_path"
+    ci_render_summary "FAIL"
+    return "$code"
+  fi
+  ci_record_stage "workspace nextest and doctests" "PASS" "$duration" "$log_path"
+  ci_render_summary "RUNNING"
+}
+
 run_cargo_gates() {
   run_fail_fast_stage "CI build inputs" "build-inputs.log" \
     ci_validate_build_inputs "$NOVA_CI_CARGO_PROFILE"
   local main_target
   main_target="$(ci_target_directory main)" || return $?
-  NOVA_CI_ARTIFACT_RECEIPT="$CI_RUN_DIR/build-info/artifacts.json"
+  NOVA_CI_ARTIFACT_RECEIPT="$CI_RUN_DIR/rust/final-prepare/artifacts.json"
   export NOVA_CI_ARTIFACT_RECEIPT
   run_fail_fast_stage "locked Cargo metadata" "cargo-metadata.log" \
     cargo metadata --locked --format-version 1
@@ -560,6 +582,9 @@ run_cargo_gates() {
     tools/ci/tests/legacy-branding-test.sh
   run_fail_fast_stage "system scenario stage tests" "system-scenarios-stage-test.log" \
     tools/ci/tests/system-scenarios-stage-test.sh
+  run_fail_fast_stage "Rust executor regression tests" "test-run-test.log" \
+    env NOVA_CI_TEST_EVIDENCE_ROOT="$CI_RUN_DIR/executor-regression" \
+    python3 tools/ci/tests/test-run-test.py
   run_fail_fast_stage "SQL helper environment binding" "sql-helper-env-file.log" \
     docker/iceberg-rest/tests/sql-helper-env-file-test.sh
   run_fail_fast_stage "shared benchmark environment guard" "shared-benchmark-environment.log" \
@@ -573,10 +598,6 @@ run_cargo_gates() {
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" \
     ci_main_cargo clippy --all-targets
-  run_fail_fast_stage "joint tests and binaries preparation" "cargo-prepare.log" \
-    ci_prepare_main "$NOVA_CI_ARTIFACT_RECEIPT"
-  run_fail_fast_stage "main binary build information" "main-build-info.log" \
-    ci_capture_main_builds "$NOVA_CI_ARTIFACT_RECEIPT" "$CI_RUN_DIR/build-info/main"
   # The SQL error manifest is a generated whitelist that other tools consume as
   # fact: the sql-test runner include_str!s it and rejects any @expect_sql_code
   # missing from it. A stale manifest therefore does not surface as "this file
@@ -584,22 +605,23 @@ run_cargo_gates() {
   # cases. Regenerating is the fix (`cargo run -p novarocks-error-manifest`).
   # The manifest path keeps the entry point explicit while Cargo resolves the
   # package through the repository workspace, profile, and committed lock.
-  local error_manifest
-  error_manifest="$(ci_bound_binary novarocks-error-manifest)" || return $?
-  run_fail_fast_stage "SQL error manifest freshness" "error-manifest-check.log" \
-    "$error_manifest" --check
   if [ "$SKIP_CARGO_TEST" = true ]; then
+    run_fail_fast_stage "joint tests and binaries preparation" "cargo-prepare.log" \
+      ci_prepare_main "$NOVA_CI_ARTIFACT_RECEIPT"
+    run_fail_fast_stage "main binary build information" "main-build-info.log" \
+      ci_capture_main_builds "$NOVA_CI_ARTIFACT_RECEIPT" "$CI_RUN_DIR/build-info/main"
+    local error_manifest
+    error_manifest="$(ci_bound_binary novarocks-error-manifest)" || return $?
+    run_fail_fast_stage "SQL error manifest freshness" "error-manifest-check.log" \
+      "$error_manifest" --check
     ci_record_stage "workspace tests" "SKIP" "0" ""
     ci_record_stage "workspace doctests" "SKIP" "0" ""
     return 0
   fi
-  run_fail_fast_stage "workspace tests" "cargo-test-workspace.log" \
-    ci_main_cargo test --tests --no-fail-fast -- --test-threads=1
-  run_fail_fast_stage "workspace doctests" "cargo-test-doc.log" \
-    ci_main_cargo test --doc --no-fail-fast -- --test-threads=1
-  # Test commands may relink real programs; refresh bindings after the last Cargo.
-  ci_collect_artifacts "$NOVA_CI_ARTIFACT_RECEIPT.cargo.jsonl" "$NOVA_CI_ARTIFACT_RECEIPT" || return $?
-  ci_capture_main_builds "$NOVA_CI_ARTIFACT_RECEIPT" "$CI_RUN_DIR/build-info/main-final"
+  # The batch owns failure control: an ordinary nextest assertion failure still
+  # runs independent doctests; cancellation or incomplete cleanup gates them.
+  # Its final joint preparation refreshes executable provenance after Cargo.
+  run_rust_batch_stage
 
 }
 

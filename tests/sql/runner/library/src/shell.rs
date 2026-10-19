@@ -65,7 +65,7 @@ pub(crate) fn execute_shell_step_until(
             Ok(directory) => directory,
             Err(error) => return (false, None, format!("prepare shell output: {error}")),
         };
-        let mut command = Command::new("sh");
+        let mut command = novarocks_test_support::ManagedCommand::new("sh");
         command.arg("-c").arg(
             sql.trim_start()
                 .strip_prefix("shell:")
@@ -91,8 +91,8 @@ pub(crate) fn execute_shell_step_until(
         match capture {
             Ok(outcome) => {
                 let timed_out = outcome.timed_out || Instant::now() >= deadline;
-                let failures = outcome.failures;
-                let result = render_command_output(outcome.output, started.elapsed());
+                let failures = &outcome.failures;
+                let result = render_command_output(&outcome.output, started.elapsed());
                 if timed_out || Instant::now() >= deadline || !failures.is_empty() {
                     let path = directory.keep();
                     return (
@@ -116,6 +116,13 @@ pub(crate) fn execute_shell_step_until(
                         ),
                     );
                 }
+                if let Err(error) = outcome.release_diagnostics() {
+                    return (
+                        false,
+                        result.1,
+                        format!("release successful shell diagnostics: {error:#}"),
+                    );
+                }
                 result
             }
             Err(error) => {
@@ -134,7 +141,7 @@ pub(crate) fn execute_shell_step_until(
 }
 
 fn render_command_output(
-    out: std::process::Output,
+    out: &std::process::Output,
     elapsed: std::time::Duration,
 ) -> (bool, Option<QueryExecution>, String) {
     let code = out.status.code().unwrap_or(-1);
@@ -174,7 +181,7 @@ fn execute_command(command: &mut Command) -> (bool, Option<QueryExecution>, Stri
     let elapsed = started.elapsed();
 
     match result {
-        Ok(out) => render_command_output(out, elapsed),
+        Ok(out) => render_command_output(&out, elapsed),
         Err(err) => (false, None, format!("failed to start shell command: {err}")),
     }
 }
@@ -256,6 +263,11 @@ mod bounded_tests {
     }
     #[test]
     fn expired_clock_never_spawns_and_timeout_stops_the_owned_group() {
+        // This fixture exercises a short payload deadline. Establish its
+        // invocation lease before starting that clock; a failed first lease
+        // must never be adopted by later tests in the same native invocation.
+        novarocks_test_support::ensure_run_retention(Instant::now() + Duration::from_secs(10))
+            .unwrap();
         let directory = tempfile::TempDir::new().unwrap();
         let marker = directory.path().join("spawned");
         let sql = format!("shell: printf created > '{}'", marker.display());

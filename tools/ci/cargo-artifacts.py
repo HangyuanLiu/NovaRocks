@@ -27,7 +27,10 @@ REQUIRED = ("novarocks", "novarocks-sql-test", "novarocks-system-tests", "novaro
 
 def digest(path):
     with open(path, "rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        value = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(chunk)
+        return value.hexdigest()
 
 def record(path):
     path = Path(path).resolve(strict=True)
@@ -35,7 +38,54 @@ def record(path):
         raise ValueError(f"artifact is not executable: {path}")
     return dict(path=str(path), sha256=digest(path))
 
+def bind_tests(binaries_path, cargo_path, output, host):
+    """Validate native nextest facts against the last joint Cargo build."""
+    metadata = json.loads(Path(binaries_path).read_text())
+    build = metadata["rust-build-meta"]
+    if build["platforms"]["host"]["platform"]["triple"] != host:
+        raise ValueError("nextest host differs from the actual native Rust host")
+    for target in build["platforms"].get("targets", []):
+        if target["platform"]["triple"] != host:
+            raise ValueError("cross-target nextest metadata is unsupported")
+    for target in build.get("target-platforms", []):
+        if target["triple"] != host:
+            raise ValueError("nextest target is not the actual native Rust host")
+    artifacts = []
+    for line in Path(cargo_path).read_text().splitlines():
+        item = json.loads(line)
+        if item.get("reason") == "compiler-artifact" and item.get("executable"):
+            artifacts.append(item)
+    bound = {}
+    for identity, binary in metadata["rust-binaries"].items():
+        if identity != binary["binary-id"]:
+            raise ValueError("inconsistent native binary identity")
+        matches = [item for item in artifacts if
+                   item["package_id"] == binary["package-id"] and
+                   item["target"]["name"] == binary["binary-name"] and
+                   binary["kind"] in item["target"]["kind"] and
+                   item["profile"]["test"] is True and
+                   Path(item["executable"]).resolve() == Path(binary["binary-path"]).resolve()]
+        if not matches:
+            raise ValueError("last joint Cargo build did not report native test binary: " + identity)
+        bound[identity] = dict(binary, **record(binary["binary-path"]))
+    if not bound:
+        raise ValueError("native binaries metadata is empty")
+    Path(output).write_text(json.dumps(dict(schema=1, host=host, binaries=bound), indent=2) + "\n")
+
+
 try:
+    if sys.argv[1] == "bind-tests":
+        bind_tests(*sys.argv[2:])
+        sys.exit(0)
+    if sys.argv[1] == "verify-tests":
+        expected = json.loads(Path(sys.argv[2]).read_text())
+        if expected["schema"] != 1:
+            raise ValueError("unsupported test binding schema")
+        for identity, binary in expected["binaries"].items():
+            actual = record(binary["path"])
+            if any(actual[key] != binary[key] for key in actual):
+                raise ValueError("prepared test executable changed: " + identity)
+        sys.exit(0)
     action, source, arg = sys.argv[1:]
     if action == "copy-server":
         found = []
