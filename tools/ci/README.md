@@ -1,0 +1,210 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Rust test entry and retained execution materials
+
+`tools/ci/dev-test.sh test` prepares the workspace's development graph and then
+executes native nextest in the foreground. Nextest owns per-test processes,
+parallel scheduling, TTY progress, input and job control. It requires nextest
+**at least 0.9.148**, using the native `nextest-version.required` configuration.
+`NOVA_CI_NEXTEST_BIN` can select an isolated `cargo-nextest` executable. Formal
+tool preparation and the governance workflow pin **0.9.148**; ordinary development
+also accepts compatible newer versions.
+
+```bash
+tools/ci/dev-test.sh test
+tools/ci/dev-test.sh list -E 'package(novarocks-test-support)'
+tools/ci/dev-test.sh test -E 'package(novarocks-test-support) & test(caller_exit)'
+tools/ci/dev-test.sh test -E 'binary(process_monitor)'
+tools/ci/dev-test.sh test --run-ignored only -E \
+  'package(novarocks-cluster-harness) & test(native_proxy_cluster_keeps_advertisement_across_process_restarts)'
+tools/ci/dev-test.sh test -E 'rdeps(novarocks-test-support)' --test-threads 2
+tools/ci/dev-test.sh doc
+tools/ci/dev-test.sh check --target-dir target/ide
+```
+
+`package()`, `binary()`, `test()` and `rdeps()` retain nextest's native meaning.
+Package, feature, target and Cargo profile switches cannot replace the prepared
+workspace graph; use runtime filters for selection. `cargo test -p ...` and bare
+`cargo nextest run` remain useful local debugging paths. They do not establish
+that the entry's last joint preparation was performed. Pure tests do not create
+test-support material roots or retention guards. The first managed operation in
+an ordinary nextest call lazily establishes its Rust-owned run lease; this does
+not require Python. Nested runners must inherit the context after their outer
+test explicitly ensures the lease.
+
+Preparation saves native Cargo metadata, native nextest binaries metadata, the
+last `cargo build --workspace --tests --bins --profile dev --locked` JSONL,
+the four program bindings/build information, native full selection and actual
+executable hashes. The binding checker matches package ID, target name/kind,
+test profile and executable path against that final Cargo stream. It validates
+the native host and checks hashes again immediately before execution. List and
+run then reuse both native metadata files without invoking Cargo. Daily copies
+under `target/nextest-prepared/<unique>/` are disposable caches, not retained
+formal evidence. Do not concurrently rebuild the same target during a run.
+
+The default configuration has four slots, no retries, no fail-fast, a failing
+one-second leaked-handle deadline, and a five-minute watchdog with ten-second
+termination grace. Native Server smoke/cluster targets consume two slots with
+a two-test group limit and a ten-minute watchdog. Process-monitor mechanics use
+their own two-test group. These limits prevent runaway tests; they are not
+performance requirements and do not extend functional operation deadlines.
+Doctests remain a separate Cargo command.
+
+The ignored example is a public native-cluster integration case; the entry
+supplies its required `NOVAROCKS_BIN` from the current prepared receipt. Internal
+ignored mechanics helpers require their outer owner and private handshake inputs,
+so ordinary examples do not select all ignored mechanics helpers.
+
+## Formal execution
+
+`tools/ci/local-full-ci.sh --cargo-only` retains its existing governance gates
+and invokes `test-run.py batch`. The same wrapper can be invoked explicitly:
+
+```bash
+python3 tools/ci/test-run.py batch --output /absolute/local/unique-attempt
+python3 tools/ci/test-run.py batch --output /absolute/local/another-attempt -- \
+  -E 'package(novarocks-test-support)'
+```
+
+The destination must not exist. The containing filesystem must be local APFS,
+ext, XFS, Btrfs or tmpfs. Containers must bind-mount a supported local state
+directory; overlay root filesystems are rejected. The Python wrapper uses
+capability checks, `os.posix_spawn(setpgroup=0, file_actions=..., setsigdef=...,
+setsigmask=())` and `flock`; it supports system Python 3.9.6 without a Python
+3.11 version gate. It does not require Python pidfd/kqueue APIs.
+
+The batch retains distinct `rust-run/` and `doctest-run/` formal registration
+contexts. Each contains `.formal`, `.pin`, `.gate`, the `closing`/`Closed` facts,
+and its own monitor records. Closing a context never reopens it. The nextest
+context is closed and checked before admitting independent doctests. An ordinary
+nextest assertion failure (native exit 100) still runs doctests. Cancellation,
+execution/environment failure, missing JUnit or incomplete/violated cleanup
+gates later stages and records them as not started. A new final joint build and
+build-info capture refresh the program bindings after doctest's Cargo command.
+Its receipt is separate from the inputs describing what actually ran.
+
+Each executor remains in the wrapper's session with an independent process
+group. Nextest receives each observed INT/TERM/HUP/QUIT event exactly once at
+its actual Child PID; Cargo/doctest receives group signals. TSTP is forwarded
+to nextest; TTIN/TTOU normalize to TSTP. The wrapper stops itself only after
+observing the child's stopped wait status. CONT resumes the actual executor;
+cancellation while paused first resumes it. Pause confirmation has a five-second
+deadline. Independently hosted payload monitors continue while the wrapper and
+nextest are stopped. An already stopped wrapper requires CONT before Python can
+process a pending HUP/TERM. SIGKILL/OOM/power loss cannot promise user-space
+summarization; incomplete materials remain for the platform containment owner.
+
+The local-full stage preserves the wrapper's inherited terminal descriptors.
+Its `rust-batch.log` is an execution-index pointer and wrapper exit record;
+executor raw output is already retained inside the batch. It does not redirect
+display into that pointer log or add a second tee/capture layer. Closed inherited
+stdio is reserved with owned null descriptors before record opens; spawn sources
+are always separate CLOEXEC descriptors above 2. A post-spawn record/display
+failure retains the original control error, cancels and actually waits the exact
+executor, then still attempts normal registration sealing and summarization.
+A pre-spawn failure also seals its domain independently, records `started=false`
+with the original error, and retains any additional cleanup error.
+
+Batch stdout/stderr go directly to exclusive raw files. Bounded daemon raw-FD
+writers display incremental copies without blocking signal handling, wait or
+cleanup. A broken/backpressured terminal does not change the raw result or
+require a display flush at exit. The executor record reports display byte counts
+and errors; the complete raw files remain authoritative. Cleanup uses one
+thirty-second deadline from observed executor exit or handled cancellation,
+covering gate closure and every record lock/read. It never kills payloads by
+historical PID; test-support's independent monitors own those children.
+
+## G15 interface: `execution-index.json`, schema 1
+
+The batch root contains the schema-1 index from startup, initially
+`complete=false`. Index updates are atomic. Monitor record inodes are never
+replaced. Consumers use these declared references and native formats, rather
+than human log layout or an invented test-result classification.
+
+| Index field | Meaning |
+| --- | --- |
+| `schema` | `1`; reject unsupported versions. |
+| `source` | Exact source commit, dirty flag and scoped Git status; no full environment dump. |
+| `arguments`, `cargo_profile`, `nextest_profile`, `nextest_version` | Original native selection, actual profiles and raw tool self-report. |
+| `materials` | Relative `path`, `format`, existence/readability facts for metadata, selection, configuration, bindings, JUnit and both cleanup summaries. |
+| `stages` | Preparation, manifest prerequisite, nextest, independent doctest, final preparation. Each has `started` and native `returncode`, or the reason it did not start. |
+| Executor stage | Actual argv/cwd, `material_root`, local stdout/stderr names, native wait status/exit, signal events, observed stopped/continued events and display completeness. The same facts are in that stage's `executor.json`. |
+| `cancelled`, `error`, `exit_code` | Original cancellation events, stage failure explanation and wrapper outcome. |
+| `complete` | Required execution/report/cleanup facts were collected. It does not mean tests passed; native nonzero exits remain nonzero. |
+
+Native inputs are in `inputs/`: `cargo-metadata.json`,
+`binaries-metadata.json`, `selected-tests.json`, `artifacts.json.cargo.jsonl`,
+`artifacts.json`, `test-artifacts.json`, raw `build-info/`, and actual configuration
+copies/hashes in `prepared.json`. `final-prepare/` owns the later joint build and
+program receipt used by subsequent SQL/System consumers. JUnit is exclusively
+`nextest/<profile>/junit.xml`, selected with an attempt-specific tool config's
+`[store].dir`. A missing or truncated JUnit is explicitly incomplete; the wrapper
+never fabricates or rewrites native JUnit. Doctest retains Cargo/rustdoc raw text
+and native exit; it does not manufacture stable Cargo doctest JSON or JUnit.
+
+Each domain's `cleanup-summary.json` schema 1 declares `registration_closed`,
+`complete`, `ok`, `records`, `late_registrations` and `errors`. Each record entry
+references `monitor/<launch>/record.jsonl`, stdout/stderr, the original `native`
+identity map, its `Final`, completeness and violations. A separate caller
+diagnostic may be retained at
+`monitor/<launch>/caller-drop-error.txt`. If this regular file exists, the entry's
+`caller_drop_error` references its relative path and `violations` records the
+caller cleanup failure, even when the monitor later publishes a successful
+`Final`. The wrapper retains the original file without reading, parsing or
+copying its text. A symlink or another nonregular diagnostic is an explicit
+incomplete-material error. The producer's JSONL
+events all use schema 1: `Pending`, `Spawned`, optional nonterminal `Liveness`,
+`ExitObserved`, and `Final`; `CleanupIncomplete` or a missing/partial Final stays
+incomplete. `Final` preserves nullable `status_raw`/`startup_error`, `owner_lost`,
+`errors` and `cleanup_complete`. A payload's nonzero exit alone is not a cleanup
+violation. Owner loss/startup failure/cleanup errors remain distinct from the
+test's native result. Shared flock descriptions are only closed, never unlocked.
+Formal contexts are excluded from ordinary release/retention GC.
+
+The ownership ruling is recorded in
+[ADR-0184](../../docs/adr/ADR-0184-native-test-execution-and-process-monitor-ownership.md).
+
+G15 may store its own selection/reuse decisions beside these inputs. It must not
+write its conclusions into native results or this G6a-owned index. A path on one
+machine is local evidence until the full referenced materials have an explicit
+shared retention owner.
+
+## Focused verification
+
+```bash
+bash tools/ci/tests/local-full-ci-classification-test.sh
+bash tools/ci/tests/system-scenarios-stage-test.sh
+python3 tools/ci/tests/test-run-test.py
+```
+
+The Python suite uses controlled executors for lifecycle/control-flow checks and,
+when nextest is installed, a dependency-free real Rust fixture with its own
+target. Mocked scripts prove command/selection control flow, not NovaRocks product
+execution. Native Linux x86_64 remains a separate required validation target;
+Linux arm64, QEMU or cross-compilation does not satisfy that requirement.
+Set `NOVA_CI_TEST_EVIDENCE_ROOT` to a unique directory to retain generated fixture
+sources, actual commands, raw outputs and indices; rebuildable fixture target
+caches stay in the worktree and are removed after verification. The governance
+entry retains these regression materials under its own run directory.
+
+When simple native tests are unexpectedly slow on macOS, follow the official
+[nextest macOS Developer Tools guidance](https://nexte.st/docs/installation/macos/)
+and inspect actual executions as needed. The entry does not automatically change
+system authorization or treat a microbenchmark as a performance gate.

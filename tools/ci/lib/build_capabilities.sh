@@ -62,6 +62,12 @@ ci_prepare_main() {
   ci_collect_artifacts "$receipt.cargo.jsonl" "$receipt"
 }
 
+ci_prepare_nextest() {
+  local output="$1"; shift
+  ci_validate_build_inputs dev || return $?
+  python3 "${REPO_ROOT:-$PWD}/tools/ci/test-run.py" prepare --output "$output" -- "$@"
+}
+
 ci_collect_artifacts() {
   python3 "${REPO_ROOT:-$PWD}/tools/ci/cargo-artifacts.py" collect "$1" "$2"
 }

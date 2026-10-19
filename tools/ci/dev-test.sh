@@ -23,13 +23,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/lib/build_capabilities.sh"
 cd "$REPO_ROOT"
+ci_validate_build_environment
 action="${1:-test}"
 [ "$#" -eq 0 ] || shift
 case "$action" in
   prepare)
     [ "$#" -eq 1 ] || { echo "usage: dev-test.sh prepare <artifact-receipt>" >&2; exit 2; }
     ci_prepare_main "$1" ;;
-  test) ci_main_cargo test --tests "$@" ;;
+  test|list)
+    # Keep metadata as generated target-local cache. Native nextest remains the
+    # foreground process after preparation, preserving its TTY and job control.
+    prepared="$(ci_target_directory main)/nextest-prepared/$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    ci_prepare_nextest "$prepared" "$@"
+    if [ "$action" = list ]; then
+      cat "$prepared/selected-tests.stdout"
+    else
+      export NOVAROCKS_BIN="$(ci_bound_binary novarocks "$prepared/artifacts.json")"
+      export NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT"
+      exec python3 "$SCRIPT_DIR/test-run.py" exec-argv --output "$prepared"
+    fi ;;
   doc) ci_main_cargo test --doc "$@" ;;
   check)
     # IDE checks must explicitly pass their effective private target directory.
@@ -40,5 +52,5 @@ case "$action" in
     else
       ci_main_cargo check --all-targets "$@"
     fi ;;
-  *) echo "usage: dev-test.sh {prepare|test|doc|check} [Cargo arguments]" >&2; exit 2 ;;
+  *) echo "usage: dev-test.sh {prepare|test|list|doc|check} [native execution arguments]" >&2; exit 2 ;;
 esac

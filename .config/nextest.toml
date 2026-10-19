@@ -1,0 +1,47 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+nextest-version = { required = "0.9.148" }
+
+[profile.default]
+test-threads = 4
+retries = 0
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "10s" }
+leak-timeout = { period = "1s", result = "fail" }
+
+[profile.default.junit]
+path = "junit.xml"
+
+[test-groups.native-process]
+max-threads = 2
+
+[test-groups.process-mechanics]
+max-threads = 2
+
+# These targets start native servers or clusters and consume two global slots.
+[[profile.default.overrides]]
+filter = 'package(/novarocks-cluster-harness/) | (package(/novarocks-server/) & binary(/server_binary_smoke/))'
+test-group = "native-process"
+threads-required = 2
+slow-timeout = { period = "60s", terminate-after = 10, grace-period = "10s" }
+
+# Fault-injection mechanics intentionally fan out payload processes. Pure unit
+# tests, allocator tests and panic-hook tests retain ordinary parallel scheduling.
+[[profile.default.overrides]]
+filter = 'package(/novarocks-test-support/) & binary(/process_(monitor|retention)/)'
+test-group = "process-mechanics"
