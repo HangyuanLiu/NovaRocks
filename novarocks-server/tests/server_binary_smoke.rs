@@ -29,7 +29,7 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
+use novarocks_test_support::{ManagedCommand, ManagedProcess, ReadyMarker, ReservedTcpPort};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 
 static SERVER_BINARY_SMOKE_LOCK: Mutex<()> = Mutex::new(());
@@ -222,7 +222,7 @@ fn spawn_novarocks(
     ready_marker: &str,
     debug_env: &[(&str, &Path)],
 ) -> ManagedProcess {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+    let mut command = ManagedCommand::new(env!("CARGO_BIN_EXE_novarocks"));
     command
         .arg("standalone")
         .arg("--role")
@@ -244,7 +244,7 @@ fn spawn_novarocks(
 }
 
 fn spawn_all_in_one(pair: &ConfigPair, debug_env: &[(&str, &Path)]) -> ManagedProcess {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+    let mut command = ManagedCommand::new(env!("CARGO_BIN_EXE_novarocks"));
     command
         .arg("standalone")
         .arg("--role")
@@ -506,6 +506,15 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
         });
         drop(rebound);
     }
+    frontend
+        .release_diagnostics()
+        .expect("release successful FE smoke output");
+    backend
+        .release_diagnostics()
+        .expect("release successful BE smoke output");
+    all_in_one
+        .release_diagnostics()
+        .expect("release successful supervisor smoke output");
 }
 
 /// CLI shape is a binary contract, not merely a parser unit. These cases reject

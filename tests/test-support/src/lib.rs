@@ -23,16 +23,27 @@
 
 // Design: ADR-0069 (docs/adr/ADR-0069-shared-test-mechanics-owner.md)
 mod managed_process;
+#[path = "monitor/client.rs"]
+mod monitor_client;
 mod reserved_tcp_port;
+mod run_retention;
 #[cfg(unix)]
 mod socket_deadline;
+mod unix;
 #[cfg(unix)]
 pub use socket_deadline::SocketDeadlineOwner;
 
 pub use managed_process::{
     ManagedProcess, ManagedProcessLogSource, ManagedProcessLogTail, ReadyMarker,
 };
+pub use monitor_client::ManagedCommand;
 pub use reserved_tcp_port::ReservedTcpPort;
+
+/// Establishes the ordinary nextest run lease before a nested runner is spawned.
+/// This is lazy: pure tests and test discovery never call it implicitly.
+pub fn ensure_run_retention(deadline: std::time::Instant) -> std::io::Result<()> {
+    run_retention::ensure_run_retention(deadline).map(|_| ())
+}
 
 #[cfg(unix)]
 pub use managed_process::{CapturedCommandOutcome, capture_command_until};
