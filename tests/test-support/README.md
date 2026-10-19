@@ -49,6 +49,8 @@ readiness 必须由 child 发布 marker。`StdoutContains` 只观察 stdout；st
 
 monitor 拥有 payload 的真实 `Child`，在独立 session 内存活；payload 另建进程组。控制方通过私有 FIFO 发操作，控制方退出关闭 lifeline，monitor 继续完成组信号、退出观察、最后组信号和实际 wait。`stop`、`kill_now`、SIGINT、SIGTERM 等正常 API 必须检查结果；Drop 仍会关闭/收束，但不能替代成功路径的错误检查。控制方失联后即使清理成功，失联事实仍保留。nextest 负责测试进程，monitor 负责这个明确创建的 payload；它们是不同的 Child owner。
 
+`request_termination()` 只发送 SIGTERM，由调用方的 `wait_for_successful_exit_until()` 维护排空期限；`interrupt_and_wait()` 同样保留调用方传入的原期限。请求信号不会提前套用 `stop()` 的 5 秒 TERM 宽限；显式 stop/kill、控制方失联或监护错误才进入独立清理流程。
+
 辅助程序由本库 `build.rs` 使用 Cargo 提供的原生编译器、target 和实际构建参数编译到自己的 `OUT_DIR`，通过编译期路径交付。测试执行期间不运行 Cargo，也不从 PATH 查找 monitor。当前交付拒绝 cross-target；不能将辅助程序单独搬到另一台机器后假定原路径继续有效。
 
 ## 原始日志与有界观察

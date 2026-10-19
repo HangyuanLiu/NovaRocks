@@ -286,10 +286,25 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
                         }
                     }
                 }
-                b'S' | b'T' | b'I' | b'K' => {
+                b'T' | b'I' => {
+                    // Signal requests preserve the caller's wait contract.
+                    // Only explicit cleanup (or owner loss/error) may start
+                    // the monitor's escalation and cleanup budget.
+                    let signal = if operation == b'I' {
+                        unix::INTERRUPT
+                    } else {
+                        unix::TERM
+                    };
+                    let prior_failures = failures.len();
+                    unix::signal_or_kill_original(&mut child, signal, &mut failures);
+                    if failures.len() != prior_failures && stopping.is_none() {
+                        stopping = Some(now);
+                        graceful_deadline = now;
+                    }
+                }
+                b'S' | b'K' => {
                     if stopping.is_none() {
                         let signal = match operation {
-                            b'I' => unix::INTERRUPT,
                             b'K' => unix::KILL,
                             _ => unix::TERM,
                         };

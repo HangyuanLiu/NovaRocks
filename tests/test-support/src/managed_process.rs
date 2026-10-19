@@ -570,6 +570,11 @@ impl ManagedProcess {
         Ok(())
     }
     pub fn request_termination(&mut self) -> Result<()> {
+        ensure!(
+            !self.settled,
+            "cannot request SIGTERM for {} after final stop",
+            self.label
+        );
         self.owner.send(b'T')
     }
     pub fn wait_for_successful_exit_until(&mut self, deadline: Instant) -> Result<ExitStatus> {
@@ -588,6 +593,11 @@ impl ManagedProcess {
         Ok(final_record.status)
     }
     pub fn interrupt_and_wait(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        ensure!(
+            !self.settled,
+            "cannot interrupt {} after final stop",
+            self.label
+        );
         let deadline = Instant::now()
             .checked_add(timeout)
             .context("interrupt deadline overflow")?;

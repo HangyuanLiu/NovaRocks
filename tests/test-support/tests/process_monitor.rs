@@ -28,13 +28,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "novarocks-process-monitor-{}-{}",
+            "novarocks-process-monitor-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
@@ -673,6 +675,85 @@ fn interrupt_success_delivers_sigint_and_waits_actual_exit() {
     let record = final_record(process.diagnostic_root());
     assert_eq!(record["status_raw"], 0);
     assert_pid_reaped(pid);
+}
+
+fn signal_request_respects_the_caller_owned_completion_gate(interrupt: bool) {
+    let directory = Directory::new();
+    let signal = if interrupt { "INT" } else { "TERM" };
+    let script = format!(
+        "trap 'printf SIGNALLED > \"$FIXTURE_BORN\"; while [ ! -e \"$FIXTURE_GATE\" ]; do sleep 0.01; done; exit 0' {signal}; printf 'READY\\n'; while :; do sleep 1; done"
+    );
+    let mut process = ManagedProcess::spawn(
+        format!("caller-owned {signal} completion gate"),
+        command_with_paths(&script, &directory),
+        ReadyMarker::StdoutContains("READY".into()),
+        Duration::from_secs(10),
+        directory.0.join("locator"),
+    )
+    .unwrap();
+    let pid = process.pid();
+    let original_deadline = Instant::now() + Duration::from_secs(30);
+    std::thread::scope(|scope| {
+        let (completed, completion) = std::sync::mpsc::channel();
+        let worker = scope.spawn(move || {
+            let result = if interrupt {
+                process.interrupt_and_wait(Duration::from_secs(30))
+            } else {
+                process
+                    .request_termination()
+                    .and_then(|()| process.wait_for_successful_exit_until(original_deadline))
+            };
+            let _ = completed.send(
+                result
+                    .as_ref()
+                    .map(|status| status.to_string())
+                    .map_err(|error| format!("{error:#}")),
+            );
+            (process, result)
+        });
+        assert_eq!(
+            wait_file(&directory.0.join("born"), original_deadline),
+            b"SIGNALLED"
+        );
+        // This minimum hold is a functional regression boundary, not a speed
+        // assertion: signal-only requests must survive the former five-second
+        // cleanup escalation while only the caller can open the exit gate.
+        let before_gate = completion.recv_timeout(Duration::from_secs(6));
+        fs::write(
+            directory.0.join("gate"),
+            b"caller permits successful exit\n",
+        )
+        .unwrap();
+        let (mut process, result) = worker.join().unwrap();
+        let settlement = process.stop();
+        assert!(
+            settlement.is_ok(),
+            "actual signal fixture settlement: {settlement:?}"
+        );
+        assert!(process.request_termination().is_err());
+        assert!(process.interrupt_and_wait(Duration::from_secs(1)).is_err());
+        assert!(
+            matches!(before_gate, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "{signal} completed before its caller released the gate: {before_gate:?}"
+        );
+        assert!(
+            result.as_ref().is_ok_and(|status| status.success()),
+            "caller-owned {signal} completion: {result:?}"
+        );
+        let record = final_record(process.diagnostic_root());
+        assert_eq!(record["status_raw"], 0);
+        assert_pid_reaped(pid);
+    });
+}
+
+#[test]
+fn termination_request_does_not_start_a_five_second_cleanup_deadline() {
+    signal_request_respects_the_caller_owned_completion_gate(false);
+}
+
+#[test]
+fn interrupt_wait_keeps_its_original_deadline_beyond_five_seconds() {
+    signal_request_respects_the_caller_owned_completion_gate(true);
 }
 
 #[test]
