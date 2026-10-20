@@ -445,10 +445,13 @@ fn sql_dependency_original_binding_record_every_control_refusal_has_no_footer_or
                     &mut source_work,
                 )
                 .unwrap();
-                let control = Control::new(resources.clone(), cause.map(|cause| (at + 1, cause)));
+                let control = Control::new(
+                    resources.clone(),
+                    cause.clone().map(|cause| (at + 1, cause)),
+                );
                 let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
                 let result = writer.write_bindings(encoded, &mut stock, 2, 91, &mut work);
-                match cause {
+                match cause.clone() {
                     None => {
                         result.unwrap();
                         count = *control.calls.lock().unwrap() - 1;

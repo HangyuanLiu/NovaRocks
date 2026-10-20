@@ -1204,7 +1204,7 @@ fn final_program_primitive_errors_preserve_only_typed_unsupported() {
     ] {
         let error = FragmentCompileError::Owner {
             phase: "local program",
-            error: Box::new(
+            error: novarocks_failure_contract::SharedFailureCause::new(
                 novarocks_local_program::LocalProgramCompileError::Primitive(primitive),
             ),
         };

@@ -570,7 +570,7 @@ fn check_refusals<T: std::fmt::Debug>(
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = RefusingControl::new(cause, stop_at);
+            let control = RefusingControl::new(cause.clone(), stop_at);
             assert!(
                 matches!(prepare(&control), Err(ProgramPrimitiveError::Control(actual)) if actual == cause)
             );

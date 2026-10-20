@@ -219,7 +219,7 @@ pub(crate) fn plan_conversion(
 pub(crate) fn comparison_type(
     left: &FunctionValueType,
     right: &FunctionValueType,
-) -> Result<FunctionValueType, String> {
+) -> Result<FunctionValueType, novarocks_type_contract::ComparisonCoercionFailure> {
     novarocks_type_contract::wider_comparison_value_type(left, right)
 }
 pub(crate) fn comparison_target(
@@ -1021,7 +1021,7 @@ mod tests {
             for at in 0..count.calls.load(Ordering::SeqCst) {
                 let refusal = Refusal {
                     at,
-                    cause,
+                    cause: cause.clone(),
                     calls: AtomicUsize::new(0),
                 };
                 let error = freeze_fold_call(

@@ -466,3 +466,61 @@ fn fixed_numeric_precision_masks_retain_exact_decimal128_and_decimal256_targets(
         }
     }
 }
+
+#[test]
+fn selected_cast_arrow_failure_journal_preserves_only_actual_data_and_its_source() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    for (source, expected) in [
+        (
+            arrow_schema::ArrowError::CastError("invalid integer".into()),
+            crate::DataFailureReason::InvalidValue,
+        ),
+        (
+            arrow_schema::ArrowError::ArithmeticOverflow("coefficient".into()),
+            crate::DataFailureReason::NumericOutOfRange,
+        ),
+    ] {
+        let row = ArrayCastFailure::Arrow(source).into_row(7).unwrap();
+        assert_eq!(row.selected_ordinal(), 7);
+        assert_eq!(row.projected_fact(), expected.failure_fact());
+        let mut cause = row.source();
+        let mut found = false;
+        while let Some(source) = cause {
+            found |= source.is::<arrow_schema::ArrowError>();
+            cause = source.source();
+        }
+        assert!(found, "journal retains the actual Arrow source");
+    }
+    for (source, expected) in [
+        (
+            arrow_schema::ArrowError::MemoryError("allocation".into()),
+            FailureClass::Resource,
+        ),
+        (
+            arrow_schema::ArrowError::OffsetOverflowError(usize::MAX),
+            FailureClass::Representation,
+        ),
+        (
+            arrow_schema::ArrowError::SchemaError("carrier".into()),
+            FailureClass::Invariant,
+        ),
+    ] {
+        let outer = ArrayCastFailure::Arrow(source).into_row(7).unwrap_err();
+        assert_eq!(outer.failure_fact().class(), expected);
+        let mut cause = outer.source();
+        let mut found = false;
+        while let Some(source) = cause {
+            found |= source.is::<arrow_schema::ArrowError>();
+            cause = source.source();
+        }
+        assert!(found, "outer failure retains the actual Arrow source");
+    }
+    let original = KernelFailure::Cancelled;
+    assert_eq!(
+        ArrayCastFailure::Outer(original.clone())
+            .into_row(7)
+            .unwrap_err(),
+        original
+    );
+}

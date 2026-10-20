@@ -128,8 +128,7 @@ impl Body {
             }
             work.flush()?;
             let selected = argument.array().slice(row, 1);
-            let value = super::f3_array::numeric_i128(&selected)
-                .map_err(|message| internal(&message))?
+            let value = super::f3_array::numeric_i128(&selected)?
                 .and_then(|value| i64::try_from(value).ok());
             work.flush()?;
             let Some(value) = value else {
@@ -277,8 +276,9 @@ impl Body {
         let output = match arrow_cast::cast(selected.as_ref(), recipe.result.data_type()) {
             Ok(output) => output,
             Err(error) => {
+                let row = super::f3_array::ArrayCastFailure::Arrow(error).into_row(ordinal)?;
                 work.flush()?;
-                return row_error(ordinal, &error.to_string(), work);
+                return Ok(CastRowResult::RowError(row));
             }
         };
         work.flush()?;
@@ -361,7 +361,11 @@ fn row_error(
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<CastRowResult, KernelFailure> {
     work.flush()?;
-    let error = RowDataError::new(ordinal, message);
+    let error = RowDataError::with_reason(
+        ordinal,
+        crate::DataFailureReason::NumericOutOfRange,
+        message,
+    );
     work.flush()?;
     Ok(CastRowResult::RowError(error))
 }

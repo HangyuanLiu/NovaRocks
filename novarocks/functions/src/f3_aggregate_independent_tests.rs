@@ -17,8 +17,7 @@
 //! Independent values retained before removing Execution differential oracles.
 //! Test-only storage delegates exactly to Global; it grants no production scope.
 use crate::aggregate_scalar::{
-    AggScalarValue as V, ScalarStateAllocator, ScalarStateError, ScalarWork,
-    TrackedAggScalarValue as T,
+    AggScalarValue as V, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue as T,
 };
 use allocator_api2::alloc::{AllocError, Allocator, Global};
 use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, ListArray};
@@ -37,13 +36,19 @@ unsafe impl Allocator for TestAllocator {
     }
 }
 impl ScalarStateAllocator for TestAllocator {
-    fn scalar_allocation_error(&self, _: &str) -> ScalarStateError {
-        crate::KernelFailure::ResourceExhausted.into()
+    fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+        &self,
+        operation: &str,
+        source: E,
+    ) -> crate::KernelFailure {
+        crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+            operation, source,
+        ))
     }
 }
 impl crate::exact_percentile_core::ExactPercentileAllocator for TestAllocator {
     type ParserReservation = ();
-    fn reserve_percentile_transient(&self, _: usize, _: &str) -> Result<(), String> {
+    fn reserve_percentile_transient(&self, _: usize, _: &str) -> Result<(), crate::KernelFailure> {
         Ok(())
     }
 }
@@ -203,7 +208,7 @@ fn f3_mann_whitney_equal_samples_without_continuity_have_independent_u_and_p() {
             .update_row(&mut state, [row, row, 0, 0], &mut work)
             .unwrap();
     }
-    let actual: serde_json::Value = serde_json::from_str(&state.build_result()).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(&state.build_result().unwrap()).unwrap();
     assert_eq!(actual.as_array().unwrap().len(), 2);
     assert_eq!(actual[0].as_f64(), Some(2.0));
     assert_eq!(actual[1].as_f64(), Some(1.0));

@@ -340,7 +340,10 @@ pub(super) fn evaluate<'a>(
             work.borrow_mut().flush()?;
             let indices = UInt64Array::from(indices);
             let compact = arrow_select::take::take(argument.array().as_ref(), &indices, None)
-                .map_err(|e| internal(&format!("checked CAST projection failed: {e}")))?;
+                .map_err(|e| {
+                    crate::control_values::AssemblyFailure::arrow("CAST projection", e)
+                        .into_kernel()
+                })?;
             work.borrow_mut().flush()?;
             let out = retag(&compact, recipe.result.data_type(), &work)?;
             let mut errors = reserve::<RowDataError>(inherited.len(), &work)?;
@@ -385,9 +388,9 @@ pub(super) fn evaluate<'a>(
                 let selected = argument.array().slice(row, 1);
                 work.borrow_mut().flush()?;
                 let converted = cast_one(&selected, recipe.result.data_type());
-                work.borrow_mut().flush()?;
                 match converted {
                     Ok(out) => {
+                        work.borrow_mut().flush()?;
                         let nonfinite = match selected.data_type() {
                             DataType::Float32 => selected
                                 .as_any()
@@ -418,12 +421,14 @@ pub(super) fn evaluate<'a>(
                                 == DecimalOverflowPolicy::ReportError
                                 || (both_decimal && recipe.allow_throw_exception))
                         {
-                            errors.push(RowDataError::new(ordinal,"Expr evaluate meet error: The numeric type cast involving decimal overflows"));
+                            errors.push(RowDataError::with_reason(ordinal, crate::DataFailureReason::NumericOutOfRange, "Expr evaluate meet error: The numeric type cast involving decimal overflows"));
                         }
                         out
                     }
-                    Err(message) => {
-                        errors.push(RowDataError::new(ordinal, &message));
+                    Err(cause) => {
+                        let row = cause.into_row(ordinal)?;
+                        work.borrow_mut().flush()?;
+                        errors.push(row);
                         new_null_array(recipe.result.data_type(), 1)
                     }
                 }
@@ -460,8 +465,10 @@ pub(super) fn evaluate<'a>(
                 sources.push(array.as_ref());
             }
             work.borrow_mut().flush()?;
-            arrow_select::interleave::interleave(&sources, &choices)
-                .map_err(|e| internal(&format!("checked selected CAST assembly failed: {e}")))?
+            arrow_select::interleave::interleave(&sources, &choices).map_err(|e| {
+                crate::control_values::AssemblyFailure::arrow("selected CAST assembly", e)
+                    .into_kernel()
+            })?
         };
         work.borrow_mut().flush()?;
         SelectedValues::try_new_observed(
@@ -515,12 +522,95 @@ fn concrete_source(array: &dyn Array) -> bool {
     }
 }
 
-fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, String> {
+#[derive(Debug)]
+pub(super) enum ArrayCastFailure {
+    Outer(KernelFailure),
+    Decimal(crate::legacy_decimal::DecimalMathFailure),
+    Arrow(arrow_schema::ArrowError),
+}
+impl From<KernelFailure> for ArrayCastFailure {
+    fn from(cause: KernelFailure) -> Self {
+        Self::Outer(cause)
+    }
+}
+impl From<crate::legacy_decimal::DecimalMathFailure> for ArrayCastFailure {
+    fn from(cause: crate::legacy_decimal::DecimalMathFailure) -> Self {
+        Self::Decimal(cause)
+    }
+}
+impl ArrayCastFailure {
+    pub(super) fn into_row(self, ordinal: usize) -> Result<RowDataError, KernelFailure> {
+        match self {
+            Self::Outer(cause) => Err(cause),
+            Self::Decimal(cause) => RowDataError::from_domain(ordinal, cause),
+            Self::Arrow(cause) => RowDataError::from_domain(ordinal, ArrayCastArrowFailure(cause)),
+        }
+    }
+}
+#[derive(Debug)]
+struct ArrayCastArrowFailure(arrow_schema::ArrowError);
+impl std::fmt::Display for ArrayCastArrowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for ArrayCastArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ArrayCastArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use arrow_schema::ArrowError;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        match &self.0 {
+            ArrowError::CastError(_) | ArrowError::ParseError(_) => {
+                return crate::DataFailureReason::InvalidValue.failure_fact();
+            }
+            ArrowError::ArithmeticOverflow(_) => {
+                return crate::DataFailureReason::NumericOutOfRange.failure_fact();
+            }
+            _ => {}
+        }
+        let (class, code) = match &self.0 {
+            ArrowError::MemoryError(_) => (FailureClass::Resource, 6101),
+            ArrowError::OffsetOverflowError(_) => (FailureClass::Representation, 6102),
+            ArrowError::IoError(..) | ArrowError::ExternalError(_) => {
+                (FailureClass::Unexpected, 6103)
+            }
+            _ => (FailureClass::Invariant, 6104),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        if matches!(self.0, ArrowError::OffsetOverflowError(_)) {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::KERNEL,
+                    code: std::num::NonZeroU16::new(6101).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+
+fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, ArrayCastFailure> {
     if result == &DataType::FixedSizeBinary(16)
         && (numeric(source.data_type())
             || matches!(source.data_type(), DataType::Boolean | DataType::Utf8))
     {
-        return crate::largeint::array_from_i128(&[numeric_i128(source)?]);
+        return crate::largeint::array_from_i128(&[numeric_i128(source)?])
+            .map_err(|cause| ArrayCastFailure::Outer(cause.into()));
     }
     if source.data_type() == &DataType::FixedSizeBinary(16)
         && (numeric(result) || result == &DataType::Boolean)
@@ -528,11 +618,11 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, String> {
         let source = source
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| "fixed numeric CAST has a foreign carrier".to_string())?;
+            .ok_or_else(|| invalid("fixed numeric CAST has a foreign carrier"))?;
         let value = if source.is_null(0) {
             None
         } else {
-            Some(crate::largeint::value_at(source, 0)?)
+            Some(crate::largeint::value_at(source, 0).map_err(KernelFailure::from)?)
         };
         macro_rules! primitive {
             ($array:ty,$map:expr) => {
@@ -552,7 +642,7 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, String> {
             DataType::Float64 => primitive!(Float64Array, |v| Some(v as f64)),
             DataType::Boolean => primitive!(BooleanArray, |v| Some(v != 0)),
             DataType::Decimal128(..) | DataType::Decimal256(..) => fixed_decimal(value, result),
-            _ => Err("fixed numeric CAST lost its selected target".into()),
+            _ => Err(invalid("fixed numeric CAST lost its selected target").into()),
         };
     }
     if source.data_type() == &DataType::Boolean {
@@ -561,12 +651,11 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, String> {
             for _ in 0..scale.unsigned_abs() {
                 factor = factor.and_then(|v| v.checked_mul(arrow_buffer::i256::from_i128(10)));
             }
-            let factor =
-                factor.ok_or_else(|| "decimal scale overflow while casting BOOLEAN".to_string())?;
+            let factor = factor.ok_or(crate::legacy_decimal::DecimalMathFailure::Overflow)?;
             let source = source
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "boolean CAST has a foreign carrier".to_string())?;
+                .ok_or_else(|| invalid("boolean CAST has a foreign carrier"))?;
             let value = if source.is_null(0) {
                 None
             } else {
@@ -583,11 +672,14 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, String> {
             let array = Decimal256Array::from(vec![value])
                 .null_if_overflow_precision(*precision)
                 .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(|cause| {
+                    crate::control_values::AssemblyFailure::arrow("CAST decimal metadata", cause)
+                        .into_kernel()
+                })?;
             return Ok(Arc::new(array));
         }
     }
-    let out = arrow_cast::cast(source.as_ref(), result).map_err(|e| e.to_string())?;
+    let out = arrow_cast::cast(source.as_ref(), result).map_err(ArrayCastFailure::Arrow)?;
     // The old scalar evaluator sanitized parser-produced non-finite floats.
     let invalid = match result {
         DataType::Float32 => out
@@ -606,7 +698,7 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, String> {
         out
     })
 }
-pub(super) fn numeric_i128(source: &ArrayRef) -> Result<Option<i128>, String> {
+pub(super) fn numeric_i128(source: &ArrayRef) -> Result<Option<i128>, KernelFailure> {
     if source.is_null(0) {
         return Ok(None);
     }
@@ -615,19 +707,22 @@ pub(super) fn numeric_i128(source: &ArrayRef) -> Result<Option<i128>, String> {
             source
                 .as_any()
                 .downcast_ref::<$array>()
-                .ok_or_else(|| "numeric fixed CAST has a foreign carrier".to_string())?
+                .ok_or_else(|| invalid("numeric fixed CAST has a foreign carrier"))?
                 .value(0)
         };
     }
     let value = match source.data_type() {
         DataType::Boolean => Some(i128::from(primitive!(BooleanArray))),
-        DataType::FixedSizeBinary(16) => Some(crate::largeint::value_at(
-            source
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "numeric fixed CAST has a foreign carrier".to_string())?,
-            0,
-        )?),
+        DataType::FixedSizeBinary(16) => Some(
+            crate::largeint::value_at(
+                source
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .ok_or_else(|| invalid("numeric fixed CAST has a foreign carrier"))?,
+                0,
+            )
+            .map_err(KernelFailure::from)?,
+        ),
         DataType::Int8 => Some(i128::from(primitive!(Int8Array))),
         DataType::Int16 => Some(i128::from(primitive!(Int16Array))),
         DataType::Int32 => Some(i128::from(primitive!(Int32Array))),
@@ -672,18 +767,16 @@ pub(super) fn numeric_i128(source: &ArrayRef) -> Result<Option<i128>, String> {
                 })
                 .and_then(|value| value.to_i128())
         }
-        _ => return Err("numeric fixed CAST lost its selected source".into()),
+        _ => return Err(invalid("numeric fixed CAST lost its selected source")),
     };
     Ok(value)
 }
-fn fixed_decimal(value: Option<i128>, result: &DataType) -> Result<ArrayRef, String> {
+fn fixed_decimal(value: Option<i128>, result: &DataType) -> Result<ArrayRef, ArrayCastFailure> {
     match result {
         DataType::Decimal128(precision, scale) => {
             let factor =
                 crate::legacy_decimal::checked_pow10_i128(usize::from(scale.unsigned_abs()))
-                    .ok_or_else(|| {
-                        "decimal scale overflow while casting fixed numeric bytes".to_string()
-                    })?;
+                    .ok_or(crate::legacy_decimal::DecimalMathFailure::Overflow)?;
             let value = value.and_then(|value| {
                 if *scale < 0 {
                     value.checked_div(factor)
@@ -694,7 +787,10 @@ fn fixed_decimal(value: Option<i128>, result: &DataType) -> Result<ArrayRef, Str
             let array = Decimal128Array::from(vec![value])
                 .null_if_overflow_precision(*precision)
                 .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(|cause| {
+                    crate::control_values::AssemblyFailure::arrow("CAST decimal metadata", cause)
+                        .into_kernel()
+                })?;
             Ok(Arc::new(array))
         }
         DataType::Decimal256(precision, scale) => {
@@ -709,10 +805,13 @@ fn fixed_decimal(value: Option<i128>, result: &DataType) -> Result<ArrayRef, Str
             let array = Decimal256Array::from(vec![value])
                 .null_if_overflow_precision(*precision)
                 .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(|cause| {
+                    crate::control_values::AssemblyFailure::arrow("CAST decimal metadata", cause)
+                        .into_kernel()
+                })?;
             Ok(Arc::new(array))
         }
-        _ => Err("numeric fixed decimal CAST lost its selected target".into()),
+        _ => Err(invalid("numeric fixed decimal CAST lost its selected target").into()),
     }
 }
 
@@ -755,7 +854,10 @@ fn retag(
             }
             work.borrow_mut().flush()?;
             let array = StructArray::try_new(to.clone(), columns, source.nulls().cloned())
-                .map_err(|e| invalid(&format!("signed Struct CAST nullability mismatch: {e}")))?;
+                .map_err(|e| {
+                    crate::control_values::AssemblyFailure::arrow("signed Struct CAST", e)
+                        .into_kernel()
+                })?;
             work.borrow_mut().flush()?;
             Ok(Arc::new(array))
         }
@@ -772,7 +874,9 @@ fn retag(
                 child,
                 source.nulls().cloned(),
             )
-            .map_err(|e| invalid(&format!("signed List CAST nullability mismatch: {e}")))?;
+            .map_err(|e| {
+                crate::control_values::AssemblyFailure::arrow("signed List CAST", e).into_kernel()
+            })?;
             work.borrow_mut().flush()?;
             Ok(Arc::new(array))
         }
@@ -789,7 +893,10 @@ fn retag(
                 child,
                 source.nulls().cloned(),
             )
-            .map_err(|e| invalid(&format!("signed LargeList CAST nullability mismatch: {e}")))?;
+            .map_err(|e| {
+                crate::control_values::AssemblyFailure::arrow("signed LargeList CAST", e)
+                    .into_kernel()
+            })?;
             work.borrow_mut().flush()?;
             Ok(Arc::new(array))
         }

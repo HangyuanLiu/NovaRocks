@@ -224,7 +224,7 @@ fn float_date_actual_compiler_native_float_constant_negative_zero_is_original_er
                 assert_eq!(result.errors().len(), 2);
                 for (ordinal, error) in result.errors().iter().enumerate() {
                     assert_eq!(error.selected_ordinal(), ordinal);
-                    assert_eq!(error.message(), message.detail());
+                    assert_eq!(error.message(), message);
                 }
             }
         }

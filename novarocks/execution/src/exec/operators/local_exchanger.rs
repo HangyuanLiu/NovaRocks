@@ -578,7 +578,7 @@ impl LocalExchanger {
                     self.partition_count,
                     false,
                     factory,
-                    control,
+                    &|| control.checkpoint(),
                 )?
             }
             LocalExchangePartitionSpec::InputSlotIds(slots) => {
@@ -592,7 +592,7 @@ impl LocalExchanger {
                     self.partition_count,
                     false,
                     factory,
-                    control,
+                    &|| control.checkpoint(),
                 )?
             }
             LocalExchangePartitionSpec::Single => {

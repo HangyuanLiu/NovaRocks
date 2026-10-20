@@ -1161,10 +1161,10 @@ mod data_stream_sink_hash_partition {
         source: &Chunk,
         rows: &[u32],
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &RuntimeKernelControl,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> crate::runtime::fragment::ExecutionResult<Chunk> {
         use crate::exec::pipeline::operator::ConstructionFailure;
-        control.checkpoint_execution()?;
+        checkpoint()?;
         let owner = factory.begin_input_construction(source)?;
         for layout in [
             std::alloc::Layout::array::<u32>(rows.len()),
@@ -1207,7 +1207,7 @@ mod data_stream_sink_hash_partition {
                 )?)
             },
         )?;
-        control.checkpoint_execution()?;
+        checkpoint()?;
         Ok(output)
     }
 
@@ -1233,18 +1233,18 @@ mod data_stream_sink_hash_partition {
         partitions: usize,
         crc: bool,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &RuntimeKernelControl,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Vec<Chunk>> {
-        control.checkpoint_execution()?;
+        checkpoint()?;
         let out = partition_chunk_by_hash_with(
             chunk,
             exprs,
             evaluation,
             partitions,
             crc,
-            |source, rows| take_partition_rows_created(source, rows, factory, control),
+            |source, rows| take_partition_rows_created(source, rows, factory, checkpoint),
         )?;
-        control.checkpoint_execution()?;
+        checkpoint()?;
         Ok(out)
     }
     fn partition_chunk_by_hash_with<E: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -1283,14 +1283,14 @@ mod data_stream_sink_hash_partition {
         partitions: usize,
         crc: bool,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &RuntimeKernelControl,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Vec<Chunk>> {
-        control.checkpoint_execution()?;
+        checkpoint()?;
         let output =
             partition_chunk_by_hash_arrays_with(chunk, keys, partitions, crc, |source, rows| {
-                take_partition_rows_created(source, rows, factory, control)
+                take_partition_rows_created(source, rows, factory, checkpoint)
             })?;
-        control.checkpoint_execution()?;
+        checkpoint()?;
         Ok(output)
     }
     fn partition_chunk_by_hash_arrays_with(
@@ -2273,7 +2273,9 @@ impl DataStreamSinkOperator {
                             crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                         )?;
                         let new_chunk =
-                            take_partition_rows_created(chunk, row_indices, factory, ctx)?;
+                            take_partition_rows_created(chunk, row_indices, factory, &|| {
+                                ctx.checkpoint()
+                            })?;
 
                         per_dest_chunks.push(vec![new_chunk]);
                     }
@@ -2296,7 +2298,12 @@ impl DataStreamSinkOperator {
                             crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                         )?;
                         partition_chunk_by_hash_arrays_created(
-                            chunk, keys, n, use_crc32, factory, ctx,
+                            chunk,
+                            keys,
+                            n,
+                            use_crc32,
+                            factory,
+                            &|| ctx.checkpoint(),
                         )?
                     }
                     None => {
@@ -2321,7 +2328,7 @@ impl DataStreamSinkOperator {
                             n,
                             use_crc32,
                             factory,
-                            ctx,
+                            &|| ctx.checkpoint(),
                         )?
                     }
                 };
@@ -5085,7 +5092,7 @@ mod created_partition_regressions {
                 3,
                 crc,
                 factory.as_ref(),
-                &control,
+                &|| control.checkpoint_execution(),
             )
             .unwrap();
             for (expected, actual) in expected.iter().zip(actual.iter()) {
@@ -5111,8 +5118,10 @@ mod created_partition_regressions {
         );
         state.error_state().set_error(original.clone());
         let control = RuntimeKernelControl::new(state.error_state());
-        let error =
-            take_partition_rows_created(&source, &[1, 3], factory.as_ref(), &control).unwrap_err();
+        let error = take_partition_rows_created(&source, &[1, 3], factory.as_ref(), &|| {
+            control.checkpoint_execution()
+        })
+        .unwrap_err();
         assert_eq!(error, original);
     }
 }

@@ -267,20 +267,56 @@ fn float_decimal128_original_value_static_error_and_hidden_null() {
         ),
         Err(KernelFailure::InvalidProgram(_))
     ));
-    // Test-only regression evidence: no runtime catch, row NULL replacement or new panic policy.
-    for (scale, array) in [
-        (i8::MIN, input(vec![None])),
-        (0, input(vec![Some(i128::MIN as f64)])),
+    // Extreme scale keeps the existing static-factor error channel even for
+    // NULL input; the minimum signed coefficient follows the overflow policy.
+    let scale = recipe(38, i8::MIN, true)
+        .evaluate_row(
+            EvaluatedArgument::Column(&input(vec![None])),
+            0,
+            0,
+            &Control::default(),
+        )
+        .unwrap();
+    let CastRowResult::RowError(error) = scale else {
+        panic!("unrepresentable scale must refuse")
+    };
+    assert_eq!(
+        error.message(),
+        "CAST failed: from Float64 to Decimal128(38, -128): decimal scale overflow while casting float to DECIMAL: scale=-128"
+    );
+    let minimum = input(vec![Some(i128::MIN as f64)]);
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
     ] {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recipe(38, scale, true).evaluate_row(
-                EvaluatedArgument::Column(&array),
+        let r = PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &FunctionValueType::new(DataType::Float64, true),
+            &FunctionValueType::new(DataType::Decimal128(38, 0), true),
+            policy,
+            false,
+            &Control::default(),
+        )
+        .unwrap();
+        let got = r
+            .evaluate_row(
+                EvaluatedArgument::Column(&minimum),
                 0,
                 0,
                 &Control::default(),
             )
-        }));
-        assert_eq!(result.is_err(), cfg!(debug_assertions));
+            .unwrap();
+        match (policy, got) {
+            (DecimalOverflowPolicy::OutputNull, CastRowResult::Null) => {}
+            (DecimalOverflowPolicy::ReportError, CastRowResult::RowError(error)) => {
+                assert_eq!(error.selected_ordinal(), 0);
+                assert_eq!(
+                    error.message(),
+                    "Expr evaluate meet error: The numeric type cast involving decimal overflows"
+                );
+            }
+            (_, other) => panic!("coefficient overflow policy changed: {other:?}"),
+        }
     }
 }
 #[test]

@@ -903,7 +903,11 @@ fn try_fold_node_with_services(
                 })
             } else {
                 let compared = selected::comparison_type(&args[0].value_type, &args[1].value_type)
-                    .map_err(SqlCompileError::InvalidRequest)?;
+                    .map_err(|cause| {
+                        SqlCompileError::CompilationSource(
+                            novarocks_failure_contract::SharedFailureCause::new(cause),
+                        )
+                    })?;
                 let left = conversion(
                     &args[0],
                     &selected::comparison_target(&compared, &args[0].value_type),
@@ -2680,9 +2684,9 @@ mod complete_fold_type_tests {
             KernelFailure::Cancelled,
             KernelFailure::DeadlineExceeded,
             KernelFailure::ResourceExhausted,
-            KernelFailure::CompileControl(CompileControlError::from_domain(
-                ProjectedOuterFoldSource,
-            )),
+            KernelFailure::CompileControl(
+                novarocks_type_contract::CompileControlError::from_domain(ProjectedOuterFoldSource),
+            ),
             KernelFailure::from_domain(ProjectedOuterFoldSource),
             KernelFailure::InvalidProgram(KernelDiagnostic::new("frozen binding mismatch")),
             KernelFailure::Internal(KernelDiagnostic::new("unexpected pure preparation failure")),
