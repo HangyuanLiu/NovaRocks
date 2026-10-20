@@ -188,7 +188,6 @@ fn check_partition_row_extent(rows: usize) -> ExecutionResult<()> {
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_all, instances as compiled_instances,
@@ -281,9 +280,8 @@ fn is_low_cardinality_exchange_dictionary(data_type: &DataType) -> bool {
 // Hash partition implementation (vectorized, no row conversion)
 mod data_stream_sink_hash_partition {
     use super::{
-        Chunk, ExprArena, ExprId, RuntimeKernelControl, StreamDictionaryKeyFailure,
-        check_partition_row_extent, is_low_cardinality_exchange_dictionary, partition_arrow,
-        stream_contract,
+        Chunk, StreamDictionaryKeyFailure, check_partition_row_extent,
+        is_low_cardinality_exchange_dictionary, partition_arrow, stream_contract,
     };
     use crate::exec::hash_table::hash::{canonical_f32_bits, canonical_f64_bits};
     use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
@@ -1211,59 +1209,6 @@ mod data_stream_sink_hash_partition {
         Ok(output)
     }
 
-    /// Geometry-only reference caller. Production partitions use the creator ports below.
-    #[cfg(test)]
-    pub fn partition_chunk_by_hash<E: crate::exec::expr::ExprEvaluation + ?Sized>(
-        chunk: &Chunk,
-        exprs: &[ExprId],
-        evaluation: &E,
-        partitions: usize,
-        crc: bool,
-    ) -> ExecutionResult<Vec<Chunk>> {
-        partition_chunk_by_hash_with(chunk, exprs, evaluation, partitions, crc, |source, rows| {
-            take_partition_rows_with(source, rows, |source, columns, _| {
-                Chunk::try_new_with_columns(source.chunk_schema_ref(), columns).map_err(Into::into)
-            })
-        })
-    }
-    pub(crate) fn partition_chunk_by_hash_created(
-        chunk: &Chunk,
-        exprs: &[ExprId],
-        evaluation: &crate::exec::expr::ExprEvaluationContext<'_>,
-        partitions: usize,
-        crc: bool,
-        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        checkpoint: &dyn Fn() -> ExecutionResult<()>,
-    ) -> ExecutionResult<Vec<Chunk>> {
-        checkpoint()?;
-        let out = partition_chunk_by_hash_with(
-            chunk,
-            exprs,
-            evaluation,
-            partitions,
-            crc,
-            |source, rows| take_partition_rows_created(source, rows, factory, checkpoint),
-        )?;
-        checkpoint()?;
-        Ok(out)
-    }
-    fn partition_chunk_by_hash_with<E: crate::exec::expr::ExprEvaluation + ?Sized>(
-        chunk: &Chunk,
-        exprs: &[ExprId],
-        evaluation: &E,
-        partitions: usize,
-        crc: bool,
-        take_rows: impl FnMut(&Chunk, &[u32]) -> ExecutionResult<Chunk>,
-    ) -> ExecutionResult<Vec<Chunk>> {
-        if chunk.is_empty() {
-            return Ok(vec![Chunk::default(); partitions]);
-        }
-        let mut keys = Vec::with_capacity(exprs.len());
-        for expr in exprs {
-            keys.push(evaluation.eval(*expr, chunk)?);
-        }
-        partition_chunk_by_hash_arrays_with(chunk, &keys, partitions, crc, take_rows)
-    }
     #[cfg(test)]
     pub fn partition_chunk_by_hash_arrays(
         chunk: &Chunk,
@@ -1377,17 +1322,14 @@ mod data_stream_sink_hash_partition {
 }
 
 #[cfg(test)]
-pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
-#[cfg(test)]
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
 pub(crate) use data_stream_sink_hash_partition::{
-    partition_chunk_by_hash_arrays_created, partition_chunk_by_hash_created,
-    take_partition_rows_created,
+    partition_chunk_by_hash_arrays_created, take_partition_rows_created,
 };
 
 /// The partition-key roots of one compiled stream branch, in key order.
 /// They are evaluated through compiled roots over the sink's input port; a
-/// compiled sink never thaws its arena into the legacy partition arena.
+/// compiled sink retains its frozen root declarations.
 #[derive(Clone)]
 pub(crate) struct CompiledPartitionKeys {
     program: Arc<LocalProgram>,
@@ -1414,7 +1356,6 @@ pub struct DataStreamSinkFactory {
     input: DataStreamSinkFactoryInput,
     fragment_instance_id: UniqueId,
     sender_id: Option<i32>,
-    partition_arena: ExprArena,
     transmitter: Arc<dyn ExchangeFrameTransmitter>,
     plan_node_id: i32,
     finish_state: Arc<DataStreamSinkFinishState>,
@@ -1429,7 +1370,6 @@ impl DataStreamSinkFactory {
         fragment_instance_id: UniqueId,
         sender_id: Option<i32>,
         plan_node_id: i32,
-        partition_arena: ExprArena,
         transmitter: Arc<dyn ExchangeFrameTransmitter>,
     ) -> Self {
         // Align with StarRocks FE ExplainAnalyzer: ExchangeSinkOperator uses the *upstream plan node id*
@@ -1439,8 +1379,7 @@ impl DataStreamSinkFactory {
         } else {
             "EXCHANGE_SINK".to_string()
         };
-        let init_error = (!input.output_exprs.is_empty())
-            .then(|| stream_contract("DATA_STREAM_SINK output_exprs are not supported"));
+        let init_error = None;
 
         Self {
             name,
@@ -1448,7 +1387,6 @@ impl DataStreamSinkFactory {
             input,
             fragment_instance_id,
             sender_id,
-            partition_arena,
             transmitter,
             plan_node_id,
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
@@ -1459,16 +1397,11 @@ impl DataStreamSinkFactory {
     }
 
     /// Evaluate this sink's partition keys through compiled roots. The
-    /// factory input must then carry no legacy partition expression.
+    /// factory retains the exact frozen key sites.
     pub(crate) fn with_compiled_partition_keys(
         mut self,
         keys: CompiledPartitionKeys,
     ) -> ExecutionResult<Self> {
-        if !self.input.output_partition_exprs.is_empty() {
-            return Err(stream_contract(
-                "compiled partition keys cannot coexist with legacy partition expressions",
-            ));
-        }
         if !self.input.output_partition_type.requires_exprs() || keys.sites.is_empty() {
             return Err(stream_contract(format_args!(
                 "compiled partition keys do not match {} partitioning",
@@ -1567,21 +1500,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             );
         }
 
-        let mut init_error = self.init_error.clone();
-        let arena = self.partition_arena.clone();
-        let expr_ids = self.input.output_partition_exprs.clone();
-        if init_error.is_none() && self.input.output_partition_type.requires_exprs() {
-            let has_variant = expr_ids.iter().any(|id| {
-                arena
-                    .data_type(*id)
-                    .is_some_and(|dt| matches!(dt, arrow::datatypes::DataType::LargeBinary))
-            });
-            if has_variant {
-                init_error = Some(stream_contract(
-                    "VARIANT is not supported in HASH_PARTITIONED partition keys",
-                ));
-            }
-        }
+        let init_error = self.init_error.clone();
 
         let send_observable = Arc::new(Observable::new());
 
@@ -1590,8 +1509,6 @@ impl OperatorFactory for DataStreamSinkFactory {
             input: self.input.clone(),
             fragment_instance_id: self.fragment_instance_id,
             transmitter: Arc::clone(&self.transmitter),
-            arena,
-            expr_ids,
             init_error,
             driver_id,
             sender_id,
@@ -1661,8 +1578,6 @@ struct DataStreamSinkOperator {
     input: DataStreamSinkFactoryInput,
     fragment_instance_id: UniqueId,
     transmitter: Arc<dyn ExchangeFrameTransmitter>,
-    arena: ExprArena,
-    expr_ids: Vec<ExprId>,
     init_error: Option<ExecutionFailure>,
     driver_id: i32,
     sender_id: i32,
@@ -2290,48 +2205,21 @@ impl DataStreamSinkOperator {
                     DataStreamPartitionType::BucketShuffleHashPartitioned
                 );
 
-                let partition_chunks = match compiled_keys {
-                    // Compiled keys feed the same hash and placement as the
-                    // legacy arena keys; only their evaluation differs.
-                    Some(keys) => {
-                        let factory = self.construction_factory.as_deref().ok_or(
-                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                        )?;
-                        partition_chunk_by_hash_arrays_created(
-                            chunk,
-                            keys,
-                            n,
-                            use_crc32,
-                            factory,
-                            &|| ctx.checkpoint(),
-                        )?
-                    }
-                    None => {
-                        if self.expr_ids.is_empty() {
-                            return Err(stream_contract(
-                                "HASH_PARTITIONED missing partition_exprs",
-                            ));
-                        }
-                        let factory = self.construction_factory.as_deref().ok_or(
-                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                        )?;
-                        let owner = factory.begin_input_construction(chunk)?;
-                        let evaluation = crate::exec::expr::ExprEvaluationContext::new(
-                            &self.arena,
-                            owner.as_ref(),
-                            ctx,
-                        );
-                        partition_chunk_by_hash_created(
-                            chunk,
-                            &self.expr_ids,
-                            &evaluation,
-                            n,
-                            use_crc32,
-                            factory,
-                            &|| ctx.checkpoint(),
-                        )?
-                    }
-                };
+                let keys = compiled_keys.ok_or_else(|| {
+                    stream_contract("HASH_PARTITIONED missing compiled partition keys")
+                })?;
+                let factory = self
+                    .construction_factory
+                    .as_deref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let partition_chunks = partition_chunk_by_hash_arrays_created(
+                    chunk,
+                    keys,
+                    n,
+                    use_crc32,
+                    factory,
+                    &|| ctx.checkpoint(),
+                )?;
 
                 // Convert Vec<Chunk> to Vec<Vec<Chunk>>
                 let mut per_dest_chunks: Vec<Vec<Chunk>> = Vec::with_capacity(n);
@@ -3405,14 +3293,10 @@ mod tests {
                 DataStreamPartitionType::Unpartitioned,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                Vec::new(),
             )
             .expect("test sink input"),
             transmitter: crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             fragment_instance_id: UniqueId::new(1, 2),
-            arena: ExprArena::default(),
-            expr_ids: Vec::new(),
             init_error: None,
             driver_id: 0,
             sender_id: 11,

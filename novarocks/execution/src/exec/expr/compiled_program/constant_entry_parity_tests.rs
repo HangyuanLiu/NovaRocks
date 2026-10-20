@@ -643,12 +643,19 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         }
         fixture.direct(children, Expected::Value(expected));
     }
-    // Negative zero is authored as UnaryNegate(Float64(0)), and typed NULL
-    // may retain an explicit Cast. Preserve these real child subexpressions
-    // as extra coverage; neither replaces the depth-one family cases above.
+    // Native unary minus is zero subtraction: +0 - +0 is +0. An explicit
+    // text CAST authors the separate -0 bit pattern. Preserve both real child
+    // subexpressions, plus typed NULL, without replacing the depth-one cases.
     for (expression, family, nullable, children, expected) in [
         (
             "-0e0 * 1e0",
+            Family::Arithmetic,
+            true,
+            vec![float(0.0), float(1.0)],
+            float(0.0),
+        ),
+        (
+            "CAST('-0' AS DOUBLE) * 1e0",
             Family::Arithmetic,
             true,
             vec![float(-0.0), float(1.0)],

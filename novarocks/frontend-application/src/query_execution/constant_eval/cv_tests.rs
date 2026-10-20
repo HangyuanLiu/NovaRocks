@@ -276,36 +276,58 @@ fn capture(
         "fixture must terminate only at its captured SQL node: {compile:?}; \
          expected node={:?}, source types={:?}, result={:?}; observed={:?}",
         state.node,
-        state.sources.as_ref().map(|sources| sources
-            .iter()
-            .map(|source| (
-                source.ordinal(),
-                source.value_type(),
-                source.pool().backing_identity()
-            ))
-            .collect::<Vec<_>>()),
+        state.sources.as_ref().map(|sources| (
+            sources.len(),
+            sources
+                .iter()
+                .take(4)
+                .map(|source| (
+                    source.ordinal(),
+                    source.value_type(),
+                    source.pool().backing_identity()
+                ))
+                .collect::<Vec<_>>()
+        )),
         state.result,
-        state.observed,
+        state
+            .observed
+            .iter()
+            .take(8)
+            .map(|request| (
+                request.args.len(),
+                request
+                    .args
+                    .iter()
+                    .take(4)
+                    .map(|arg| (
+                        arg.value.ordinal(),
+                        &arg.value_type,
+                        arg.value.pool().backing_identity(),
+                    ))
+                    .collect::<Vec<_>>(),
+                &request.result_type,
+            ))
+            .collect::<Vec<_>>(),
     );
     state
         .captured
         .expect("SQL must have authored the exact request")
 }
-// Bind each original checked CV to its exact SELECT projection root. The
-// fixture has no syntactic wrapper between this site and its owned source.
-// Later
-// SELECT items use the analyzer's existing alias substitution, so their
-// bindings see the actual source types before any optimizer folding occurs.
+// Bind each original checked CV to the exact nested source occurrence in its
+// owned SELECT projection. Later SELECT items use the analyzer's existing
+// alias substitution, so bindings see the actual source types before folding.
+// Keeping Nested also exercises structural-site validation after normalization.
 fn statement_with_sources(
     expression: &str,
     hint: &str,
     sources: &[ConstantValue],
 ) -> novarocks_sql::compiler::SqlStatementInput {
     use novarocks_sql::compiler::{
-        SqlConstantExpressionSite, SqlExpressionConstant, SqlStatementInput,
+        SqlConstantExpressionSite, SqlConstantExpressionStep, SqlExpressionConstant,
+        SqlStatementInput,
     };
     let projections = (0..sources.len())
-        .map(|i| format!("NULL AS v{i}"))
+        .map(|i| format!("(NULL) AS v{i}"))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT {hint}{projections}, {expression} AS result");
@@ -322,6 +344,7 @@ fn statement_with_sources(
                 SqlConstantExpressionSite::SelectProjection { column },
                 value.clone(),
             )
+            .with_expression_path(vec![SqlConstantExpressionStep::Nested])
         })
         .collect::<Vec<_>>()
         .into();
@@ -506,7 +529,9 @@ fn decimal_value(value: &ConstantValue) -> i128 {
 
 #[test]
 fn folds_int32_addition_without_an_integer_carrier_roundtrip() {
-    let request = binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int64);
+    // Reusing one immutable source mirrors SQL's equal-constant interning;
+    // the two arguments still assert their exact original checked backing.
+    let request = binary(BinOp::Add, vec![i32(1); 2], DataType::Int64);
     assert!(
         request
             .args
@@ -1074,7 +1099,7 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
     request.result_type = complete;
     assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
     assert_all_callbacks(
-        &binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int64),
+        &binary(BinOp::Add, vec![i32(1); 2], DataType::Int64),
         |result| assert!(matches!(result, Ok(Some(_)))),
     );
 }
@@ -1139,7 +1164,7 @@ fn source_annotations_do_not_mint_a_type_resource_refusal() {
 }
 #[test]
 fn explicit_result_policy_refusal_is_typed_preparation_and_has_no_later_callback() {
-    let mut request = binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int64);
+    let mut request = binary(BinOp::Add, vec![i32(1); 2], DataType::Int64);
     request.constant_policy.max_rows = 0;
     let good = Control::default();
     assert!(matches!(
@@ -1422,7 +1447,7 @@ fn call_prepared_result_nullability_is_checked_before_the_arena_nonnull_decline(
         FixtureNode::Function {
             name: "nullif".into(),
         },
-        vec![i64(1), i64(1)],
+        vec![i64(1); 2],
         DataType::Int64,
     );
     let FrozenFoldNode::Call(call) = &request.kind else {

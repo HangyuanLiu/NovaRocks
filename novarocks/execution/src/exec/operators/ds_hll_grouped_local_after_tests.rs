@@ -123,13 +123,12 @@ fn ds_hll_grouped_local_after_hash_slots_real_identity_native_and_nulls() {
                 source_contract.call()
             ));
             assert!(final_stage.sites.is_empty());
-            // Empty arena deliberately has no expression nodes: the actual exchange
-            // must consume already published group slots, not legacy expressions.
+            // The actual exchange consumes the already published group slots;
+            // no legacy expression arena participates in routing.
             let exchange = LocalExchanger::new(
                 2,
                 2,
                 LocalExchangePartitionSpec::InputSlotIds(partition_slots),
-                Arc::new(crate::exec::expr::ExprArena::default()),
             );
             let state = RuntimeState::for_local_execution(
                 None,

@@ -27,18 +27,11 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::exec::expr::ExprId;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Data distribution modes used for stream routing and exchange planning.
 pub enum Distribution {
     Any,
     Single,
-    Hash {
-        keys: Vec<ExprId>,
-        partitions: usize,
-        hash_version: u32,
-    },
     /// Compiled local stages route already emitted keys by actual output slots.
     HashInputSlots {
         slots: Vec<novarocks_types::SlotId>,

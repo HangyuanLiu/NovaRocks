@@ -2350,10 +2350,6 @@ mod opaque_memory_host_tests;
 #[path = "compiled_writer_statistics/prepared_source_tests.rs"]
 mod prepared_source_tests;
 
-#[path = "compiled_writer_statistics/prepared_grouped.rs"]
-mod prepared_grouped;
-pub(crate) use prepared_grouped::create_prepared_grouped_in;
-
 #[cfg(test)]
 #[path = "compiled_writer_statistics/prepared_final_tests.rs"]
 mod prepared_final_tests;

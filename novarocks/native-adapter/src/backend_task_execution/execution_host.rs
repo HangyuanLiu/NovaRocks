@@ -3395,10 +3395,6 @@ pub(crate) mod tests {
             novarocks_execution::runtime::function_set::ExecutionFunctionSetBuilder::new();
         novarocks_sql::compiler::contribute_builtin_functions(function_set.catalog_builder_mut())
             .expect("builtin function metadata");
-        novarocks_execution::runtime::function_set::contribute_builtin_aggregate_implementations(
-            &mut function_set,
-        )
-        .expect("builtin aggregate implementations");
         let function_set = Arc::new(function_set.seal().expect("builtin execution function set"));
         Arc::new(
             ExecutionRuntime::new(

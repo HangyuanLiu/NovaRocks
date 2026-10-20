@@ -48,8 +48,6 @@ use super::output_filter::{
     record_rows_read, scan_limit_decision,
 };
 use crate::exec::chunk::Chunk;
-#[cfg(test)]
-use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::{
     ScanExitBodyProof, ScanExitObservation, ScanOp, ScanOutputStream, ScanStreamSource,
 };
@@ -2653,7 +2651,7 @@ mod tests {
     fn the_scan_keeps_producing_while_a_second_worker_runs_the_downstream() {
         let control = Arc::new(StreamControl::default());
         let (scan, _source) = stream_scan_source(&control);
-        let exchanger = LocalExchanger::new_handoff(1, 1, 8, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 1, 8);
         let state = Arc::new(RuntimeState::default());
         let mut exchange_sink =
             LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);

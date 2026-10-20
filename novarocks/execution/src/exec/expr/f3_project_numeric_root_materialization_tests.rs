@@ -18,7 +18,8 @@
 //! Mount as a test child of exec::expr; input and expected data are independent.
 #![cfg(novarocks_dev_controls)]
 
-use super::numeric_unary_owned_transaction_tests::programs;
+use super::filter_conjunction_actual_sql_compiler_tests::compiler_results_with_declared_read_fields;
+use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use super::sql_test_source::sql_source_with_declared_fields;
 use crate::exec::chunk::{
     Chunk, ChunkSchema, RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage,
@@ -33,6 +34,26 @@ use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, StaticSinkProgram};
 use std::sync::Arc;
+
+// Preserve each SQL source declaration through the real package extraction and
+// LocalCompiler author. The numeric-unary fixture intentionally admits only a
+// single nonnull column and is not an author for these multi/nullable sources.
+fn programs(
+    source: &novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+    fields: &[Field],
+) -> std::collections::BTreeMap<novarocks_physical_plan::FragmentId, Arc<LocalProgram>> {
+    compiler_results_with_declared_read_fields(source, fields, &installed_builtin_owner_catalogue())
+        .into_iter()
+        .map(|(fragment, result)| {
+            (
+                fragment,
+                Arc::new(result.expect(
+                    "the original SQL Project must compile with its exact input declaration",
+                )),
+            )
+        })
+        .collect()
+}
 
 fn run_project(program: Arc<LocalProgram>, node: Option<ProgramNodeId>, input: Chunk) -> Chunk {
     let errors = Arc::new(RuntimeErrorState::default());
@@ -93,12 +114,13 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
             } else {
                 expression
             };
+            let fields = [
+                Field::new("count_all", input_type.clone(), true),
+                Field::new("count_distinct", input_type, true),
+            ];
             let source = sql_source_with_declared_fields(
                 &format!("SELECT {expression} AS arithmetic_result FROM fixture"),
-                &[
-                    Field::new("count_all", input_type.clone(), true),
-                    Field::new("count_distinct", input_type, true),
-                ],
+                &fields,
             );
             assert_eq!(
                 source.plan().result_port().unwrap().fields[0]
@@ -106,7 +128,7 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
                     .data_type(),
                 &output_type
             );
-            let programs = programs(&source);
+            let programs = programs(&source, &fields);
             // Select the actual computing Project by its frozen two-column
             // input port. A result alias/gather is not a second producer.
             let mut producers = Vec::new();
@@ -229,11 +251,10 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
 #[test]
 fn project_casts_final_output_to_declared_slot_type() {
     use arrow::array::Int32Array;
-    let source = sql_source_with_declared_fields(
-        "SELECT CAST(k AS INT) AS out FROM fixture",
-        &[Field::new("k", DataType::Int64, false)],
-    );
-    let programs = programs(&source);
+    let fields = [Field::new("k", DataType::Int64, false)];
+    let source =
+        sql_source_with_declared_fields("SELECT CAST(k AS INT) AS out FROM fixture", &fields);
+    let programs = programs(&source, &fields);
     let mut producers = Vec::new();
     for program in programs.values() {
         for node in program.graph().nodes() {
@@ -278,11 +299,9 @@ fn project_casts_final_output_to_declared_slot_type() {
 
 fn identity_fixture() -> (Arc<LocalProgram>, ProgramNodeId, Chunk) {
     use arrow::array::StringArray;
-    let source = sql_source_with_declared_fields(
-        "SELECT k AS alias FROM fixture",
-        &[Field::new("k", DataType::Utf8, true)],
-    );
-    let programs = programs(&source);
+    let fields = [Field::new("k", DataType::Utf8, true)];
+    let source = sql_source_with_declared_fields("SELECT k AS alias FROM fixture", &fields);
+    let programs = programs(&source, &fields);
     let mut producers = Vec::new();
     for program in programs.values() {
         for node in program.graph().nodes() {

@@ -46,8 +46,6 @@ use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 use crate::runtime_filter::contribution::OrderedScalar;
 
 use crate::exec::hash_table::key_table::KeyLookup;
-use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
-use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AggregateTopNCandidate<K = OrderedTuple> {
@@ -565,15 +563,6 @@ impl AggregateTopNBoundaryBinding {
         })
     }
 
-    pub(crate) fn try_from_spec(
-        spec: &AggregateTopNRuntimeFilterProducerBinding,
-    ) -> Result<Self, AggregateTopNBoundaryError> {
-        let RuntimeFilterExecutionContract::Ordered(contract) = spec.contract().contract() else {
-            return Err(AggregateTopNBoundaryError::NonOrderedContract);
-        };
-        Self::try_new(spec.group_key_ordinal, spec.limit, contract.clone())
-    }
-
     pub(crate) const fn state(&self) -> &AggregateTopNBoundaryState {
         &self.state
     }
@@ -581,27 +570,6 @@ impl AggregateTopNBoundaryBinding {
     pub(crate) fn state_mut(&mut self) -> &mut AggregateTopNBoundaryState {
         &mut self.state
     }
-}
-
-pub(crate) fn build_topn_boundary_bindings(
-    specs: &[AggregateTopNRuntimeFilterProducerBinding],
-) -> Result<Vec<AggregateTopNBoundaryBinding>, AggregateTopNBoundaryError> {
-    specs
-        .iter()
-        .map(AggregateTopNBoundaryBinding::try_from_spec)
-        .collect()
-}
-
-pub(crate) fn validate_topn_boundary_specs(
-    specs: &[AggregateTopNRuntimeFilterProducerBinding],
-) -> Result<(), AggregateTopNBoundaryError> {
-    for spec in specs {
-        let RuntimeFilterExecutionContract::Ordered(contract) = spec.contract().contract() else {
-            return Err(AggregateTopNBoundaryError::NonOrderedContract);
-        };
-        validate_topn_boundary_contract(contract)?;
-    }
-    Ok(())
 }
 
 fn validate_topn_boundary_contract(
@@ -822,7 +790,6 @@ mod tests {
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
-    use crate::runtime_filter as execution;
     use arrow::array::{
         ArrayRef, Date32Array, Decimal128Array, DictionaryArray, Int8Array, Int16Array, Int32Array,
         Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -835,12 +802,10 @@ mod tests {
 
     use super::{
         AggregateTopNBoundaryBinding, AggregateTopNBoundaryError, AggregateTopNBoundarySnapshot,
-        AggregateTopNBoundaryState, build_topn_boundary_bindings, observe_key_table_group,
+        AggregateTopNBoundaryState, observe_key_table_group,
     };
     use crate::exec::hash_table::key_builder::build_group_key_views;
     use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-    use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
-    use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
     use crate::runtime_filter::contribution::{
         OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey,
         RuntimeOrderNullOrder as NullOrder, RuntimeOrderSortDirection as SortDirection,
@@ -858,12 +823,6 @@ mod tests {
             [0; 32],
             [0; 32],
         ))
-    }
-
-    fn execution_ordered_contract_for_test(
-        contract: &RuntimeOrderContract,
-    ) -> RuntimeFilterExecutionContract {
-        RuntimeFilterExecutionContract::Ordered(Arc::new(contract.clone()).into())
     }
 
     fn tuple(contract: &RuntimeOrderContract, value: Option<OrderedScalar>) -> OrderedTuple {
@@ -1408,19 +1367,16 @@ mod tests {
     fn topn_boundary_bindings_reconstruct_only_the_aggregate_candidate_contract() {
         let contract =
             runtime_contract(DataType::Int64, SortDirection::Descending, NullOrder::First);
-        let spec = AggregateTopNRuntimeFilterProducerBinding::new(
-            crate::exec::expr::ExprId(13),
+        // The neutral boundary owns only candidate facts: no producer/session
+        // wrapper is needed to declare the ordinal, limit and exact order.
+        let bindings = [AggregateTopNBoundaryBinding::try_new(
             2,
             NonZeroU32::new(4).unwrap(),
-            execution::RuntimeFilterProducerContract::ordered_bound(
-                execution::RuntimeFilterBindingId::new(11),
-                execution::RuntimeFilterChannelId::new(12),
-                execution_ordered_contract_for_test(&contract),
-            )
-            .expect("ordered producer contract"),
-        );
-
-        let bindings = build_topn_boundary_bindings(&[spec]).unwrap();
+            contract.clone(),
+        )
+        .unwrap()];
+        assert_eq!(bindings[0].group_key_ordinal, 2);
+        assert_eq!(bindings[0].state().limit, 4);
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].state().contract().as_ref(), contract.as_ref());
     }

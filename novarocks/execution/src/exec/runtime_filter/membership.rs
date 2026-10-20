@@ -31,7 +31,6 @@ use arrow::array::{ArrayRef, BooleanArray};
 use arrow::compute::{filter, filter_record_batch};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
 use novarocks_types::SlotId;
 
 use super::RuntimeFilterType;
@@ -302,17 +301,6 @@ impl RuntimeMembershipFilter {
             RuntimeMembershipFilter::Bitset(filter) => filter.apply_to_selection(array, keep),
             RuntimeMembershipFilter::Empty(_) => Ok(()),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn filter_chunk_with_expr(
-        &self,
-        arena: &ExprArena,
-        expr_id: ExprId,
-        chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
-        let array = arena.eval(expr_id, &chunk)?;
-        self.filter_chunk_with_array(&array, chunk)
     }
 
     pub fn is_empty(&self) -> bool {

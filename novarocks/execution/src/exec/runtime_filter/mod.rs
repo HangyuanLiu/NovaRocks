@@ -26,7 +26,6 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-mod apply;
 mod binary;
 mod bitset;
 mod bloom;
@@ -37,15 +36,6 @@ mod merger;
 pub mod min_max;
 mod types;
 
-#[allow(unused_imports)]
-pub use apply::{
-    RuntimeFilterDictionaryFoldCache, filter_chunk_by_in_filters_with_exprs,
-    filter_chunk_by_in_filters_with_exprs_and_dict_cache,
-    filter_chunk_by_membership_filters_with_exprs,
-    filter_chunk_by_membership_filters_with_exprs_and_dict_cache,
-    filter_chunk_by_min_max_filters_with_exprs,
-    filter_chunk_by_min_max_filters_with_exprs_and_dict_cache,
-};
 pub use bitset::{RuntimeBitsetFilter, maybe_build_runtime_bitset_filter};
 pub use bloom::RuntimeBloomFilter;
 pub use in_filter::RuntimeInFilter;

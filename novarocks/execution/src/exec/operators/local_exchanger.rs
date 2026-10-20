@@ -32,11 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
 #[cfg(test)]
-use crate::exec::operators::data_stream_sink::{
-    partition_chunk_by_hash, partition_chunk_by_hash_arrays,
-};
+use crate::exec::operators::data_stream_sink::partition_chunk_by_hash_arrays;
 use crate::exec::pipeline::chunk_buffer_memory_manager::ChunkBufferMemoryManager;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::MemTracker;
@@ -80,7 +77,6 @@ struct LocalExchangerState {
 /// Partitioning strategies used by local exchange routing.
 pub(crate) enum LocalExchangePartitionSpec {
     Single,
-    Exprs(Vec<ExprId>),
     InputSlotIds(Vec<SlotId>),
 }
 
@@ -106,7 +102,6 @@ pub(crate) struct LocalExchanger {
     consumer_count: usize,
     partition_spec: LocalExchangePartitionSpec,
     capacity: LocalExchangeCapacity,
-    arena: Arc<ExprArena>,
     memory_manager: Arc<ChunkBufferMemoryManager>,
     source_observable: Arc<Observable>,
     sink_observable: Arc<Observable>,
@@ -135,16 +130,8 @@ impl LocalExchanger {
         partition_count: usize,
         producer_count: usize,
         partition_spec: LocalExchangePartitionSpec,
-        arena: Arc<ExprArena>,
     ) -> Arc<Self> {
-        Self::new_with_limits(
-            partition_count,
-            producer_count,
-            partition_spec,
-            arena,
-            1,
-            i64::MAX,
-        )
+        Self::new_with_limits(partition_count, producer_count, partition_spec, 1, i64::MAX)
     }
 
     /// Exchange whose consumers each read one partition, bounded by bytes and
@@ -153,7 +140,6 @@ impl LocalExchanger {
         partition_count: usize,
         producer_count: usize,
         partition_spec: LocalExchangePartitionSpec,
-        arena: Arc<ExprArena>,
         buffer_mem_limit_per_driver: usize,
         max_buffered_rows: i64,
     ) -> Arc<Self> {
@@ -175,7 +161,6 @@ impl LocalExchanger {
             partition_spec,
             LocalExchangeCapacity::Buffered,
             memory_manager,
-            arena,
         )
     }
 
@@ -186,7 +171,6 @@ impl LocalExchanger {
         producer_count: usize,
         consumer_count: usize,
         max_queued_chunks: usize,
-        arena: Arc<ExprArena>,
     ) -> Arc<Self> {
         // Bytes are still accounted for peaks and trackers, but only the chunk
         // count decides admission.
@@ -204,7 +188,6 @@ impl LocalExchanger {
                 max_chunks: max_queued_chunks.max(1),
             },
             memory_manager,
-            arena,
         )
     }
 
@@ -215,7 +198,6 @@ impl LocalExchanger {
         partition_spec: LocalExchangePartitionSpec,
         capacity: LocalExchangeCapacity,
         memory_manager: Arc<ChunkBufferMemoryManager>,
-        arena: Arc<ExprArena>,
     ) -> Arc<Self> {
         let partition_count = partition_count.max(1);
         let consumer_count = consumer_count.max(1);
@@ -251,7 +233,6 @@ impl LocalExchanger {
             consumer_count,
             partition_spec,
             capacity,
-            arena,
             memory_manager,
             source_observable: Arc::new(Observable::new()),
             sink_observable: Arc::new(Observable::new()),
@@ -561,26 +542,9 @@ impl LocalExchanger {
         &self,
         chunk: &Chunk,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &dyn crate::exec::expr::ExprEvaluationControl,
+        control: &crate::exec::pipeline::step_context::StepContext<'_>,
     ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
         let partitioned = match &self.partition_spec {
-            LocalExchangePartitionSpec::Exprs(exprs) => {
-                let owner = factory.begin_input_construction(chunk)?;
-                let evaluation = crate::exec::expr::ExprEvaluationContext::new(
-                    &self.arena,
-                    owner.as_ref(),
-                    control,
-                );
-                super::data_stream_sink::partition_chunk_by_hash_created(
-                    chunk,
-                    exprs,
-                    &evaluation,
-                    self.partition_count,
-                    false,
-                    factory,
-                    &|| control.checkpoint(),
-                )?
-            }
             LocalExchangePartitionSpec::InputSlotIds(slots) => {
                 let arrays = slots
                     .iter()
@@ -610,9 +574,6 @@ impl LocalExchanger {
         chunk: &Chunk,
     ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
         let partitioned = match &self.partition_spec {
-            LocalExchangePartitionSpec::Exprs(exprs) => {
-                partition_chunk_by_hash(chunk, exprs, &self.arena, self.partition_count, false)?
-            }
             LocalExchangePartitionSpec::InputSlotIds(slot_ids) => {
                 let mut arrays = Vec::with_capacity(slot_ids.len());
                 for slot_id in slot_ids {
@@ -752,12 +713,7 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
 
     fn exchanger() -> Arc<LocalExchanger> {
-        LocalExchanger::new(
-            1,
-            1,
-            LocalExchangePartitionSpec::Single,
-            Arc::new(ExprArena::default()),
-        )
+        LocalExchanger::new(1, 1, LocalExchangePartitionSpec::Single)
     }
 
     fn int_chunk(value: i32) -> Chunk {
@@ -781,7 +737,6 @@ mod tests {
             2,
             1,
             LocalExchangePartitionSpec::InputSlotIds(vec![SlotId::new(1)]),
-            Arc::new(ExprArena::default()),
             1 << 30,
             -1,
         );
@@ -839,7 +794,7 @@ mod tests {
 
     #[test]
     fn natural_end_of_one_consumer_does_not_close_a_shared_handoff_queue() {
-        let exchanger = LocalExchanger::new_handoff(1, 3, 4, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 3, 4);
         exchanger.close_consumer(0);
         exchanger.close_consumer(0);
         exchanger.close_consumer(1);

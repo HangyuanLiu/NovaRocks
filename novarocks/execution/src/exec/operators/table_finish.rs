@@ -44,7 +44,9 @@ fn finish_connector(source: novarocks_spi::connector::ConnectorError) -> Executi
     .into()
 }
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,7 +54,9 @@ use arrow::array::{
     Array, ArrayRef, BinaryBuilder, BooleanArray, Int8Array, Int32Array, Int64Array, new_null_array,
 };
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
+#[cfg(test)]
+use arrow::datatypes::{Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
@@ -64,15 +68,10 @@ use novarocks_spi::connector::write_stack::{
     validate_root_write_result_row, validate_writer_multiplex_row,
 };
 
-use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+use crate::exec::chunk::Chunk;
 #[cfg(test)]
-use crate::exec::node::table_finish::FinishFixture;
+use crate::exec::chunk::ChunkSchema;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
-use crate::exec::node::table_write_aggregate::{
-    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
-};
 #[cfg(test)]
 use crate::exec::node::table_write_relation::WriterMultiplexRelationSchema;
 use crate::exec::node::table_write_relation::{
@@ -83,13 +82,9 @@ use crate::exec::node::table_write_relation::{
 use crate::exec::node::table_write_relation::{
     TableWriteAggregateBoundary, TableWriteAggregateGuard,
 };
-use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
-use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
-#[cfg(test)]
-use crate::exec::operators::unpivot_processor::UnpivotFixtureFactory;
 use crate::exec::pipeline::input::{PreparedInput, RawInput};
 use crate::exec::pipeline::operator::{
     FinishWatch, InputConstructionFactory, InputEncodingPolicy, Operator, forward_observable,
@@ -105,46 +100,19 @@ use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
-#[derive(Clone, Debug)]
-enum FinishCoverageCalls {
-    Original(Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>),
-    Prepared(novarocks_local_program::PreparedWriterAggregateCalls),
-}
-impl Default for FinishCoverageCalls {
-    fn default() -> Self {
-        Self::Original(Vec::new())
-    }
-}
-enum FinishCoverageIter<'a> {
-    Original(
-        std::iter::Copied<std::slice::Iter<'a, (novarocks_types::SlotId, novarocks_types::SlotId)>>,
-    ),
-    Prepared(std::slice::Iter<'a, novarocks_local_program::PreparedWriterAggregateCall>),
-}
-impl Iterator for FinishCoverageIter<'_> {
-    type Item = (novarocks_types::SlotId, novarocks_types::SlotId);
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Original(calls) => calls.next(),
-            Self::Prepared(calls) => calls.next().map(|call| (call.input(), call.output())),
-        }
-    }
-}
+#[derive(Clone, Debug, Default)]
+struct FinishCoverageCalls(Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>);
 impl FinishCoverageCalls {
     fn len(&self) -> usize {
-        match self {
-            Self::Original(calls) => calls.len(),
-            Self::Prepared(calls) => calls.calls().len(),
-        }
+        self.0.len()
     }
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.0.is_empty()
     }
-    fn iter(&self) -> FinishCoverageIter<'_> {
-        match self {
-            Self::Original(calls) => FinishCoverageIter::Original(calls.iter().copied()),
-            Self::Prepared(calls) => FinishCoverageIter::Prepared(calls.calls().iter()),
-        }
+    fn iter(
+        &self,
+    ) -> impl Iterator<Item = (novarocks_types::SlotId, novarocks_types::SlotId)> + '_ {
+        self.0.iter().copied()
     }
 }
 
@@ -165,36 +133,13 @@ impl FinishStatisticsCoverage {
         mappings: Option<Vec<(u32, novarocks_types::SlotId)>>,
     ) -> Self {
         Self {
-            calls: FinishCoverageCalls::Original(calls),
+            calls: FinishCoverageCalls(calls),
             mappings,
-        }
-    }
-
-    #[cfg(test)]
-    fn from_plan(plan: &WriterFinalAggregatePlan) -> Self {
-        Self {
-            calls: match &plan.prepared {
-                Some(calls) => FinishCoverageCalls::Prepared(calls.clone()),
-                None => FinishCoverageCalls::Original(
-                    plan.calls
-                        .iter()
-                        .map(|call| (call.intermediate_input_slot_id, call.final_output_slot_id))
-                        .collect(),
-                ),
-            },
-            mappings: plan.unpivot.as_ref().map(|unpivot| {
-                unpivot
-                    .mappings
-                    .iter()
-                    .map(|mapping| (mapping.grouping_key, mapping.input_value_slot_id))
-                    .collect()
-            }),
         }
     }
 }
 
-/// An owner of a finish's statistics other than the plan-tree build from the
-/// process function set and the decoder's expression arena: it supplies the
+/// The compiled owner of a finish's statistics supplies the
 /// final aggregate over every `AGGREGATE_PARTIAL` row and the grouped Unpivot
 /// of each batch that aggregate emits.
 pub(crate) trait FinishStatisticsFactory: Send + Sync {
@@ -295,8 +240,6 @@ impl GroupedOutput {
 /// Construction state only; type meaning remains in the frozen template.
 #[derive(Clone)]
 enum RootSchemaPreparation {
-    #[cfg(test)]
-    Fixture(RootWriteResultRelationSchema),
     Compiled {
         template: RootWriteResultRelationTemplate,
         prepared: Option<RootWriteResultRelationSchema>,
@@ -310,8 +253,6 @@ impl RootSchemaPreparation {
 
     fn prepared(&self) -> Option<&RootWriteResultRelationSchema> {
         match self {
-            #[cfg(test)]
-            Self::Fixture(schema) => Some(schema),
             Self::Compiled { prepared, .. } => prepared.as_ref(),
         }
     }
@@ -320,14 +261,13 @@ impl RootSchemaPreparation {
         &mut self,
         factory: Option<&Arc<dyn InputConstructionFactory>>,
     ) -> ExecutionResult<()> {
-        if let Self::Compiled { template, prepared } = self {
-            if prepared.is_none() {
-                let factory = factory
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                let schema = factory.create_compiled_chunk_schema(template.layout())?;
-                // Publish only after the complete template/slot check succeeds.
-                *prepared = Some(template.bind_created_schema(schema)?);
-            }
+        let Self::Compiled { template, prepared } = self;
+        if prepared.is_none() {
+            let factory = factory
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let schema = factory.create_compiled_chunk_schema(template.layout())?;
+            // Publish only after the complete template/slot check succeeds.
+            *prepared = Some(template.bind_created_schema(schema)?);
         }
         Ok(())
     }
@@ -340,61 +280,19 @@ pub struct TableFinishOperatorFactory {
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     writer_schema: WriterRelationPreparation,
     root_schema: RootSchemaPreparation,
-    /// The plan-tree statistics, built from the process function set and
-    /// `arena` when `statistics` is absent.
-    #[cfg(test)]
-    final_plan: WriterFinalAggregatePlan,
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
-    #[cfg(test)]
-    arena: Arc<ExprArena>,
 }
 
 impl TableFinishOperatorFactory {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "A local finish joins frozen relation facts and exact Task validation capability"
-    )]
-    #[cfg(test)]
-    pub(crate) fn new_local(
-        node_id: i32,
-        expected_targets: Vec<WriteTargetOrdinal>,
-        writer_schema: WriterMultiplexRelationTemplate,
-        root_schema: RootWriteResultRelationTemplate,
-        #[cfg(test)] final_plan: WriterFinalAggregatePlan,
-        binding: &TableFinishRuntimeBinding,
-        #[cfg(test)] arena: Arc<ExprArena>,
-    ) -> ExecutionResult<Self> {
-        Self::new_core(
-            node_id,
-            expected_targets,
-            WriterRelationPreparation::compiled(writer_schema),
-            RootSchemaPreparation::Compiled {
-                template: root_schema,
-                prepared: None,
-            },
-            #[cfg(test)]
-            final_plan,
-            binding,
-            #[cfg(test)]
-            arena,
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The shared constructor keeps explicit legacy and compiled preparation facts"
-    )]
     fn new_core(
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
         writer_schema: WriterRelationPreparation,
         root_schema: RootSchemaPreparation,
-        #[cfg(test)] final_plan: WriterFinalAggregatePlan,
         binding: &TableFinishRuntimeBinding,
-        #[cfg(test)] arena: Arc<ExprArena>,
     ) -> ExecutionResult<Self> {
         novarocks_spi::connector::write_stack::validate_query_target_ordinals(&expected_targets)
             .map_err(finish_connector)?;
@@ -403,9 +301,6 @@ impl TableFinishOperatorFactory {
         } else {
             "TABLE_FINISH".to_string()
         };
-        #[cfg(test)]
-        let coverage = FinishStatisticsCoverage::from_plan(&final_plan);
-        #[cfg(not(test))]
         let coverage = FinishStatisticsCoverage::default();
         Ok(Self {
             name,
@@ -414,20 +309,15 @@ impl TableFinishOperatorFactory {
             writer_schema,
             root_schema,
             coverage,
-            #[cfg(test)]
-            final_plan,
             statistics: None,
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::clone(&binding.aggregate_guard),
-            #[cfg(test)]
-            arena,
         })
     }
 
     /// A compiled finish over the program's positional relations. Its
     /// statistics, if any, are the compiled owner's, checked against its
-    /// coverage facts exactly as the plan-tree statistics are; no function
-    /// set is read and the empty arena is never consulted.
+    /// coverage facts. No process function set or expression arena is consulted.
     pub(crate) fn new_compiled(
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
@@ -444,44 +334,13 @@ impl TableFinishOperatorFactory {
                 template: root_template,
                 prepared: None,
             },
-            #[cfg(test)]
-            WriterFinalAggregatePlan::default(),
             binding,
-            #[cfg(test)]
-            Arc::new(ExprArena::default()),
         )?;
         if let Some((coverage, statistics)) = statistics {
             factory.coverage = coverage;
             factory.statistics = Some(statistics);
         }
         Ok(factory)
-    }
-
-    /// Construct the NCP-8 composite with the same immutable expression arena
-    /// that decoded the generic Unpivot constants.
-    #[cfg(test)]
-    fn for_test_fixture(node: &FinishFixture, arena: Arc<ExprArena>) -> Self {
-        let name = if node.node_id >= 0 {
-            format!("TABLE_FINISH (id={})", node.node_id)
-        } else {
-            "TABLE_FINISH".to_string()
-        };
-        Self {
-            name,
-            expected_targets: Arc::clone(node.expected_targets()),
-            fragment_validator: Arc::clone(node.fragment_validator()),
-            writer_schema: WriterRelationPreparation::Existing(
-                node.writer_multiplex_schema().clone(),
-            ),
-            root_schema: RootSchemaPreparation::Fixture(node.root_result_schema().clone()),
-            final_plan: node.final_aggregate_plan().clone(),
-            coverage: FinishStatisticsCoverage::from_plan(node.final_aggregate_plan()),
-            statistics: None,
-            #[cfg(novarocks_dev_controls)]
-            aggregate_guard: Arc::clone(node.aggregate_guard()),
-            #[cfg(test)]
-            arena,
-        }
     }
 
     fn create_operator(&self, dop: i32, driver_id: i32) -> TableFinishStep {
@@ -502,8 +361,6 @@ impl TableFinishOperatorFactory {
             fragment_validator: Arc::clone(&self.fragment_validator),
             writer_schema: self.writer_schema.clone(),
             root_schema: self.root_schema.clone(),
-            #[cfg(test)]
-            final_plan: self.final_plan.clone(),
             coverage: self.coverage.clone(),
             statistics: self.statistics.clone(),
             #[cfg(novarocks_dev_controls)]
@@ -520,8 +377,6 @@ impl TableFinishOperatorFactory {
                         .position(|(input, _)| input == *slot)
                 })
                 .collect(),
-            #[cfg(test)]
-            arena: Arc::clone(&self.arena),
             parallelism_error,
             rows: WriteRowCountAccumulator::new(),
             ledger: PreparedWriteSetLedger::new(),
@@ -789,15 +644,11 @@ struct TableFinishOperator {
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     writer_schema: WriterRelationPreparation,
     root_schema: RootSchemaPreparation,
-    #[cfg(test)]
-    final_plan: WriterFinalAggregatePlan,
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     channel_to_call: Vec<Option<usize>>,
-    #[cfg(test)]
-    arena: Arc<ExprArena>,
     parallelism_error: Option<ExecutionFailure>,
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
@@ -1134,9 +985,9 @@ impl TableFinishOperator {
     }
 
     fn start_grouped_unpivot(&mut self, final_chunk: Chunk) -> ExecutionResult<()> {
-        let driver: Box<dyn GroupedUnpivotSource> = match self.statistics.as_ref() {
-            Some(statistics) => {
-                statistics.grouped_unpivot(
+        let driver: Box<dyn GroupedUnpivotSource> =
+            match self.statistics.as_ref() {
+                Some(statistics) => statistics.grouped_unpivot(
                     self.grouped_control.as_ref().ok_or(
                         crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                     )?,
@@ -1146,60 +997,13 @@ impl TableFinishOperator {
                     Arc::clone(self.construction.as_ref().ok_or(
                         crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
                     )?),
-                )?
-            }
-            #[cfg(test)]
-            None if self.final_plan.prepared.is_some() => {
-                let factory =
-                    Arc::clone(self.construction.as_ref().ok_or(
-                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                    )?);
-                let plan = self.final_plan.unpivot.as_ref().ok_or_else(|| {
-                    crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
-                        "writer grouped Unpivot declaration is absent".into(),
-                    )
-                })?;
-                super::compiled_writer_statistics::create_prepared_grouped_in(
-                    &self.arena,
-                    plan,
-                    final_chunk,
-                    Arc::clone(self.prepared_root_schema()?.chunk_schema()),
-                    self.output_tracker.as_ref().map(Arc::clone),
-                    factory,
-                    self.grouped_control.as_ref().ok_or(
-                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                    )?,
-                )?
-            }
-            #[cfg(test)]
-            None => {
-                let arena = Arc::clone(&self.arena);
-                let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
-                    finish_contract(
-                        FinishContractSite::FinalGroups,
-                        "table finish final aggregate is missing grouped Unpivot",
-                    )
-                })?;
-                Box::new(Source::new(GroupedUnpivotFixtureKernel::try_new(
-                    arena,
-                    plan,
-                    Arc::clone(self.prepared_root_schema()?.chunk_schema()),
-                    final_chunk,
-                    self.output_tracker.as_ref().map(Arc::clone),
-                    self.grouped_control
-                        .as_ref()
-                        .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
-                        .for_receiver(),
-                    self.construction.clone(),
-                )?))
-            }
-            #[cfg(not(test))]
-            None => {
-                return Err(
-                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
-                );
-            }
-        };
+                )?,
+                None => {
+                    return Err(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
+                    );
+                }
+            };
         driver.visit_targets(&mut |target| {
             if !self.final_groups_seen.insert(target) {
                 return Err(finish_contract(FinishContractSite::FinalGroups, format_args!("table finish final aggregate produced duplicate target {target} across output batches")));
@@ -1271,416 +1075,6 @@ impl TableFinishOperator {
                 self.final_aggregate_blocked_time.elapsed_ns(),
             ),
         );
-    }
-}
-
-#[cfg(test)]
-fn build_final_aggregate(
-    plan: &WriterFinalAggregatePlan,
-    arena: &Arc<ExprArena>,
-    function_set: Arc<crate::runtime::function_set::SealedExecutionFunctionSet>,
-    node_id: i32,
-) -> ExecutionResult<Box<dyn Operator>> {
-    let unpivot = plan.unpivot.as_ref().ok_or_else(|| {
-        finish_contract(
-            FinishContractSite::Relation,
-            "table finish final aggregates require grouped Unpivot",
-        )
-    })?;
-    let mut aggregate_arena = arena.as_ref().clone();
-    let grouping = aggregate_arena.push_typed(
-        ExprNode::SlotId(unpivot.grouping_input_slot_id),
-        DataType::Int32,
-    );
-    let mut functions = Vec::with_capacity(plan.calls.len());
-    let mut resolved = Vec::with_capacity(plan.calls.len());
-    let mut fields = vec![Field::new("write_target_ordinal", DataType::Int32, false)];
-    let mut slot_ids = vec![unpivot.grouping_output_slot_id];
-    for (index, call) in plan.calls.iter().enumerate() {
-        let input = aggregate_arena.push_typed(
-            ExprNode::SlotId(call.intermediate_input_slot_id),
-            call.resolved.intermediate_type.clone(),
-        );
-        functions.push(AggFunction {
-            frozen: call.frozen.clone(),
-            name: call.function_name.to_string(),
-            inputs: vec![input],
-            input_is_intermediate: true,
-            types: Some(AggTypeSignature {
-                intermediate_type: Some(call.resolved.intermediate_type.clone()),
-                output_type: Some(call.resolved.output_type.clone()),
-                input_arg_type: call.resolved.argument_types.first().cloned(),
-            }),
-            order: Default::default(),
-        });
-        fields.push(Field::new(
-            format!("final_aggregate_{index}"),
-            call.resolved.output_type.clone(),
-            true,
-        ));
-        slot_ids.push(call.final_output_slot_id);
-        resolved.push(call.resolved.clone());
-    }
-    let output_schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(&Schema::new(fields), &slot_ids)?;
-    let factory = AggregateProcessorFactory::new_native(
-        node_id,
-        Arc::new(aggregate_arena),
-        vec![grouping],
-        functions,
-        function_set,
-        resolved,
-        false,
-        false,
-        output_schema,
-        Vec::new(),
-        None,
-        1,
-        None,
-    )?;
-    Ok(factory.create(1, 0))
-}
-
-#[cfg(test)]
-struct GroupedUnpivotFixtureKernel {
-    #[cfg(test)]
-    arena: Arc<ExprArena>,
-    plan: WriterGroupedUnpivotPlan,
-    root_schema: crate::exec::chunk::ChunkSchemaRef,
-    final_chunk: Chunk,
-    rows: Vec<(u32, usize)>,
-    next_row: usize,
-    mappings: BTreeMap<u32, Vec<WriterGroupedUnpivotMapping>>,
-    active: Option<ChildStep>,
-    active_exit_started: bool,
-    tracker: Option<Arc<MemTracker>>,
-    source_observable: Arc<Observable>,
-    control: RuntimeKernelControl,
-    construction: Option<Arc<dyn InputConstructionFactory>>,
-}
-
-#[cfg(test)]
-impl GroupedUnpivotFixtureKernel {
-    fn try_new(
-        arena: Arc<ExprArena>,
-        plan: WriterGroupedUnpivotPlan,
-        root_schema: crate::exec::chunk::ChunkSchemaRef,
-        mut final_chunk: Chunk,
-        tracker: Option<Arc<MemTracker>>,
-        control: RuntimeKernelControl,
-        construction: Option<Arc<dyn InputConstructionFactory>>,
-    ) -> ExecutionResult<Self> {
-        if let Some(tracker) = tracker.as_ref() {
-            final_chunk
-                .try_transfer_to(tracker)
-                .map_err(ExecutionFailure::from_domain)?;
-        }
-        let groups = final_chunk
-            .column_by_slot_id(plan.grouping_output_slot_id)?
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or_else(|| {
-                finish_contract(
-                    FinishContractSite::Relation,
-                    "table finish final aggregate grouping output is not Int32",
-                )
-            })?
-            .clone();
-        let mut rows = Vec::with_capacity(groups.len());
-        let mut seen = std::collections::HashSet::with_capacity(groups.len());
-        for row in 0..groups.len() {
-            if groups.is_null(row) {
-                return Err(finish_contract(
-                    FinishContractSite::Relation,
-                    "table finish final aggregate produced a null grouping key",
-                ));
-            }
-            let raw = groups.value(row);
-            let target = target_ordinal_from_wire(raw).map_err(|error| finish_connector(error))?;
-            if !seen.insert(target.get()) {
-                return Err(finish_contract(
-                    FinishContractSite::Relation,
-                    format_args!(
-                        "table finish final aggregate produced duplicate target {}",
-                        target.get()
-                    ),
-                ));
-            }
-            rows.push((target.get(), row));
-        }
-        let mut mappings = BTreeMap::<u32, Vec<_>>::new();
-        for mapping in &plan.mappings {
-            mappings
-                .entry(mapping.grouping_key)
-                .or_default()
-                .push(mapping.clone());
-        }
-        for (target, _) in &rows {
-            if !mappings.contains_key(target) {
-                return Err(finish_contract(
-                    FinishContractSite::Relation,
-                    format_args!(
-                        "table finish final aggregate produced target {target} with no grouped Unpivot mapping"
-                    ),
-                ));
-            }
-        }
-        Ok(Self {
-            #[cfg(test)]
-            arena,
-            plan,
-            root_schema,
-            final_chunk,
-            rows,
-            next_row: 0,
-            mappings,
-            active: None,
-            active_exit_started: false,
-            tracker,
-            source_observable: Arc::new(Observable::new()),
-            control,
-            construction,
-        })
-    }
-
-    fn install_active(&mut self, active: Box<dyn Operator>) -> ExecutionResult<()> {
-        let mut child = ChildStep::new(active, self.source_observable.clone());
-        child.bind_failure_port(self.control.failure_port())?;
-        child.prepare()?;
-        self.active = Some(child);
-        self.active_exit_started = false;
-        Ok(())
-    }
-
-    fn output_schema(&self, target: u32) -> ExecutionResult<crate::exec::chunk::ChunkSchemaRef> {
-        let slots = [
-            self.plan.passthrough_output_slot_id,
-            self.plan.literal_output_slot_ids[0],
-            self.plan.literal_output_slot_ids[1],
-            self.plan.value_output_slot_id,
-            self.plan.literal_output_slot_ids[2],
-        ];
-        let mut fields = slots
-            .iter()
-            .map(|slot| {
-                self.root_schema.slot(*slot).cloned().ok_or_else(|| {
-                    finish_contract(
-                        FinishContractSite::FinalGroups,
-                        format_args!("table finish Root schema is missing slot {slot}"),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        fields[0] = fields[0].with_nullable(false);
-        let mappings = self.mappings.get(&target).ok_or_else(|| {
-            finish_contract(
-                FinishContractSite::FinalGroups,
-                format_args!("table finish target {target} has no grouped mappings"),
-            )
-        })?;
-        let literal_positions = [1usize, 2, 4];
-        for (literal_index, position) in literal_positions
-            .iter()
-            .copied()
-            .enumerate()
-            .take(self.plan.literal_output_slot_ids.len())
-        {
-            let nullable = mappings.iter().any(|mapping| {
-                matches!(
-                    mapping.constants[literal_index],
-                    crate::exec::node::unpivot::UnpivotConstant::Scalar { nullable: true, .. }
-                )
-            });
-            fields[position] = fields[position].with_nullable(nullable);
-        }
-        let value_nullable = mappings.iter().try_fold(false, |nullable, mapping| {
-            self.final_chunk
-                .chunk_schema()
-                .slot(mapping.input_value_slot_id)
-                .map(|slot| nullable || slot.nullable())
-                .ok_or_else(|| {
-                    finish_contract(
-                        FinishContractSite::FinalGroups,
-                        format_args!(
-                            "table finish final aggregate is missing value slot {}",
-                            mapping.input_value_slot_id
-                        ),
-                    )
-                })
-        })?;
-        fields[3] = fields[3].with_nullable(value_nullable);
-        ChunkSchema::try_new(fields)
-            .map(Arc::new)
-            .map_err(ExecutionFailure::from)
-    }
-
-    fn start_next(
-        &mut self,
-        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
-    ) -> ExecutionResult<bool> {
-        let Some((target, row)) = self.rows.get(self.next_row).copied() else {
-            return Ok(false);
-        };
-        let mappings = self
-            .mappings
-            .get(&target)
-            .ok_or_else(|| {
-                finish_contract(
-                    FinishContractSite::Relation,
-                    format_args!("table finish target {target} lost its grouped mappings"),
-                )
-            })?
-            .iter()
-            .map(|mapping| UnpivotValueMapping {
-                input_value_slot_id: mapping.input_value_slot_id,
-                constants: mapping.constants.clone(),
-            })
-            .collect();
-        let factory = UnpivotFixtureFactory::new(
-            -1,
-            Arc::clone(&self.arena),
-            vec![UnpivotPassthroughColumn {
-                input_slot_id: self.plan.grouping_output_slot_id,
-                output_slot_id: self.plan.passthrough_output_slot_id,
-            }],
-            self.plan.value_output_slot_id,
-            self.plan.literal_output_slot_ids.clone(),
-            mappings,
-            self.output_schema(target)?,
-            self.plan.max_output_rows,
-            self.plan.max_output_bytes,
-        )?;
-        let mut active = factory.create_bound(self.control.for_receiver());
-        if let Some(factory) = self.construction.as_ref() {
-            active.set_construction_factory(factory.clone());
-        }
-        if let Some(tracker) = self.tracker.as_ref() {
-            active.set_mem_tracker(Arc::clone(tracker));
-        }
-        self.install_active(active)?;
-        let input = if self.final_chunk.chunk_schema().is_typed() {
-            let factory = self
-                .construction
-                .as_ref()
-                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-            let owner = factory.begin_input_construction(&self.final_chunk)?;
-            self.final_chunk
-                .slice_typed_observed::<crate::exec::pipeline::operator::ConstructionFailure, _>(
-                    row,
-                    1,
-                    owner.storage_lifetime(),
-                    |step| owner.observe(0, &[], step),
-                )?
-        } else {
-            self.final_chunk.slice(row, 1)
-        };
-        let child = self.active.as_mut().expect("installed grouped Unpivot");
-        child.offer(input)?;
-        child.finish_input();
-        Ok(true)
-    }
-
-    fn step(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
-        if self.active.as_ref().is_some_and(ChildStep::is_complete) {
-            self.active_exit_started = true;
-        }
-        if self.active_exit_started {
-            let next = self
-                .active
-                .as_mut()
-                .expect("retiring grouped child")
-                .retire(ctx)?;
-            if !matches!(next, NextStep::Finished) {
-                return Ok(StepResult::new(None, next, 0));
-            }
-            self.active = None;
-            self.active_exit_started = false;
-            self.next_row += 1;
-            return Ok(StepResult::new(
-                None,
-                if self.next_row == self.rows.len() {
-                    NextStep::Finished
-                } else {
-                    NextStep::Runnable
-                },
-                0,
-            ));
-        }
-        if self.active.is_none() && self.next_row == self.rows.len() {
-            return Ok(StepResult::new(None, NextStep::Finished, 0));
-        }
-        if !ctx.work().try_consume(1) {
-            return Ok(StepResult::new(None, NextStep::Yield, 0));
-        }
-        if self.active.is_none() {
-            self.start_next(ctx)?;
-            return Ok(StepResult::new(None, NextStep::Runnable, 0));
-        }
-        let active = self.active.as_mut().expect("started grouped Unpivot");
-        let output = active.advance(ctx)?;
-        let next = if active.is_complete() {
-            self.active_exit_started = true;
-            NextStep::Runnable
-        } else {
-            active.work_next()
-        };
-        let output = match output {
-            Some(chunk) => root_artifact_chunk(chunk, &self.root_schema, self.tracker.as_ref())?,
-            None => None,
-        };
-        Ok(StepResult::new(output, next, 0))
-    }
-}
-#[cfg(test)]
-impl GroupedUnpivotKernel for GroupedUnpivotFixtureKernel {
-    fn visit_targets(
-        &self,
-        visit: &mut dyn FnMut(u32) -> ExecutionResult<()>,
-    ) -> ExecutionResult<()> {
-        for (target, _) in &self.rows {
-            visit(*target)?;
-        }
-        Ok(())
-    }
-}
-#[cfg(test)]
-impl SourceKernel for GroupedUnpivotFixtureKernel {
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
-        self.step(ctx)
-    }
-    fn control_observable(&self) -> Option<Arc<Observable>> {
-        Some(self.source_observable.clone())
-    }
-}
-#[cfg(test)]
-impl OperatorLifecycle for GroupedUnpivotFixtureKernel {
-    fn name(&self) -> &str {
-        "GROUPED_WRITER_UNPIVOT"
-    }
-    fn begin_exit(&mut self) -> ExecutionResult<()> {
-        if let Some(active) = self.active.as_mut() {
-            active.begin_exit()?;
-        }
-        Ok(())
-    }
-    fn close(&mut self) -> ExecutionResult<()> {
-        if let Some(active) = self.active.as_mut() {
-            active.close()?;
-        }
-        Ok(())
-    }
-    fn cancel(&mut self) {
-        if let Some(active) = self.active.as_mut() {
-            active.cancel();
-        }
-    }
-    fn visit_exits(
-        &mut self,
-        visit: &mut dyn FnMut(crate::exec::pipeline::operator::ExitObservation),
-    ) {
-        if let Some(active) = self.active.as_mut() {
-            active.visit_exits(visit);
-        }
     }
 }
 
@@ -2161,70 +1555,6 @@ impl OperatorLifecycle for TableFinishOperator {
                     .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
                     .as_ref(),
             )?,
-            #[cfg(test)]
-            None if self.final_plan.prepared.is_some() => {
-                let factory = self
-                    .construction
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                let input = Arc::clone(self.writer_schema.schema()?.chunk_schema());
-                let owner = factory.begin_typed_construction(&input)?;
-                let prepared = self
-                    .final_plan
-                    .prepared
-                    .as_ref()
-                    .expect("checked prepared source");
-                if prepared
-                    .calls()
-                    .iter()
-                    .map(|call| (call.input(), call.output()))
-                    .ne(self.coverage.calls.iter())
-                {
-                    return Err(
-                        crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
-                            "writer final prepared occurrences differ from the original coverage"
-                                .into(),
-                        )
-                        .into(),
-                    );
-                }
-                let unpivot = self.final_plan.unpivot.as_ref().ok_or_else(|| {
-                    crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
-                        "writer final grouping declaration is absent".into(),
-                    )
-                })?;
-                super::compiled_writer_statistics::create_prepared_final_in(
-                    prepared.clone(),
-                    unpivot.grouping_input_slot_id,
-                    unpivot.grouping_output_slot_id,
-                    input,
-                    state.error_state(),
-                    owner.as_ref(),
-                )?
-            }
-            #[cfg(test)]
-            None if self.writer_schema.is_compiled() => {
-                return Err(
-                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
-                );
-            }
-            #[cfg(test)]
-            None => {
-                // Explicit legacy expansion fixture route; production prepared
-                // relations never resolve a function name here.
-                let arena = Arc::clone(&self.arena);
-                let function_set = state
-                    .execution_runtime()
-                    .map(|runtime| Arc::clone(runtime.function_set()))
-                    .ok_or_else(|| {
-                        finish_contract(
-                            FinishContractSite::Binding,
-                            "table finish aggregate plan requires the execution function set",
-                        )
-                    })?;
-                build_final_aggregate(&self.final_plan, &arena, function_set, -1)?
-            }
-            #[cfg(not(test))]
             None => {
                 return Err(
                     crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
@@ -2240,8 +1570,7 @@ impl OperatorLifecycle for TableFinishOperator {
             ));
         }
         if let Some(factory) = self.construction.as_ref() {
-            // Expression input construction uses this same caller-owned scope
-            // even when the child retains a legacy output declaration.
+            // Expression input construction uses this same caller-owned scope.
             aggregate.set_construction_factory(Arc::clone(factory));
         } else if aggregate.creates_typed_storage() {
             return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
@@ -2643,10 +1972,6 @@ mod tests {
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
     use super::*;
-    use crate::exec::node::table_write_aggregate::{
-        WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
-        WriterGroupedUnpivotPlan,
-    };
     use crate::exec::operators::table_writer::tests::target;
     use crate::runtime::ExecutionRuntime;
     use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
@@ -3115,21 +2440,84 @@ mod tests {
         }
     }
 
-    fn finish_fixture(
-        targets: usize,
-        validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
-    ) -> FinishFixture {
-        let expected = (0..targets)
-            .map(|value| target(u32::try_from(value).expect("bounded")))
+    /// Protocol-only tests use SPI-owned relation declarations. These facts
+    /// carry no aggregate implementation and do not calculate an expected value.
+    fn protocol_layout(
+        schema: &Schema,
+        slots: &[novarocks_types::SlotId],
+    ) -> novarocks_local_program::StaticLayout {
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let bindings = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let value = FunctionValueType::new(field.data_type().clone(), field.is_nullable());
+                (value.typed_binding().clone(), None)
+            })
             .collect();
-        FinishFixture::try_new(3, expected, validator).expect("table finish node")
+        novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+            Arc::new(schema.clone()),
+            Arc::from(slots),
+            bindings,
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &compiled_fixture::FixtureControl,
+        )
+        .expect("complete SPI relation metadata")
+    }
+
+    fn protocol_factory(
+        targets: Vec<WriteTargetOrdinal>,
+        validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+    ) -> ExecutionResult<TableFinishOperatorFactory> {
+        let writer = WriterMultiplexRelationSchema::empty();
+        let root = RootWriteResultRelationSchema::fixed();
+        let writer_layout = protocol_layout(
+            writer.chunk_schema().arrow_schema_ref().as_ref(),
+            writer.chunk_schema().slot_ids(),
+        );
+        let root_layout = protocol_layout(
+            root.chunk_schema().arrow_schema_ref().as_ref(),
+            root.chunk_schema().slot_ids(),
+        );
+        TableFinishOperatorFactory::new_compiled(
+            3,
+            targets,
+            WriterMultiplexRelationTemplate::try_new(&writer_layout)?,
+            RootWriteResultRelationTemplate::try_new(&root_layout)?,
+            None,
+            &TableFinishRuntimeBinding::new(validator),
+        )
     }
 
     fn factory(targets: usize) -> TableFinishOperatorFactory {
-        TableFinishOperatorFactory::for_test_fixture(
-            &finish_fixture(targets, Arc::new(AcceptEveryCarrier::default())),
-            #[cfg(test)]
-            Arc::new(ExprArena::default()),
+        protocol_factory(
+            (0..targets)
+                .map(|value| target(u32::try_from(value).unwrap()))
+                .collect(),
+            Arc::new(AcceptEveryCarrier::default()),
+        )
+        .expect("actual compiled finish constructor")
+    }
+
+    fn install_protocol_creator(operator: &mut dyn Operator) {
+        let tracker = MemTracker::new_root("finish protocol schema creator");
+        let failures = Arc::new(RuntimeErrorState::default());
+        let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker, failures,
+        ).expect("actual protocol construction host");
+        operator.set_construction_factory(construction);
+    }
+
+    fn metadata_function_set() -> Arc<crate::runtime::function_set::SealedExecutionFunctionSet> {
+        let mut builder = crate::runtime::function_set::ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+            .unwrap();
+        Arc::new(
+            builder
+                .seal()
+                .expect("P14 metadata-only execution catalogue"),
         )
     }
 
@@ -3151,8 +2539,17 @@ mod tests {
         // the operator must still validate the row rather than trusting schema
         // metadata as proof about an untrusted Exchange batch.
         let relation = WriterMultiplexRelationSchema::empty();
-        let schema = relation.chunk_schema().arrow_schema_ref();
-        let chunk_schema = Arc::clone(relation.chunk_schema());
+        let layout = protocol_layout(
+            relation.chunk_schema().arrow_schema_ref().as_ref(),
+            relation.chunk_schema().slot_ids(),
+        );
+        let creator = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            MemTracker::new_root("finish protocol input declaration"),
+            Arc::new(RuntimeErrorState::default()),
+        ).unwrap();
+        let chunk_schema = creator.create_compiled_chunk_schema(&layout).unwrap();
+        let schema = chunk_schema.arrow_schema_ref();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int8Array::from(kinds)),
             Arc::new(Int32Array::from(ordinals)),
@@ -3248,126 +2645,79 @@ mod tests {
         );
     }
 
+    /// The saved program is the sole author of every final slot and complete
+    /// result declaration used by scripted child-output probes.
+    struct CompositeFactory {
+        inner: TableFinishOperatorFactory,
+        program: Arc<novarocks_local_program::LocalProgram>,
+        node: novarocks_local_program::ProgramNodeId,
+    }
+    impl std::ops::Deref for CompositeFactory {
+        type Target = TableFinishOperatorFactory;
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+    impl std::ops::DerefMut for CompositeFactory {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
     fn composite_fixture(
         target_count: usize,
         channel_count: usize,
         max_output_rows: usize,
     ) -> (
-        TableFinishOperatorFactory,
+        CompositeFactory,
         RuntimeState,
         WriterMultiplexRelationSchema,
     ) {
-        let function_set = crate::exec::expr::agg::test_builtin_execution_function_set();
-        let resolved = function_set
-            .catalog()
-            .resolve_aggregate_trusted("any_value", &[DataType::Binary])
-            .expect("any_value(Binary)");
-        let writer_contract = WriterMultiplexSchema::try_new(
-            (0..channel_count)
-                .map(|index| {
-                    WriterAuxiliaryChannel::try_new(
-                        100 + u32::try_from(index).expect("channel slot"),
-                        format!("partial_{index}"),
-                        novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
-                    )
-                    .expect("auxiliary channel")
-                })
-                .collect(),
-        )
-        .expect("writer schema");
-        let writer_schema = WriterMultiplexRelationSchema::try_new(writer_contract)
-            .expect("execution writer schema");
-        let root_schema = RootWriteResultRelationSchema::try_new(RootWriteResultSchema::new())
-            .expect("root schema");
-        let grouping_output_slot_id = novarocks_types::SlotId::new(10_000);
-        let calls = (0..channel_count)
-            .map(|index| WriterFinalAggregateCall {
-                // Explicit legacy carrier fixture; this is not frozen-binding admission.
-                frozen: None,
-                function_name: Arc::from("any_value"),
-                resolved: resolved.clone(),
-                intermediate_input_slot_id: novarocks_types::SlotId::new(
-                    100 + u32::try_from(index).expect("channel slot"),
-                ),
-                final_output_slot_id: novarocks_types::SlotId::new(
-                    10_001 + u32::try_from(index).expect("final slot"),
-                ),
+        let program = compiled_fixture::compile(target_count, channel_count, max_output_rows);
+        let (node, _) = program
+            .graph()
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, item)| {
+                matches!(
+                    item.kind(),
+                    novarocks_local_program::ProgramNodeKind::TableFinish { .. }
+                )
             })
-            .collect::<Vec<_>>();
-        let mut arena = ExprArena::default();
-        let blob_type = arena.push_typed(
-            crate::exec::expr::ExprNode::Literal(crate::exec::expr::LiteralValue::Utf8(
-                "test/blob-v1".to_string(),
-            )),
-            DataType::Utf8,
-        );
-        let mappings = (0..target_count)
-            .flat_map(|target_index| {
-                (0..channel_count).map(move |channel_index| (target_index, channel_index))
-            })
-            .map(
-                |(target_index, channel_index)| WriterGroupedUnpivotMapping {
-                    grouping_key: u32::try_from(target_index).expect("target"),
-                    input_value_slot_id: calls[channel_index].final_output_slot_id,
-                    constants: vec![
-                        crate::exec::node::unpivot::UnpivotConstant::Int32List(vec![
-                            i32::try_from(target_index * channel_count + channel_index + 1)
-                                .expect("field id"),
-                        ]),
-                        crate::exec::node::unpivot::UnpivotConstant::Scalar {
-                            expr_id: blob_type,
-                            nullable: false,
-                        },
-                        crate::exec::node::unpivot::UnpivotConstant::Utf8Map(Vec::new()),
-                    ],
-                },
-            )
-            .collect();
-        let final_plan = WriterFinalAggregatePlan {
-            prepared: None,
-            calls,
-            unpivot: Some(WriterGroupedUnpivotPlan {
-                grouping_input_slot_id:
-                    crate::exec::node::table_write_relation::WRITE_RELATION_TARGET_SLOT,
-                grouping_output_slot_id,
-                passthrough_output_slot_id: novarocks_types::SlotId::new(
-                    root_write_result_column_id(ROOT_WRITE_RESULT_TARGET_INDEX),
-                ),
-                value_output_slot_id: novarocks_types::SlotId::new(root_write_result_column_id(
-                    ROOT_WRITE_RESULT_BODY_INDEX,
-                )),
-                literal_output_slot_ids: vec![
-                    novarocks_types::SlotId::new(root_write_result_column_id(
-                        ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
-                    )),
-                    novarocks_types::SlotId::new(root_write_result_column_id(
-                        ROOT_WRITE_RESULT_BLOB_TYPE_INDEX,
-                    )),
-                    novarocks_types::SlotId::new(root_write_result_column_id(
-                        ROOT_WRITE_RESULT_PROPERTIES_INDEX,
-                    )),
-                ],
-                mappings,
-                max_output_rows,
-                max_output_bytes: 32 * 1024 * 1024,
-            }),
-        };
-        let expected = (0..target_count)
-            .map(|index| target(u32::try_from(index).expect("target")))
-            .collect();
-        let node = FinishFixture::try_new_with_relations(
+            .expect("actual compiled finish");
+        let node = novarocks_local_program::ProgramNodeId::new(node);
+        let state = composite_runtime_state(metadata_function_set(), None);
+        let binding = TableFinishRuntimeBinding::new(Arc::new(AcceptEveryCarrier::default()));
+        let factory = crate::exec::operators::compiled_writer::compiled_table_finish_factory(
+            &program,
+            node,
             3,
-            expected,
-            Arc::new(AcceptEveryCarrier::default()),
-            writer_schema.clone(),
-            root_schema,
-            #[cfg(test)]
-            final_plan,
+            &binding,
+            &state.error_state(),
         )
-        .expect("composite finish node");
-        let state = composite_runtime_state(Arc::clone(&function_set), None);
+        .expect("actual compiled finish owner");
+        let novarocks_local_program::ProgramNodeKind::TableFinish {
+            writer_multiplex_layout,
+            ..
+        } = program.graph().nodes()[node.index()].kind()
+        else {
+            unreachable!()
+        };
+        // Input arrays are fixed test data. Their schema/slots come from the
+        // program's actual typed transport, not from guessed carrier types.
+        let schema_creator = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            MemTracker::new_root("composite input schema creator"), state.error_state(),
+        ).unwrap();
+        let template = WriterMultiplexRelationTemplate::try_new(writer_multiplex_layout).unwrap();
+        let writer_schema = template.prepare(schema_creator.as_ref()).unwrap();
         (
-            TableFinishOperatorFactory::for_test_fixture(&node, Arc::new(arena)),
+            CompositeFactory {
+                inner: factory,
+                program,
+                node,
+            },
             state,
             writer_schema,
         )
@@ -3390,14 +2740,38 @@ mod tests {
     }
 
     fn scripted_final_chunk(
-        factory: &TableFinishOperatorFactory,
+        fixture: &CompositeFactory,
         rows: Vec<(i32, Vec<Option<Vec<u8>>>)>,
     ) -> Chunk {
-        let unpivot = factory.final_plan.unpivot.as_ref().expect("unpivot plan");
-        let mut groups = Vec::with_capacity(rows.len());
-        let mut values = (0..factory.final_plan.calls.len())
+        use crate::exec::chunk::ChunkSlotSchema;
+        use novarocks_local_program::{ProgramCallSite, ProgramNodeKind, ProgramStateTemplate};
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let ProgramNodeKind::TableFinish {
+            writer_multiplex_layout,
+            final_aggregates,
+            ..
+        } = fixture.program.graph().nodes()[fixture.node.index()].kind()
+        else {
+            unreachable!()
+        };
+        let unpivot = final_aggregates.unpivot.as_ref().unwrap();
+        let grouping = writer_multiplex_layout
+            .value_binding(unpivot.grouping_input_slot_id)
+            .unwrap();
+        let mut slots = vec![
+            ChunkSlotSchema::try_new_typed(
+                unpivot.grouping_output_slot_id,
+                Arc::new(Field::new("write_target_ordinal", DataType::Int32, false)),
+                grouping.clone(),
+                None,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        ];
+        let mut values = (0..final_aggregates.calls.len())
             .map(|_| BinaryBuilder::new())
             .collect::<Vec<_>>();
+        let mut groups = Vec::with_capacity(rows.len());
         for (group, row_values) in rows {
             assert_eq!(row_values.len(), values.len());
             groups.push(group);
@@ -3408,24 +2782,79 @@ mod tests {
                 }
             }
         }
-        let mut fields = vec![Field::new("write_target_ordinal", DataType::Int32, false)];
-        let mut slots = vec![unpivot.grouping_output_slot_id];
         let mut columns = vec![Arc::new(Int32Array::from(groups)) as ArrayRef];
-        for (index, (call, mut builder)) in factory.final_plan.calls.iter().zip(values).enumerate()
-        {
-            fields.push(Field::new(
-                format!("final_aggregate_{index}"),
-                call.resolved.output_type.clone(),
-                true,
-            ));
-            slots.push(call.final_output_slot_id);
+        for (index, (call, mut builder)) in final_aggregates.calls.iter().zip(values).enumerate() {
+            let Some(ProgramStateTemplate::Aggregate { kernel, .. }) = fixture
+                .program
+                .state_template(ProgramCallSite::WriterFinal {
+                    node: fixture.node,
+                    call: index as u32,
+                })
+            else {
+                panic!("actual prepared final handle")
+            };
+            let declared = kernel.contract().final_type();
+            assert_eq!(declared.data_type(), &DataType::Binary);
+            assert!(declared.nullable());
+            slots.push(
+                ChunkSlotSchema::try_new_typed(
+                    call.final_output_slot_id,
+                    Arc::new(
+                        declared
+                            .try_to_field(format!("final_aggregate_{index}"))
+                            .unwrap(),
+                    ),
+                    declared.typed_binding().clone(),
+                    None,
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+            );
             columns.push(Arc::new(builder.finish()));
         }
-        let schema = Schema::new(fields);
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &slots)
-            .expect("scripted final schema");
-        let batch = RecordBatch::try_new(Arc::new(schema), columns).expect("scripted final batch");
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("scripted final chunk")
+        let schema =
+            Arc::new(ChunkSchema::try_new_typed(slots, ValueTypeStorageLifetime::pure()).unwrap());
+        let batch = RecordBatch::try_new(schema.arrow_schema_ref(), columns).unwrap();
+        Chunk::try_new_with_chunk_schema(batch, schema).expect("scripted typed final output")
+    }
+
+    /// A readiness-only injection at the exact existing ChildStep boundary.
+    /// It does not evaluate Unpivot or manufacture an artifact. Value and
+    /// constant evaluation remain covered by the actual compiled owner tests.
+    struct GroupedReadinessProbe {
+        child: ChildStep,
+        observable: Arc<Observable>,
+    }
+    impl GroupedReadinessProbe {
+        fn new(operator: Box<dyn Operator>, failures: Arc<RuntimeErrorState>) -> Self {
+            let observable = Arc::new(Observable::new());
+            let mut child = ChildStep::new(operator, observable.clone());
+            child.bind_failure_port(failures).unwrap();
+            child.prepare().unwrap();
+            Self { child, observable }
+        }
+    }
+    impl OperatorLifecycle for GroupedReadinessProbe {
+        fn name(&self) -> &str {
+            "GROUPED_READINESS_PROBE"
+        }
+    }
+    impl SourceKernel for GroupedReadinessProbe {
+        fn control_observable(&self) -> Option<Arc<Observable>> {
+            Some(self.observable.clone())
+        }
+        fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            let output = self.child.advance(ctx)?;
+            Ok(StepResult::new(output, self.child.work_next(), 0))
+        }
+    }
+    impl GroupedUnpivotKernel for GroupedReadinessProbe {
+        fn visit_targets(
+            &self,
+            _: &mut dyn FnMut(u32) -> ExecutionResult<()>,
+        ) -> ExecutionResult<()> {
+            Ok(())
+        }
     }
 
     fn row_count_row(ordinal: i32, rows: i64) -> RawRow {
@@ -3490,6 +2919,7 @@ mod tests {
     fn table_finish_runs_at_dop_one_and_rejects_any_other_parallelism() {
         let factory = factory(1);
         let mut single = factory.create(1, 0);
+        install_protocol_creator(single.as_mut());
         assert!(single.prepare().is_ok());
 
         let mut wide = factory.create(4, 0);
@@ -3507,6 +2937,7 @@ mod tests {
     fn table_finish_checked_sums_row_counts_from_many_senders_in_any_order() {
         let factory = factory(2);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let outputs = run(
             &mut operator,
@@ -3558,6 +2989,7 @@ mod tests {
     fn table_finish_emits_only_a_summary_when_no_writer_staged_anything() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let outputs =
             run(&mut operator, vec![writer_rows(vec![row_count_row(0, 0)])]).expect("finish");
@@ -3618,6 +3050,7 @@ mod tests {
         for (rows, expected) in cases {
             let factory = factory(1);
             let mut operator = factory.create(1, 0);
+            install_protocol_creator(operator.as_mut());
             operator.prepare().expect("prepare");
             let state = RuntimeState::default();
             let error = complete_input(operator.as_mut(), &state, writer_rows(rows))
@@ -3633,6 +3066,7 @@ mod tests {
     fn table_finish_rejects_a_target_ordinal_outside_the_sealed_set() {
         let factory = factory(2);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let error = complete_input(
@@ -3650,10 +3084,9 @@ mod tests {
 
     #[test]
     fn table_finish_rejects_a_non_canonical_carrier_before_it_enters_the_set() {
-        let node = finish_fixture(1, Arc::new(RejectEveryCarrier));
-        let factory =
-            TableFinishOperatorFactory::for_test_fixture(&node, Arc::new(ExprArena::default()));
+        let factory = protocol_factory(vec![target(0)], Arc::new(RejectEveryCarrier)).unwrap();
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let error = complete_input(
@@ -3673,6 +3106,7 @@ mod tests {
     fn table_finish_row_count_overflow_is_an_error_not_a_saturating_counter() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let mut processor = TestDriver::new(operator.as_mut(), &state);
@@ -3696,6 +3130,7 @@ mod tests {
         // huge unsigned row count the client would see as truth.
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let error = complete_input(
@@ -3714,6 +3149,7 @@ mod tests {
     fn table_finish_rejects_a_negative_target_ordinal_as_corrupt_data() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let error = complete_input(
@@ -3733,6 +3169,7 @@ mod tests {
         let state = RuntimeState::default();
         let at_limit = factory(1);
         let mut operator = at_limit.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         complete_input(
             operator.as_mut(),
@@ -3746,6 +3183,7 @@ mod tests {
 
         let over_limit = factory(1);
         let mut operator = over_limit.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let error = complete_input(
             operator.as_mut(),
@@ -3767,6 +3205,7 @@ mod tests {
     fn table_finish_rejects_the_prepared_write_set_byte_budget() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let mut processor = TestDriver::new(operator.as_mut(), &state);
@@ -3789,6 +3228,7 @@ mod tests {
     fn table_finish_rejects_the_prepared_write_set_entry_budget() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let mut processor = TestDriver::new(operator.as_mut(), &state);
@@ -3810,6 +3250,7 @@ mod tests {
         let mut operator = factory.create(1, 0);
         let tracker = MemTracker::new_root("table-finish-large-prefix");
         operator.set_mem_tracker(Arc::clone(&tracker));
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         for index in 0..40u8 {
@@ -3882,6 +3323,7 @@ mod tests {
     fn table_finish_emits_nothing_before_eos_and_releases_its_buffer_on_abort() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         {
@@ -3929,6 +3371,7 @@ mod tests {
         let factory = factory(1);
         let mut operator = factory.create_operator(1, 0);
         operator.set_mem_tracker(tracker.clone());
+        install_protocol_creator(&mut operator);
         operator.prepare().unwrap();
         let state = RuntimeState::default();
         operator.bind_runtime_state(&state).unwrap();
@@ -4029,6 +3472,7 @@ mod tests {
     fn table_finish_drops_its_buffer_when_a_row_is_rejected() {
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let mut processor = TestDriver::new(operator.as_mut(), &state);
@@ -4063,6 +3507,7 @@ mod tests {
         use crate::exec::pipeline::step::InputResult;
         let factory = factory(1);
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().unwrap();
         let state = RuntimeState::default();
         with_step(&state, 64, |ctx| {
@@ -4089,15 +3534,11 @@ mod tests {
 
     #[test]
     fn table_finish_requires_a_non_empty_duplicate_free_target_set() {
+        assert!(protocol_factory(Vec::new(), Arc::new(AcceptEveryCarrier::default())).is_err());
         assert!(
-            FinishFixture::try_new(3, Vec::new(), Arc::new(AcceptEveryCarrier::default()),)
-                .is_err()
-        );
-        assert!(
-            FinishFixture::try_new(
-                3,
+            protocol_factory(
                 vec![target(1), target(1)],
-                Arc::new(AcceptEveryCarrier::default()),
+                Arc::new(AcceptEveryCarrier::default())
             )
             .is_err()
         );
@@ -4110,18 +3551,14 @@ mod tests {
     /// to the session's sealed target set, not to any one query.
     #[test]
     fn table_finish_accepts_a_single_writer_query_at_a_non_zero_ordinal() {
-        let node =
-            FinishFixture::try_new(3, vec![target(2)], Arc::new(AcceptEveryCarrier::default()))
-                .expect("a single-writer query at ordinal 2");
-        assert!(node.accepts_target(target(2)));
-        // Membership stays exact: a bound check would have admitted every
-        // ordinal below the one this query actually feeds.
-        assert!(!node.accepts_target(target(0)));
-        assert!(!node.accepts_target(target(1)));
+        let factory = protocol_factory(vec![target(2)], Arc::new(AcceptEveryCarrier::default()))
+            .expect("a single-writer query at ordinal 2");
+        assert!(factory.expected_targets.contains(&target(2)));
+        assert!(!factory.expected_targets.contains(&target(0)));
+        assert!(!factory.expected_targets.contains(&target(1)));
 
-        let factory =
-            TableFinishOperatorFactory::for_test_fixture(&node, Arc::new(ExprArena::default()));
         let mut operator = factory.create(1, 0);
+        install_protocol_creator(operator.as_mut());
         operator.prepare().expect("prepare");
         let state = RuntimeState::default();
         let mut processor = TestDriver::new(operator.as_mut(), &state);
@@ -4565,37 +4002,13 @@ mod tests {
 
     #[test]
     fn composite_finish_forwards_grouped_unpivot_child_readiness() {
-        let (factory, _state, _writer_schema) = composite_fixture(1, 1, 8);
-        let final_chunk =
-            scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
-        let mut grouped = GroupedUnpivotFixtureKernel::try_new(
-            Arc::clone(&factory.arena),
-            factory
-                .final_plan
-                .unpivot
-                .as_ref()
-                .cloned()
-                .expect("grouped Unpivot plan"),
-            Arc::clone(
-                factory
-                    .root_schema
-                    .prepared()
-                    .expect("legacy fixture root schema")
-                    .chunk_schema(),
-            ),
-            final_chunk,
-            None,
-            RuntimeKernelControl::new(_state.error_state()),
-            None,
-        )
-        .expect("grouped Unpivot driver");
+        let (factory, state, _writer_schema) = composite_fixture(1, 1, 8);
         let child = crate::exec::pipeline::shape::fanout::test_support::Probe::new(true);
         let child_observable = child.event.clone();
-        grouped
-            .install_active(crate::exec::pipeline::shape::fanout::test_support::sink(
-                child,
-            ))
-            .unwrap();
+        let grouped = GroupedReadinessProbe::new(
+            crate::exec::pipeline::shape::fanout::test_support::sink(child),
+            state.error_state(),
+        );
 
         let mut operator = factory.create_operator(1, 0);
         use crate::exec::pipeline::shape::StepOperator;
@@ -4604,7 +4017,7 @@ mod tests {
             .expect("stable source observable while consuming");
         operator
             .kernel_for_test_mut()
-            .install_grouped_unpivot(grouped, _state.error_state());
+            .install_grouped_unpivot(grouped, state.error_state());
         operator.kernel_for_test_mut().phase = FinishPhase::Producing;
         let generation = source_identity.generation();
 
@@ -4967,6 +4380,8 @@ mod tests {
             "the original construction owner is tracked"
         );
         operator.prepare().expect("prepare");
+        let prepared_schema_bytes = tracker.current();
+        assert!(prepared_schema_bytes >= creator_bytes);
         operator.bind_runtime_state(&state).expect("bind");
         complete_input(
             &mut operator,
@@ -5019,8 +4434,8 @@ mod tests {
         operator.close().unwrap();
         assert_eq!(
             tracker.current(),
-            creator_bytes,
-            "only the live operator's original creator metadata remains"
+            prepared_schema_bytes,
+            "only the live operator creator and actually prepared relation schemas remain"
         );
         drop(operator);
         assert_eq!(
@@ -5390,5 +4805,1052 @@ mod tests {
             failures.error().is_none(),
             "cleanup never enters original Runtime originating error"
         );
+    }
+    /// Real physical binding / package / compiler author. This contains no
+    /// aggregate or expression calculator, and no erased execution registry.
+    mod compiled_fixture {
+        use super::*;
+        use crate::exec::operators::table_writer::tests::adapter;
+        use arrow::array::{MapArray, StructArray};
+        use novarocks_connector_contract::{
+            ConnectorCodecCategory, ConnectorCodecRevision, ConnectorEncodedPayload,
+            ConnectorEnvelopeHeader, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+            ConnectorWriteInputShape, ConnectorWriteRecipeCompiler, ConnectorWriteRecipeDraft,
+            PureProviderCompileError, PureProviderManifestEntry, PureProviderProgramCatalog,
+            PureProviderProgramDefinition,
+        };
+        use novarocks_functions::{
+            AggregateBindingSelection, AggregateKernelPhase, AggregatePreparationOptions,
+            AggregateStateFormatIdentity, CallArgumentUses, CallEffectInput, ConstantPolicy,
+            EngineFunctionCatalogBuilder, FunctionBindingRequest, FunctionBindingSelection,
+            FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
+            PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
+            PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+        };
+        use novarocks_local_compiler::{
+            LocalCompileOptions, compile_fragment, validate_fragment_providers,
+        };
+        use novarocks_local_program::{KernelAbiVersion, LocalProgram};
+        use novarocks_physical_plan::{
+            AggregateBinding, AggregatePhase, AggregateSequenceId, BoundFunction, ConstantPool,
+            ConstantPoolId, ConstantReference, Distribution, Edge, EdgeDestination, EdgeId,
+            EdgeKind, EdgePartitioning, EdgeSource, ExprKind, Fragment, FragmentBuilder,
+            FragmentId, FragmentPackageAdmission, FragmentSink, FrozenFragmentCalls,
+            FrozenFragmentPruning, FrozenPhysicalCall, LiteralValue, NodeId, NodeKind, OutputPort,
+            PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite, PhysicalExpressionRoots,
+            PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain,
+            PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
+            ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField, ResultPort, RowMultiplicity,
+            SetOperationKind, StaticFunctionArgument, UnpivotConstant, ValueOrigin,
+            WRITER_MULTIPLEX_SCHEMA_REVISION, WriterAggregateCall, WriterDerivedKind,
+            WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec,
+            WriterRelationField, WriterRelationFieldRole, WriterRelationSchema, WriterTarget,
+            WriterTargetField, extract_fragment_packages,
+        };
+        use novarocks_spi::connector::write_stack::{
+            root_write_result_schema, writer_output_schema,
+        };
+        use novarocks_type_contract::{
+            CallProofScope, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
+            EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+            ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+            FunctionValueType, PureCompileControl, SemanticParameters,
+        };
+        use std::collections::BTreeMap;
+        use std::num::NonZeroUsize;
+        const LIST_POOL: ConstantPoolId = ConstantPoolId::new(1);
+        const MAP_POOL: ConstantPoolId = ConstantPoolId::new(2);
+        const BLOB_TYPE: &str = "test/blob-v1";
+        pub(super) struct FixtureControl;
+        impl PureCompileControl for FixtureControl {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+        fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
+            FunctionValueType::new(data_type, nullable)
+        }
+        fn property(distribution: Distribution) -> PhysicalProperties {
+            PhysicalProperties {
+                distribution,
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            }
+        }
+        fn dop() -> PipelineDopDomain {
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            }
+        }
+        fn catalog() -> PureEngineFunctionCatalog {
+            let actual =
+                novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                    .unwrap();
+            let mut builder = EngineFunctionCatalogBuilder::new();
+            builder
+                .register(
+                    actual
+                        .definition("any_value", FunctionKind::Aggregate)
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap();
+            builder
+                .seal_pure([InstalledPureKernel {
+                    function: FunctionId::try_new("builtin.aggregate/any_value/v1").unwrap(),
+                    kind: FunctionKind::Aggregate,
+                    implementation: PureImplementationDeclaration {
+                        overload: FunctionOverloadId::try_new(
+                            "builtin.aggregate/any_value/derived-v1",
+                        )
+                        .unwrap(),
+                        implementation: PureImplementationId::try_new(
+                            "builtin.aggregate/any_value/selected-v1",
+                        )
+                        .unwrap(),
+                        abi: PureKernelAbi::AggregateV1,
+                    },
+                    aggregate_state_format: Some(
+                        AggregateStateFormatIdentity::try_new("novarocks/any_value/state-v1")
+                            .unwrap(),
+                    ),
+                }])
+                .unwrap()
+        }
+        fn draft(channels: usize) -> ConnectorWriteRecipeDraft {
+            let binding = adapter().binding().clone();
+            let payload = ConnectorEncodedPayload::new(
+                ConnectorEnvelopeHeader::new(
+                    binding.descriptor().provider_id.clone(),
+                    binding.catalog_handle().clone(),
+                    ConnectorCodecCategory::WriteHandle,
+                    ConnectorCodecRevision::try_new(1).unwrap(),
+                ),
+                bytes::Bytes::from_static(b"finish-test-writer-handle"),
+            );
+            ConnectorWriteRecipeDraft::try_new(
+                binding,
+                payload,
+                ConnectorWriteInputShape::Data {
+                    fields: (0..channels)
+                        .map(|ordinal| {
+                            ConnectorWriteFieldBinding::try_new_typed(
+                                ConnectorWriteFieldToken::from_bytes({
+                                    let mut bytes = [0u8; 32];
+                                    bytes[..8].copy_from_slice(&(ordinal as u64 + 1).to_le_bytes());
+                                    bytes
+                                }),
+                                Field::new(format!("source_{ordinal}"), DataType::Binary, true),
+                                ty(DataType::Binary, true),
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap()
+        }
+        struct KeepDraft;
+        impl ConnectorWriteRecipeCompiler for KeepDraft {
+            type Error = ConnectorError;
+            fn compile_private(
+                &self,
+                draft: &ConnectorWriteRecipeDraft,
+                _: &dyn PureCompileControl,
+            ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<ConnectorError>>
+            {
+                Ok(draft.clone())
+            }
+        }
+        fn relation_fields(
+            builder: &mut FragmentBuilder,
+            owner: NodeId,
+            root: bool,
+        ) -> Box<[WriterRelationField]> {
+            let schema = if root {
+                root_write_result_schema()
+            } else {
+                writer_output_schema()
+            };
+            schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let (role, kind) = match index {
+                        0 => (
+                            WriterRelationFieldRole::Kind,
+                            WriterDerivedKind::RelationKind,
+                        ),
+                        1 => (
+                            WriterRelationFieldRole::TargetOrdinal,
+                            WriterDerivedKind::WriteTargetOrdinal,
+                        ),
+                        2 => (
+                            WriterRelationFieldRole::RowCount,
+                            WriterDerivedKind::AffectedRows,
+                        ),
+                        3 => (
+                            WriterRelationFieldRole::CommitFragment,
+                            WriterDerivedKind::CommitFragment,
+                        ),
+                        _ => (
+                            WriterRelationFieldRole::Auxiliary,
+                            WriterDerivedKind::RelationAuxiliary,
+                        ),
+                    };
+                    let ty = ty(field.data_type().clone(), field.is_nullable());
+                    let value = builder
+                        .add_value(
+                            ty.clone(),
+                            ValueOrigin::WriterDerived {
+                                writer_node: owner,
+                                kind,
+                            },
+                        )
+                        .unwrap();
+                    WriterRelationField {
+                        value,
+                        name: field.name().as_str().into(),
+                        ty,
+                        role,
+                    }
+                })
+                .collect()
+        }
+
+        fn any_value_binding(
+            catalog: &PureEngineFunctionCatalog,
+            input: &FunctionValueType,
+            phase: AggregatePhase,
+        ) -> AggregateBinding {
+            let arguments = [StaticFunctionArgument::Value {
+                value_type: input.clone(),
+                constant: None,
+            }];
+            let bound = catalog
+                .metadata()
+                .resolve_bound_trusted(
+                    "any_value",
+                    FunctionKind::Aggregate,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                        expected_result_type: None,
+                    },
+                    &FixtureControl,
+                )
+                .unwrap();
+            let aggregate = bound.selected.aggregate.clone().unwrap();
+            let FunctionResultType::Scalar(result_type) = bound.selected.result_type.clone() else {
+                panic!("any_value returns one scalar")
+            };
+            AggregateBinding {
+                state_interpretation: None,
+                state_argument_contract: aggregate.state_argument_contract,
+                function: BoundFunction {
+                    legacy_metadata: None,
+                    function_id: bound.function_id,
+                    overload: bound.selected.overload.clone(),
+                    kind: FunctionKind::Aggregate,
+                    argument_types: bound.selected.argument_types.clone(),
+                    result_type,
+                },
+                phase,
+                logical_argument_count: 1,
+                intermediate_type: aggregate.intermediate_type,
+                state_format: aggregate.state_format,
+            }
+        }
+
+        fn any_value_request(binding: &AggregateBinding) -> PhysicalCallRequest {
+            let [novarocks_type_contract::FunctionArgumentType::Value(input)] =
+                binding.function.argument_types.as_ref()
+            else {
+                panic!("any_value has one value argument")
+            };
+            PhysicalCallRequest {
+                arguments: Box::from([StaticFunctionArgument::Value {
+                    value_type: input.clone(),
+                    constant: None,
+                }]),
+                logical_argument_count: 1,
+                expected_result_type: None,
+                constant_policy: constants(),
+            }
+        }
+
+        fn constants() -> ConstantPolicy {
+            ConstantPolicy {
+                max_rows: 4096,
+                max_array_nodes: 128,
+                max_logical_elements: 16_384,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            }
+        }
+
+        fn pools(count: usize) -> [(ConstantPoolId, ConstantPool); 2] {
+            let root = root_write_result_schema();
+            let list_type = ty(
+                root.field(ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX)
+                    .data_type()
+                    .clone(),
+                false,
+            );
+            let DataType::List(item) = &list_type.data_type() else {
+                unreachable!()
+            };
+            let raw = ListArray::from_iter_primitive::<arrow::datatypes::Int32Type, _, _>(
+                (1..=count).map(|id| Some(vec![Some(i32::try_from(id).unwrap())])),
+            );
+            let lists = ListArray::try_new(
+                Arc::clone(item),
+                raw.offsets().clone(),
+                raw.values().clone(),
+                None,
+            )
+            .unwrap()
+            .to_data();
+            let list = ConstantPool::try_new(
+                Arc::new(list_type.try_to_field("input_fields").unwrap()),
+                list_type,
+                lists,
+                constants(),
+                CompilePhase::Validate,
+                &FixtureControl,
+            )
+            .unwrap();
+            let map_type = ty(
+                root.field(ROOT_WRITE_RESULT_PROPERTIES_INDEX)
+                    .data_type()
+                    .clone(),
+                false,
+            );
+            let DataType::Map(entries, sorted) = &map_type.data_type() else {
+                unreachable!()
+            };
+            let DataType::Struct(fields) = entries.data_type() else {
+                unreachable!()
+            };
+            let children = StructArray::try_new(
+                fields.clone(),
+                vec![
+                    Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+                    Arc::new(StringArray::from(Vec::<&str>::new())),
+                ],
+                None,
+            )
+            .unwrap();
+            let empty =
+                ListArray::from_iter_primitive::<arrow::datatypes::Int32Type, _, _>([Some(Vec::<
+                    Option<i32>,
+                >::new(
+                ))]);
+            let maps = MapArray::try_new(
+                Arc::clone(entries),
+                empty.offsets().clone(),
+                children,
+                None,
+                *sorted,
+            )
+            .unwrap()
+            .to_data();
+            let map = ConstantPool::try_new(
+                Arc::new(map_type.try_to_field("properties").unwrap()),
+                map_type,
+                maps,
+                constants(),
+                CompilePhase::Validate,
+                &FixtureControl,
+            )
+            .unwrap();
+            [(LIST_POOL, list), (MAP_POOL, map)]
+        }
+
+        fn with_requests<'a>(
+            fragment: Fragment,
+            sites: impl Iterator<Item = (PhysicalCallSite, &'a AggregateBinding)>,
+        ) -> Fragment {
+            let mut entries = fragment
+                .call_requests()
+                .entries()
+                .iter()
+                .map(|(definition, request)| (*definition, request.clone()))
+                .collect::<Vec<_>>();
+            for (site, binding) in sites {
+                entries.push((
+                    PhysicalCallDefinition::Relational(site),
+                    any_value_request(binding),
+                ));
+            }
+            fragment
+                .with_call_requests_observed(entries, &FixtureControl)
+                .unwrap()
+        }
+
+        fn freeze(
+            fragment: &Fragment,
+            catalog: &PureEngineFunctionCatalog,
+        ) -> (PhysicalRootUses, FrozenFragmentCalls) {
+            let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
+            let mut uses = Vec::new();
+            let mut bindings = Vec::new();
+            for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
+                let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
+                uses.push(ExpressionInvocation {
+                    context: ExpressionEffectContext {
+                        use_id: id,
+                        domain: EvaluationDomainId::new(0),
+                        demand: root.demand,
+                    },
+                    definition: root.expr,
+                    control: ControlShape::Eager,
+                    arguments: Box::default(),
+                });
+                bindings.push((*site, id));
+            }
+            let mut next_use = u32::try_from(uses.len()).unwrap();
+            let mut domains = vec![ExpressionEvaluationDomain {
+                id: EvaluationDomainId::new(0),
+                parent: None,
+                guard: None,
+            }];
+            let mut sites = Vec::new();
+            for node in fragment.nodes().values() {
+                let (calls, partial): (&[WriterAggregateCall], bool) = match &node.kind {
+                    NodeKind::TableWriter { target } => (&target.partial_aggregates, true),
+                    NodeKind::TableFinish(spec) => (&spec.final_aggregates, false),
+                    _ => continue,
+                };
+                for (call, item) in calls.iter().enumerate() {
+                    let site = if partial {
+                        PhysicalCallSite::WriterPartial {
+                            node: node.id,
+                            call: call as u32,
+                        }
+                    } else {
+                        PhysicalCallSite::WriterFinal {
+                            node: node.id,
+                            call: call as u32,
+                        }
+                    };
+                    let mut context = || {
+                        let context = ExpressionEffectContext {
+                            use_id: ExpressionUseId::new(next_use),
+                            domain: EvaluationDomainId::new(domains.len() as u32),
+                            demand: EvaluationDemand::Value,
+                        };
+                        domains.push(ExpressionEvaluationDomain {
+                            id: context.domain,
+                            parent: None,
+                            guard: None,
+                        });
+                        next_use += 1;
+                        context
+                    };
+                    let relational = context();
+                    let input = context();
+                    sites.push((site, item, relational, input));
+                }
+            }
+            let flow = ExpressionControlFlow::try_new(
+                domains,
+                uses,
+                fragment.expressions(),
+                CompilePhase::Validate,
+                &FixtureControl,
+            )
+            .unwrap();
+            let root_uses =
+                PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
+            let parameters = SemanticParameters::try_new([]).unwrap();
+            let frozen = sites
+                .into_iter()
+                .map(|(site, item, context, input)| {
+                    let binding = &item.binding;
+                    let selected = Arc::new(FunctionBindingSelection {
+                        overload: binding.function.overload.clone(),
+                        argument_types: binding.function.argument_types.clone(),
+                        result_type: FunctionResultType::Scalar(
+                            binding.function.result_type.clone(),
+                        ),
+                        aggregate: Some(AggregateBindingSelection {
+                            state_argument_contract: binding.state_argument_contract,
+                            intermediate_type: binding.intermediate_type.clone(),
+                            state_format: binding.state_format.clone(),
+                        }),
+                    });
+                    let request = any_value_request(binding);
+                    let arguments = request
+                        .arguments
+                        .iter()
+                        .map(|argument| match argument {
+                            StaticFunctionArgument::Value { value_type, .. } => {
+                                StaticFunctionArgument::Value {
+                                    value_type: value_type.clone(),
+                                    constant: None,
+                                }
+                            }
+                            StaticFunctionArgument::Lambda { .. } => unreachable!(),
+                        })
+                        .collect::<Vec<_>>();
+                    let state_type = fragment.values()[&item.input].ty.clone();
+                    let argument_uses = [Some(input.use_id)];
+                    let partial = matches!(site, PhysicalCallSite::WriterPartial { .. });
+                    let phase = if partial {
+                        AggregateKernelPhase::Partial
+                    } else {
+                        AggregateKernelPhase::Final
+                    };
+                    let token = catalog
+                        .prepare_fresh(
+                            CallEffectInput {
+                                context,
+                                argument_uses: if partial {
+                                    CallArgumentUses::SelectedChannels(&argument_uses)
+                                } else {
+                                    CallArgumentUses::AggregateMerge {
+                                        phase,
+                                        state_context: input,
+                                        state_input_type: &state_type,
+                                    }
+                                },
+                                function_id: &binding.function.function_id,
+                                kind: FunctionKind::Aggregate,
+                                selected: selected.as_ref(),
+                                request: FunctionBindingRequest {
+                                    arguments: &arguments,
+                                    logical_argument_count: 1,
+                                    expected_result_type: None,
+                                },
+                                environment: &[],
+                                parameters: &parameters,
+                                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                                proof_scope: CallProofScope::Domain(context.domain),
+                            },
+                            Arc::clone(&selected),
+                            PureCallPreparation::Aggregate {
+                                arguments: ScopedExpressionEffects::primitive(
+                                    context,
+                                    ExpressionEffects::PURE_VALUE,
+                                ),
+                                options: AggregatePreparationOptions {
+                                    state_interpretation: None,
+                                    phase,
+                                    distinct: false,
+                                    order_keys: Arc::from([]),
+                                    state_input_type: (!partial).then(|| state_type.clone()),
+                                },
+                            },
+                            &FixtureControl,
+                        )
+                        .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
+                    FrozenPhysicalCall {
+                        materialized_writer_input: Some(input),
+                        regexp_count_pattern_source: None,
+                        to_base64_byte_source: None,
+                        temporal_source: None,
+                        site,
+                        context,
+                        effects: token.call_contract().effects().clone(),
+                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    }
+                })
+                .collect();
+            let calls = FrozenFragmentCalls::try_new(fragment, &root_uses, frozen, &FixtureControl)
+                .unwrap_or_else(|error| panic!("frozen writer calls validate: {error}"));
+            (root_uses, calls)
+        }
+
+        fn plan(
+            target_count: usize,
+            channel_count: usize,
+            max_output_rows: usize,
+        ) -> (
+            PhysicalPlan,
+            BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
+        ) {
+            assert!(target_count > 0 && channel_count > 0);
+            let catalog = catalog();
+            let mut plan = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap());
+            let mut consumer = FragmentBuilder::new(FragmentId::new(target_count as u32 + 1));
+            let mut receivers = Vec::new();
+            let mut received_fields = Vec::<Box<[WriterRelationField]>>::new();
+            let mut drafts = BTreeMap::new();
+            for target_index in 0..target_count {
+                let ordinal = target(target_index as u32);
+                let edge = EdgeId::new(target_index as u32 + 1);
+                let fragment_id = FragmentId::new(target_index as u32 + 1);
+                let mut producer = FragmentBuilder::new(fragment_id);
+                let source = producer.reserve_node_id().unwrap();
+                let input = (0..channel_count)
+                    .map(|output_ordinal| {
+                        producer
+                            .add_value(
+                                ty(DataType::Binary, true),
+                                ValueOrigin::NodeOutput {
+                                    node: source,
+                                    output_ordinal: output_ordinal as u32,
+                                },
+                            )
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                producer
+                    .insert_node_unchecked(PhysicalNode {
+                        id: source,
+                        inputs: Box::default(),
+                        required_inputs: Box::default(),
+                        output_properties: property(Distribution::Singleton),
+                        output: OutputPort {
+                            node: source,
+                            columns: input.clone().into_boxed_slice(),
+                        },
+                        kind: NodeKind::Values {
+                            rows: Box::default(),
+                        },
+                    })
+                    .unwrap();
+                let writer = producer.reserve_node_id().unwrap();
+                let mut fields = relation_fields(&mut producer, writer, false).into_vec();
+                for channel in 0..channel_count {
+                    let value = producer
+                        .add_value(
+                            ty(DataType::Binary, true),
+                            ValueOrigin::WriterDerived {
+                                writer_node: writer,
+                                kind: WriterDerivedKind::RelationAuxiliary,
+                            },
+                        )
+                        .unwrap();
+                    fields.push(WriterRelationField {
+                        value,
+                        name: format!("partial_{channel}").into(),
+                        ty: ty(DataType::Binary, true),
+                        role: WriterRelationFieldRole::Auxiliary,
+                    });
+                }
+                let phase = AggregatePhase::Partial {
+                    sequence: AggregateSequenceId::new(1),
+                };
+                let partial = (0..channel_count)
+                    .map(|channel| WriterAggregateCall {
+                        input: input[channel],
+                        binding: any_value_binding(&catalog, &ty(DataType::Binary, true), phase),
+                        output: fields[4 + channel].value,
+                    })
+                    .collect::<Box<[_]>>();
+                let recipe = draft(channel_count);
+                producer
+                    .insert_node_unchecked(PhysicalNode {
+                        id: writer,
+                        inputs: Box::from([source]),
+                        required_inputs: Box::from([property(Distribution::Singleton)]),
+                        output_properties: property(Distribution::Unconstrained),
+                        output: OutputPort {
+                            node: writer,
+                            columns: fields.iter().map(|field| field.value).collect(),
+                        },
+                        kind: NodeKind::TableWriter {
+                            target: WriterTarget {
+                                handle: recipe.payload().clone(),
+                                write_target_ordinal: ordinal,
+                                input: input.clone().into_boxed_slice(),
+                                required_distribution: Distribution::Singleton,
+                                target_fields: recipe
+                                    .input()
+                                    .fields_iter()
+                                    .zip(&input)
+                                    .map(|(binding, value)| WriterTargetField {
+                                        provider_name: binding.field().name().clone().into(),
+                                        token: binding.token(),
+                                        input: *value,
+                                        ty: binding
+                                            .execution_type()
+                                            .expect("typed provider input")
+                                            .clone(),
+                                        hidden: false,
+                                    })
+                                    .collect(),
+                                output_schema: WriterRelationSchema {
+                                    revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
+                                    fields: fields.clone().into_boxed_slice(),
+                                },
+                                partial_aggregates: partial.clone(),
+                            },
+                        },
+                    })
+                    .unwrap();
+                let fragment = with_requests(
+                    producer
+                        .finish_definition(writer, FragmentSink::Stream { edge }, dop())
+                        .unwrap(),
+                    partial.iter().enumerate().map(|(call, item)| {
+                        (
+                            PhysicalCallSite::WriterPartial {
+                                node: writer,
+                                call: call as u32,
+                            },
+                            &item.binding,
+                        )
+                    }),
+                );
+                plan.add_fragment(fragment).unwrap();
+                drafts.insert(ordinal, recipe);
+                let exchange = consumer.reserve_node_id().unwrap();
+                let imported = fields
+                    .iter()
+                    .map(|field| {
+                        let value = consumer
+                            .add_value(
+                                field.ty.clone(),
+                                ValueOrigin::ExchangeImport {
+                                    edge,
+                                    source_value: field.value,
+                                },
+                            )
+                            .unwrap();
+                        WriterRelationField {
+                            value,
+                            name: field.name.clone(),
+                            ty: field.ty.clone(),
+                            role: field.role,
+                        }
+                    })
+                    .collect::<Box<[_]>>();
+                let mapping = fields
+                    .iter()
+                    .zip(&imported)
+                    .map(|(source, destination)| (source.value, destination.value))
+                    .collect::<Box<[_]>>();
+                consumer
+                    .insert_node_unchecked(PhysicalNode {
+                        id: exchange,
+                        inputs: Box::default(),
+                        required_inputs: Box::default(),
+                        output_properties: property(Distribution::Singleton),
+                        output: OutputPort {
+                            node: exchange,
+                            columns: imported.iter().map(|field| field.value).collect(),
+                        },
+                        kind: NodeKind::ExchangeSource {
+                            edge,
+                            imports: mapping.clone(),
+                        },
+                    })
+                    .unwrap();
+                plan.add_edge(Edge {
+                    id: edge,
+                    kind: EdgeKind::Stream,
+                    source: EdgeSource {
+                        fragment: fragment_id,
+                        projection: fields.iter().map(|field| field.value).collect(),
+                    },
+                    destination: EdgeDestination {
+                        fragment: consumer.id(),
+                        node: exchange,
+                        receive_mapping: mapping,
+                    },
+                    partitioning: EdgePartitioning {
+                        source: Distribution::Singleton,
+                        source_multiplicity: RowMultiplicity::SingleCopy,
+                        destination: Distribution::Singleton,
+                        destination_multiplicity: RowMultiplicity::SingleCopy,
+                    },
+                })
+                .unwrap();
+                receivers.push(exchange);
+                received_fields.push(imported);
+            }
+            let (input_node, input_fields) = if target_count == 1 {
+                (receivers[0], received_fields.remove(0))
+            } else {
+                let union = consumer.reserve_node_id().unwrap();
+                let fields = received_fields[0]
+                    .iter()
+                    .enumerate()
+                    .map(|(output_ordinal, field)| {
+                        let value = consumer
+                            .add_value(
+                                field.ty.clone(),
+                                ValueOrigin::NodeOutput {
+                                    node: union,
+                                    output_ordinal: output_ordinal as u32,
+                                },
+                            )
+                            .unwrap();
+                        WriterRelationField {
+                            value,
+                            name: field.name.clone(),
+                            ty: field.ty.clone(),
+                            role: field.role,
+                        }
+                    })
+                    .collect::<Box<[_]>>();
+                consumer
+                    .insert_node_unchecked(PhysicalNode {
+                        id: union,
+                        inputs: receivers.into_boxed_slice(),
+                        required_inputs: (0..target_count)
+                            .map(|_| property(Distribution::Singleton))
+                            .collect(),
+                        output_properties: property(Distribution::Singleton),
+                        output: OutputPort {
+                            node: union,
+                            columns: fields.iter().map(|field| field.value).collect(),
+                        },
+                        kind: NodeKind::SetOp {
+                            kind: SetOperationKind::UnionAll,
+                            input_mappings: received_fields
+                                .iter()
+                                .map(|fields| {
+                                    fields.iter().map(|field| field.value).collect::<Box<[_]>>()
+                                })
+                                .collect(),
+                        },
+                    })
+                    .unwrap();
+                (union, fields)
+            };
+            let finish = consumer.reserve_node_id().unwrap();
+            let outputs = relation_fields(&mut consumer, finish, true);
+            let phase = AggregatePhase::Final {
+                sequence: AggregateSequenceId::new(1),
+            };
+            let finals = (0..channel_count)
+                .map(|channel| {
+                    let binding = any_value_binding(&catalog, &ty(DataType::Binary, true), phase);
+                    let output = consumer
+                        .add_value(
+                            binding.function.result_type.clone(),
+                            ValueOrigin::WriterDerived {
+                                writer_node: finish,
+                                kind: WriterDerivedKind::RelationAuxiliary,
+                            },
+                        )
+                        .unwrap();
+                    WriterAggregateCall {
+                        input: input_fields[4 + channel].value,
+                        binding,
+                        output,
+                    }
+                })
+                .collect::<Box<[_]>>();
+            let grouping_output = consumer
+                .add_value(
+                    ty(DataType::Int32, false),
+                    ValueOrigin::WriterDerived {
+                        writer_node: finish,
+                        kind: WriterDerivedKind::GroupingKey,
+                    },
+                )
+                .unwrap();
+            let mut mappings = Vec::new();
+            for target_index in 0..target_count {
+                for channel in 0..channel_count {
+                    let blob = consumer
+                        .add_expression(
+                            finish,
+                            ty(DataType::Utf8, false),
+                            ExprKind::Literal(LiteralValue::Utf8(BLOB_TYPE.into())),
+                        )
+                        .unwrap();
+                    mappings.push(WriterGroupedUnpivotMapping {
+                        write_target_ordinal: target(target_index as u32),
+                        input: finals[channel].output,
+                        constants: Box::from([
+                            UnpivotConstant::Int32List(ConstantReference {
+                                pool: LIST_POOL,
+                                ordinal: (target_index * channel_count + channel) as u32,
+                            }),
+                            UnpivotConstant::Scalar(blob),
+                            UnpivotConstant::Utf8Map(ConstantReference {
+                                pool: MAP_POOL,
+                                ordinal: 0,
+                            }),
+                        ]),
+                    });
+                }
+            }
+            let ordinals = (0..target_count)
+                .map(|index| target(index as u32))
+                .collect::<Box<[_]>>();
+            let grouping_input = input_fields[1].value;
+            consumer
+                .insert_node_unchecked(PhysicalNode {
+                    id: finish,
+                    inputs: Box::from([input_node]),
+                    required_inputs: Box::from([property(Distribution::Singleton)]),
+                    output_properties: property(Distribution::Singleton),
+                    output: OutputPort {
+                        node: finish,
+                        columns: outputs.iter().map(|field| field.value).collect(),
+                    },
+                    kind: NodeKind::TableFinish(WriterFinishSpec {
+                        expected_target_ordinals: ordinals.clone(),
+                        input_schema: WriterRelationSchema {
+                            revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
+                            fields: input_fields,
+                        },
+                        output_schema: WriterRelationSchema {
+                            revision: ROOT_WRITE_RESULT_SCHEMA_REVISION,
+                            fields: outputs.clone(),
+                        },
+                        final_aggregates: finals.clone(),
+                        grouped_unpivot: Some(WriterGroupedUnpivotSpec {
+                            statistics_target_ordinals: ordinals,
+                            grouping_input,
+                            grouping_output,
+                            passthrough_output: outputs[1].value,
+                            value_output: outputs[ROOT_WRITE_RESULT_BODY_INDEX].value,
+                            literal_outputs: Box::from([
+                                outputs[ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX].value,
+                                outputs[ROOT_WRITE_RESULT_BLOB_TYPE_INDEX].value,
+                                outputs[ROOT_WRITE_RESULT_PROPERTIES_INDEX].value,
+                            ]),
+                            mappings: mappings.into_boxed_slice(),
+                            max_output_rows: u64::try_from(max_output_rows)
+                                .expect("fixture output row limit fits the frozen u64 contract"),
+                            max_output_bytes: 32 * 1024 * 1024,
+                        }),
+                    }),
+                })
+                .unwrap();
+            let consumer = with_requests(
+                consumer
+                    .finish_definition(finish, FragmentSink::Result, dop())
+                    .unwrap(),
+                finals.iter().enumerate().map(|(call, item)| {
+                    (
+                        PhysicalCallSite::WriterFinal {
+                            node: finish,
+                            call: call as u32,
+                        },
+                        &item.binding,
+                    )
+                }),
+            );
+            let consumer_id = consumer.id();
+            plan.add_fragment(consumer).unwrap();
+            for (id, pool) in pools(target_count * channel_count) {
+                plan.insert_constant_pool(id, pool).unwrap();
+            }
+            plan.set_result_port(ResultPort {
+                scalar_schema: None,
+                fragment: consumer_id,
+                output: OutputPort {
+                    node: finish,
+                    columns: outputs.iter().map(|field| field.value).collect(),
+                },
+                fields: outputs
+                    .iter()
+                    .map(|field| ResultField {
+                        domain: crate::test_result_domain::result_value_domain(&field.ty),
+                        name: field.name.clone(),
+                        alias: None,
+                        value: field.value,
+                        ty: field.ty.clone(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+            (
+                plan.finish_observed(&FixtureControl)
+                    .expect("real writer/union/finish plan validates"),
+                drafts,
+            )
+        }
+        pub(super) fn compile(
+            target_count: usize,
+            channel_count: usize,
+            max_output_rows: usize,
+        ) -> Arc<LocalProgram> {
+            let catalog = catalog();
+            let (plan, drafts) = plan(target_count, channel_count, max_output_rows);
+            let mut uses = BTreeMap::new();
+            let mut calls = BTreeMap::new();
+            let mut pruning = BTreeMap::new();
+            let mut admissions = BTreeMap::new();
+            for (&id, fragment) in plan.fragments() {
+                let (root_uses, frozen) = freeze(fragment, &catalog);
+                uses.insert(id, root_uses);
+                calls.insert(id, frozen);
+                pruning.insert(
+                    id,
+                    FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
+                );
+                admissions.insert(
+                    id,
+                    FragmentPackageAdmission {
+                        plan_limits: PlanLimits::FROZEN,
+                        source_retained_bytes: 64 * 1024 * 1024,
+                        property_projection_limits: PropertyProofProjectionLimits {
+                            max_request_bytes: 16 * 1024 * 1024,
+                            max_coexisting_bytes: 256 * 1024 * 1024,
+                            max_projection_work: 16 * 1024 * 1024,
+                        },
+                    },
+                );
+            }
+            let mut packages = extract_fragment_packages(
+                &plan,
+                &BTreeMap::new(),
+                &drafts,
+                &uses,
+                &calls,
+                &pruning,
+                &admissions,
+                &FixtureControl,
+            )
+            .unwrap();
+            let provider = adapter().binding().descriptor().provider_id.clone();
+            let providers = PureProviderProgramCatalog::try_new(
+                &[PureProviderManifestEntry::new(
+                    provider.clone(),
+                    false,
+                    true,
+                )],
+                vec![PureProviderProgramDefinition::new(
+                    provider,
+                    None,
+                    Some(Arc::new(KeepDraft)
+                        as Arc<
+                            dyn ConnectorWriteRecipeCompiler<Error = ConnectorError>,
+                        >),
+                )],
+                &FixtureControl,
+            )
+            .unwrap();
+            let package = Arc::new(
+                packages
+                    .remove(&FragmentId::new(target_count as u32 + 1))
+                    .unwrap(),
+            );
+            let validated =
+                validate_fragment_providers(package, &providers, &FixtureControl).unwrap();
+            Arc::new(
+                compile_fragment(
+                    validated,
+                    &catalog,
+                    LocalCompileOptions {
+                        pipeline_dop: NonZeroUsize::new(1).unwrap(),
+                        root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
+                        kernel_abi: KernelAbiVersion::CURRENT,
+                        constants: constants(),
+                        exchange_wait: Duration::from_secs(120),
+                    },
+                    &FixtureControl,
+                )
+                .expect("actual local compiler accepts frozen any_value writer statistics"),
+            )
+        }
     }
 }

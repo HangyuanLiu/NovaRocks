@@ -193,7 +193,7 @@ impl ExecutionRuntime {
 
 #[cfg(test)]
 pub(crate) fn test_execution_function_set() -> Arc<SealedExecutionFunctionSet> {
-    crate::exec::expr::agg::test_builtin_execution_function_set()
+    crate::runtime::function_set::test_builtin_execution_function_set()
 }
 
 #[cfg(test)]

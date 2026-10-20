@@ -21,7 +21,6 @@ use futures::Stream;
 use futures::future::BoxFuture;
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::ExprId;
 use crate::runtime::profile::RuntimeProfile;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 
@@ -159,21 +158,6 @@ pub trait ScanSource: Send + Sync {
 
     fn profile_name(&self) -> Option<String> {
         None
-    }
-
-    /// Rebuild this source around the fragment's runtime-filter consumer
-    /// contracts.
-    ///
-    /// The contracts are decoded after the source is lowered, so a source that
-    /// can consult a live filter learns of them here rather than at
-    /// construction. Returning `None` keeps the source exactly as it was built,
-    /// which is what every source that cannot consult a filter does.
-    fn with_runtime_filter_contracts(
-        &self,
-        contracts: &[crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding],
-    ) -> Result<Option<Arc<dyn ScanSource>>, String> {
-        let _ = contracts;
-        Ok(None)
     }
 }
 

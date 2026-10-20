@@ -15,9 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Process function-set composition, independent of expression evaluation.
-// The sealed implementation moves here when the legacy index is retired.
-pub use crate::exec::expr::agg::{
-    ExecutionFunctionSetBuilder, ExecutionFunctionSetError, SealedExecutionFunctionSet,
-    contribute_builtin_aggregate_implementations,
-};
+//! Sealed process function metadata. Compiled execution owns its pure kernels.
+pub use novarocks_functions::FunctionCatalogError as ExecutionFunctionSetError;
+use novarocks_functions::{EngineFunctionCatalog, EngineFunctionCatalogBuilder};
+use std::{fmt, sync::Arc};
+
+pub struct ExecutionFunctionSetBuilder {
+    catalog: EngineFunctionCatalogBuilder,
+}
+impl Default for ExecutionFunctionSetBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl ExecutionFunctionSetBuilder {
+    pub fn new() -> Self {
+        Self {
+            catalog: EngineFunctionCatalogBuilder::new(),
+        }
+    }
+    pub fn catalog_builder_mut(&mut self) -> &mut EngineFunctionCatalogBuilder {
+        &mut self.catalog
+    }
+    pub fn catalog_builder(&self) -> &EngineFunctionCatalogBuilder {
+        &self.catalog
+    }
+    pub fn seal(self) -> Result<SealedExecutionFunctionSet, ExecutionFunctionSetError> {
+        Ok(SealedExecutionFunctionSet {
+            catalog: Arc::new(self.catalog.seal()?),
+        })
+    }
+}
+
+pub struct SealedExecutionFunctionSet {
+    catalog: Arc<EngineFunctionCatalog>,
+}
+impl fmt::Debug for SealedExecutionFunctionSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedExecutionFunctionSet")
+            .field("catalog_digest", &self.catalog.digest())
+            .finish()
+    }
+}
+impl SealedExecutionFunctionSet {
+    pub fn catalog(&self) -> &Arc<EngineFunctionCatalog> {
+        &self.catalog
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_builtin_execution_function_set() -> Arc<SealedExecutionFunctionSet> {
+    let mut builder = ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .expect("builtin function metadata");
+    Arc::new(builder.seal().expect("builtin function metadata seal"))
+}

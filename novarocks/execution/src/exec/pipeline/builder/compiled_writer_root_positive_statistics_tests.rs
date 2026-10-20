@@ -18,12 +18,11 @@
 #[test]
 fn root_positive_source_structural_compiled_statistics_canonical_owner() {
     for rows in [vec![], vec![(1, Some("a")), (2, None), (1, Some("a"))]] {
-        let outcome = differential(0, &[rows], |_| true);
+        let outcome = statistics_run(0, &[rows], |_| true);
         let compiled = outcome
             .compiled_root
             .expect("actual compiled finish publishes");
-        let original = outcome.v1_root.expect("actual original finish publishes");
-        assert_same_rows(&compiled, &original);
+        assert_same_rows(&compiled, &outcome.expected_root);
         assert!(!compiled.is_empty());
         for chunk in compiled {
             // Actual preparation owns the canonical schema independently of

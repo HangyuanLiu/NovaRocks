@@ -47,19 +47,7 @@ mod key_failure;
 mod operation_failure;
 pub(crate) use key_failure::SortKeyFailure;
 
-mod chunks_sorter_heap_sort;
-mod chunks_sorter_topn;
 pub(super) mod creation;
-mod sort_processor;
-
-/// Shared sorter abstraction for sort/topn operator implementations.
-pub(crate) trait ChunksSorter: Send + Sync {
-    fn sort_chunks(
-        &self,
-        chunks: &[Chunk],
-        creation: &creation::SortCreation<'_>,
-    ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>>;
-}
 
 #[cfg(test)]
 fn sort_field_from_array(field: &Field, array: &ArrayRef) -> Field {
@@ -552,10 +540,6 @@ pub(crate) fn append_stable_row_index_sort_column_observed(
     Ok(())
 }
 
-pub(crate) use chunks_sorter_heap_sort::ChunksSorterHeapSort;
-pub(crate) use chunks_sorter_topn::{ChunksSorterPartitionTopN, ChunksSorterTopN};
-pub use sort_processor::SortProcessorFactory;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,6 +876,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-mod typed_sort_owner_tests;

@@ -242,7 +242,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::exec::chunk::Chunk;
-    use crate::exec::expr::ExprArena;
     use crate::exec::operators::local_exchanger::LocalExchangePartitionSpec;
     use crate::exec::operators::{LocalExchangeSinkFactory, LocalExchangeSourceFactory};
     use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -269,8 +268,7 @@ mod tests {
     #[test]
     fn local_exchange_forwards_chunks() {
         let rt = RuntimeState::default();
-        let arena = Arc::new(ExprArena::default());
-        let exchanger = LocalExchanger::new_handoff(1, 1, 2, Arc::clone(&arena));
+        let exchanger = LocalExchanger::new_handoff(1, 1, 2);
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
 
@@ -419,7 +417,7 @@ mod tests {
             step_context::{StepContext, TurnWork},
         };
         let rt = RuntimeState::default();
-        let exchanger = LocalExchanger::new_handoff(1, 1, 1, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 1, 1);
         let mut sink = LocalExchangeSinkFactory::new(-1, exchanger.clone()).create(1, 0);
         install_actual_creator(sink.as_mut(), &rt);
         let mut source = LocalExchangeSourceFactory::new(-1, 1, exchanger.clone()).create(1, 0);
@@ -484,7 +482,7 @@ mod tests {
     #[test]
     fn handoff_queue_backpressures_at_its_chunk_bound_and_wakes_on_pop() {
         let rt = RuntimeState::default();
-        let exchanger = LocalExchanger::new_handoff(1, 3, 2, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 3, 2);
         let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
         install_actual_creator(sink.as_mut(), &rt);
         let mut source =
@@ -515,7 +513,7 @@ mod tests {
     #[test]
     fn handoff_consumers_share_one_queue_and_take_each_chunk_once() {
         let rt = RuntimeState::default();
-        let exchanger = LocalExchanger::new_handoff(1, 3, 8, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 3, 8);
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
@@ -551,7 +549,7 @@ mod tests {
     fn racing_handoff_consumers_neither_duplicate_nor_lose_chunks() {
         const CHUNKS: i32 = 2_000;
         let rt = RuntimeState::default();
-        let exchanger = LocalExchanger::new_handoff(1, 3, 2, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 3, 2);
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
@@ -601,14 +599,8 @@ mod tests {
     #[test]
     fn buffered_queue_wakes_on_push_capacity_recovery_and_last_producer_eos() {
         let rt = RuntimeState::default();
-        let exchanger = LocalExchanger::new_with_limits(
-            1,
-            2,
-            LocalExchangePartitionSpec::Single,
-            Arc::new(ExprArena::default()),
-            1,
-            -1,
-        );
+        let exchanger =
+            LocalExchanger::new_with_limits(1, 2, LocalExchangePartitionSpec::Single, 1, -1);
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let mut first = sink_factory.create(2, 0);
         install_actual_creator(first.as_mut(), &rt);
@@ -664,18 +656,10 @@ mod tests {
     fn cancelling_the_last_consumer_releases_queue_owners_in_both_capacity_policies() {
         for handoff in [false, true] {
             let rt = RuntimeState::default();
-            let arena = Arc::new(ExprArena::default());
             let exchanger = if handoff {
-                LocalExchanger::new_handoff(1, 1, 1, arena)
+                LocalExchanger::new_handoff(1, 1, 1)
             } else {
-                LocalExchanger::new_with_limits(
-                    1,
-                    1,
-                    LocalExchangePartitionSpec::Single,
-                    arena,
-                    1,
-                    -1,
-                )
+                LocalExchanger::new_with_limits(1, 1, LocalExchangePartitionSpec::Single, 1, -1)
             };
             let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
             install_actual_creator(sink.as_mut(), &rt);
@@ -731,7 +715,7 @@ mod tests {
     #[test]
     fn partial_consumer_close_keeps_the_shared_queue_for_the_others() {
         let rt = RuntimeState::default();
-        let exchanger = LocalExchanger::new_handoff(1, 2, 8, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 2, 8);
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
@@ -755,7 +739,7 @@ mod tests {
     #[test]
     fn last_consumer_close_finishes_producers_and_drops_the_queue() {
         let rt = RuntimeState::default();
-        let exchanger = LocalExchanger::new_handoff(1, 2, 8, Arc::new(ExprArena::default()));
+        let exchanger = LocalExchanger::new_handoff(1, 2, 8);
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let mut sink = sink_factory.create(1, 0);
@@ -820,9 +804,7 @@ mod tests {
         use std::time::Duration;
 
         let state = Arc::new(RuntimeState::default());
-        let arena = Arc::new(ExprArena::default());
-        let exchanger =
-            LocalExchanger::new(1, 1, LocalExchangePartitionSpec::Single, Arc::clone(&arena));
+        let exchanger = LocalExchanger::new(1, 1, LocalExchangePartitionSpec::Single);
         let sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let local_source = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let schema = chunk_of(&[1]).chunk_schema_ref();
@@ -961,7 +943,6 @@ mod tests {
             2,
             1,
             LocalExchangePartitionSpec::InputSlotIds(vec![SlotId::new(1)]),
-            Arc::new(ExprArena::default()),
             1024 * 1024,
             1,
         );

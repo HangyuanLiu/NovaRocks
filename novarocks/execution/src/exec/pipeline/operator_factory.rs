@@ -48,13 +48,6 @@ pub trait OperatorFactory: Send + Sync {
 
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator>;
 
-    #[cfg(test)]
-    fn native_aggregate_topn_producers(
-        &self,
-    ) -> &[crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding] {
-        &[]
-    }
-
     fn is_source(&self) -> bool {
         false
     }

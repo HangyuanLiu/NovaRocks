@@ -73,24 +73,20 @@ use crate::scan_io::ScanIoServices;
 use crate::static_plan::ServerStaticPlan;
 use novarocks_execution::runtime::function_set::{
     ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
-    contribute_builtin_aggregate_implementations,
 };
 
-/// Seals the one process-wide engine function set: builtin metadata, builtin
-/// aggregate implementations and the Iceberg function bundle.
+/// Seals the process metadata and its installed pure owners from the builtin
+/// declarations and the original Iceberg function bundle.
 pub fn compose_process_function_set() -> anyhow::Result<std::sync::Arc<SealedExecutionFunctionSet>>
 {
     let mut builder = ExecutionFunctionSetBuilder::new();
     novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
         .map_err(|error| anyhow!("contribute builtin function metadata: {error}"))?;
-    contribute_builtin_aggregate_implementations(&mut builder)
-        .map_err(|error| anyhow!("contribute builtin aggregate implementations: {error}"))?;
-    builder
-        .register_typed_aggregate(
-            novarocks_connector_iceberg_functions::iceberg_theta_registration()
-                .map_err(|error| anyhow!("build Iceberg function bundle: {error}"))?,
-        )
-        .map_err(|error| anyhow!("contribute Iceberg function bundle: {error}"))?;
+    novarocks_functions::FunctionBundleContributor::contribute(
+        &novarocks_connector_iceberg_functions::IcebergFunctionBundle,
+        builder.catalog_builder_mut(),
+    )
+    .map_err(|error| anyhow!("contribute Iceberg function metadata: {error}"))?;
     Ok(std::sync::Arc::new(builder.seal().map_err(|error| {
         anyhow!("seal process engine function set: {error}")
     })?))

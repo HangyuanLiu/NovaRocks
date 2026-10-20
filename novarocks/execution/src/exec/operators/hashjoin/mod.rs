@@ -24,32 +24,20 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-mod broadcast_join_probe_processor;
 pub(crate) mod broadcast_join_shared;
 mod build_artifact;
 mod build_requirements;
 pub(crate) mod build_state;
 pub(crate) mod compiled_hash_join;
-mod hash_join_build_sink;
-mod hash_join_probe_core;
 mod join_hash_map;
 mod join_hash_table;
-pub(crate) mod join_probe_utils;
 pub(crate) mod native_runtime_filter;
-mod partitioned_join_probe_processor;
-pub(crate) mod partitioned_join_shared;
 
-// Re-export all public types
-pub use broadcast_join_probe_processor::BroadcastJoinProbeProcessorFactory;
-pub use hash_join_build_sink::HashJoinBuildSinkFactory;
-pub use partitioned_join_probe_processor::PartitionedJoinProbeProcessorFactory;
-
-#[cfg(test)]
-pub(crate) use join_hash_map::gather::gather_probe_build_batches_typed;
 pub(crate) use join_hash_map::gather::{
     JoinGatherError, TypedJoinBatch, filter_probe_typed, gather_join_batch_typed,
     gather_left_with_null_right_typed,
 };
-
 #[cfg(test)]
-mod probe_step_test_support;
+pub(crate) use join_hash_map::gather::{
+    MAX_JOIN_OUTPUT_ROWS_PER_BATCH, gather_probe_build_batches_typed,
+};

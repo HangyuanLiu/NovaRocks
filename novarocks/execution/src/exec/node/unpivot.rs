@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::expr::ExprId;
+use novarocks_local_program::ProgramExprId;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
@@ -33,7 +32,10 @@ pub struct UnpivotValueMapping {
 
 #[derive(Clone, Debug)]
 pub enum UnpivotConstant {
-    Scalar { expr_id: ExprId, nullable: bool },
+    Scalar {
+        expr_id: ProgramExprId,
+        nullable: bool,
+    },
     Int32List(Vec<i32>),
     Utf8Map(Vec<(String, String)>),
 }

@@ -14,8 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::expr::ExprId;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NestedLoopJoinType {

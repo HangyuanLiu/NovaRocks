@@ -183,6 +183,7 @@ impl crate::exec::expr::ExprEvaluationControl for RuntimeKernelControl {
         self.wait_execution(duration)
     }
 }
+
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {
         if self.error.is_stopped() {
@@ -936,6 +937,30 @@ impl OperatorFactory for CompiledFilterProcessorFactory {
         }))
     }
 }
+#[derive(Debug)]
+struct CompiledFilterArrowFailure(arrow::error::ArrowError);
+
+impl std::fmt::Display for CompiledFilterArrowFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "filter kernel: {}", self.0)
+    }
+}
+
+impl std::error::Error for CompiledFilterArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for CompiledFilterArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::FilterArrow.reason(),
+        )
+    }
+}
+
 struct CompiledFilterProcessor {
     name: String,
     body: CompiledFilterBody,
@@ -975,9 +1000,8 @@ impl crate::exec::pipeline::shape::TransformKernel for CompiledFilterProcessor {
             .body
             .evaluate(CompiledInputLoan::from_chunk(&chunk), &self.control)?;
         let mask = crate::exec::chunk::normalize_filter_mask_observed(&truth, || Ok(()))?;
-        let batch = filter_record_batch(chunk.record_batch(), &mask).map_err(|error| {
-            ExecutionFailure::from_domain(super::filter_processor::FilterFailure::Arrow(error))
-        })?;
+        let batch = filter_record_batch(chunk.record_batch(), &mask)
+            .map_err(|error| ExecutionFailure::from_domain(CompiledFilterArrowFailure(error)))?;
         let output = Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref())?;
         Ok(StepResult::new(Some(output), NextStep::NeedInput, rows))
     }

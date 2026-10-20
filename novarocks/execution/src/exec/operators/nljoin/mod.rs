@@ -26,9 +26,7 @@
 
 mod failure;
 mod nljoin_build_sink;
-mod nljoin_probe_processor;
 mod nljoin_shared;
 
 pub use nljoin_build_sink::NlJoinBuildSinkFactory;
-pub use nljoin_probe_processor::NlJoinProbeProcessorFactory;
 pub(crate) use nljoin_shared::NlJoinSharedState;
