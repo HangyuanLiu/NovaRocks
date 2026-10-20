@@ -54,6 +54,8 @@ jobs:
         run: cargo install cargo-nextest --version 0.9.148 --locked
 
       - name: Run admission
+        # Leave time for the always-run material upload after a native timeout.
+        timeout-minutes: 150
         run: tools/ci/admission.sh --output "$RUNNER_TEMP/admission"
 
       - name: Publish admission summary
