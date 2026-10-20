@@ -165,6 +165,7 @@ impl FrontendQueryCompilerError {
             E::ResourceExhausted => {
                 Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
             }
+            E::Source { source } => Self::Source(source.clone()),
             E::Analyze { error } => match error.control_error() {
                 Some(control) => Self::Control(control),
                 None => Self::Analyze(error.clone()),
@@ -1221,6 +1222,66 @@ mod compile_control_tests {
         );
         assert_eq!(service.user_error().unwrap().location(), None);
         assert!(!service.message().contains("provider-local"));
+    }
+
+    #[test]
+    fn actual_constant_limit_keeps_its_source_through_the_completion_session_consumer() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        use novarocks_query_application::execution_error::ExecutionFailureSite;
+        use novarocks_query_application::preparation::FinalPlanCompletionError;
+        let mut policy = novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+        policy.max_rows = 0;
+        let cause = novarocks_functions::ConstantValue::from_i64(
+            Arc::new(Field::new("value", DataType::Int64, false)),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            1,
+            policy,
+            novarocks_type_contract::CompilePhase::Validate,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cause,
+            novarocks_functions::ConstantError::Limit(_)
+        ));
+        let expected = cause.failure_fact();
+        assert_eq!(expected.class(), FailureClass::Resource);
+        assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+        assert_eq!(expected.reason().code(), 2);
+        let compile = SqlCompileError::from(cause);
+        let SqlCompileError::CompilationSource(original) = &compile else {
+            panic!("the constant author must retain its source");
+        };
+        let original = original.clone();
+        let completion = FinalPlanCompletionError::Source {
+            source: original.clone(),
+        };
+        for error in [
+            FrontendQueryCompilerError::from_compile(compile),
+            FrontendQueryCompilerError::from_completion(&completion),
+        ] {
+            assert!(
+                matches!(&error, FrontendQueryCompilerError::Source(source) if source == &original)
+            );
+            let routed = service(error);
+            let input = routed.execution_failure().unwrap();
+            assert_eq!(input.fact(), expected);
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                (input.descriptor().errno, input.descriptor().sqlstate),
+                (1041, "HY000")
+            );
+            assert_eq!(
+                routed.compile_control_error(),
+                Some(CompileControlError::Source(original.clone()))
+            );
+            assert_eq!(
+                routed.user_error().unwrap().phase(),
+                novarocks_user_error::ErrorPhase::Execution
+            );
+            assert_eq!(routed.user_error().unwrap().location(), None);
+        }
     }
 
     #[test]

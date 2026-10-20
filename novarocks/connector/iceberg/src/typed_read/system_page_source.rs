@@ -5345,7 +5345,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let mut request = |_| Ok(());
-            let mut work = |_| Err(expected);
+            let mut work = |_| Err(expected.clone());
             let mut creation = ConnectorReadSchemaCreation::new(
                 ValueTypeStorageLifetime::pure(),
                 &mut request,

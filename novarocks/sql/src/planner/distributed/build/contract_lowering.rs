@@ -12485,7 +12485,7 @@ fn expression_kind_name(kind: &ExprKind) -> &'static str {
 #[derive(Debug)]
 pub(crate) enum ContractLoweringError {
     ComparisonCoercion(novarocks_type_contract::ComparisonCoercionFailure),
-    UnsupportedCapability(&'static str),
+    ConstantSource(novarocks_constant_contract::ConstantError),
     CallRequests(novarocks_physical_plan::CallRequestError),
     Control(CompileControlError),
     AggregateSource(AggregateRequestCaptureError),
@@ -12786,8 +12786,8 @@ impl fmt::Display for ContractLoweringError {
                 formatter,
                 "{context} expected expression type {expected:?}, got {actual:?}"
             ),
-            Self::UnsupportedCapability(detail) => {
-                write!(formatter, "constant admission limit: {detail}")
+            Self::ConstantSource(cause) => {
+                write!(formatter, "constant admission limit: {cause}")
             }
             Self::InvalidLiteral { kind, detail } => {
                 write!(formatter, "invalid {kind} literal: {detail}")
@@ -12838,6 +12838,7 @@ impl std::error::Error for ContractLoweringError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ComparisonCoercion(cause) => Some(cause),
+            Self::ConstantSource(cause) => Some(cause),
             _ => None,
         }
     }
@@ -12847,8 +12848,8 @@ impl From<novarocks_constant_contract::ConstantError> for ContractLoweringError 
     fn from(error: novarocks_constant_contract::ConstantError) -> Self {
         match error {
             novarocks_constant_contract::ConstantError::Control(error) => Self::Control(error),
-            novarocks_constant_contract::ConstantError::Limit(detail) => {
-                Self::UnsupportedCapability(detail)
+            error @ novarocks_constant_contract::ConstantError::Limit(_) => {
+                Self::ConstantSource(error)
             }
             error => Self::InvalidLiteral {
                 kind: "checked constant",
@@ -12887,13 +12888,13 @@ impl From<SqlOperationalProjectionError> for ContractLoweringError {
         match error {
             SqlOperationalProjectionError::Control(cause) => Self::Control(cause),
             SqlOperationalProjectionError::Constant(
-                novarocks_constant_contract::ConstantError::Limit(detail),
+                error @ novarocks_constant_contract::ConstantError::Limit(_),
             )
             | SqlOperationalProjectionError::Reference(
                 novarocks_physical_plan::ConstantReferenceError::Constant(
-                    novarocks_constant_contract::ConstantError::Limit(detail),
+                    error @ novarocks_constant_contract::ConstantError::Limit(_),
                 ),
-            ) => Self::UnsupportedCapability(detail),
+            ) => Self::ConstantSource(error),
             error => Self::InvalidFunctionBinding {
                 detail: format!("scalar operational source: {error}"),
             },
@@ -12962,9 +12963,7 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
             ContractLoweringError::ComparisonCoercion(cause) => {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
             }
-            ContractLoweringError::UnsupportedCapability(detail) => {
-                Self::from(novarocks_constant_contract::ConstantError::Limit(detail))
-            }
+            ContractLoweringError::ConstantSource(cause) => Self::from(cause),
             error => Self::Compilation(error.to_string()),
         }
     }
@@ -18590,7 +18589,11 @@ mod constant_limit_category_tests {
     use super::*;
     use crate::compiler::SqlCompileError;
     use novarocks_constant_contract::ConstantError;
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
     use novarocks_physical_plan::ConstantReferenceError;
+    use std::{error::Error, num::NonZeroU16};
 
     #[test]
     fn direct_reference_and_operational_constant_limits_keep_their_typed_category() {
@@ -18606,14 +18609,26 @@ mod constant_limit_category_tests {
                 ConstantReferenceError::Constant(ConstantError::Limit("row limit")),
             )),
         ];
+        let expected = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::CONSTANT, NonZeroU16::new(2).unwrap()),
+        );
         for source in sources {
-            assert!(matches!(
-                source,
-                ContractLoweringError::UnsupportedCapability("row limit")
-            ));
+            let original = ConstantError::Limit("row limit");
             assert!(
-                matches!(SqlCompileError::from(source), SqlCompileError::UnsupportedCapability(message) if message == "constant admission limit: row limit")
+                matches!(&source, ContractLoweringError::ConstantSource(cause) if cause == &original)
             );
+            assert_eq!(
+                source.source().unwrap().downcast_ref::<ConstantError>(),
+                Some(&original)
+            );
+            let compiled = SqlCompileError::from(source);
+            let cause = compiled
+                .source_failure()
+                .expect("original constant domain source");
+            assert_eq!(cause.downcast_ref::<ConstantError>(), Some(&original));
+            assert_eq!(cause.failure_fact(), expected);
+            assert!(matches!(compiled, SqlCompileError::CompilationSource(_)));
         }
         for cause in [
             CompileControlError::Cancelled,
@@ -18621,9 +18636,24 @@ mod constant_limit_category_tests {
             CompileControlError::ResourceExhausted,
         ] {
             let source = ContractLoweringError::from(ConstantReferenceError::Constant(
-                ConstantError::Control(cause),
+                ConstantError::Control(cause.clone()),
             ));
             assert_eq!(SqlCompileError::from(source), SqlCompileError::from(cause));
+        }
+    }
+
+    #[test]
+    fn constant_limit_diagnostic_text_does_not_author_a_constant_source() {
+        for source in [
+            ContractLoweringError::from(ConstantError::Invalid("row limit")),
+            ContractLoweringError::from(SqlOperationalProjectionError::from(
+                ConstantError::Invalid("row limit"),
+            )),
+        ] {
+            assert!(matches!(
+                SqlCompileError::from(source),
+                SqlCompileError::Compilation(_)
+            ));
         }
     }
 }

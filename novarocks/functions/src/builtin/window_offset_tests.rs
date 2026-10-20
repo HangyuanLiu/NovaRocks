@@ -1936,7 +1936,7 @@ fn lead_lag_static_admission_keeps_every_original_control_refusal() {
         ] {
             let control = CompileControl {
                 trace: Mutex::default(),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(matches!(admit_offset_profile(&fixture,&control),
                 Err(FunctionBindingError::Control(actual)) if actual == cause));

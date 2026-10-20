@@ -66,6 +66,8 @@ pub struct FragmentPackageSemantics {
 #[derive(Debug)]
 pub enum PackageSemanticsError {
     Control(CompileControlError),
+    /// The original constant admission owner, without reclassifying its limit.
+    ConstantSource(novarocks_functions::ConstantError),
     Occurrence(String),
     Journal(String),
     Effects(String),
@@ -80,6 +82,7 @@ impl fmt::Display for PackageSemanticsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(cause) => cause.fmt(f),
+            Self::ConstantSource(cause) => write!(f, "constant admission limit: {cause}"),
             Self::Occurrence(detail) => write!(f, "package expression occurrences: {detail}"),
             Self::Journal(detail) => write!(f, "package call source: {detail}"),
             Self::Effects(detail) => write!(f, "package call effects: {detail}"),
@@ -97,6 +100,7 @@ impl std::error::Error for PackageSemanticsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Control(cause) => Some(cause),
+            Self::ConstantSource(cause) => Some(cause),
             _ => None,
         }
     }
@@ -108,6 +112,7 @@ impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
         };
         let (class, code) = match self {
             Self::Control(cause) => return cause.failure_fact(),
+            Self::ConstantSource(cause) => return cause.failure_fact(),
             Self::Occurrence(_) => (FailureClass::Invariant, 7),
             Self::Journal(_) => (FailureClass::Invariant, 8),
             Self::Effects(_) => (FailureClass::Invariant, 9),
@@ -145,7 +150,9 @@ impl From<SqlSourceJournalError> for PackageSemanticsError {
 }
 /// Only the typed constant owner can identify structural constant limits.
 /// Similar diagnostic text from invalid sources or real control never qualifies.
-fn constant_limit_from_effects(error: &PhysicalFragmentEffectsError) -> Option<&'static str> {
+fn constant_limit_from_effects(
+    error: PhysicalFragmentEffectsError,
+) -> Result<novarocks_functions::ConstantError, PhysicalFragmentEffectsError> {
     use super::physical_aggregate_requests::PhysicalAggregateRequestError as A;
     use super::physical_expression_effects::PhysicalExpressionEffectsError as E;
     use super::physical_scalar_requests::PhysicalScalarRequestError as S;
@@ -153,23 +160,42 @@ fn constant_limit_from_effects(error: &PhysicalFragmentEffectsError) -> Option<&
     use super::physical_window_requests::PhysicalWindowRequestError as W;
     use super::physical_writer_requests::PhysicalWriterRequestError as R;
     match error {
-        PhysicalFragmentEffectsError::Expressions(E::Argument(argument))
-        | PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument)))
-        | PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument)))
-        | PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument))
-        | PhysicalFragmentEffectsError::TableRequest(T::Argument(argument))
-        | PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument))) => {
-            argument.constant_limit()
+        PhysicalFragmentEffectsError::Expressions(E::Argument(argument)) => argument
+            .into_constant_limit()
+            .map_err(|argument| PhysicalFragmentEffectsError::Expressions(E::Argument(argument))),
+        PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument))) => {
+            argument.into_constant_limit().map_err(|argument| {
+                PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument)))
+            })
         }
-        _ => None,
+        PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument))) => {
+            argument.into_constant_limit().map_err(|argument| {
+                PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument)))
+            })
+        }
+        PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument)) => {
+            argument.into_constant_limit().map_err(|argument| {
+                PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument))
+            })
+        }
+        PhysicalFragmentEffectsError::TableRequest(T::Argument(argument)) => argument
+            .into_constant_limit()
+            .map_err(|argument| PhysicalFragmentEffectsError::TableRequest(T::Argument(argument))),
+        PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument))) => {
+            argument.into_constant_limit().map_err(|argument| {
+                PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument)))
+            })
+        }
+        other => Err(other),
     }
 }
 
 impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
     fn from(error: PhysicalFragmentEffectsError) -> Self {
-        if let Some(detail) = constant_limit_from_effects(&error) {
-            return Self::UnsupportedCapability(format!("constant admission limit: {detail}"));
-        }
+        let error = match constant_limit_from_effects(error) {
+            Ok(cause) => return Self::ConstantSource(cause),
+            Err(error) => error,
+        };
         match error {
             PhysicalFragmentEffectsError::Control(cause) => Self::Control(cause),
             error @ PhysicalFragmentEffectsError::Expressions(
@@ -444,43 +470,82 @@ mod constant_limit_projection_tests {
     use super::super::physical_window_requests::PhysicalWindowRequestError as W;
     use super::super::physical_writer_requests::PhysicalWriterRequestError as R;
     use super::*;
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
     use novarocks_functions::ConstantError;
+    use std::{error::Error, num::NonZeroU16};
 
-    fn argument() -> PhysicalArgumentError {
-        PhysicalArgumentError::from(ConstantError::Limit("rows exceed policy"))
+    fn argument(reference: bool) -> PhysicalArgumentError {
+        let original = ConstantError::Limit("rows exceed policy");
+        if reference {
+            PhysicalArgumentError::from(novarocks_physical_plan::ConstantReferenceError::Constant(
+                original,
+            ))
+        } else {
+            PhysicalArgumentError::from(original)
+        }
     }
 
     #[test]
     fn typed_limits_survive_all_physical_call_argument_wrappers() {
         use PhysicalExpressionEffectsError as E;
-        let errors = [
-            PhysicalFragmentEffectsError::Expressions(E::Argument(argument())),
-            PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument()))),
-            PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument()))),
-            PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument())),
-            PhysicalFragmentEffectsError::TableRequest(T::Argument(argument())),
-            PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument()))),
-        ];
-        for error in errors {
-            assert!(
-                matches!(PackageSemanticsError::from(error), PackageSemanticsError::UnsupportedCapability(detail) if detail == "constant admission limit: rows exceed policy")
-            );
+        let expected = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::CONSTANT, NonZeroU16::new(2).unwrap()),
+        );
+        for reference in [false, true] {
+            let errors = [
+                PhysicalFragmentEffectsError::Expressions(E::Argument(argument(reference))),
+                PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument(
+                    reference,
+                )))),
+                PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument(
+                    reference,
+                )))),
+                PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument(reference))),
+                PhysicalFragmentEffectsError::TableRequest(T::Argument(argument(reference))),
+                PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument(
+                    reference,
+                )))),
+            ];
+            for error in errors {
+                let error = PackageSemanticsError::from(error);
+                let original = ConstantError::Limit("rows exceed policy");
+                assert!(
+                    matches!(&error, PackageSemanticsError::ConstantSource(cause) if cause == &original)
+                );
+                assert_eq!(
+                    error.source().unwrap().downcast_ref::<ConstantError>(),
+                    Some(&original)
+                );
+                assert_eq!(error.failure_fact(), expected);
+            }
         }
-        let error = PhysicalFragmentEffectsError::Expressions(E::Argument(
+        for argument in [
             PhysicalArgumentError::from(ConstantError::Invalid("rows exceed policy")),
-        ));
-        assert!(matches!(
-            PackageSemanticsError::from(error),
-            PackageSemanticsError::Effects(_)
-        ));
+            PhysicalArgumentError::from(novarocks_physical_plan::ConstantReferenceError::Constant(
+                ConstantError::Invalid("rows exceed policy"),
+            )),
+            PhysicalArgumentError::from(ConstantError::Type(
+                novarocks_type_contract::ValueTypeError::TooDeep,
+            )),
+        ] {
+            let error = PhysicalFragmentEffectsError::Expressions(E::Argument(argument));
+            assert!(matches!(
+                PackageSemanticsError::from(error),
+                PackageSemanticsError::Effects(_)
+            ));
+        }
         for cause in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            assert!(
-                matches!(PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause)), PackageSemanticsError::Control(actual) if actual == cause)
-            );
+            let error =
+                PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause.clone()));
+            assert!(matches!(&error, PackageSemanticsError::Control(actual) if actual == &cause));
+            assert_eq!(error.failure_fact(), cause.failure_fact());
         }
     }
 }

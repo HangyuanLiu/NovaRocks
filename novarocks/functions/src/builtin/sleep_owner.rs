@@ -733,7 +733,7 @@ mod tests {
     struct FailCompile(CompileControlError);
     impl PureCompileControl for FailCompile {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
     #[test]
@@ -753,7 +753,7 @@ mod tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = FailCompile(cause);
+            let control = FailCompile(cause.clone());
             assert!(matches!(owner.resolve(request(&arguments), &control),
                 Err(FunctionBindingError::Control(actual)) if actual == cause));
             assert!(matches!(owner.validate_and_refine(exact, &control),

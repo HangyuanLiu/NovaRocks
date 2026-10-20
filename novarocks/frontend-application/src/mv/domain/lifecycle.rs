@@ -208,6 +208,7 @@ impl RefreshError {
             kind: RefreshErrorKind::UserError,
             message: cause.to_string(),
             compile_control: Some(cause),
+            unavailable_implementation: None,
         }
     }
 

@@ -1135,9 +1135,11 @@ pub fn copy_nested_values_construction<H>(
             .request_layout(layout)
             .map_err(CopyConstructionError::Creator)?;
         let mut values = Vec::new();
-        values
-            .try_reserve_exact(count)
-            .map_err(|_| CopyError::Control(crate::KernelFailure::ResourceExhausted))?;
+        values.try_reserve_exact(count).map_err(|source| {
+            CopyError::Control(crate::KernelFailure::from_domain(
+                crate::allocation_failure::AllocationRefusal::new("nested Values scratch", source),
+            ))
+        })?;
         work.flush().map_err(CopyError::Control)?;
         Ok(values)
     }

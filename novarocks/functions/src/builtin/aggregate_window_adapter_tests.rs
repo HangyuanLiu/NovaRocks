@@ -976,7 +976,7 @@ fn extrema_static_window_refusal_preserves_all_original_control_causes() {
         ] {
             let control = CompileControl {
                 trace: Mutex::default(),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(admit_extrema_profile(&fixture,PureCallLifecycle::AggregateWindow,&control),

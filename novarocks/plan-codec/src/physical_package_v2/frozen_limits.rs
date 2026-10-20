@@ -757,7 +757,7 @@ mod tests {
         impl PureCompileControl for Refuse {
             fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
-                    Err(self.cause)
+                    Err(self.cause.clone())
                 } else {
                     Ok(())
                 }
@@ -772,7 +772,7 @@ mod tests {
             ] {
                 let control = Refuse {
                     calls: AtomicUsize::new(0),
-                    cause,
+                    cause: cause.clone(),
                 };
                 let result = if recursive {
                     recursive_reader_model(

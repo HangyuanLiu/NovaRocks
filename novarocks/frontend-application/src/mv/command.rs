@@ -1173,18 +1173,18 @@ mod refresh_refusal_projection_tests {
             CompileControlError::ResourceExhausted,
         ] {
             for compile in [
-                SqlCompileError::from(control),
-                SqlCompileError::Analyze(AnalyzeError::control(control)),
+                SqlCompileError::from(control.clone()),
+                SqlCompileError::Analyze(AnalyzeError::control(control.clone())),
             ] {
                 let refresh = RefreshError::from(compile.clone());
                 assert!(refresh.kind.should_rollback_after_commit());
-                assert_eq!(refresh.compile_control_error(), Some(control));
+                assert_eq!(refresh.compile_control_error(), Some(control.clone()));
                 assert_eq!(refresh.unavailable_implementation(), None);
                 let failure = prepare_failure(compile);
-                assert_eq!(failure.compile_control_error(), Some(control));
+                assert_eq!(failure.compile_control_error(), Some(control.clone()));
                 assert_eq!(failure.unavailable_implementation(), None);
                 let user = mv_command_error(mv_compile_error(failure));
-                assert_eq!(user.compile_control_error(), Some(control));
+                assert_eq!(user.compile_control_error(), Some(control.clone()));
                 assert_eq!(user.to_string(), control.to_string());
                 assert_eq!(
                     user.kind(),
@@ -1198,10 +1198,10 @@ mod refresh_refusal_projection_tests {
             let missing = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
                 FunctionOverloadId::try_new("fixture/mv/controlled/missing-pure-v1").unwrap(),
             ));
-            let failure = prepare_failure(missing).with_compile_control(Some(control));
+            let failure = prepare_failure(missing).with_compile_control(Some(control.clone()));
             assert!(failure.unavailable_implementation().is_some());
             let user = mv_command_error(mv_compile_error(failure));
-            assert_eq!(user.compile_control_error(), Some(control));
+            assert_eq!(user.compile_control_error(), Some(control.clone()));
             assert_eq!(user.to_string(), control.to_string());
         }
     }

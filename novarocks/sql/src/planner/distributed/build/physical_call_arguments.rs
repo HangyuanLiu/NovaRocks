@@ -62,13 +62,14 @@ impl From<ConstantReferenceError> for PhysicalArgumentError {
 }
 
 impl PhysicalArgumentError {
-    pub(crate) fn constant_limit(&self) -> Option<&'static str> {
+    /// Consume only the exact limit carrier; preserve all other argument errors.
+    pub(crate) fn into_constant_limit(self) -> Result<ConstantError, Self> {
         match self {
-            Self::Constant(ConstantError::Limit(detail))
-            | Self::Reference(ConstantReferenceError::Constant(ConstantError::Limit(detail))) => {
-                Some(*detail)
+            Self::Constant(error @ ConstantError::Limit(_))
+            | Self::Reference(ConstantReferenceError::Constant(error @ ConstantError::Limit(_))) => {
+                Ok(error)
             }
-            _ => None,
+            other => Err(other),
         }
     }
 }
