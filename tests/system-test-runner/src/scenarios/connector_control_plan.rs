@@ -1035,7 +1035,15 @@ mod tests {
     fn declaration_overflow_fails_before_launch_without_expanding_grant_budget() {
         let (_directory, binary) = binary();
         let owner = Owner::default();
-        let too_many = (0..11)
+        let maximum = novarocks_failpoint::session::MAX_GRANTS;
+        let observations_per_statement = Spec::observed("SELECT 1".into(), &[READER, GRPC])
+            .observations
+            .len();
+        let statement_count = (maximum - 1) / observations_per_statement + 1;
+        assert!(statement_count <= 64);
+        let expected_grants = 1 + statement_count * observations_per_statement;
+        assert!(expected_grants > maximum);
+        let too_many = (0..statement_count)
             .map(|_| Spec::observed("SELECT 1".into(), &[READER, GRPC]))
             .collect();
         let error = owner
@@ -1049,8 +1057,13 @@ mod tests {
             )
             .err()
             .unwrap();
-        assert!(error.to_string().contains("67 grants"));
-        assert!(error.to_string().contains("exceeds 64"));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "connector Frontend launch 0 needs {expected_grants} grants, exceeds {maximum}"
+            )
+        );
+        assert!(owner.take(0).is_err());
     }
 
     #[test]

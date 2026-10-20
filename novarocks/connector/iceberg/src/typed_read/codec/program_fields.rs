@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn system_actual_author_keeps_utc_map_key_null_and_json_with_reordered_ids() {
+    fn system_actual_author_keeps_utc_map_key_null_and_rejects_json_with_reordered_ids() {
         let schema = schema(vec![NestedField::required(
             1,
             "id",
@@ -1389,8 +1389,8 @@ mod tests {
                 let at = fields
                     .fields()
                     .iter()
-                    .position(|field| field.name() == "readable_metrics")
-                    .unwrap();
+                    .position(|field| field.name() == "file_path")
+                    .expect("the accepted Files schema has a physical UTF-8 path");
                 let fields = fields.fields().to_vec();
                 let mut logical = fields
                     .iter()
@@ -1401,8 +1401,11 @@ mod tests {
                         )
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(logical[at], ValueLogicalType::Json);
-                logical[at] = ValueLogicalType::Physical;
+                // The accepted public Files schema has no private JSON
+                // metrics column. Its real UTF-8 path must remain physical;
+                // the same carrier cannot authorize an invented JSON domain.
+                assert_eq!(logical[at], ValueLogicalType::Physical);
+                logical[at] = ValueLogicalType::Json;
                 rejected(
                     &relation,
                     &columns,
@@ -1425,14 +1428,38 @@ mod tests {
                 })
                 .collect(),
         );
+        // Bounds are the accepted fixed field-ID/binary MAP, independently
+        // of base-table width. A real partition spec supplies a genuinely wide
+        // metadata ROW without restoring the retired private bounds shape.
+        let mut builder = PartitionSpec::builder(Arc::new(schema.clone())).with_spec_id(0);
+        for id in 1..=320 {
+            builder = builder
+                .add_partition_field(
+                    format!("c{id}"),
+                    format!("p_c{id}"),
+                    crate::iceberg::spec::Transform::Identity,
+                )
+                .unwrap();
+        }
+        let specs = [builder.build().unwrap()];
         let kind = crate::typed_read::IcebergSystemTableType::Files;
-        let fields = crate::typed_read::system_relation_schema(kind, &schema, &[]).unwrap();
-        let columns = crate::typed_read::system_relation_columns(kind, &schema, &[]).unwrap();
+        let fields = crate::typed_read::system_relation_schema(kind, &schema, &specs).unwrap();
+        let columns = crate::typed_read::system_relation_columns(kind, &schema, &specs).unwrap();
         let at = fields
             .fields()
             .iter()
-            .position(|field| field.name() == "lower_bounds")
+            .position(|field| field.name() == "partition")
             .unwrap();
+        let DataType::Struct(children) = fields.fields()[at].data_type() else {
+            panic!("the real identity partition author publishes its ROW");
+        };
+        assert_eq!(children.len(), 320);
+        assert_eq!(columns[at].base_column_identity().children().len(), 320);
+        for (index, field) in children.iter().enumerate() {
+            assert_eq!(field.name(), &format!("p_c{}", index + 1));
+            assert_eq!(field.data_type(), &DataType::Int64);
+            assert!(field.is_nullable());
+        }
         let relation = IcebergRuntimeRelation::SystemTable(
             IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
                 schema_table_name: name(),
@@ -1447,7 +1474,7 @@ mod tests {
         let original = columns[at].clone();
         let columns = std::slice::from_ref(&columns[at]);
         // Mutating both private/public top NULL must still refuse the original
-        // dynamic source author's nullable ROW declaration.
+        // schema/spec author's nullable partition ROW declaration.
         let bad_column = replace_column(&original, original.base_column_identity().clone(), false);
         let bad_public = system_public(
             kind,

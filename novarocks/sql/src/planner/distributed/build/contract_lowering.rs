@@ -7748,7 +7748,13 @@ impl<'a> ContractLoweringVisitor<'a> {
         table_function: &crate::planner::payload::PlanTableFunctionNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let result = self.lower_table_function_inner(plan, table_function);
-        if matches!(&result, Err(ContractLoweringError::Control(_))) {
+        if matches!(
+            &result,
+            Err(ContractLoweringError::Control(_)
+                | ContractLoweringError::ConstantSource(
+                    novarocks_constant_contract::ConstantError::Limit(_)
+                ))
+        ) {
             return result;
         }
         if result.is_err() {
@@ -8243,7 +8249,13 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
         let result = self.lower_window_call_inner(owner, window, visible);
-        if matches!(&result, Err(ContractLoweringError::Control(_))) {
+        if matches!(
+            &result,
+            Err(ContractLoweringError::Control(_)
+                | ContractLoweringError::ConstantSource(
+                    novarocks_constant_contract::ConstantError::Limit(_)
+                ))
+        ) {
             return result;
         }
         if result.is_err() {
@@ -8788,7 +8800,13 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
         let result = self.lower_expression_inner(owner, expression, visible);
-        if matches!(&result, Err(ContractLoweringError::Control(_))) {
+        if matches!(
+            &result,
+            Err(ContractLoweringError::Control(_)
+                | ContractLoweringError::ConstantSource(
+                    novarocks_constant_contract::ConstantError::Limit(_)
+                ))
+        ) {
             return result;
         }
         if result.is_err() {
@@ -12906,6 +12924,11 @@ impl From<LogicalCallArgumentCaptureError> for ContractLoweringError {
     fn from(error: LogicalCallArgumentCaptureError) -> Self {
         match error {
             LogicalCallArgumentCaptureError::Control(cause) => Self::Control(cause),
+            LogicalCallArgumentCaptureError::Binding(
+                novarocks_functions::FunctionBindingError::Constant(
+                    source @ novarocks_constant_contract::ConstantError::Limit(_),
+                ),
+            ) => Self::ConstantSource(source),
             other => Self::LogicalCallSource(other),
         }
     }
@@ -13274,6 +13297,177 @@ mod tests {
                     matches!(result, Err(ContractLoweringError::Control(actual)) if actual == cause)
                 );
                 assert_eq!(*refused.trace.lock().unwrap(), expected[..=at]);
+            }
+        }
+    }
+
+    #[test]
+    fn actual_literal_table_and_window_limits_precede_late_lowering_control() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        use novarocks_functions::{ConstantError, FunctionArgument};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Control {
+            trace: Mutex<Vec<(CompilePhase, u32)>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert!(units <= 256);
+                let mut trace = self.trace.lock().unwrap();
+                let at = trace.len();
+                if let Some((stop, _)) = self.refusal {
+                    assert!(at <= stop, "callback after original refusal");
+                }
+                trace.push((phase, units));
+                match self.refusal.clone() {
+                    Some((stop, cause)) if stop == at => Err(cause),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        let active = crate::compiler::SqlCompileControl::unbounded();
+        let literal = literal_int(7);
+        let list_type = ValueType::new(
+            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int64,
+                true,
+            ))),
+            true,
+        );
+        let resolved = catalog
+            .resolve_table_binding(
+                "unnest",
+                &[FunctionArgument::Value {
+                    value_type: list_type.clone(),
+                    constant: None,
+                }],
+                &active,
+            )
+            .unwrap();
+        let item = column(91, "item", DataType::Int64, true);
+        let table = PlanTableFunctionNode {
+            function_name: "unnest".into(),
+            args: vec![TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                value_type: list_type,
+            }],
+            binding: SqlFunctionBinding::new(
+                resolved,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
+            output_columns: vec![item.clone()],
+            alias: None,
+            is_left_join: false,
+        };
+        let plan = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TableFunction(table.clone()),
+            children: vec![values(vec![], vec![vec![]])],
+            output_columns: vec![item],
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let resolved = catalog
+            .resolve_window_binding(
+                "lag",
+                &[FunctionArgument::Value {
+                    value_type: literal.value_type.clone(),
+                    constant: None,
+                }],
+                &active,
+            )
+            .unwrap();
+        let window = WindowExpr {
+            name: "lag".into(),
+            args: vec![literal.clone()],
+            distinct: false,
+            binding: SqlFunctionBinding::new(
+                resolved,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
+            function_order_by: vec![],
+            aggregate_binding: None,
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            result_type: DataType::Int64,
+            output_name: "previous".into(),
+            output_column_id: ColumnId::new_for_test(92),
+            ignore_nulls: false,
+        };
+        for which in 0..3 {
+            let run = |control: &Control| -> Result<(), ContractLoweringError> {
+                let mut policy = crate::constant::test_constant_policy();
+                policy.max_rows = 0;
+                let mut visitor = ContractLoweringVisitor::new(
+                    version(),
+                    dop(),
+                    None,
+                    catalog.snapshot(),
+                    false,
+                    policy,
+                    control,
+                )?;
+                let owner = visitor.fragment_mut().reserve_node_id()?;
+                match which {
+                    0 => visitor
+                        .lower_expression(owner, &literal, &BTreeMap::new())
+                        .map(|_| ()),
+                    1 => visitor.lower_table_function(&plan, &table).map(|_| ()),
+                    2 => visitor
+                        .lower_window_call(owner, &window, &BTreeMap::new())
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                }
+            };
+            let baseline = Control::default();
+            let original = run(&baseline).unwrap_err();
+            let ContractLoweringError::ConstantSource(source @ ConstantError::Limit(_)) = &original
+            else {
+                panic!("actual lowering path {which} lost its constant source: {original:?}");
+            };
+            let expected_source = source.clone();
+            let expected = source.failure_fact();
+            assert_eq!(expected.class(), FailureClass::Resource);
+            assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+            assert_eq!(expected.reason().code(), 2);
+            let trace = baseline.trace.lock().unwrap().clone();
+            assert!(!trace.is_empty());
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let late = Control {
+                    refusal: Some((trace.len(), cause.clone())),
+                    ..Default::default()
+                };
+                let actual = run(&late).unwrap_err();
+                let ContractLoweringError::ConstantSource(source) = &actual else {
+                    panic!("late control replaced path {which}'s source: {actual:?}");
+                };
+                assert_eq!(source, &expected_source);
+                assert_eq!(source.failure_fact(), expected);
+                assert_eq!(*late.trace.lock().unwrap(), trace);
+                let compile = crate::compiler::SqlCompileError::from(actual);
+                assert_eq!(compile.source_failure().unwrap().failure_fact(), expected);
+                for at in 0..trace.len() {
+                    let earlier = Control {
+                        refusal: Some((at, cause.clone())),
+                        ..Default::default()
+                    };
+                    assert!(
+                        matches!(run(&earlier), Err(ContractLoweringError::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(*earlier.trace.lock().unwrap(), trace[..=at]);
+                }
             }
         }
     }

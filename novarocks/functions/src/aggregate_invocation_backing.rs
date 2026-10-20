@@ -27,7 +27,7 @@ use std::{
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering, fence},
 };
-/// A real host-allocated immutable block. No allocation occurs during Clone.
+/// A real host-allocated block, immutable while shared. Clone never allocates.
 struct SharedBlock<T> {
     references: AtomicUsize,
     allocator: HostAggregateAllocator,
@@ -87,6 +87,25 @@ impl<T> HostShared<T> {
         let result = Self { pointer };
         work.flush()?;
         Ok(result)
+    }
+    /// Borrow the value exclusively when this is the only owning handle.
+    /// This owner has no Weak handles and never publishes its raw pointer.
+    pub(crate) fn get_mut(&mut self) -> Option<&mut T> {
+        // SAFETY: this live handle pins the initialized block while reading
+        // its reference count.
+        if unsafe { self.pointer.as_ref() }
+            .references
+            .load(Ordering::Acquire)
+            != 1
+        {
+            return None;
+        }
+        // SAFETY: &mut self excludes concurrent use of this handle and any
+        // value borrow derived from it. With no Weak handles, a count of one
+        // leaves no other handle that can borrow the value or create a clone.
+        // Acquire observes the Release decrement of any previous last clone
+        // before granting mutation. The returned borrow cannot outlive self.
+        Some(unsafe { &mut (*self.pointer.as_ptr()).value })
     }
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         self.pointer == other.pointer

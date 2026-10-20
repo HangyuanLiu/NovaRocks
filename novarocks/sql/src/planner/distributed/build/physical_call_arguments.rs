@@ -62,6 +62,14 @@ impl From<ConstantReferenceError> for PhysicalArgumentError {
 }
 
 impl PhysicalArgumentError {
+    pub(crate) fn is_constant_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::Constant(ConstantError::Limit(_))
+                | Self::Reference(ConstantReferenceError::Constant(ConstantError::Limit(_)))
+        )
+    }
+
     /// Consume only the exact limit carrier; preserve all other argument errors.
     pub(crate) fn into_constant_limit(self) -> Result<ConstantError, Self> {
         match self {

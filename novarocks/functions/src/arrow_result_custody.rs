@@ -45,13 +45,13 @@ struct OriginalArray {
     data: ArrayData,
 }
 struct OriginalBacking<C> {
-    loan: std::sync::Mutex<Option<OriginalArray>>,
+    loan: Option<OriginalArray>,
     custody: C,
 }
 impl<C> OriginalBacking<C> {
     fn new(original: ArrayRef, data: ArrayData, custody: C) -> Self {
         Self {
-            loan: std::sync::Mutex::new(Some(OriginalArray { original, data })),
+            loan: Some(OriginalArray { original, data }),
             custody,
         }
     }
@@ -906,20 +906,19 @@ pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + '
 /// ONE original immutable Buffer/ArrayData custody author for output charges
 /// and already-owned source leases. Generic custody never selects value math.
 fn wrap_original_group<C: Send + Sync + 'static>(
-    owner: HostShared<OriginalBacking<C>>,
+    mut owner: HostShared<OriginalBacking<C>>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
-    // No callback runs while this private one-time extraction lock is held.
-    // The local loan is destroyed before the owner parameter on every exit,
+    // Extract the private one-time loan before publishing any owner clones.
+    // No callback or allocation occurs during this exclusive mutation. The
+    // local loan is destroyed before the owner parameter on every exit,
     // including a refusal partway through wrapping or final observation.
-    let loan = {
-        let mut slot = owner
-            .loan
-            .lock()
-            .map_err(|_| invalid("original custody loan is poisoned"))?;
-        slot.take()
-            .ok_or_else(|| invalid("original custody loan was already consumed"))?
-    };
+    let loan = owner
+        .get_mut()
+        .ok_or_else(|| invalid("original custody loan requires its unique construction owner"))?
+        .loan
+        .take()
+        .ok_or_else(|| invalid("original custody loan was already consumed"))?;
     if normalized_primitive_nulls(loan.original.as_ref(), &loan.data).is_some() {
         let original = loan.original.as_ref();
         return arrow_array::downcast_primitive_array!(

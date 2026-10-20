@@ -117,7 +117,14 @@ fn invoke(
 ) -> Result<FunctionArgument, PhysicalArgumentError> {
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
     let result = author_physical_argument_observed(source, pools, policy, PHASE, &mut work);
-    if matches!(&result, Err(PhysicalArgumentError::Control(_))) {
+    if matches!(
+        &result,
+        Err(PhysicalArgumentError::Control(_)
+            | PhysicalArgumentError::Constant(ConstantError::Limit(_))
+            | PhysicalArgumentError::Reference(ConstantReferenceError::Constant(
+                ConstantError::Limit(_)
+            )))
+    ) {
         return result;
     }
     work.finish()?;
@@ -339,6 +346,28 @@ fn physical_call_request_legacy_literal_uses_the_sole_factory_and_preserves_erro
         Err(PhysicalArgumentError::Constant(ConstantError::Limit(_)))
     ));
     assert_eq!(control.trace(), direct_control.trace());
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = Control {
+            refusal: Some((direct_control.trace().len(), cause)),
+            ..Control::good()
+        };
+        let error = invoke(&node, &empty, low, &control).unwrap_err();
+        let PhysicalArgumentError::Constant(source @ ConstantError::Limit(_)) = error else {
+            panic!("the original constant limit must remain primary");
+        };
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        let expected = source.failure_fact();
+        assert_eq!(expected.class(), FailureClass::Resource);
+        assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+        assert_eq!(expected.reason().code(), 2);
+        let compiled = crate::compiler::SqlCompileError::from(source);
+        assert_eq!(compiled.source_failure().unwrap().failure_fact(), expected);
+        assert_eq!(control.trace(), direct_control.trace());
+    }
 }
 
 fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType {

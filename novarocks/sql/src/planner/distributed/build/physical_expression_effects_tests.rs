@@ -1195,3 +1195,81 @@ fn expression_effects_whole_success_prefixes_and_wide_actual_traversal_sampling(
     );
     assert!(trace.contains(&(PHASE, 256)));
 }
+
+#[test]
+fn actual_literal_limit_is_primary_before_the_expression_composer_footer() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    use novarocks_functions::ConstantError;
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let (mut builder, input, owner) = empty();
+    let root = literal(
+        &mut builder,
+        owner,
+        ty(DataType::Int64, false),
+        LiteralValue::Int64(7),
+    );
+    project(&mut builder, input, owner, &[root]);
+    let fragment = finish(builder, owner);
+    let roots = uses(&fragment, &catalog);
+    let pools = ConstantPools::empty();
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let scopes = BTreeMap::new();
+    let run = |control: &Control| {
+        author_physical_expression_effects_observed(
+            PhysicalExpressionEffectsInput {
+                temporal_sources: None,
+                fragment: &fragment,
+                roots: &roots,
+                constants: &pools,
+                parameters: &parameters,
+                literal_policy: ConstantPolicy {
+                    max_rows: 0,
+                    ..policy()
+                },
+                call_scopes: &scopes,
+            },
+            &catalog,
+            control,
+        )
+    };
+    let baseline = Control::default();
+    let original = run(&baseline).unwrap_err();
+    let PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
+        source @ ConstantError::Limit(_),
+    )) = &original
+    else {
+        panic!("the actual literal author must retain its source: {original:?}");
+    };
+    let expected_source = source.clone();
+    let expected = source.failure_fact();
+    assert_eq!(expected.class(), FailureClass::Resource);
+    assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+    assert_eq!(expected.reason().code(), 2);
+    let trace = baseline.trace();
+    assert!(!trace.is_empty());
+    for cause in CAUSES {
+        let late = Control {
+            refusal: Some((trace.len(), cause.clone())),
+            ..Default::default()
+        };
+        let actual = run(&late).unwrap_err();
+        let PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(source)) =
+            actual
+        else {
+            panic!("a later footer must not replace the constant limit");
+        };
+        assert_eq!(source, expected_source);
+        assert_eq!(source.failure_fact(), expected);
+        assert_eq!(late.trace(), trace);
+        for at in 0..trace.len() {
+            let earlier = Control {
+                refusal: Some((at, cause.clone())),
+                ..Default::default()
+            };
+            assert!(
+                matches!(run(&earlier), Err(PhysicalExpressionEffectsError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(earlier.trace(), trace[..=at]);
+        }
+    }
+}
