@@ -5886,12 +5886,19 @@ mod tests {
                 .get(&lp::ProgramExpressionArena::Main)
                 .unwrap();
             let mut uses = main.uses().values().cloned().collect::<Vec<_>>();
-            let mut next_use = uses
-                .iter()
-                .map(|item| item.context.use_id.get())
-                .max()
-                .unwrap()
-                + 1;
+            // Relational calls occupy the same use-ID namespace even though
+            // their contexts are not entries in the scalar occurrence forest.
+            let mut next_use =
+                uses.iter()
+                    .map(|item| item.context.use_id.get())
+                    .chain(
+                        resolved.calls().values().map(|call| {
+                            call.specialization().call_contract().context().use_id.get()
+                        }),
+                    )
+                    .max()
+                    .unwrap()
+                    + 1;
             for (channel, source) in other.mappings.iter().enumerate() {
                 assert_eq!(source.grouping_key, 1);
                 let mut mapping = source.clone();
