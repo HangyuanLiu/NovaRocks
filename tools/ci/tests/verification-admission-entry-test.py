@@ -65,6 +65,7 @@ class Entry(unittest.TestCase):
         self.declarations = [self.scope, self.pending]
         self.native_exit = 0
         self.stage_exit = 0
+        self.extra_files = {}
         self.event = self.root / "event.json"
         put(self.event, {"merge_group": {"head_sha": HEAD, "base_sha": BASE}})
 
@@ -92,8 +93,13 @@ class Entry(unittest.TestCase):
         rows = ["#!/bin/bash", "set -eu", "mkdir -p logs/ci-full/native-fixture/identity logs/ci-full/native-fixture/invocations",
             "printf '%s\\n' " + shlex.quote(json.dumps(source)) + " > logs/ci-full/native-fixture/identity/source-start.json",
             "cp logs/ci-full/native-fixture/identity/source-start.json logs/ci-full/native-fixture/identity/source-end.json",
-            "printf '%s\\n' " + shlex.quote(json.dumps(invocation)) + " > logs/ci-full/native-fixture/invocations/0001-fixture.json",
-            "exit " + str(self.native_exit)]
+            "printf '%s\\n' " + shlex.quote(json.dumps(invocation)) + " > logs/ci-full/native-fixture/invocations/0001-fixture.json"]
+        for name, value in self.extra_files.items():
+            path = "logs/ci-full/native-fixture/" + name
+            text = value if isinstance(value, str) else json.dumps(value)
+            rows += ["mkdir -p " + shlex.quote(str(Path(path).parent)),
+                     "printf '%s\\n' " + shlex.quote(text) + " > " + shlex.quote(path)]
+        rows.append("exit " + str(self.native_exit))
         script.write_text("\n".join(rows) + "\n")
 
     def run_entry(self, environment=None):
@@ -125,12 +131,56 @@ class Entry(unittest.TestCase):
         self.assertFalse(json.loads((self.out / "composition.json").read_text())["layer_ok"])
         self.assertEqual(json.loads((self.attempt / "invocations/0001-fixture.json").read_text())["exit"]["code"], 1)
 
-    def test_native_nonzero_does_not_determine_composed_exit(self):
-        # Independent passing required scopes remain the decision source.
-        # Rust quarantine/member derivation is tested in the composition owner.
+    def test_quarantined_rust_failure_passes_through_real_native_material_reader(self):
+        aggregate = "stage:workspace nextest and doctests"
+        rust = "rust-test:p::bad"
+        doc = "rust-doctest:workspace"
+        identity = dict(IDENTITY, executable_sha256="binary", nextest_profile="default",
+                        nextest_config_sha256="config")
+        self.declarations += [Scope(aggregate, (UnitKey.parse(aggregate),), IDENTITY, "immutable"),
+                              Scope(rust, (UnitKey.parse(rust),), identity, "isolated"),
+                              Scope(doc, (UnitKey.parse(doc),), IDENTITY, "isolated")]
+        declaration = json.loads(self.declaration.read_text())
+        declaration["enabled"]["stage"].append("workspace nextest and doctests")
+        put(self.declaration, declaration)
+        put(self.repo / "tools/ci/baselines/dispositions.json", {"schema": 1, "known_failures": [],
+            "quarantine": [{"unit": rust, "reason": "tracked instability", "owner": "rust-owner",
+                            "exit_condition": "fix and revalidate", "review_by": "2999-01-01"}]})
+        cleanup = {"schema": 1, "registration_closed": True, "complete": True, "ok": True,
+                   "records": [], "errors": []}
+        def confirmed(domain, key, value):
+            return {"schema": 1, "domain": domain, "scopes": {key: {"declared": True,
+                    "inputs_start": value, "inputs_end": value, "inputs_stable": True}}}
+        self.extra_files = {
+            "rust/inputs/prepared.json": {"schema": 1, "profile": "default", "config_sha256": "config"},
+            "rust/inputs/test-artifacts.json": {"schema": 1, "binaries": {"p": {"sha256": "binary"}}},
+            "rust/inputs/selected-tests.json": {"rust-suites": {"p": {"testcases": {
+                "bad": {"filter-match": {"status": "matches"}}}}}},
+            "rust/inputs/tool-config.toml": '[store]\ndir = "/private/materials"\n',
+            "rust/identity/nextest.json": confirmed("nextest", "p::bad", identity),
+            "rust/identity/doctest.json": confirmed("doctest", "workspace", IDENTITY),
+            "rust/rust-run/cleanup-summary.json": cleanup,
+            "rust/doctest-run/cleanup-summary.json": cleanup,
+            "rust/nextest/junit.xml": '<testsuites><testsuite name="p"><testcase name="bad" classname="p"><failure/></testcase></testsuite></testsuites>',
+            "rust/execution-index.json": {"schema": 1, "complete": True, "cancelled": None, "exit_code": 1,
+                "stages": {name: {"started": True, "returncode": 100 if name == "nextest" else 0,
+                                  "errors": []} for name in ("prepare", "error_manifest", "nextest", "doctest", "final_prepare")},
+                "materials": {"inputs": "inputs", "selection": "inputs/selected-tests.json",
+                    "test_bindings": "inputs/test-artifacts.json", "tool_config": "inputs/tool-config.toml",
+                    "junit": {"path": "nextest/junit.xml", "complete": True},
+                    "rust_cleanup": "rust-run/cleanup-summary.json", "doctest_cleanup": "doctest-run/cleanup-summary.json"}},
+            "invocations/0002-batch.json": {"schema": 1, "seq": 2, "kind": "stage",
+                "units": [aggregate], "started_at": "start", "ended_at": "end", "exit": {"code": 1},
+                "inputs_start": IDENTITY, "inputs_end": IDENTITY, "inputs_stable": True,
+                "cleanup": {"summary": "ok"}, "materials": {"execution_index": str(self.attempt / "rust/execution-index.json")}},
+        }
         self.native_exit = 1
         self.assertEqual(self.run_entry(), 0)
-        self.assertEqual(json.loads((self.out / "entry.json").read_text())["native_exit"], 1)
+        scopes = {item["key"]: item for item in json.loads((self.out / "composition.json").read_text())["scopes"]}
+        self.assertEqual(scopes[rust]["verdict"], "excluded")
+        self.assertEqual(scopes[rust]["observations"][0]["result"], "fail")
+        self.assertEqual(scopes[aggregate]["verdict"], "satisfied")
+        self.assertEqual(scopes[aggregate]["native_exit"][0]["code"], 1)
 
     def test_invalid_scope_saves_all_entry_outputs_without_running_native(self):
         put(self.declaration, {"schema": 999})
