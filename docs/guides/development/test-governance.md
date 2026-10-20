@@ -43,7 +43,9 @@ G15 交付集合派生、证据组合和续跑规则；PR 准入入口提供正�
 
 ## PR 准入链路
 
-[Admission 工作流](../../../.github/workflows/admission.yml) 在 `merge_group` 上运行名为 `admission` 的检查；PR 上该 job 跳过并另行运行快速预检，手动运行用于基线与诊断。工作流文件存在不代表规则集已经启用；仓库设置与真实队列验收须另外完成。
+[Admission 工作流](../../../.github/workflows/admission.yml) 在 `merge_group` 上运行名为 `admission` 的检查；PR 上该 job 跳过，独立的 `pr-validation` 在普通 `pull_request` 事件运行完整 cargo-only 链，默认检出 PR 的测试合并 SHA。它与正式 job 通过 YAML anchors 共用工具准备、环境、执行步骤、失败摘要与原始材料上传；PR 材料仍归为 `diagnostic`。`precheck` 继续提供独立快速反馈。PR 的两种检查各有按 PR 编号隔离的并发组，新提交取消各自的过时运行，不取消合并组或 main 手动运行。
+
+`pr-validation` 在合入按钮上方的 Checks 区保留真实的排队、运行、成功、失败或取消状态，不使用 `continue-on-error` 或成功包装。它不加入 required checks，因此其失败本身不阻塞合入；是否要求检查通过由仓库设置决定。为提前获得完整反馈，接受每次 PR 更新额外运行完整 cargo-only 链的成本，见 [ADR-0188](../../adr/ADR-0188-optional-pr-validation-and-formal-admission.md)。手动运行用于基线与诊断；工作流文件存在不代表规则集已经启用，仓库设置与真实队列验收须另外完成。
 
 ```bash
 tools/ci/admission.sh --output /absolute/new/admission-attempt

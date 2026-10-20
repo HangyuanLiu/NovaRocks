@@ -5,6 +5,9 @@ domain: [test-capabilities]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0188
+    scope: "PR-only fast precheck cost decision; formal admission and evidence rules remain active"
 partially-supersedes:
   - id: ADR-0186
     scope: "admission activation, formal provenance and Rust aggregate verdict"

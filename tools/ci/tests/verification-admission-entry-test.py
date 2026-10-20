@@ -208,6 +208,7 @@ class Entry(unittest.TestCase):
         cases = [(self.environment(), "formal-admission"),
                  (self.environment("workflow_dispatch", "refs/heads/main"), "formal-admission"),
                  (self.environment("workflow_dispatch", "refs/heads/topic"), "diagnostic"),
+                 (self.environment("pull_request", "refs/pull/1237/merge"), "diagnostic"),
                  ({}, "local-rehearsal")]
         for env, expected in cases:
             with self.subTest(expected=expected, event=env.get("GITHUB_EVENT_NAME")):

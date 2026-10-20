@@ -855,7 +855,14 @@ the merge-group commit, from the current formal attempt; it does not read the
 impact graph. `tools/ci/baselines/admission-scope.json` declares activation and
 reports pending/enumeration gaps. The Admission workflow supplies the required
 `admission` check once the merge-queue ruleset is separately authorized and enabled;
-local rehearsals do not establish activation. Full verification runs every maintained unit and
+local rehearsals do not establish activation. PRs also run the independent,
+non-required `pr-validation` check on their test merge SHA, reusing the complete
+cargo-only execution steps and material upload. Its evidence remains diagnostic;
+preserve real failure/cancellation status and keep it out of required checks.
+The independent `precheck` remains fast feedback. PR-number concurrency cancels
+only each PR check's superseded runs. See
+[ADR-0188](docs/adr/ADR-0188-optional-pr-validation-and-formal-admission.md).
+Full verification runs every maintained unit and
 required mode in the current attempt and registers failures. G17 owns the formal
 platform, merge gate and scheduling. Local runs, including an admission rehearsal,
 do not establish formal admission. See [layer rules](docs/guides/development/test-governance.md#三层验证与证据组合).

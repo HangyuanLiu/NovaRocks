@@ -31,11 +31,11 @@ jobs:
     if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    env:
+    env: &admission_env
       CARGO_BUILD_JOBS: "4"
       NOVA_CI_CARGO_PROFILE: dev
       NOVA_ADMISSION_RUNNER_LABEL: ubuntu-24.04
-    steps:
+    steps: &admission_steps
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -112,6 +112,18 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
+
+  # Design: ADR-0188 (docs/adr/ADR-0188-optional-pr-validation-and-formal-admission.md)
+  pr_validation:
+    name: pr-validation
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env: *admission_env
+    concurrency:
+      group: pr-validation-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps: *admission_steps
 
   precheck:
     name: precheck

@@ -315,8 +315,22 @@ cannot establish aggregate success. Development's deferred aggregate is unchange
 Internal prepare/error-manifest/final-prepare records supply the registered
 preparation, error manifest and build-info stage observations.
 
-The workflow runs `admission` for merge groups and dispatches, skips it on PRs,
-and runs a separate non-required PR precheck. Required-check/merge-queue settings
+The workflow runs `admission` for merge groups and dispatches and skips that job
+on PRs. On `pull_request`, the independent `pr-validation` check runs the same
+cargo-only entry, pinned tools, environment, summary publication and raw-material
+upload through shared YAML anchors. Default checkout tests the PR merge SHA;
+its evidence is `diagnostic`, even when every enabled scope passes. A separate
+`precheck` supplies fast repository feedback. Each PR check has its own
+PR-number concurrency group that cancels superseded runs without cancelling
+merge-group or main-dispatch admission.
+
+`pr-validation` is intentionally non-required: its real pending, running,
+success, failure or cancelled state appears in the PR Checks box. No job or
+step ignores a failure. Keep it out of required-check settings so its failure
+does not itself block merging. This early feedback costs an additional complete
+cargo-only run per PR update, alongside any later formal admission. See
+[ADR-0188](../../docs/adr/ADR-0188-optional-pr-validation-and-formal-admission.md).
+Required-check/merge-queue settings
 need explicit rollout authorization after a successful formal main baseline.
 Real successful, rejected and repaired/re-enqueued PRs are required activation
 evidence; local validation alone does not mean the gate is active.
