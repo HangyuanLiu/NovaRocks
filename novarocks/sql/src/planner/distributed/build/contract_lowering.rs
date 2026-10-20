@@ -9384,7 +9384,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
         self.work.flush()?;
         let selection = crate::compiler::selected_scalar_call::canonical_scalar_request_observed(
-            self.functions,
+            self.functions.as_ref(),
             binding,
             logical_argument_count,
             arguments,
@@ -10002,7 +10002,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     ) -> Result<ExprId, ContractLoweringError> {
         let source = self.expression_value_type(expression)?;
         let plan = crate::compiler::selected_scalar_call::plan_conversion(
-            self.functions,
+            self.functions.as_ref(),
             &source,
             target,
             policy,
