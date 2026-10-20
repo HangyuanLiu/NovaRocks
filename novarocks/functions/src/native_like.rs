@@ -276,7 +276,7 @@ impl PreparedNativeLikeRecipe {
                     return Err(invalid("LIKE exact Utf8 carrier is absent"));
                 }
                 work.step()?;
-                if let EvaluatedArgument::Constant(value) = arg {
+                if let Some(value) = arg.constant_value() {
                     if value.value_type().logical_type() != expected.logical_type()
                         || (value.value_type().nullable() && !expected.nullable())
                     {

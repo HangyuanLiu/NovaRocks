@@ -31,6 +31,7 @@ pub(super) fn supports_result(ty: &DataType) -> bool {
 
 enum OwnedValue {
     Constant(novarocks_functions::ConstantValue),
+    ConstantView(constant_projection::CanonicalConstant),
     Column(ArrayRef),
     Source(ArrayRef, Arc<input_source::ActualInvocationDomain>),
     Selected(ArrayRef, Box<[RowDataError]>),
@@ -65,6 +66,7 @@ impl OwnedValue {
                 .into_value(selection, work)?
                 .retaining_continuation(owner, work)?,
             Self::Constant(value) => Value::Constant(value),
+            Self::ConstantView(value) => Value::ConstantView(value),
             Self::Column(value) => Value::Column(value),
             Self::Source(array, domain) => {
                 let actual = domain.selection(work.control)?;
@@ -175,6 +177,14 @@ impl OwnedValue {
             Self::Constant(value) => {
                 let owner = input_source::ArrayContinuation::from_constant(&value, allocator);
                 Self::Constant(value).with_continuation(owner.or(previous))
+            }
+            Self::ConstantView(value) => {
+                // The projection's new creator is independent of original CV
+                // purity. Its existing pin already contains that exact CV.
+                let owner = previous.or_else(|| {
+                    input_source::ArrayContinuation::from_constant(&value.original, allocator)
+                });
+                Self::ConstantView(value).with_continuation(owner)
             }
             Self::Selected(array, errors) => {
                 let (array, creator) =
@@ -1714,7 +1724,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         } else {
             match definition.kind() {
                 StaticExprKind::Constant(constant) => {
-                    complete_constant_leaf(constant, result_type, local_selection, work)?
+                    complete_constant_leaf(constant, result_type, local_selection, allocator, work)?
                 }
                 StaticExprKind::SlotId(_) => {
                     let Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
@@ -1891,6 +1901,7 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord +
     for child in children {
         sources.push(match child.value.uncontinued() {
             OwnedValue::Constant(value) => ScalarInvocationSource::Constant(value),
+            OwnedValue::ConstantView(value) => ScalarInvocationSource::ConstantView(value.view()),
             OwnedValue::Source(array, source) => ScalarInvocationSource::Array(
                 EvaluatedSourceLoan::new(array, source.selection(work.control)?),
             ),
@@ -3000,6 +3011,7 @@ fn duplicate_child(child: &Child, work: &mut Work<'_, '_>) -> Result<Child, Kern
     let value = match child.value.uncontinued() {
         OwnedValue::Continued(_, _) => unreachable!("continuation was unwrapped"),
         OwnedValue::Constant(value) => OwnedValue::Constant(value.clone()),
+        OwnedValue::ConstantView(value) => OwnedValue::ConstantView(value.clone()),
         OwnedValue::Column(value) => OwnedValue::Column(Arc::clone(value)),
         OwnedValue::Source(value, domain) => OwnedValue::Source(Arc::clone(value), domain.clone()),
         OwnedValue::Selected(value, source_errors) => {
@@ -3090,17 +3102,71 @@ fn complete_constant_leaf(
     constant: &novarocks_functions::ConstantValue,
     result: &novarocks_functions::FunctionValueType,
     selection: Selection<'_>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_>,
 ) -> Result<OwnedValue, KernelFailure> {
     work.flush()?;
-    validate_evaluated_argument_observed(
-        EvaluatedArgument::Constant(constant),
-        selection,
-        result,
-        work.control,
+    let exact = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+        constant.pool().array().data_type(),
+        result.data_type(),
+        || work.step(),
     )?;
-    Ok(OwnedValue::Constant(constant.clone()))
+    // Only actual array DataType fields can require an execution wrapper.
+    // The original root source Field and its provider annotations are not
+    // array metadata. Composite exact equality ignores spare metadata capacity;
+    // let the existing normalizer prove its zero-construction fast path.
+    let composite = matches!(
+        constant.pool().array().data_type(),
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+    );
+    if exact && !composite {
+        validate_evaluated_argument_observed(
+            EvaluatedArgument::Constant(constant),
+            selection,
+            result,
+            work.control,
+        )?;
+        return Ok(OwnedValue::Constant(constant.clone()));
+    }
+    // Original CV owns semantics and NULL rules; source annotations never
+    // rewrite it. The shared normalizer may change representation only.
+    if !constant
+        .value_type()
+        .fits_physical_binding_observed(result, || work.step())?
+    {
+        return Err(invalid(
+            "constant argument differs from its complete frozen declaration",
+        ));
+    }
+    match constant_projection::project(constant, result, allocator, work)? {
+        Some((projected, creator)) => {
+            validate_evaluated_argument_observed(
+                projected.argument(),
+                selection,
+                result,
+                work.control,
+            )?;
+            Ok(OwnedValue::ConstantView(projected).with_continuation(creator))
+        }
+        None => {
+            validate_evaluated_argument_observed(
+                EvaluatedArgument::Constant(constant),
+                selection,
+                result,
+                work.control,
+            )?;
+            Ok(OwnedValue::Constant(constant.clone()))
+        }
+    }
 }
+
 fn child_context<K>(
     frame: &Frame<K>,
     shape: ControlShape,
@@ -3212,6 +3278,7 @@ mod result_creator_continuation_tests {
     #[test]
     fn fresh_selected_creator_pin_does_not_own_output_array_and_preserves_previous_source_creator()
     {
+        canonical_constant_creator_cases();
         let source_drops = Arc::new(AtomicUsize::new(0));
         let canonical_drops = Arc::new(AtomicUsize::new(0));
         let source_type = declared(&source_drops);
@@ -3282,5 +3349,321 @@ mod result_creator_continuation_tests {
         assert_eq!(source_drops.load(Ordering::SeqCst), 1);
         assert_eq!(canonical_drops.load(Ordering::SeqCst), 1);
         assert_eq!(tracker.current(), 0);
+    }
+    impl novarocks_type_contract::PureCompileControl for Active {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    fn canonical_constant_creator_cases() {
+        canonical_root_source_annotations_need_no_wrapper_host();
+        use arrow::array::{ListArray, NullArray, StructArray};
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow::datatypes::Field;
+        use novarocks_functions::{ConstantPolicy, ConstantPool};
+
+        for (finite, bufferless) in [(false, false), (true, false), (false, true)] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let child = Arc::new(
+                Field::new(
+                    "payload",
+                    if bufferless {
+                        DataType::Null
+                    } else {
+                        DataType::Int32
+                    },
+                    true,
+                )
+                .with_metadata([("provider.fact".into(), "kept".into())].into()),
+            );
+            let raw: ArrayRef = if bufferless {
+                Arc::new(StructArray::new(
+                    vec![child].into(),
+                    vec![Arc::new(NullArray::new(3))],
+                    None,
+                ))
+            } else {
+                Arc::new(ListArray::new(
+                    child,
+                    OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 3, 4])),
+                    Arc::new(Int32Array::from(vec![111, 22, 33, 999])),
+                    None,
+                ))
+            };
+            let pure = FunctionValueType::new(raw.data_type().clone(), false);
+            let ty = if finite {
+                FunctionValueType::try_from_value(
+                    pure.value_type().clone(),
+                    ValueLayout::try_new(
+                        raw.data_type(),
+                        ValueTypeStorageLifetime::held(Arc::new(Creator(drops.clone()))),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            } else {
+                pure
+            };
+            let policy = ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            };
+            let pool = ConstantPool::try_new(
+                Arc::new(Field::new("original", raw.data_type().clone(), false)),
+                ty.clone(),
+                raw.to_data(),
+                policy,
+                novarocks_type_contract::CompilePhase::Validate,
+                &Active,
+            )
+            .unwrap();
+            let original = pool.value(1).unwrap();
+            if !finite && !bufferless {
+                canonical_projection_original_refusal_prefix(&original, &ty);
+            }
+            let tracker =
+                crate::runtime::mem_tracker::MemTracker::new_root("canonical-cv-wrapper-creator");
+            let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+                crate::runtime::tracked_state_allocator::expression_allocation_host(
+                    tracker.clone(),
+                );
+            let observed = ObservedControl {
+                original: &Active,
+                refused: AtomicBool::new(false),
+                operation_aborted: AtomicBool::new(false),
+            };
+            let mut work = Work {
+                control: &observed,
+                pending: 0,
+                scalar_scope: None,
+            };
+            let value =
+                complete_constant_leaf(&original, &ty, Selection::all(1), Some(&host), &mut work)
+                    .unwrap();
+            let created = match value.uncontinued() {
+                OwnedValue::ConstantView(view) => {
+                    assert_eq!(view.original.ordinal(), 1);
+                    assert_eq!(
+                        view.original.pool().backing_identity(),
+                        original.pool().backing_identity()
+                    );
+                    view.created.clone()
+                }
+                _ => panic!("raw annotations require the actual metadata creator"),
+            };
+            let value = value
+                .retaining_result_type(&ty, Some(&host), &Active)
+                .unwrap();
+            let materialized = value
+                .into_value(Selection::all(1), &mut work)
+                .unwrap()
+                .materialize(Selection::all(1), ty.data_type(), &mut work)
+                .unwrap();
+            let output = materialized.values().clone();
+            let alias = if bufferless {
+                None
+            } else {
+                Some(output.to_data().child_data()[0].buffers()[0].clone())
+            };
+            drop((materialized, original, pool, ty, raw, host));
+            assert!(
+                created.upgrade().is_some(),
+                "new creator must survive actual root gather even for a pure original CV"
+            );
+            assert!(tracker.current() > 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            let last = output.clone();
+            drop(output);
+            assert!(created.upgrade().is_some());
+            drop(last);
+            if let Some(alias) = alias {
+                assert!(
+                    created.upgrade().is_some(),
+                    "last child Buffer retains metadata creator"
+                );
+                std::thread::spawn(move || drop(alias)).join().unwrap();
+            }
+            assert!(created.upgrade().is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), usize::from(finite));
+            assert_eq!(tracker.current(), 0);
+            assert_eq!(tracker.allocated(), tracker.deallocated());
+        }
+    }
+
+    fn canonical_projection_original_refusal_prefix(
+        original: &novarocks_functions::ConstantValue,
+        ty: &FunctionValueType,
+    ) {
+        use std::sync::Mutex;
+        struct Probe {
+            checks: Mutex<Vec<u32>>,
+            fail: Option<(usize, KernelFailure)>,
+        }
+        impl KernelEvaluationControl for Probe {
+            fn checkpoint(&self, work: u32) -> Result<(), KernelFailure> {
+                let mut checks = self.checks.lock().unwrap();
+                let at = checks.len();
+                checks.push(work);
+                if let Some((stop, cause)) = &self.fail
+                    && *stop == at
+                {
+                    Err(cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+                panic!("projection cannot wait")
+            }
+        }
+        fn run(
+            original: &novarocks_functions::ConstantValue,
+            ty: &FunctionValueType,
+            host: &Arc<dyn novarocks_functions::AggregateStateAllocator>,
+            probe: &Probe,
+        ) -> Result<OwnedValue, KernelFailure> {
+            let observed = ObservedControl {
+                original: probe,
+                refused: AtomicBool::new(false),
+                operation_aborted: AtomicBool::new(false),
+            };
+            let mut work = Work {
+                control: &observed,
+                pending: 0,
+                scalar_scope: None,
+            };
+            complete_constant_leaf(original, ty, Selection::all(1), Some(host), &mut work)
+        }
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("canonical-cv-prefix");
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
+        let good = Probe {
+            checks: Mutex::new(vec![]),
+            fail: None,
+        };
+        drop(run(original, ty, &host, &good).unwrap());
+        let checks = good.checks.into_inner().unwrap();
+        assert_eq!(tracker.current(), 0);
+        let limited =
+            crate::runtime::mem_tracker::MemTracker::new_root("canonical-cv-actual-capacity");
+        limited.install_limit_once(1).unwrap();
+        let limited_host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            crate::runtime::tracked_state_allocator::expression_allocation_host(limited.clone());
+        let limited_probe = Probe {
+            checks: Mutex::new(vec![]),
+            fail: None,
+        };
+        let capacity = match run(original, ty, &limited_host, &limited_probe) {
+            Err(cause) => cause,
+            Ok(_) => panic!("the real finite host must refuse new metadata stock"),
+        };
+        assert!(matches!(capacity, KernelFailure::Capacity(_)));
+        let limited_checks = limited_probe.checks.into_inner().unwrap();
+        assert_eq!(limited_checks, checks[..limited_checks.len()]);
+        assert_eq!(limited.current(), 0);
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            capacity,
+            KernelFailure::Internal(KernelDiagnostic::new("original projection callback source")),
+        ] {
+            for at in 0..checks.len() {
+                let probe = Probe {
+                    checks: Mutex::new(vec![]),
+                    fail: Some((at, cause.clone())),
+                };
+                let actual = match run(original, ty, &host, &probe) {
+                    Err(cause) => cause,
+                    Ok(_) => panic!("original callback refusal"),
+                };
+                assert_eq!(actual, cause);
+                assert_eq!(probe.checks.into_inner().unwrap(), checks[..=at]);
+                assert_eq!(tracker.current(), 0);
+            }
+        }
+    }
+    fn canonical_root_source_annotations_need_no_wrapper_host() {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Field;
+        struct NoAllocationHost;
+        impl novarocks_functions::AggregateStateAllocator for NoAllocationHost {
+            fn allocate(
+                &self,
+                _: std::alloc::Layout,
+            ) -> Result<std::ptr::NonNull<u8>, KernelFailure> {
+                panic!("canonical array needs no new wrapper or custody allocation")
+            }
+            unsafe fn release(&self, _: std::ptr::NonNull<u8>, _: std::alloc::Layout) {
+                panic!("the source author made no host allocation")
+            }
+        }
+        let array: ArrayRef = Arc::new(StructArray::new(
+            vec![Arc::new(Field::new("payload", DataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(vec![11, 22, 33]))],
+            None,
+        ));
+        let ty = FunctionValueType::new(array.data_type().clone(), false);
+        let field = Arc::new(
+            Field::new("provider-root", array.data_type().clone(), false)
+                .with_metadata([("provider.root".into(), "must stay original".into())].into()),
+        );
+        let policy = novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        };
+        let pool = novarocks_functions::ConstantPool::try_new(
+            field,
+            ty.clone(),
+            array.to_data(),
+            policy,
+            novarocks_type_contract::CompilePhase::Validate,
+            &Active,
+        )
+        .unwrap();
+        let value = pool.value(1).unwrap();
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            Arc::new(NoAllocationHost);
+        let observed = ObservedControl {
+            original: &Active,
+            refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
+        };
+        let mut work = Work {
+            control: &observed,
+            pending: 0,
+            scalar_scope: None,
+        };
+        let actual =
+            complete_constant_leaf(&value, &ty, Selection::all(1), Some(&host), &mut work).unwrap();
+        let OwnedValue::Constant(actual) = actual else {
+            panic!("root annotations are not array metadata")
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert!(Arc::ptr_eq(actual.pool().array(), value.pool().array()));
+        assert_eq!(
+            actual.field().metadata()["provider.root"],
+            "must stay original"
+        );
     }
 }

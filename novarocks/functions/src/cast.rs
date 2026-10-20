@@ -2103,7 +2103,7 @@ impl PreparedCastRecipe {
         work: &mut EvaluationCheckpoints<'_>,
         concrete_shape: impl FnOnce(&dyn Array) -> bool,
     ) -> Result<usize, KernelFailure> {
-        if let EvaluatedArgument::Constant(value) = argument {
+        if let Some(value) = argument.constant_value() {
             let actual = value.value_type();
             let matches = actual.fits_value_type_observed(&self.source, || work.step())?;
             work.step()?;
@@ -2121,6 +2121,7 @@ impl PreparedCastRecipe {
         }
         let shape = match argument {
             EvaluatedArgument::Scalar(array) => array.len() == 1,
+            EvaluatedArgument::ConstantView(value) => value.has_original_shape(),
             EvaluatedArgument::SelectedColumn(values) => {
                 values.selection().row(ordinal) == Some(logical_row)
             }

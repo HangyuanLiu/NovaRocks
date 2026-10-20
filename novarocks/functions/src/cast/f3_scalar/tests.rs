@@ -377,3 +377,193 @@ fn decimal_calendar_reuses_numeric_calendar_grammar() {
         ],
     );
 }
+
+// P05 qualification: exact target limits follow two's-complement integer
+// ranges. These constants are not observations of an evaluator.
+#[test]
+fn p05_decimal_signed_width_endpoints_and_overflow_all_modes() {
+    use novarocks_failure_contract::FailureProjection;
+    for (target, min, max) in [
+        (DataType::Int8, i8::MIN as i128, i8::MAX as i128),
+        (DataType::Int16, i16::MIN as i128, i16::MAX as i128),
+        (DataType::Int32, i32::MIN as i128, i32::MAX as i128),
+        (DataType::Int64, i64::MIN as i128, i64::MAX as i128),
+    ] {
+        let coefficients = vec![Some(min), Some(max), Some(min - 1), Some(max + 1), None];
+        let narrow = Arc::new(
+            Decimal128Array::from(coefficients.clone())
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        ) as ArrayRef;
+        let wide = Arc::new(
+            Decimal256Array::from(
+                coefficients
+                    .iter()
+                    .map(|value| value.map(i256::from_i128))
+                    .collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(76, 0)
+            .unwrap(),
+        ) as ArrayRef;
+        for input in [narrow, wide] {
+            for (policy, allow) in modes() {
+                let r = recipe(input.data_type().clone(), target.clone(), policy, allow);
+                for row in 0..5 {
+                    let actual = r
+                        .evaluate_row(EvaluatedArgument::Column(&input), row, row, &Control)
+                        .unwrap();
+                    match row {
+                        0 => assert_eq!(actual, CastRowResult::Signed(min as i64)),
+                        1 => assert_eq!(actual, CastRowResult::Signed(max as i64)),
+                        2 | 3 if policy == DecimalOverflowPolicy::ReportError => {
+                            let CastRowResult::RowError(error) = actual else {
+                                panic!("finite range overflow is a row error")
+                            };
+                            assert_eq!(error.selected_ordinal(), row);
+                            assert_eq!(
+                                error.failure_fact().reason(),
+                                crate::DataFailureReason::NumericOutOfRange
+                                    .failure_fact()
+                                    .reason()
+                            );
+                        }
+                        _ => assert_eq!(actual, CastRowResult::Null),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn p05_float32_precision_policy_and_date_epoch_extrema_are_independent() {
+    let input = Arc::new(Float32Array::from(vec![
+        Some(12.0),
+        Some(1000.0),
+        Some(f32::NAN),
+        Some(f32::INFINITY),
+        None,
+    ])) as ArrayRef;
+    for (policy, allow) in modes() {
+        let r = recipe(DataType::Float32, DataType::Decimal128(3, 0), policy, allow);
+        assert_eq!(
+            r.evaluate_row(EvaluatedArgument::Column(&input), 0, 0, &Control)
+                .unwrap(),
+            CastRowResult::Decimal128(12)
+        );
+        let overflow = r
+            .evaluate_row(EvaluatedArgument::Column(&input), 1, 1, &Control)
+            .unwrap();
+        if policy == DecimalOverflowPolicy::ReportError {
+            let CastRowResult::RowError(error) = overflow else {
+                panic!("finite decimal precision overflow must report")
+            };
+            assert_eq!(error.selected_ordinal(), 1);
+        } else {
+            assert_eq!(overflow, CastRowResult::Null);
+        }
+        for row in 2..5 {
+            assert_eq!(
+                r.evaluate_row(EvaluatedArgument::Column(&input), row, row, &Control)
+                    .unwrap(),
+                CastRowResult::Null
+            );
+        }
+    }
+    // DATE uses signed epoch days; it is not a yyyyMMdd conversion.
+    let input = Arc::new(Date32Array::from(vec![
+        Some(i32::MIN),
+        Some(i32::MAX),
+        None,
+    ])) as ArrayRef;
+    for target in [DataType::Int32, DataType::Int64] {
+        check(
+            input.clone(),
+            target,
+            &[
+                CastRowResult::Signed(i32::MIN as i64),
+                CastRowResult::Signed(i32::MAX as i64),
+                CastRowResult::Null,
+            ],
+        );
+    }
+}
+
+#[test]
+fn p05_extended_preparation_types_nullability_and_effects_follow_each_semantic_branch() {
+    use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
+    let context = ExpressionEffectContext {
+        use_id: ExpressionUseId::new(1),
+        domain: EvaluationDomainId::new(0),
+        demand: EvaluationDemand::Value,
+    };
+    // A tag specifies the independently stated successful-NULL/error contract,
+    // not a recipe body's private enum or a runtime-computed expected value.
+    for (source, target, contract) in [
+        (DataType::Decimal128(8, 2), DataType::Int16, "numeric"),
+        (DataType::Decimal256(40, 2), DataType::Int16, "numeric"),
+        (DataType::Utf8, DataType::Float64, "text_float"),
+        (DataType::Utf8, DataType::Decimal128(8, 1), "text_decimal"),
+        (
+            DataType::Decimal256(40, 2),
+            DataType::Decimal128(8, 1),
+            "narrow",
+        ),
+        (DataType::Date32, DataType::Int64, "exact"),
+        (
+            DataType::Boolean,
+            DataType::Decimal128(8, 2),
+            "boolean_decimal",
+        ),
+        (DataType::Decimal256(40, 2), DataType::Boolean, "exact"),
+        (
+            DataType::Float32,
+            DataType::Decimal128(8, 1),
+            "float_decimal",
+        ),
+    ] {
+        for (policy, allow) in modes() {
+            let null_possible = match contract {
+                "numeric" | "boolean_decimal" => policy == DecimalOverflowPolicy::OutputNull,
+                "narrow" => policy == DecimalOverflowPolicy::OutputNull && !allow,
+                "exact" => false,
+                _ => true,
+            };
+            let may_raise = match contract {
+                "numeric" => policy == DecimalOverflowPolicy::ReportError,
+                "text_float" | "exact" => false,
+                _ => true,
+            };
+            for source_nullable in [false, true] {
+                for target_nullable in [false, true] {
+                    let from = FunctionValueType::new(source.clone(), source_nullable);
+                    let to = FunctionValueType::new(target.clone(), target_nullable);
+                    let actual = PreparedCastRecipe::try_new(
+                        CastOperation::Carrier,
+                        &from,
+                        &to,
+                        policy,
+                        allow,
+                        &Control,
+                    );
+                    if !target_nullable && (source_nullable || null_possible) {
+                        assert_eq!(actual, Err(CastPrepareError::TypeMismatch));
+                    } else {
+                        let r = actual.unwrap();
+                        assert_eq!(r.source_type(), &from);
+                        assert_eq!(r.result_type(), &to);
+                        assert_eq!(r.policy(), policy);
+                        assert_eq!(r.allow_throw_exception(), allow);
+                        assert_eq!(
+                            r.own_effects(context)
+                                .for_use(context)
+                                .unwrap()
+                                .may_raise_row_error,
+                            may_raise
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

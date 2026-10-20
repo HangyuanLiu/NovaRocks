@@ -256,7 +256,7 @@ fn argument_body_reachable(
         argument.validate_shape_observed::<ReachabilityFailure>(selection, || {
             work.step().map_err(ReachabilityFailure::Control)
         })?;
-        if let EvaluatedArgument::Constant(value) = argument {
+        if let Some(value) = argument.constant_value() {
             work.step().map_err(ReachabilityFailure::Control)?;
             if !value.value_type().fits_value_type_observed(expected, || {
                 work.step().map_err(ReachabilityFailure::Control)

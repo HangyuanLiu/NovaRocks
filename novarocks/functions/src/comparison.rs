@@ -504,7 +504,7 @@ fn checked_row(
     expected: &FunctionValueType,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<usize, KernelFailure> {
-    if let EvaluatedArgument::Constant(value) = argument {
+    if let Some(value) = argument.constant_value() {
         let ty = value.value_type();
         if ty.logical_type() != expected.logical_type() || (ty.nullable() && !expected.nullable()) {
             return Err(invalid(
@@ -520,6 +520,11 @@ fn checked_row(
     match argument {
         EvaluatedArgument::Scalar(array) if array.len() != 1 => {
             return Err(invalid("comparison scalar has invalid cardinality"));
+        }
+        EvaluatedArgument::ConstantView(value) if !value.has_original_shape() => {
+            return Err(invalid(
+                "comparison canonical constant has a foreign scalar address",
+            ));
         }
         EvaluatedArgument::SelectedColumn(values)
             if values.selection().row(ordinal) != Some(batch_row) =>

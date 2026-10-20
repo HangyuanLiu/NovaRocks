@@ -107,7 +107,7 @@ pub fn validate_argument_observed(
     let mut work = EvaluationCheckpoints::new(control);
     let result = (|| {
         argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
-        if let EvaluatedArgument::Constant(value) = argument {
+        if let Some(value) = argument.constant_value() {
             work.step()?;
             if !value
                 .value_type()

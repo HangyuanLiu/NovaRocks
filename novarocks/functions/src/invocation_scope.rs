@@ -121,6 +121,8 @@ pub enum ScalarInvocationSource<'a> {
     Array(EvaluatedSourceLoan<'a>),
     /// Only this checked ordinal participates, irrespective of pool row count.
     Constant(&'a ConstantValue),
+    /// Canonical same-shape representation of the same original checked CV.
+    ConstantView(crate::CanonicalConstantView<'a>),
     /// An explicitly authored one-row broadcast, not an inferred short column.
     Scalar(&'a ArrayRef),
 }
@@ -157,6 +159,12 @@ impl ScalarInvocationSource<'_> {
             }
             Self::Constant(value) => validate_argument_observed(
                 EvaluatedArgument::Constant(value),
+                scope.actual_domain,
+                ty,
+                control,
+            ),
+            Self::ConstantView(value) => validate_argument_observed(
+                EvaluatedArgument::ConstantView(value),
                 scope.actual_domain,
                 ty,
                 control,

@@ -103,7 +103,7 @@ pub(crate) fn evaluate<'a>(
                 })?;
             }
         }
-        if let EvaluatedArgument::Constant(value) = argument {
+        if let Some(value) = argument.constant_value() {
             if !value
                 .value_type()
                 .fits_value_type_observed(source, || work.borrow_mut().step())?

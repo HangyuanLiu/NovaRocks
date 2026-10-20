@@ -33,11 +33,15 @@ use std::sync::Arc;
 pub(super) enum OwnedArraySource {
     Array(ArrayRef),
     Constant(ConstantValue),
+    ConstantView(ConstantValue, ArrayRef),
 }
 impl OwnedArraySource {
     pub(super) fn from_source(source: &ScalarInvocationSource<'_>) -> Self {
         match source {
             ScalarInvocationSource::Constant(value) => Self::Constant((*value).clone()),
+            ScalarInvocationSource::ConstantView(value) => {
+                Self::ConstantView(value.original().clone(), value.values().clone())
+            }
             ScalarInvocationSource::Scalar(array) => Self::Array(Arc::clone(array)),
             ScalarInvocationSource::Array(loan) => Self::Array(Arc::clone(loan.array())),
         }
@@ -121,6 +125,7 @@ pub(super) fn actual_array(
             return Ok(Arc::clone(loan.array()));
         }
         ScalarInvocationSource::Scalar(array) => (*array, 0),
+        ScalarInvocationSource::ConstantView(value) => (value.values(), value.original().ordinal()),
         ScalarInvocationSource::Constant(value) => (value.pool().array(), value.ordinal()),
     };
     work.flush()?;

@@ -171,6 +171,12 @@ fn exact_call(
                 expected,
                 work.control,
             )?,
+            OwnedValue::ConstantView(value) => validate_evaluated_argument_observed(
+                value.argument(),
+                selected_rows,
+                expected,
+                work.control,
+            )?,
             OwnedValue::Selected(array, errors) => {
                 let selected = SelectedValues::try_new_observed(
                     selected_rows,
@@ -482,7 +488,13 @@ fn evaluate_inner(
     let mut values = Vec::with_capacity(children.len());
     for child in children {
         values.push(TypedValue {
-            value: complete_constant_leaf(child, child.value_type(), Selection::all(1), work)?,
+            value: complete_constant_leaf(
+                child,
+                child.value_type(),
+                Selection::all(1),
+                None,
+                work,
+            )?,
             ty: child.value_type().clone(),
         });
         work.step()?;

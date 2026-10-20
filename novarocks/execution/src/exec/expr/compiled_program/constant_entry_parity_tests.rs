@@ -546,6 +546,8 @@ fn largeint(value: i128) -> ArrayRef {
 #[test]
 fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
     let functions = installed_builtin_owner_catalogue();
+    metadata_cv_source_cross_entry(&functions, false);
+    metadata_cv_source_cross_entry(&functions, true);
     let cases: Vec<(&str, Family, bool, Vec<ArrayRef>, ArrayRef)> = vec![
         (
             "20 + 22",
@@ -927,4 +929,199 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
         };
         fixture.direct(vec![decimal(Some(99_999), 5, 2)], expected);
     }
+}
+
+// The source is a REAL checked CV and enters the actual SQL compiler before
+// package/LocalCompiler/Frame. No frozen call, program, output, or capability is forged.
+fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_empty: bool) {
+    use arrow::array::{Int32Array, ListArray};
+    use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow::datatypes::Field;
+    use novarocks_sql::compiler::{
+        DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
+        SqlCompileProgress, SqlCompiler, SqlConstantExpressionSite, SqlExpressionConstant,
+        SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+        builtin_sql_function_catalog, noop_constant_evaluator,
+    };
+    let metadata = if spare_empty {
+        std::collections::HashMap::with_capacity(16)
+    } else {
+        [("provider.fact".into(), "kept".into())].into()
+    };
+    let raw_field = Arc::new(
+        Field::new(
+            if spare_empty { "item" } else { "source" },
+            DataType::Int32,
+            true,
+        )
+        .with_metadata(metadata),
+    );
+    let raw: ArrayRef = Arc::new(ListArray::new(
+        raw_field,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 3, 4])),
+        Arc::new(Int32Array::from(vec![111, 22, 33, 999])),
+        None,
+    ));
+    let ty = FunctionValueType::new(raw.data_type().clone(), false);
+    let pool = novarocks_functions::ConstantPool::try_new(
+        Arc::new(Field::new("actual-source", raw.data_type().clone(), false)),
+        ty.clone(),
+        raw.to_data(),
+        policy(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let original = pool.value(1).unwrap();
+    let source_identity = pool.backing_identity();
+    let parsed = novarocks_parser::parse("SELECT NULL AS metadata_cv_source").unwrap();
+    let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_slice() else {
+        panic!("one query")
+    };
+    let control = SqlCompileControl::unbounded();
+    let statement = SqlStatementInput::query_with_expression_constants(
+        Box::new(query.clone()),
+        vec![SqlExpressionConstant::new(
+            vec![],
+            SqlConstantExpressionSite::SelectProjection { column: 0 },
+            original.clone(),
+        )]
+        .into(),
+        &control,
+    )
+    .unwrap();
+    let request = SqlFinalPlanCompileRequest::new(
+        novarocks_physical_plan::PlanVersionId::try_new([69; 16]).unwrap(),
+        statement,
+        SqlCompileIntent::Query,
+        SqlSessionContext {
+            sql_semantics: SqlSemanticSettings::default(),
+            current_catalog: None,
+            current_database: "fixture".into(),
+            optimizer_settings: SessionOptimizerSettings {
+                enable_materialized_view_rewrite: Some(false),
+                enable_common_subexpr_reuse: Some(false),
+                ..SessionOptimizerSettings::default()
+            },
+        },
+        SqlPlanningEnvironment::Distributed,
+        builtin_sql_function_catalog().snapshot(),
+        noop_constant_evaluator(),
+        policy(),
+        control.clone(),
+        novarocks_physical_plan::PipelineDopDomain {
+            min: 1,
+            max: 8,
+            requires_power_of_two: true,
+        },
+        novarocks_physical_plan::ScanReadBudget {
+            max_batch_rows: 64,
+            max_batch_bytes: 1 << 20,
+        },
+        DEFAULT_COMPLETION_LIMITS,
+    );
+    let SqlCompileProgress::Complete(completed) =
+        SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap()
+    else {
+        panic!("a source-only constant query requires no external facts")
+    };
+    let source = completed.into_plan();
+    let programs = programs_with_catalogue(&source, functions);
+    let mut found = 0;
+    for program in programs.values() {
+        let expressions = program.checked().channels().expressions();
+        let snapshot = expressions.resolved_calls().snapshot();
+        for (&root, &use_id) in snapshot.bindings() {
+            let definition = snapshot.flows()[&root.arena()].uses()[&use_id].definition;
+            let node = snapshot.roots().arenas()[&root.arena()]
+                .node(definition)
+                .unwrap();
+            let StaticExprKind::Constant(actual) = node.kind() else {
+                continue;
+            };
+            if !actual
+                .equals_observed(&original, CompilePhase::Validate, &Control)
+                .unwrap()
+            {
+                continue;
+            }
+            assert_eq!(actual.ordinal(), 1);
+            assert_eq!(actual.pool().backing_identity(), source_identity);
+            assert_eq!(
+                expressions.definition_type(root.arena(), definition),
+                Some(&FunctionArgumentType::Value(ty.clone()))
+            );
+            found += 1;
+            let mut instance =
+                CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+            for (rows, selected) in [(1usize, vec![0]), (7, vec![1, 4, 6]), (7, vec![])] {
+                let batch = RecordBatch::try_new_with_options(
+                    Arc::new(Schema::empty()),
+                    vec![],
+                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+                )
+                .unwrap();
+                let selection = Selection::try_sparse(rows, &selected).unwrap();
+                let compiled = instance.evaluate(&batch, selection, &Control).unwrap();
+                assert!(compiled.errors().is_empty());
+                assert_eq!(compiled.values().data_type(), ty.data_type());
+                let list = compiled
+                    .values()
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                assert_eq!(list.len(), selected.len());
+                let values = list.values().as_any().downcast_ref::<Int32Array>().unwrap();
+                assert_eq!(
+                    values.iter().collect::<Vec<_>>(),
+                    (0..selected.len())
+                        .flat_map(|_| [Some(22), Some(33)])
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    assert!(
+        found > 0,
+        "the actual original CV must reach a compiled constant root"
+    );
+    let ConstantNodeOutcome::Value(single) = evaluate_constant_node(
+        ConstantNode::Conversion(ConstantConversion::Identity),
+        &[original.clone()],
+        &ty,
+        &Control,
+        CompilePhase::FunctionSpecialization,
+    )
+    .unwrap() else {
+        panic!("identity value")
+    };
+    let list = single.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(
+        list.values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(22), Some(33)]
+    );
+    assert_eq!(single.data_type(), ty.data_type());
+    assert_eq!(original.ordinal(), 1);
+    assert_eq!(original.pool().backing_identity(), source_identity);
+    assert!(Arc::ptr_eq(pool.array(), original.pool().array()));
+    let DataType::List(field) = original.field().data_type() else {
+        panic!("source List")
+    };
+    assert_eq!(field.name(), if spare_empty { "item" } else { "source" });
+    if spare_empty {
+        assert!(field.metadata().is_empty());
+        assert!(field.metadata().capacity() > 0);
+    } else {
+        assert_eq!(field.metadata()["provider.fact"], "kept");
+    }
+    let DataType::List(field) = single.data_type() else {
+        panic!("canonical List")
+    };
+    assert_eq!(field.name(), "item");
+    assert_eq!(field.metadata().capacity(), 0);
 }

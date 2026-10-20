@@ -123,7 +123,7 @@ pub(super) fn validate_typed_argument(
                 "aggregate typed source differs from complete selected semantics/layout",
             ));
         }
-        if let EvaluatedArgument::Constant(value) = argument {
+        if let Some(value) = argument.constant_value() {
             if !value
                 .value_type()
                 .fits_value_type_observed(source, || work.step())?

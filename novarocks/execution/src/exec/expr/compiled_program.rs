@@ -142,6 +142,7 @@ impl Work<'_, '_> {
 // a gather.
 enum Value<'a> {
     Constant(novarocks_functions::ConstantValue),
+    ConstantView(constant_projection::CanonicalConstant),
     Column(ArrayRef),
     Selected(SelectedValues<'a>),
     Continued(Box<Self>, input_source::ArrayContinuation),
@@ -168,6 +169,7 @@ impl Value<'_> {
     fn argument(&self) -> EvaluatedArgument<'_> {
         match self {
             Self::Constant(value) => EvaluatedArgument::Constant(value),
+            Self::ConstantView(value) => value.argument(),
             Self::Column(array) => EvaluatedArgument::Column(array),
             Self::Selected(value) => EvaluatedArgument::SelectedColumn(value),
             Self::Continued(value, _) => value.argument(),
@@ -199,6 +201,7 @@ impl Value<'_> {
     ) -> Result<Self, KernelFailure> {
         let value = match self {
             Self::Constant(value) => Self::Constant(value),
+            Self::ConstantView(value) => Self::ConstantView(value),
             Self::Column(array) => Self::Column(owner.retain(array, work.control)?),
             Self::Selected(value) => {
                 let (selection, array, errors) = value.into_parts();
@@ -1230,6 +1233,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod copy_tests;
 
+mod constant_projection;
 mod guarded;
 mod node_recipes;
 mod scalar_invocation;

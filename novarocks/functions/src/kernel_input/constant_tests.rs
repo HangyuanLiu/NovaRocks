@@ -353,7 +353,7 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
     .unwrap();
     for wrong_child in [
         child.clone().with_metadata(physical_metadata),
-        child.with_nullable(true),
+        child.clone().with_nullable(true),
     ] {
         let wrong = FunctionValueType::from_legacy_declared_projection(
             DataType::Struct(vec![Arc::new(wrong_child)].into()),
@@ -363,6 +363,104 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
             validate(&value, Selection::all(2), &wrong, &Control::default()),
             Err(KernelFailure::InvalidProgram(_))
         ));
+    }
+    // Raw source metadata is independently preserved by the checked CV; the
+    // canonical view is a paired execution loan, not another CV declaration.
+    let raw: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::new(child.clone())].into(),
+        vec![Arc::new(StringArray::from(vec![
+            "{\"unused\":1}",
+            "{\"selected\":2}",
+            "{\"future\":3}",
+        ]))],
+        None,
+    ));
+    let raw_pool = ConstantPool::try_new(
+        Arc::new(Field::new(
+            "original-source",
+            raw.data_type().clone(),
+            false,
+        )),
+        p.value_type().clone(),
+        raw.to_data(),
+        policy(),
+        CompilePhase::Validate,
+        &ConstructionControl,
+    )
+    .unwrap();
+    let original = raw_pool.value(1).unwrap();
+    assert!(matches!(
+        validate(
+            &original,
+            Selection::all(3),
+            p.value_type(),
+            &Control::default()
+        ),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let canonical = crate::array_projection::normalize_execution_array(&raw).unwrap();
+    let view = crate::CanonicalConstantView::from_authored_projection(&original, &canonical);
+    let argument = EvaluatedArgument::ConstantView(view);
+    assert!(std::ptr::eq(argument.constant_value().unwrap(), &original));
+    assert_eq!(view.original().ordinal(), 1);
+    assert!(Arc::ptr_eq(
+        view.original().pool().array(),
+        raw_pool.array()
+    ));
+    let sparse_rows = [2usize, 8, 10];
+    for selection in [
+        Selection::all(0),
+        Selection::all(3),
+        Selection::try_sparse(11, &sparse_rows).unwrap(),
+    ] {
+        validate_argument_observed(argument, selection, p.value_type(), &Control::default())
+            .unwrap();
+        for (ordinal, row) in selection.iter().enumerate() {
+            assert_eq!(argument.value_row(ordinal, row), 1);
+            let actual = argument
+                .array()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert_eq!(
+                actual
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(argument.value_row(ordinal, row)),
+                "{\"selected\":2}"
+            );
+        }
+    }
+    let DataType::Struct(fields) = original.field().data_type() else {
+        panic!("raw Struct")
+    };
+    assert_eq!(fields[0].metadata()["provider.field-id"], "17");
+    assert_eq!(fields[0].metadata()["nr_logical_type"], "json");
+    // A different semantic child/nullable source cannot hide behind an exact
+    // canonical carrier. The SAME old Constant semantic checks apply.
+    let wrong = FunctionValueType::new(canonical.data_type().clone(), false);
+    assert!(matches!(
+        validate_argument_observed(argument, Selection::all(3), &wrong, &Control::default()),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let successful = Control::default();
+    validate_argument_observed(argument, Selection::all(3), p.value_type(), &successful).unwrap();
+    let expected = successful.checks();
+    for cause in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+    ] {
+        for at in 0..expected.len() {
+            let control = Control::fail_at(at, cause.clone());
+            assert_eq!(
+                validate_argument_observed(argument, Selection::all(3), p.value_type(), &control),
+                Err(cause.clone())
+            );
+            assert_eq!(control.checks(), expected[..=at]);
+        }
     }
 }
 
