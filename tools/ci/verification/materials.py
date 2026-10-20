@@ -381,7 +381,8 @@ def read_rust(root, attempt_id, declarations=()):
                 result = "cancelled"
             observations.append(Observation(unit, _scope_for(unit, declarations), attempt_id, "doctest",
                 identity, result, stable, complete, terminated, cleanup, "canonical", None,
-                str(root / "execution-index.json") + "#stages.doctest", declared))
+                str(root / "execution-index.json") + "#stages.doctest", declared,
+                {"batch_root": str(root.resolve())}))
             continue
         junit_cases = {}
         report = materials.get("junit", {})
@@ -426,7 +427,7 @@ def read_rust(root, attempt_id, declarations=()):
                     identity, result, stable, complete and raw is not None, terminated and result in {"pass", "fail"},
                     cleanup, "canonical" if tool_ok else "diagnostic", None,
                     str(_path(root, report)) + "#" + native if report else str(root / "execution-index.json"), declared,
-                    {"batch_complete": index.get("complete"), "domain_returncode": code, "raw_result": raw_result}))
+                    {"batch_root": str(root.resolve()), "batch_complete": index.get("complete"), "domain_returncode": code, "raw_result": raw_result}))
     return observations, errors
 
 
@@ -486,6 +487,34 @@ def read_invocation(path, attempt_id, declarations=()):
             cleanup if cleanup in {"ok", "violation", "unknown"} else "unknown",
             "canonical" if platform_recorded((invocation.get("inputs_start") or {}).get("platform")) else "diagnostic", None,
             str(path), invocation.get("inputs_declared", True), {"invocation": invocation, "evidence": evidence}))
+    if kind == "stage" and any(unit.id == "workspace nextest and doctests" for unit in units):
+        index = {}
+        try:
+            index_path = _path(path.parent, invocation.get("materials", {}).get("execution_index"))
+            if path.parent.parent.resolve() not in index_path.resolve().parents:
+                raise MaterialError("Rust batch index is outside its owning attempt")
+            index = read_json(index_path)
+        except (MaterialError, OSError) as error:
+            errors.append(str(error))
+        for observation in observations:
+            observation.detail["batch_index"] = index
+            observation.detail["batch_root"] = str(index_path.parent.resolve()) if index else None
+        internal = {"prepare": "joint tests and binaries preparation",
+                    "error_manifest": "SQL error manifest freshness",
+                    "final_prepare": "main binary build information"}
+        for native, name in internal.items():
+            stage = index.get("stages", {}).get(native, {})
+            native_code = stage.get("returncode")
+            done = isinstance(native_code, int) and stage.get("started") is not False
+            unit = UnitKey("stage", name)
+            observations.append(Observation(unit, _scope_for(unit, declarations), attempt_id,
+                str(invocation.get("seq", path.stem)) + ":" + native,
+                invocation.get("inputs_start"), "not_run" if not done else "pass" if native_code == 0 and not stage.get("errors") else "fail",
+                confirmed(invocation), done, done,
+                cleanup if cleanup in {"ok", "violation", "unknown"} else "unknown",
+                "canonical" if platform_recorded((invocation.get("inputs_start") or {}).get("platform")) else "diagnostic",
+                None, str(index_path) + "#stages." + native if index else str(path), True,
+                {"native_stage": native, "raw": stage, "aggregate_invocation": str(path)}))
     return observations, errors
 
 

@@ -26,10 +26,10 @@ under the License.
 | 层 | 必需集合与来源 | 结论边界 |
 |---|---|---|
 | 开发阶段 | 影响图选中的原生单元及必需模式；本轮执行或合格的本地/正式同输入来源 | 改动相关部分已验证；其余常规项明确延后给准入，重项履行作者义务或写明理由 |
-| PR 准入 | 实际合入提交的全部常规单元及其必需模式，含具名静态阶段；本轮正式执行或正式同输入来源 | 常规功能正确性通过；不以影响图减少集合 |
+| PR 准入 | 合入队列的合并组提交上，常规集合中已经启用的单元及必需模式；当前正式尝试，暂不跨运行复用 | 仅对启用范围下结论；未纳入、无纳入计划和列举缺口逐项保留；不读影响图 |
 | 合入后全量 | 全部未暂停单元及全部必需模式，仅认本轮执行 | 登记新失败、仍失败、最近一次通过但未关闭、已关闭与未运行；不阻断合入 |
 
-G15 交付集合派生、证据组合和续跑规则；G17 负责正式运行的信任边界、合入队列/门禁、准入预算与全量调度、登记存储和展示。`local-full-ci.sh` 是本地完整入口，`dev-verify.sh compose --layer admission` 仅作本地准入演练；运行 wrapper、干净 commit、文件名或 `.formal` 进程登记上下文均不能自行将材料升级为正式来源。它们也不证明实际合入的提交已验证。
+G15 交付集合派生、证据组合和续跑规则；PR 准入入口提供正式上下文、启用范围与合入队列检查。合入后全量、跨运行共享证据及登记展示尚未交付。`local-full-ci.sh` 是本地完整入口，`dev-verify.sh compose --layer admission` 仅作本地准入演练；运行 wrapper、干净 commit、文件名或 `.formal` 进程登记上下文均不能自行将材料升级为正式来源。它们也不证明实际合入的提交已验证。
 
 组合记录把五件事分开：来源是本轮还是历史；原始结果是通过、失败、未知、取消还是未运行；记录/单元/共享清理/整个尝试分别完成到哪一级；输入与验证义务是否适用；本层如何处置。`complete=true` 不等于通过，整个尝试未完成也不必抹掉其中已收束的独立范围。旧材料与所有反例保留，组合只写派生记录。
 
@@ -40,6 +40,26 @@ G15 交付集合派生、证据组合和续跑规则；G17 负责正式运行的
 [dispositions.json](../../../tools/ci/baselines/dispositions.json) 是处置来源。`known_failures` 仅接受 default SQL case，必须有 reason、owner、expires；特征为准确错误码，或语句序号加 actual 摘要的结果 mismatch。Rust 断言、超时、suite 初始化/加载失败、取消、未知、未运行、未执行验证和清理违约不可作为已知失败豁免。`quarantine` 必须有 reason、owner、exit_condition、review_by；过期失效。通过后提示陈旧处置，不自动删除记录或关闭问题。
 
 全量失败只按具体身份、输入、失败特征与来源登记。一次通过更新“最近一次通过但未关闭”；关闭还需关联修复与符合要求的复验。G15 的登记派生接口不创建共享问题库，也不自动关闭或修复任何问题。
+
+## PR 准入链路
+
+[Admission 工作流](../../../.github/workflows/admission.yml) 在 `merge_group` 上运行名为 `admission` 的检查；PR 上该 job 跳过并另行运行快速预检，手动运行用于基线与诊断。工作流文件存在不代表规则集已经启用；仓库设置与真实队列验收须另外完成。
+
+```bash
+tools/ci/admission.sh --output /absolute/new/admission-attempt
+```
+
+输出目录必须不存在。入口运行一次 `local-full-ci.sh --cargo-only`，保留其真实退出，再以组合的 `layer_ok` 决定退出：0 为启用范围通过，1 为未通过，2 为入口错误。构建/原生列举失败仍保存 `entry.json`、失败的 `composition.json`、`summary.md` 与已有原始材料；本次未能列举的种类是阻断缺口，空列举不能成为通过。
+
+正式来源必须同时属于准确仓库的 `.github/workflows/admission.yml`、GitHub 托管 runner，以及 `merge_group` 或 main 的手动事件。合并组 head/base 来自原始事件，head 与 GitHub SHA 和干净源码开始/结束记录一致；保存 workflow ref/SHA、run/attempt 和 runner 事实。其它 GitHub 上下文为 `diagnostic`，本地为 `local-rehearsal`，两者都不授予正式来源。下载材料或伪造环境变量不具备 GitHub 检查的权威。
+
+[admission-scope.json](../../../tools/ci/baselines/admission-scope.json) 是分步启用声明。第一批只含 cargo-only 阶段、全部常规 Rust test 与 workspace doctest；SQL/System 暂未纳入。具名阶段显式列名，只有 Rust 种类允许 `all`；名称用本次原生列举校验。未纳入的常规范围、缺少纳入计划和绑定构造的列举缺口都在组合与摘要中逐项可见；任何已观察清理违约仍阻断。新增成员须先在准入环境的 main 通过或取得有效处置，再通过 PR 纳入；全部常规单元纳入后可删除该文件，恢复完整常规集合规则。
+
+准入/全量的 Rust 聚合阶段同时记录原生退出与成员推导结论。准入隔离可以排除成员断言，但批处理必须完整收束、清理通过，prepare/error-manifest/final-prepare 成功，无环境错误或取消；nextest 100 是普通测试失败。现有 Cargo doctest 非零退出无法区分断言与环境错误，不能据此推导聚合通过。全量不应用准入隔离；开发层的聚合延后规则保持不变。批处理索引中的 prepare、error_manifest、final_prepare 分别提供联合准备、错误清单新鲜度和 build-info 阶段观测，不改写原生索引。
+
+每次正式运行只消费当前尝试。GitHub artifact 包含入口输出和原生运行目录（包括隐藏诊断文件），名称带 run/attempt，配置保留 90 天；这一有限平台保留期不构成持久证据服务。维护者须在到期前为未解决失败和正式引用安排可恢复交接。复跑另建尝试，不能覆盖原失败。只有一位维护者时不要求自审，准入逻辑修改由入队者审阅 diff；只读令牌、无 secret 和每次全新的托管 runner 是执行边界。
+
+上线顺序是本地验证、经授权发布/合入、main 正式基线、经授权启用规则集、真实队列成功/失败/修复再入队验收。本地可发布检查点不等于门禁交付；未执行的正式基线、设置和队列验收继续记为 NOT_RUN。长期规则见 [ADR-0187](../../adr/ADR-0187-merge-queue-admission-and-current-attempt-evidence.md)。
 
 ## 影响声明、发现与开发入口
 

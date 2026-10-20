@@ -137,12 +137,18 @@ novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
 novarocks-connector-iceberg-functions = { path = "../novarocks/connector/iceberg-functions" }
 EOF
 
-  cat >"$root/idl/novarocks/plan.proto" <<'EOF'
+  cat >"$root/idl/novarocks/physical_package_v2.proto" <<'EOF'
 syntax = "proto3";
-message DataSink {
-  reserved 8;
-  reserved "statistics";
-  bool result = 1;
+package novarocks.physical_package_v2;
+message FragmentSink {
+  oneof kind {
+    Empty result = 1;
+    uint32 stream_edge_id = 2;
+    MulticastSink multicast = 3;
+    RouterSink router = 4;
+    Empty noop = 5;
+    RootOutputContract root_result = 6;
+  }
 }
 EOF
 }
@@ -194,17 +200,65 @@ valid="$fixture_root/valid"
 write_fixture "$valid"
 "$CHECKER" --repo-root "$valid" --manifest-path "$valid/Cargo.toml"
 
+# Compiled FragmentSink is a different protobuf message from retired DataSink:
+# the old tag 8 reservation cannot constrain an unrelated field in this message.
+independent_tag="$fixture_root/independent-tag"
+cp -R "$valid" "$independent_tag"
+replace_once "$independent_tag/idl/novarocks/physical_package_v2.proto" \
+  '    Empty noop = 5;' $'    Empty noop = 5;\n    bytes future_extension = 8;'
+"$CHECKER" --repo-root "$independent_tag" --manifest-path "$independent_tag/Cargo.toml"
+
+# Statistics facts outside a sink remain legal (for example writer ordinals and
+# operator counters); comments do not reintroduce the retired wire vocabulary.
+unrelated_statistics="$fixture_root/unrelated-statistics"
+cp -R "$valid" "$unrelated_statistics"
+cat >>"$unrelated_statistics/idl/novarocks/physical_package_v2.proto" <<'EOF'
+// message DataSink { bool statistics = 8; }
+message WriterInput { repeated uint32 statistics_target_ordinals = 1; }
+EOF
+"$CHECKER" --repo-root "$unrelated_statistics" --manifest-path "$unrelated_statistics/Cargo.toml"
+
+legacy_plan="$fixture_root/legacy-plan"
+cp -R "$valid" "$legacy_plan"
+cat >"$legacy_plan/idl/novarocks/plan.proto" <<'EOF'
+syntax = "proto3";
+message DataSink { reserved 8; reserved "statistics"; }
+EOF
+assert_rejected "$legacy_plan" "retired plan.proto must not be restored"
+
+legacy_sink="$fixture_root/legacy-sink"
+cp -R "$valid" "$legacy_sink"
+printf 'message DataSink { bool statistics = 8; }\n' \
+  >"$legacy_sink/idl/novarocks/restored.proto"
+assert_rejected "$legacy_sink" "retired proto message DataSink must not be restored"
+
+legacy_statistics="$fixture_root/legacy-statistics"
+cp -R "$valid" "$legacy_statistics"
+printf 'message StatisticsSink {}\n' >"$legacy_statistics/idl/novarocks/restored.proto"
+assert_rejected "$legacy_statistics" "retired proto message StatisticsSink must not be restored"
+
 sink_tag="$fixture_root/sink-tag"
 cp -R "$valid" "$sink_tag"
-replace_once "$sink_tag/idl/novarocks/plan.proto" \
-  'reserved 8;' 'bool statistics = 8;'
-assert_rejected "$sink_tag" "DataSink must reserve field number 8"
+replace_once "$sink_tag/idl/novarocks/physical_package_v2.proto" \
+  '    Empty noop = 5;' $'    Empty noop = 5;\n    bytes statistics = 8;'
+assert_rejected "$sink_tag" "FragmentSink must not declare a statistics sink"
 
 sink_name="$fixture_root/sink-name"
 cp -R "$valid" "$sink_name"
-replace_once "$sink_name/idl/novarocks/plan.proto" \
-  'reserved "statistics";' 'bool statistics = 9;'
-assert_rejected "$sink_name" "DataSink must reserve field name statistics"
+replace_once "$sink_name/idl/novarocks/physical_package_v2.proto" \
+  '    Empty noop = 5;' $'    Empty noop = 5;\n    bytes statistics = 9;'
+assert_rejected "$sink_name" "FragmentSink must not declare a statistics sink"
+
+sink_type="$fixture_root/sink-type"
+cp -R "$valid" "$sink_type"
+replace_once "$sink_type/idl/novarocks/physical_package_v2.proto" \
+  '    Empty noop = 5;' $'    Empty noop = 5;\n    StatisticsPayload old_path = 7;'
+assert_rejected "$sink_type" "FragmentSink must not declare a statistics sink"
+
+missing_package="$fixture_root/missing-package"
+cp -R "$valid" "$missing_package"
+rm "$missing_package/idl/novarocks/physical_package_v2.proto"
+assert_rejected "$missing_package" "compiled physical_package_v2.proto is missing"
 
 role="$fixture_root/role"
 cp -R "$valid" "$role"
