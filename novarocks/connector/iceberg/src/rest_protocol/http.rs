@@ -669,6 +669,7 @@ mod tests {
         let (_, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
             .await;
+        drop(client);
         let started = std::time::Instant::now();
         assert_eq!(
             body.expect("success body").read_to_end().await,
@@ -690,12 +691,18 @@ mod tests {
         let (stage, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
             .await;
+        drop(client);
         assert_eq!(
             stage,
             DispatchStage::WrittenNoStatus(NoStatusCause::DeadlineExceeded)
         );
         assert!(body.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(server.wait_for(Duration::from_secs(1), |requests| {
+            requests
+                .iter()
+                .any(|request| request.method == "GET" && request.path() == "/table")
+        }));
         assert_eq!(server.count("GET", "/table"), 1);
     }
 
@@ -721,6 +728,7 @@ mod tests {
         let (stage, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
             .await;
+        drop(client);
         assert!(matches!(stage, DispatchStage::Status { code: 200, .. }));
         assert_eq!(
             body.unwrap().read_to_end().await,
