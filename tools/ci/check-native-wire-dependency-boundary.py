@@ -36,6 +36,7 @@ PROTO = "novarocks-proto-codec"
 TASK_CODEC = "novarocks-task-codec"
 EXECUTION_CONTRACT = "novarocks-execution-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
+FAILURE_CONTRACT = "novarocks-failure-contract"
 PLAN_CODEC = "novarocks-plan-codec"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
@@ -54,7 +55,7 @@ TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES = {
     SPI,
     TYPES,
 }
-EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES = {TYPES, RESULT_CONTRACT}
+EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES = {TYPES, RESULT_CONTRACT, FAILURE_CONTRACT}
 ROLE_DIRECT_REQUIREMENTS = {MODELS, PROTO}
 WIRE_PACKAGES = {MODELS, PROTO, TASK_CODEC}
 
@@ -108,6 +109,7 @@ LOWER_LAYER_ROOTS = {
     TYPES,
     EXECUTION_CONTRACT,
     RESULT_CONTRACT,
+    FAILURE_CONTRACT,
     "novarocks-sql",
     "novarocks-execution",
     "novarocks-state-store-foundationdb",
@@ -274,6 +276,10 @@ def verify_execution_contract(metadata):
             f"{EXECUTION_CONTRACT} internal normal dependencies must be exactly: "
             + ", ".join(sorted(EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES))
         )
+    if FAILURE_CONTRACT not in normal_dependency_names(contract, include_optional=False):
+        fail(
+            f"{EXECUTION_CONTRACT} must directly declare required normal dependency {FAILURE_CONTRACT}"
+        )
     forbidden = sorted(
         normal_closure(metadata, EXECUTION_CONTRACT)
         & FORBIDDEN_EXECUTION_CONTRACT_CLOSURE
@@ -296,16 +302,39 @@ def verify_role_direct_dependencies(metadata):
             )
 
 
-def verify_result_contract(metadata):
-    # The root-result vocabulary and flat validation are dependency-free facts.
-    # Check declarations and the resolved graph independently, including external
-    # crates and optional normal edges, rather than permitting a runtime closure.
-    direct = sorted(normal_dependency_names(package_by_name(metadata, RESULT_CONTRACT)))
+def verify_failure_contract(metadata):
+    # Neutral failure facts cannot acquire any production dependency, even an
+    # external or inactive optional normal declaration. Check the independently
+    # resolved graph as well, so a missing declaration cannot hide reachability.
+    direct = sorted(normal_dependency_names(package_by_name(metadata, FAILURE_CONTRACT)))
     if direct:
-        fail(f"{RESULT_CONTRACT} must not declare normal dependencies: " + ", ".join(direct))
-    reachable = sorted(normal_closure(metadata, RESULT_CONTRACT) - {RESULT_CONTRACT})
+        fail(f"{FAILURE_CONTRACT} must not declare normal dependencies: " + ", ".join(direct))
+    reachable = sorted(normal_closure(metadata, FAILURE_CONTRACT) - {FAILURE_CONTRACT})
     if reachable:
-        fail(f"{RESULT_CONTRACT} normal dependency closure must be empty: " + ", ".join(reachable))
+        fail(f"{FAILURE_CONTRACT} normal dependency closure must be empty: " + ", ".join(reachable))
+
+
+def verify_result_contract(metadata):
+    # Result facts forward the neutral failure vocabulary, and nothing else.
+    # Declarations include external and optional normal edges; the mandatory
+    # fact owner and the exact resolved closure are checked independently.
+    result = package_by_name(metadata, RESULT_CONTRACT)
+    direct = normal_dependency_names(result)
+    if direct != {FAILURE_CONTRACT}:
+        fail(
+            f"{RESULT_CONTRACT} normal dependencies must be exactly: {FAILURE_CONTRACT}"
+            + " (actual: " + ", ".join(sorted(direct)) + ")"
+        )
+    if FAILURE_CONTRACT not in normal_dependency_names(result, include_optional=False):
+        fail(
+            f"{RESULT_CONTRACT} must directly declare required normal dependency {FAILURE_CONTRACT}"
+        )
+    reachable = normal_closure(metadata, RESULT_CONTRACT) - {RESULT_CONTRACT}
+    if reachable != {FAILURE_CONTRACT}:
+        fail(
+            f"{RESULT_CONTRACT} normal dependency closure must be exactly: {FAILURE_CONTRACT}"
+            + " (actual: " + ", ".join(sorted(reachable)) + ")"
+        )
 
 
 def verify_codec_closures(metadata):
@@ -448,6 +477,7 @@ def main():
     verify_models(metadata)
     verify_proto(metadata)
     verify_task_codec(metadata)
+    verify_failure_contract(metadata)
     verify_execution_contract(metadata)
     verify_result_contract(metadata)
     verify_role_direct_dependencies(metadata)

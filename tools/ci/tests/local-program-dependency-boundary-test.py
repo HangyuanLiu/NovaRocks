@@ -17,6 +17,7 @@
 
 """Exercise capability mutations using real Cargo metadata, without compiling."""
 
+import copy
 import importlib.util
 import subprocess
 import tempfile
@@ -32,17 +33,20 @@ spec.loader.exec_module(guard)
 
 class BoundaryTests(unittest.TestCase):
     def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False,
-                result_dependency="", functions_dependency="", functions_build=None,
-                functions_extra=""):
+                result_dependency=None, functions_dependency="", functions_build=None,
+                functions_extra="", failure_dependency=""):
+        if result_dependency is None:
+            result_dependency = 'novarocks-failure-contract = { path = "../failure" }\n'
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         (root / "Cargo.toml").write_text(
-            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result", "functions"]\n')
+            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result", "functions", "failure"]\n')
         for directory, name, dependencies in (
                 ("program", "novarocks-local-program", root_dependency),
                 ("types", "novarocks-types", types_dependency),
                 ("result", "novarocks-result-contract", result_dependency),
+                ("failure", "novarocks-failure-contract", failure_dependency),
                 ("runtime", "tokio", ""),
                 ("functions", "novarocks-functions", functions_dependency)):
             package = root / directory
@@ -73,20 +77,20 @@ class BoundaryTests(unittest.TestCase):
         result = self.fixture('novarocks-types = { path = "../types" }\n')
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_dependency_free_result_contract_is_allowed(self):
+    def test_result_contract_with_only_neutral_failure_facts_is_allowed(self):
         result = self.fixture('novarocks-result-contract = { path = "../result" }\n')
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_result_contract_cannot_acquire_runtime_even_through_a_pure_root(self):
         result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
                               result_dependency='tokio = { path = "../runtime" }\n')
-        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
+        self.assert_rejected(result, "novarocks-result-contract declares unaudited normal edges")
         self.assertIn("runtime/wire/provider/storage capability: tokio", result.stderr)
 
     def test_result_contract_cannot_add_an_otherwise_pure_dependency(self):
         result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
                               result_dependency='novarocks-types = { path = "../types" }\n')
-        self.assert_rejected(result, "novarocks-result-contract must remain dependency-free")
+        self.assert_rejected(result, "novarocks-result-contract declares unaudited normal edges")
 
     def test_transitive_runtime_is_rejected(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n',
@@ -163,7 +167,7 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(guard.verify_package(self.external(name, version), set()), [])
 
     def test_same_named_pure_contract_replacement_is_rejected(self):
-        for name in ("novarocks-types", "novarocks-functions"):
+        for name in ("novarocks-types", "novarocks-functions", guard.FAILURE_CONTRACT):
             package = self.external(name)
             self.assertIn("not the workspace-owned pure package", " ".join(
                 guard.verify_package(package, set())))
@@ -246,6 +250,111 @@ class BoundaryTests(unittest.TestCase):
         package["dependencies"][0].update(kind="build", target=None)
         self.assertIn("declares a build dependency", " ".join(
             guard.verify_package(package, {"constant-local"})))
+
+
+class ActualMetadataTests(unittest.TestCase):
+    """Mutate real current Cargo facts, never a dependency-free Result surrogate."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = CHECKER.parents[2] / "Cargo.toml"
+        support = guard.metadata_support()
+        cls.metadata = support.cargo_metadata(cls.manifest)
+        cls.graph = support.Graph(cls.metadata)
+        cls.selected_ids = [p["id"] for p in guard.selected_packages(cls.manifest, cls.graph)]
+
+    def package(self, metadata, name):
+        graph = guard.metadata_support().Graph(metadata)
+        return graph.workspace_package(name)
+
+    def violations(self, metadata):
+        graph = guard.metadata_support().Graph(metadata)
+        packages = [graph.packages_by_id[identity] for identity in self.selected_ids]
+        return " ".join(guard.verify_selected_packages(packages, graph))
+
+    def failure_edge(self):
+        result = self.graph.workspace_package("novarocks-result-contract")
+        return copy.deepcopy(next(d for d in result["dependencies"]
+                                  if d["name"] == guard.FAILURE_CONTRACT))
+
+    def test_actual_selected_closure_accepts_only_the_neutral_leaf(self):
+        self.assertIn(self.graph.workspace_package(guard.FAILURE_CONTRACT)["id"],
+                      self.selected_ids)
+        self.assertEqual(self.violations(self.metadata), "")
+        result = self.graph.workspace_package("novarocks-result-contract")
+        self.assertEqual({d["name"] for d in result["dependencies"]},
+                         {guard.FAILURE_CONTRACT})
+        self.assertEqual(self.graph.workspace_package(guard.FAILURE_CONTRACT)["dependencies"], [])
+
+    def test_actual_result_contract_cannot_hide_other_edge_kinds(self):
+        for kind in ("dev", "build"):
+            with self.subTest(kind=kind):
+                data = copy.deepcopy(self.metadata)
+                edge = self.failure_edge()
+                edge["kind"] = kind
+                self.package(data, "novarocks-result-contract")["dependencies"].append(edge)
+                self.assertIn("may depend only on neutral FailureContract through a normal edge",
+                              self.violations(data))
+
+    def test_actual_failure_leaf_rejects_all_declared_edge_kinds(self):
+        for kind, optional, target, renamed in (
+                (None, False, None, None),
+                (None, True, None, "renamed_pure"),
+                (None, False, 'cfg(target_os = "none")', None),
+                ("build", False, None, None),
+                ("dev", False, None, None)):
+            with self.subTest(kind=kind, optional=optional, target=target):
+                data = copy.deepcopy(self.metadata)
+                edge = self.failure_edge()
+                # An otherwise pure dependency is sufficient to violate the
+                # zero-edge leaf; no runtime-name denylist can make this pass.
+                edge.update(name="novarocks-type-contract", kind=kind,
+                            optional=optional, target=target, rename=renamed)
+                self.package(data, guard.FAILURE_CONTRACT)["dependencies"].append(edge)
+                self.assertIn("novarocks-failure-contract must remain dependency-free",
+                              self.violations(data))
+
+    def test_actual_failure_leaf_rejects_resolve_only_authority(self):
+        for kind in (None, "build", "dev"):
+            with self.subTest(kind=kind):
+                data = copy.deepcopy(self.metadata)
+                graph = guard.metadata_support().Graph(data)
+                leaf = graph.workspace_package(guard.FAILURE_CONTRACT)
+                target = graph.workspace_package("novarocks-type-contract")
+                graph.resolve_nodes[leaf["id"]]["deps"].append({
+                    "name": "novarocks_type_contract", "pkg": target["id"],
+                    "dep_kinds": [{"kind": kind, "target": None}]})
+                self.assertIn("resolved closure must remain dependency-free",
+                              self.violations(data))
+        data = copy.deepcopy(self.metadata)
+        graph = guard.metadata_support().Graph(data)
+        leaf = graph.workspace_package(guard.FAILURE_CONTRACT)
+        graph.resolve_nodes[leaf["id"]]["dependencies"].append(
+            graph.workspace_package("novarocks-type-contract")["id"])
+        self.assertIn("resolved closure must remain dependency-free", self.violations(data))
+
+    def test_actual_failure_leaf_missing_resolve_facts_fail_closed(self):
+        data = copy.deepcopy(self.metadata)
+        leaf_id = self.graph.workspace_package(guard.FAILURE_CONTRACT)["id"]
+        data["resolve"]["nodes"] = [n for n in data["resolve"]["nodes"]
+                                    if n["id"] != leaf_id]
+        self.assertIn("resolve graph omits dependency facts", self.violations(data))
+
+    def test_actual_fact_consumers_still_reject_runtime_wire_provider_storage(self):
+        for owner in sorted(guard.FAILURE_FACT_CONSUMERS):
+            for forbidden in ("tokio", "tonic", "novarocks-connector-iceberg", "object_store"):
+                with self.subTest(owner=owner, forbidden=forbidden):
+                    data = copy.deepcopy(self.metadata)
+                    edge = self.failure_edge()
+                    edge.update(name=forbidden, optional=True, rename="hidden_capability")
+                    self.package(data, owner)["dependencies"].append(edge)
+                    self.assertIn("runtime/wire/provider/storage capability: " + forbidden,
+                                  self.violations(data))
+
+    def test_actual_failure_leaf_cannot_select_a_foreign_authority(self):
+        data = copy.deepcopy(self.metadata)
+        self.package(data, guard.FAILURE_CONTRACT)["source"] = guard.REGISTRY_SOURCE
+        self.assertIn("not the workspace-owned pure package", self.violations(data))
 
 
 if __name__ == "__main__":

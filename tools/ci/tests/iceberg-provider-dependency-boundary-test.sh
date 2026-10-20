@@ -35,7 +35,7 @@ write_package() {
 write_fixture() {
   local root="$1"
   mkdir -p "$root"
-  for package in novarocks-connector-iceberg novarocks-server novarocks-server-application novarocks-frontend-application novarocks-state-store-sqlite novarocks-fs novarocks-spi iceberg-catalog-rest iceberg-sdk-bridge; do
+  for package in novarocks-connector-iceberg novarocks-server novarocks-server-application novarocks-frontend-application novarocks-state-store-sqlite novarocks-fs novarocks-spi novarocks-failure-contract iceberg-catalog-rest iceberg-sdk-bridge; do
     write_package "$root" "$package"
   done
   cat >"$root/Cargo.toml" <<'EOF'
@@ -48,6 +48,7 @@ members = [
   "novarocks-state-store-sqlite",
   "novarocks-fs",
   "novarocks-spi",
+  "novarocks-failure-contract",
   "iceberg-catalog-rest",
   "iceberg-sdk-bridge",
 ]
@@ -58,6 +59,7 @@ EOF
 [dependencies]
 novarocks-fs = { path = "../novarocks-fs" }
 novarocks-spi = { path = "../novarocks-spi" }
+novarocks-failure-contract = { path = "../novarocks-failure-contract" }
 EOF
   cat >>"$root/novarocks-server/Cargo.toml" <<'EOF'
 
@@ -85,6 +87,18 @@ assert_rejected() {
 valid="$tmpdir/valid"
 write_fixture "$valid"
 "$CHECKER" --manifest-path "$valid/Cargo.toml"
+
+# The shared failure vocabulary cannot hide a normal/build execution owner.
+# Cargo does not activate a dependency's own dev dependencies for its consumer.
+for kind in dependencies build-dependencies; do
+  failure_owner="$tmpdir/failure-owner-$kind"
+  cp -R "$valid" "$failure_owner"
+  write_package "$failure_owner" novarocks-execution
+  printf '\n[%s]\nnovarocks-execution = { path = "../novarocks-execution" }\n' "$kind" \
+    >>"$failure_owner/novarocks-failure-contract/Cargo.toml"
+  assert_rejected "$failure_owner" \
+    "provider closure contains forbidden packages: novarocks-execution"
+done
 
 forbidden="$tmpdir/forbidden"
 cp -R "$valid" "$forbidden"

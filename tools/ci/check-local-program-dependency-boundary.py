@@ -40,8 +40,18 @@ from pathlib import Path
 
 
 PACKAGE_NAME = "novarocks-local-program"
+FAILURE_CONTRACT = "novarocks-failure-contract"
+# ADR-0187 Domain facts are neutral values, never execution authority.
+# Only these existing owners may acquire the one dependency-free leaf.
+FAILURE_FACT_CONSUMERS = frozenset({
+    PACKAGE_NAME, "novarocks-connector-contract", "novarocks-constant-contract",
+    "novarocks-execution-contract", "novarocks-functions",
+    "novarocks-function-contract", "novarocks-result-contract",
+    "novarocks-type-contract", "novarocks-types",
+})
 PURE_OWNERS = frozenset({
     PACKAGE_NAME,
+    FAILURE_CONTRACT,
     "novarocks-connector-contract",
     "novarocks-constant-contract",
     "novarocks-execution-contract",
@@ -95,8 +105,12 @@ def verify_package(package, workspace_ids):
     if internal:
         if package["id"] not in workspace_ids or package["source"] is not None:
             violations.append(f"{name} is not the workspace-owned pure package")
-        if name == "novarocks-result-contract" and package["dependencies"]:
+        if name == FAILURE_CONTRACT and package["dependencies"]:
             violations.append(f"{name} must remain dependency-free")
+        if name == "novarocks-result-contract" and any(
+                d["name"] != FAILURE_CONTRACT or d["kind"] is not None
+                for d in package["dependencies"]):
+            violations.append(f"{name} may depend only on neutral FailureContract through a normal edge")
         # A feature/target variant of a repository-owned contract requires a new
         # audit. Optional dependencies cannot hide outside the selected tree.
         allowed_features = {"test-support"} if name == "novarocks-functions" else set()
@@ -120,8 +134,14 @@ def verify_package(package, workspace_ids):
         if any("proc-macro" in target["kind"] for target in package["targets"]):
             violations.append(f"{name} executes a proc-macro target")
         support = metadata_support()
-        if name in support.INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS:
-            allowed = support.INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS[name]
+        # LocalProgram owns its policy. The shared metadata helper may also
+        # audit this same neutral leaf; union is idempotent in either revision.
+        allowed = support.INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS.get(name)
+        if name == FAILURE_CONTRACT:
+            allowed = frozenset()
+        elif allowed is not None and name in FAILURE_FACT_CONSUMERS:
+            allowed = allowed | {FAILURE_CONTRACT}
+        if allowed is not None:
             unexpected = {d["name"] for d in package["dependencies"] if d["kind"] is None} - allowed
             if unexpected:
                 violations.append(f"{name} declares unaudited normal edges: {sorted(unexpected)}")
@@ -140,6 +160,23 @@ def verify_package(package, workspace_ids):
             support.EXTERNAL_PROC_MACROS | EXTRA_PROC_MACROS, build_edges))
         if package["source"] != REGISTRY_SOURCE:
             violations.append(f"{name} has unaudited dependency source: {package['source']}")
+    return violations
+
+
+def verify_selected_packages(packages, graph):
+    """Check both declared authority and the actually resolved neutral leaf."""
+    violations = [message for package in packages
+                  for message in verify_package(package, graph.workspace_members)]
+    for package in packages:
+        if package["name"] != FAILURE_CONTRACT:
+            continue
+        node = graph.resolve_nodes.get(package["id"])
+        if node is None or not isinstance(node.get("deps"), list):
+            violations.append(f"{FAILURE_CONTRACT} resolve graph omits dependency facts")
+        elif node["deps"] or node.get("dependencies"):
+            # No kind/target filter: dev/build/selected optional edges cannot
+            # hide authority behind an otherwise empty declared surface.
+            violations.append(f"{FAILURE_CONTRACT} resolved closure must remain dependency-free")
     return violations
 
 
@@ -204,8 +241,7 @@ def main():
     except (ValueError, KeyError) as error:
         print(f"local-program dependency boundary violation: {error}", file=sys.stderr)
         return 1
-    violations = [message for package in packages
-                  for message in verify_package(package, graph.workspace_members)]
+    violations = verify_selected_packages(packages, graph)
     if violations:
         for violation in violations:
             print(f"local-program dependency boundary violation: {violation}", file=sys.stderr)
