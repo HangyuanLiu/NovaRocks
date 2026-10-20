@@ -44,7 +44,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake libclang-dev libssl-dev pkg-config
+          sudo apt-get install --yes clang cmake libclang-dev libssl-dev pkg-config ripgrep
 
       - name: Install pinned Rust toolchain
         run: rustup show
