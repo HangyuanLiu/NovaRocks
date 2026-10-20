@@ -317,6 +317,10 @@ impl ManifestAssembledRound {
             let moved = match self.advance(drive).await {
                 Ok(moved) => moved,
                 Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "Active Task protocol failed before attempt terminal"
+                    );
                     self.pending_terminal
                         .get_or_insert_with(|| task_protocol_failure(error));
                     false
