@@ -35,6 +35,7 @@ MODELS = "novarocks-proto-models"
 PROTO = "novarocks-proto-codec"
 TASK_CODEC = "novarocks-task-codec"
 EXECUTION_CONTRACT = "novarocks-execution-contract"
+FAILURE_CONTRACT = "novarocks-failure-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
 PLAN_CODEC = "novarocks-plan-codec"
 SPI = "novarocks-spi"
@@ -54,7 +55,7 @@ TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES = {
     SPI,
     TYPES,
 }
-EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES = {TYPES, RESULT_CONTRACT}
+EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES = {TYPES, RESULT_CONTRACT, FAILURE_CONTRACT}
 ROLE_DIRECT_REQUIREMENTS = {MODELS, PROTO}
 WIRE_PACKAGES = {MODELS, PROTO, TASK_CODEC}
 
@@ -297,15 +298,23 @@ def verify_role_direct_dependencies(metadata):
 
 
 def verify_result_contract(metadata):
-    # The root-result vocabulary and flat validation are dependency-free facts.
-    # Check declarations and the resolved graph independently, including external
-    # crates and optional normal edges, rather than permitting a runtime closure.
-    direct = sorted(normal_dependency_names(package_by_name(metadata, RESULT_CONTRACT)))
-    if direct:
-        fail(f"{RESULT_CONTRACT} must not declare normal dependencies: " + ", ".join(direct))
-    reachable = sorted(normal_closure(metadata, RESULT_CONTRACT) - {RESULT_CONTRACT})
-    if reachable:
-        fail(f"{RESULT_CONTRACT} normal dependency closure must be empty: " + ", ".join(reachable))
+    # Result errors share only the neutral failure vocabulary. Check declarations
+    # and the resolved graph independently; this does not permit a runtime closure.
+    expected = {FAILURE_CONTRACT}
+    direct = normal_dependency_names(package_by_name(metadata, RESULT_CONTRACT))
+    if direct != expected:
+        fail(
+            f"{RESULT_CONTRACT} normal dependencies must be exactly: {FAILURE_CONTRACT}"
+            + " (missing: " + ", ".join(sorted(expected - direct))
+            + "; unexpected: " + ", ".join(sorted(direct - expected)) + ")"
+        )
+    reachable = normal_closure(metadata, RESULT_CONTRACT) - {RESULT_CONTRACT}
+    if reachable != expected:
+        fail(
+            f"{RESULT_CONTRACT} normal dependency closure must contain only: {FAILURE_CONTRACT}"
+            + " (missing: " + ", ".join(sorted(expected - reachable))
+            + "; unexpected: " + ", ".join(sorted(reachable - expected)) + ")"
+        )
 
 
 def verify_codec_closures(metadata):

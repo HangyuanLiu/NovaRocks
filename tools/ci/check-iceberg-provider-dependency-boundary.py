@@ -49,6 +49,7 @@ FORBIDDEN_PROVIDER_CLOSURE = {
 ALLOWED_PROVIDER_INTERNAL = {
     "novarocks-connector-contract",
     "novarocks-type-contract",
+    "novarocks-failure-contract",
     "novarocks-failpoint",
     "novarocks-connector-iceberg-functions",
     "novarocks-fs",

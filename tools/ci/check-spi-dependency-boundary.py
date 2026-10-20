@@ -47,6 +47,7 @@ PACKAGE_NAME = "novarocks-spi"
 NEUTRAL_INTERNAL_PACKAGES = frozenset(
     {
         "novarocks-connector-contract",
+        "novarocks-failure-contract",
         "novarocks-secret",
         "novarocks-type-contract",
         "novarocks-result-contract",

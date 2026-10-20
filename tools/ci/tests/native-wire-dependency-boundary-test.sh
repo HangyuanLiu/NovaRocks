@@ -149,13 +149,29 @@ jq '
 assert_rejected "$task_codec_missing_result_contract" \
   "missing: novarocks-result-contract"
 
-execution_contract_missing_result_contract="$tmpdir/execution-contract-missing-result-contract.json"
+# The real graph above includes the neutral failure vocabulary. Both contracts
+# are required, while unrelated direct dependencies remain forbidden.
+for required_contract in novarocks-result-contract novarocks-failure-contract; do
+  execution_contract_missing="$tmpdir/execution-contract-missing-${required_contract}.json"
+  drop_normal_resolve_edge novarocks-execution-contract "$required_contract" \
+    "$execution_contract_missing"
+  jq --arg required_contract "$required_contract" '
+    (.packages[] | select(.name == "novarocks-execution-contract") | .dependencies) |= map(
+      select(.name != $required_contract)
+    )
+  ' "$execution_contract_missing" >"$tmpdir/execution-contract-missing-consistent.json"
+  mv "$tmpdir/execution-contract-missing-consistent.json" "$execution_contract_missing"
+  assert_rejected "$execution_contract_missing" \
+    "novarocks-execution-contract internal normal dependencies must be exactly"
+done
+
+execution_contract_extra="$tmpdir/execution-contract-extra.json"
 jq '
-  (.packages[] | select(.name == "novarocks-execution-contract") | .dependencies) |= map(
-    select(.name != "novarocks-result-contract")
-  )
-' "$base_metadata" >"$execution_contract_missing_result_contract"
-assert_rejected "$execution_contract_missing_result_contract" \
+  (.packages[] | select(.name == "novarocks-execution-contract") | .dependencies) += [{
+    name: "novarocks-spi", kind: null, optional: false
+  }]
+' "$base_metadata" >"$execution_contract_extra"
+assert_rejected "$execution_contract_extra" \
   "novarocks-execution-contract internal normal dependencies must be exactly"
 
 result_contract_direct="$tmpdir/result-contract-direct.json"
@@ -165,13 +181,34 @@ jq '
   }]
 ' "$base_metadata" >"$result_contract_direct"
 assert_rejected "$result_contract_direct" \
-  "novarocks-result-contract must not declare normal dependencies: bytes"
+  "novarocks-result-contract normal dependencies must be exactly: novarocks-failure-contract"
+grep -Fq "unexpected: bytes" "$result_contract_direct.stderr"
+
+result_contract_missing_failure="$tmpdir/result-contract-missing-failure.json"
+drop_normal_resolve_edge novarocks-result-contract novarocks-failure-contract \
+  "$result_contract_missing_failure"
+jq '
+  (.packages[] | select(.name == "novarocks-result-contract") | .dependencies) |= map(
+    select(.name != "novarocks-failure-contract")
+  )
+' "$result_contract_missing_failure" >"$tmpdir/result-contract-missing-consistent.json"
+mv "$tmpdir/result-contract-missing-consistent.json" "$result_contract_missing_failure"
+assert_rejected "$result_contract_missing_failure" \
+  "novarocks-result-contract normal dependencies must be exactly: novarocks-failure-contract"
+grep -Fq "missing: novarocks-failure-contract" "$result_contract_missing_failure.stderr"
+
+result_contract_missing_resolved_failure="$tmpdir/result-contract-missing-resolved-failure.json"
+drop_normal_resolve_edge novarocks-result-contract novarocks-failure-contract \
+  "$result_contract_missing_resolved_failure"
+assert_rejected "$result_contract_missing_resolved_failure" \
+  "novarocks-result-contract normal dependency closure must contain only: novarocks-failure-contract"
+grep -Fq "missing: novarocks-failure-contract" "$result_contract_missing_resolved_failure.stderr"
 
 for forbidden in novarocks-proto-models novarocks-execution tonic; do
   result_contract_closure="$tmpdir/result-contract-${forbidden}.json"
   add_normal_resolve_edge novarocks-result-contract "$forbidden" "$result_contract_closure"
   assert_rejected "$result_contract_closure" \
-    "novarocks-result-contract normal dependency closure must be empty:"
+    "novarocks-result-contract normal dependency closure must contain only: novarocks-failure-contract"
   grep -Fq "$forbidden" "$result_contract_closure.stderr"
 done
 
@@ -243,6 +280,27 @@ add_normal_resolve_edge novarocks-execution-contract novarocks-proto-models \
 assert_rejected "$contract_wire_closure" \
   "novarocks-execution-contract normal dependency closure contains forbidden packages:"
 grep -Fq "novarocks-proto-models" "$contract_wire_closure.stderr"
+
+# Permitting the neutral vocabulary must not permit a wire/runtime dependency
+# hidden behind it. Keep the declaration and resolved normal edge consistent.
+failure_contract_id="$(package_id novarocks-failure-contract)"
+for forbidden in novarocks-proto-models novarocks-execution; do
+  failure_contract_closure="$tmpdir/failure-contract-${forbidden}.json"
+  forbidden_id="$(package_id "$forbidden")"
+  jq --arg failure_contract_id "$failure_contract_id" \
+     --arg forbidden "$forbidden" --arg forbidden_id "$forbidden_id" '
+    (.packages[] | select(.name == "novarocks-failure-contract") | .dependencies) += [{
+      name: $forbidden, kind: null, optional: false
+    }] |
+    (.resolve.nodes[] | select(.id == $failure_contract_id) | .deps) += [{
+      name: ($forbidden | gsub("-"; "_")), pkg: $forbidden_id,
+      dep_kinds: [{kind: null, target: null}]
+    }]
+  ' "$base_metadata" >"$failure_contract_closure"
+  assert_rejected "$failure_contract_closure" \
+    "novarocks-execution-contract normal dependency closure contains forbidden packages:"
+  grep -Fq "$forbidden" "$failure_contract_closure.stderr"
+done
 
 for forbidden in \
   novarocks-frontend-application \
