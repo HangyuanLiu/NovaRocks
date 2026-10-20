@@ -3152,6 +3152,44 @@ mod tests {
 
     #[test]
     fn an_oversized_handle_or_fragment_is_refused_by_the_codec_layer() {
+        fn assert_original_capacity(
+            error: &ConnectorWriteCodecError,
+            path: ConnectorFieldPath,
+            detail: &'static str,
+        ) {
+            use novarocks_failure_contract::{
+                FailureClass, FailureEvidence, FailureProjection, SharedFailureCause, domain,
+            };
+            let protocol = error.protocol();
+            assert!(matches!(protocol.kind(), ProtocolErrorKind::Domain(_)));
+            assert_eq!(
+                std::error::Error::source(error)
+                    .unwrap()
+                    .downcast_ref::<ProtocolError>(),
+                Some(protocol)
+            );
+            let shared = std::error::Error::source(protocol)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .expect("the protocol keeps the original codec error");
+            let original = shared
+                .downcast_ref::<ConnectorCodecError>()
+                .expect("the hard byte limit is authored by the codec");
+            let expected =
+                ConnectorCodecError::new(path, ConnectorCodecErrorKind::Capacity, detail);
+            assert_eq!(original, &expected);
+            assert!(std::error::Error::source(original).is_none());
+            let fact = protocol.failure_fact();
+            assert_eq!(fact, expected.failure_fact());
+            assert_eq!(fact.class(), FailureClass::Resource);
+            assert_eq!(fact.evidence(), FailureEvidence::Originating);
+            assert_eq!(fact.reason().domain(), domain::CONNECTOR.get());
+            assert_eq!(fact.reason().code(), 167);
+            // This hard-limit author supplies no measured quantities. The
+            // adapter preserves that absence instead of deriving or inventing them.
+            assert_eq!(fact.resource(), None);
+        }
+
         let facets = generation();
 
         // One path past the 16 MiB writer-handle bound. A bare path keeps the
@@ -3169,7 +3207,11 @@ mod tests {
             .handle_encoder
             .encode_writer_handle(&neutral)
             .expect_err("an oversized writer handle");
-        assert_eq!(error.protocol().kind(), &ProtocolErrorKind::Capacity);
+        assert_original_capacity(
+            &error,
+            ConnectorFieldPath::root("writer_handle").field("iceberg"),
+            "Iceberg writer handle exceeds its hard byte limit",
+        );
         assert_public_provider_error_path(&error, "writer_handle.iceberg");
 
         // One path past the 1 MiB commit-fragment bound.
@@ -3189,7 +3231,11 @@ mod tests {
             .fragment_encoder
             .encode_commit_fragment(&neutral)
             .expect_err("an oversized commit fragment");
-        assert_eq!(error.protocol().kind(), &ProtocolErrorKind::Capacity);
+        assert_original_capacity(
+            &error,
+            ConnectorFieldPath::root("commit_fragment").field("iceberg"),
+            "Iceberg commit fragment exceeds its hard byte limit",
+        );
         assert_public_provider_error_path(&error, "commit_fragment.iceberg");
     }
     fn unpartitioned() -> IcebergArtifactPartition {

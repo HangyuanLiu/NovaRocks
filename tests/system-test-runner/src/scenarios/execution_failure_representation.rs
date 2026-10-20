@@ -40,6 +40,14 @@ struct RepresentationRecoveryPolicy {
     intent: SqlIntentOwner,
 }
 impl Scenario for RepresentationRecoveryPolicy {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        super::declarations::for_module(
+            "execution_failure_representation",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
     fn name(&self) -> &'static str {
         "execution-failure/representation-recovery-policy"
     }

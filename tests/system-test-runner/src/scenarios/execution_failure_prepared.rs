@@ -63,6 +63,14 @@ struct AcceptedPreparedFailureDelayedExit {
     intent: DirectIntentOwner,
 }
 impl Scenario for AcceptedPreparedFailureDelayedExit {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        super::declarations::for_module(
+            "execution_failure_prepared",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
     fn name(&self) -> &'static str {
         "execution-failure/accepted-prepared-failure-delayed-exit"
     }

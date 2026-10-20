@@ -6758,6 +6758,44 @@ pub(crate) mod tests {
         installs: AtomicUsize,
         submit_refusal: Mutex<Option<TaskStatusReporter>>,
         reject_submit: AtomicBool,
+        abort_pause: Mutex<Option<Arc<PausedRootWorker>>>,
+    }
+
+    /// Holds the real runnable's abort delegation, not a readiness callback
+    /// whose synchronous borrower can belong to another notifying thread.
+    struct PausedNativeAbort {
+        inner: Arc<dyn RunnableTask>,
+        gate: Arc<PausedRootWorker>,
+    }
+    impl std::fmt::Debug for PausedNativeAbort {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PausedNativeAbort")
+                .field("inner", &self.inner)
+                .finish()
+        }
+    }
+    impl RunnableTask for PausedNativeAbort {
+        fn commit_creation(&self) {
+            self.inner.commit_creation();
+        }
+        fn cancel(&self, reason: CancelReason) {
+            self.inner.cancel(reason);
+        }
+        fn quiesce(&self) {
+            self.inner.quiesce();
+        }
+        fn abort(&self, cause: AbortCause) {
+            if let Some(sender) = self.gate.started.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
+            let mut open = self.gate.open.lock().unwrap();
+            while !*open {
+                open = self.gate.changed.wait(open).unwrap();
+            }
+            drop(open);
+            self.inner.abort(cause);
+        }
     }
 
     impl TaskExecutionHost for CountingHost {
@@ -6811,7 +6849,12 @@ pub(crate) mod tests {
                     "injected submit refusal after actual Native receiver preparation",
                 )));
             }
-            self.inner.submit_runnable(descriptor, reporter)
+            let inner = self.inner.submit_runnable(descriptor, reporter)?;
+            let gate = self.abort_pause.lock().unwrap().clone();
+            Ok(match gate {
+                Some(gate) => Arc::new(PausedNativeAbort { inner, gate }) as Arc<dyn RunnableTask>,
+                None => inner,
+            })
         }
 
         fn apply_task_domain(
@@ -6910,6 +6953,7 @@ pub(crate) mod tests {
                 installs: AtomicUsize::new(0),
                 submit_refusal: Mutex::new(None),
                 reject_submit: AtomicBool::new(false),
+                abort_pause: Mutex::new(None),
             });
             let mut config = TaskExecutionRegistryConfig::for_process(backend, 16, 16);
             config.gate_poll_interval = Duration::from_secs(3600);
@@ -7954,6 +7998,14 @@ pub(crate) mod tests {
         ] {
             let fixture = OwnerFixture::new(query);
             let pause = RootWorkerPause::new(&fixture.host.inner.root_producer_pool);
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let fanout_gate = Arc::new(PausedRootWorker {
+                open: Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+                started: Mutex::new(Some(sender)),
+            });
+            let fanout_pause = CallbackPause(fanout_gate.clone());
+            *fixture.host.abort_pause.lock().unwrap() = Some(fanout_gate);
             let root = fixture.identity(1);
             let descriptor = consistent_descriptor(root, UniqueId::new(query, 1));
             let receipt = fixture.create(
@@ -7961,6 +8013,33 @@ pub(crate) mod tests {
                 &Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]),
             );
             assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
+            let source = fixture.registry.status_source(fixture.context).unwrap();
+            // Accepted and the host's receiver map precede Worker installation.
+            // The original five-second observation budget covers installation
+            // and the exact abort-delegation gate; it is never restarted.
+            let abort_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let installed = loop {
+                let current = source.latest(root).unwrap();
+                if current.installed() && current.state() == TaskState::Running {
+                    break Some(current);
+                }
+                if current.is_terminal() || std::time::Instant::now() >= abort_deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            if installed.is_none() {
+                pause.open();
+                drop(fanout_pause);
+                let pool_exit = fixture.host.inner.root_producer_pool.shutdown();
+                let completion_exit = fixture.host.inner.completion_supervisor.shutdown();
+                assert!(pool_exit.is_ok(), "{pool_exit:?}");
+                assert!(completion_exit.is_ok(), "{completion_exit:?}");
+                panic!(
+                    "the real root was not Installed and Running: {:?}",
+                    source.latest(root)
+                );
+            }
             let channel = fixture
                 .host
                 .inner
@@ -7969,58 +8048,41 @@ pub(crate) mod tests {
                 .root_channel
                 .clone()
                 .unwrap();
-            let source = fixture.registry.status_source(fixture.context).unwrap();
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            let fanout_gate = Arc::new(PausedRootWorker {
-                open: Mutex::new(false),
-                changed: std::sync::Condvar::new(),
-                started: Mutex::new(None),
-            });
-            let callback_gate = fanout_gate.clone();
-            let fanout_pause = CallbackPause(fanout_gate.clone());
-            let abort_thread_id = Arc::new(Mutex::new(None));
-            let callback_thread_id = abort_thread_id.clone();
-            let source_at_seal = source.clone();
-            let weak_channel = Arc::downgrade(&channel);
-            let once = std::sync::atomic::AtomicBool::new(true);
-            let observer = channel.writable_observable().subscribe(Arc::new(move || {
-                if weak_channel
-                    .upgrade()
-                    .is_some_and(|channel| channel.is_closed())
-                    && *callback_thread_id.lock().unwrap() == Some(std::thread::current().id())
-                    && once.swap(false, Ordering::AcqRel)
-                {
-                    sender.send(source_at_seal.latest(root).unwrap()).unwrap();
-                    let mut open = callback_gate.open.lock().unwrap();
-                    while !*open {
-                        open = callback_gate.changed.wait(open).unwrap();
-                    }
-                }
-            }));
             let registry = fixture.registry.clone();
             let context = fixture.context;
             let abort = std::thread::spawn(move || {
-                *abort_thread_id.lock().unwrap() = Some(std::thread::current().id());
                 registry.abort_query_context(&novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(TaskOperationId::new_v7(), context, cause))
             });
-            let at_seal = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
-            // Unblock the actual producer while the runnable abort is still
-            // held behind finish_seal's callback. The driver must conclude
-            // from the cause fixed under the Worker fence.
+            let reached_fanout = receiver
+                .recv_timeout(abort_deadline.saturating_duration_since(std::time::Instant::now()));
+            let at_seal = source.latest(root).unwrap();
+            let root_sealed = channel.is_closed();
+            // The actual Worker fence and seal already ran, but the wrapper
+            // has not delegated to the real NativeRunnableTask.abort yet.
             pause.open();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let terminal = loop {
                 let current = source.latest(root).unwrap();
-                if current.is_terminal() {
-                    break current;
-                }
-                if std::time::Instant::now() >= deadline {
+                if current.is_terminal() || std::time::Instant::now() >= deadline {
                     break current;
                 }
                 std::thread::sleep(Duration::from_millis(1));
             };
+            // Every final assertion follows actual fan-out exit and completion
+            // cleanup, even when the intended observation would be RED.
             drop(fanout_pause);
-            let receipt = abort.join().unwrap();
+            let abort_result = abort.join();
+            let pool_exit = fixture.host.inner.root_producer_pool.shutdown();
+            let completion_exit = fixture.host.inner.completion_supervisor.shutdown();
+            assert!(
+                reached_fanout.is_ok(),
+                "real runnable abort gate was not reached: {reached_fanout:?}; pool exit={pool_exit:?}; completion exit={completion_exit:?}"
+            );
+            assert!(
+                root_sealed,
+                "Worker must seal the real root before runnable fan-out"
+            );
+            let receipt = abort_result.unwrap();
             assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
             assert_eq!(at_seal.state(), TaskState::Aborting);
             assert_eq!(
@@ -8036,8 +8098,8 @@ pub(crate) mod tests {
                 terminal.termination(),
                 Some(&TerminationDetail::Aborted(cause))
             );
-            drop(observer);
-            fixture.host.inner.root_producer_pool.shutdown().unwrap();
+            assert!(pool_exit.is_ok(), "{pool_exit:?}");
+            assert!(completion_exit.is_ok(), "{completion_exit:?}");
         }
     }
 

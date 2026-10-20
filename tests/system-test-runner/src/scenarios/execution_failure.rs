@@ -58,6 +58,14 @@ struct ResourceRecoveryPolicy {
     intent: SqlIntentOwner,
 }
 impl Scenario for ResourceRecoveryPolicy {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        super::declarations::for_module(
+            "execution_failure",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
     fn name(&self) -> &'static str {
         "execution-failure/resource-recovery-policy"
     }

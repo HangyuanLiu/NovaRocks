@@ -1284,9 +1284,31 @@ mod tests {
             &Control::default(),
         )
         .unwrap_err();
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
+        };
+        let Failure::Provider(error) = error else {
+            panic!("expected the original provider Unsupported refusal");
+        };
+        assert_eq!(error.path(), &ConnectorFieldPath::root("read_columns"));
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
         assert!(
-            matches!(error, Failure::Provider(error) if error.kind() == &ConnectorCodecErrorKind::Unsupported)
+            matches!(error.kind(), ConnectorCodecErrorKind::Domain(actual) if actual == source)
         );
+        let original = source.downcast_ref::<ConnectorError>().unwrap();
+        assert_eq!(
+            original.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        );
+        let expected = FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(4).unwrap()),
+        );
+        assert_eq!(original.failure_fact(), expected);
+        assert_eq!(error.failure_fact(), original.failure_fact());
     }
 
     #[test]
@@ -1473,10 +1495,32 @@ mod tests {
             .dereference(&[2])
             .unwrap();
         let public = physical_public(vec![Arc::new(Field::new("bucket", DataType::Int32, true))]);
+        let error = run(&system(), &[column], &public, &Control::default()).unwrap_err();
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
+        };
+        let Failure::Provider(error) = error else {
+            panic!("expected the original provider Unsupported refusal");
+        };
+        assert_eq!(error.path(), &ConnectorFieldPath::root("read_columns"));
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
         assert!(
-            matches!(run(&system(), &[column], &public, &Control::default()),
-            Err(Failure::Provider(error)) if error.kind() == &ConnectorCodecErrorKind::Unsupported)
+            matches!(error.kind(), ConnectorCodecErrorKind::Domain(actual) if actual == source)
         );
+        let original = source.downcast_ref::<ConnectorError>().unwrap();
+        assert_eq!(
+            original.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        );
+        let expected = FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(4).unwrap()),
+        );
+        assert_eq!(original.failure_fact(), expected);
+        assert_eq!(error.failure_fact(), original.failure_fact());
     }
 
     #[test]
