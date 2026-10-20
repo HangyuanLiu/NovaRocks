@@ -19,29 +19,9 @@
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build_capabilities.sh"
 
 
-ci_load_stable_suites() {
-  local manifest="$1"
-  local line
-  local suite
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    suite="${line#"${line%%[![:blank:]]*}"}"
-    suite="${suite%"${suite##*[![:blank:]]}"}"
-
-    case "$suite" in
-      ""|\#*)
-        continue
-        ;;
-      *)
-        printf "%s\n" "$suite"
-        ;;
-    esac
-  done <"$manifest"
-}
-
 ci_tier_suites() {
   local tier="$1"
-  local stable_manifest="$2"
+  local repo_root="$2"
 
   case "$tier" in
     smoke)
@@ -51,7 +31,7 @@ ci_tier_suites() {
       printf "%s\n" optimizer optimizer-dist iceberg-rest aggregate runtime-filter
       ;;
     full)
-      ci_load_stable_suites "$stable_manifest"
+      ci_discover_sql_suites "$repo_root" default
       ;;
     *)
       return 1
@@ -65,7 +45,7 @@ ci_native_cross_process_core_suites() {
 
 ci_native_cross_process_suites() {
   if [ "${NOVA_CI_NATIVE_CROSS_PROCESS_FULL:-0}" = "1" ]; then
-    ci_tier_suites full "$STABLE_SUITES_FILE"
+    ci_tier_suites full "$REPO_ROOT"
     return $?
   fi
 

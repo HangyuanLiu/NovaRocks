@@ -33,6 +33,18 @@ runner="$(ci_bound_binary novarocks-system-tests)"
 
 CLI package 为 `novarocks-system-test-cli`，原 package `novarocks-system-test-runner` 为库，保留原 `CARGO_MANIFEST_DIR`。完整 `--list` 包括显式与暂停场景；默认 `--list-default` 与无 selector 使用同一集合，排除兼容场景与其它显式专项。Paimon 及 mixed UEA4 暂停项继续显示 DISABLED 并在 fixture/launch 前拒绝显式选择，production provider 仍注册。`performance` launch profile 选择 clean harness 配置，不表示测量实验。
 
+## 声明与收束材料
+
+`--list-declarations` 不启动 fixture/cluster，输出 schema 1 的完整注册集合，包括 default、explicit、compatibility、paused/paused_reason，以及原生 `declaration` 中的 `impact.paths`、`env_inputs`（value/file-content）、`initial_state`、`basis`、`heavy`。它是 `dev-verify.sh` 的场景影响来源；shell 不另存场景表。声明初始状态只接受已有隔离、复位或不可变事实，未证明的状态保留 null。暂停项仍拒绝执行；显式/重项不能当作暂停。
+
+每个场景在 cluster shutdown 和 fixture teardown 后另写 schema 1 `scenario-teardown.json`，无论断言通过还是失败；`scenario-evidence.json` schema 5 保持原合同。收束材料分别给出 fixture launch_config、teardown 状态/错误、外部 resources，cluster launch、shutdown、error 和 partial_cleanup。部分 cluster 启动失败会注明由 monitor 补证，不能由一次总退出码推断清理。缺记录或缺必需 monitor/资源终态一律未知。`tools/ci` 调用 owner 在执行前后写 invocation 和范围身份，关联这两份材料；直接 CLI 的本地输出仍需完整材料才能组合。
+
+仅绑定现成外部端点的场景尚无 G5 的隔离/复位保证；其 `initial_state=null`，即使单次成功也不能借此沿用历史结果。不增加共享 fixture 的删除或清空权限来补这个缺口。当前尝试的真实断言、前置、退出事实继续保留。
+
+新增不随进程退出消失的资源 owner 时，必须在产生首个外部副作用前调用 cluster-harness 的 `resource_registration::register(root, owner, id, label)`，并在所有成功、失败和 shutdown 路径用 `Registration::settle` 写出实际清理结果。`list/collect` 递归观察本次 PID 新登记的资源；损坏/未知 owner 和未 settlement 保持 unsettled，cleanup_failed 不得被幂等 shutdown 覆盖。句柄 Drop 不代表释放。现有隔离 REST/MinIO 的登记覆盖 Compose 项目和私有 runtime；hook 镜像构建纳入登记范围，但释放记录不证明构建镜像已回收，也不新增镜像删除权。
+
+登记仅记录 owner 事实，不授予回收权限。人工或工具后续确认必须只观察准确资源，保存独立确认，原清理违约永久保留；`dev-verify.sh confirm-cleanup` 不删除任何资源。规则与层结论见 [测试治理](../../docs/guides/development/test-governance.md#影响声明发现与开发入口)。
+
 ## 产物与有限授权
 
 普通与受控步骤使用唯一显式 `--binary` 主 Server，原生 owner 按实际选中动作冻结角色需求、会话和 statement。dev 编入能力但不授予动作，标准 release 排除能力；缺能力/授权在 spawn 前失败。无授权角色也可运行同一 dev Server。兼容变体从实际 Cargo artifact 独立复制，启动及 restart 前保持准确程序与 grants 绑定。路径、identity、runner profile 不代替实际 FE/BE 自报，unknown 保留；原始 stdout/stderr、退出、清理失败和重跑材料分开保留。详见 [构建与授权](../../docs/guides/development/test-governance.md#构建选择与控制授权)。

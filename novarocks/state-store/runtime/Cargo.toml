@@ -40,3 +40,7 @@ tracing.workspace = true
 [dev-dependencies]
 novarocks-state-store-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

@@ -15,6 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Known SQL failures accepted by local CI tier classification.
-# Every [[failure]] row must include a reason and an expiry date.
-# Expired rows are treated as failures until they are refreshed or removed.
+explicit_only = false
+
+[impact]
+paths = ["novarocks/execution/src/exec/operators/hashjoin/**", "novarocks/execution/src/exec/operators/nljoin/**", "novarocks/sql/src/optimizer/**"]
+
+[reuse]
+scope = "suite"
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

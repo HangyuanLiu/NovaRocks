@@ -4,6 +4,7 @@ mod backend_membership;
 mod catalog_publication;
 mod catalog_state;
 mod connector;
+mod declarations;
 mod distributed_writer;
 #[cfg(unix)]
 pub(crate) mod exact_mysql_native_driver;

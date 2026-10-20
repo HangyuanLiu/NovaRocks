@@ -3,6 +3,7 @@ use crate::config::RunnerConfig;
 use crate::scenario::{
     Scenario, ScenarioContext, ScenarioEvidenceOutcome, resolve_backend_binaries, resolve_binary,
 };
+use crate::scenario_settlement::ScenarioSettlement;
 use crate::scenarios;
 use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
@@ -21,6 +22,13 @@ pub fn run(cli: Cli, build: crate::build_information::BuildInformation) -> Resul
 
 fn run_dispatch(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
     let scenarios = scenarios::all();
+    if cli.list_declarations {
+        println!(
+            "{}",
+            serde_json::to_string(&scenario_declarations(&scenarios, &cli.only)?)?
+        );
+        return Ok(());
+    }
     if cli.list || cli.list_default {
         for scenario in list_scenarios(&scenarios, cli.list_default)? {
             if let Some(reason) = scenarios::disabled_reason(scenario.name()) {
@@ -219,6 +227,39 @@ fn list_scenarios(
     }
 }
 
+fn scenario_declarations(
+    scenarios: &[Box<dyn Scenario>],
+    only: &[String],
+) -> Result<serde_json::Value> {
+    for requested in only {
+        anyhow::ensure!(
+            scenarios
+                .iter()
+                .any(|scenario| scenario.name() == requested),
+            "unknown system scenario {requested}"
+        );
+    }
+    let entries = scenarios
+        .iter()
+        .filter(|scenario| {
+            only.is_empty() || only.iter().any(|requested| requested == scenario.name())
+        })
+        .map(|scenario| {
+            let paused_reason = scenarios::disabled_reason(scenario.name());
+            serde_json::json!({
+                "name": scenario.name(),
+                "default": !scenario.is_explicit_stage() && paused_reason.is_none(),
+                "explicit": scenario.is_explicit_stage(),
+                "compatibility": scenario.is_compatibility_stage(),
+                "paused": paused_reason.is_some(),
+                "paused_reason": paused_reason,
+                "declaration": scenario.declaration(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({"schema": 1, "scenarios": entries}))
+}
+
 #[cfg(unix)]
 fn select_exact<'a>(
     scenarios: &'a [Box<dyn Scenario>],
@@ -293,12 +334,30 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let scenario_root = config.artifact_root.join(scenario.name().replace('/', "-"));
     fs::create_dir_all(&scenario_root)
         .with_context(|| format!("create scenario artifact root {}", scenario_root.display()))?;
+    let settlement = ScenarioSettlement::new(scenario.name(), &scenario_root)?;
+    let result = run_one_inner(scenario, config, scenario_root, &settlement);
+    match settlement.write() {
+        Ok(()) => result,
+        Err(error) => finish_exact_mysql_scenario(result.err(), Err(error), Ok(())),
+    }
+}
+
+fn run_one_inner(
+    scenario: &dyn Scenario,
+    config: &RunnerConfig,
+    scenario_root: std::path::PathBuf,
+    settlement: &ScenarioSettlement,
+) -> Result<()> {
+    if let Some(reason) = scenarios::disabled_reason(scenario.name()) {
+        bail!("system scenario {} is disabled: {reason}", scenario.name());
+    }
     let mut launch_config = match scenario.launch_config(&scenario_root) {
         Ok(config) => config,
         Err(error) => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
+            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
         }
     };
+    settlement.launch_config_succeeded();
     // The explicit FE-child fixture pair is the existing activation contract.
     // Capture only once before launch; serial startup consumes this original budget.
     let exact_mysql_clock = match crate::scenario::ExactMysqlPrelaunchClock::capture(
@@ -306,12 +365,14 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     ) {
         Ok(clock) => clock,
         Err(error) => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
+            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
         }
     };
     let root_observation_clock = match scenario.root_observation_deadline() {
         Ok(clock) => clock,
-        Err(error) => return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown()),
+        Err(error) => {
+            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+        }
     };
     if exact_mysql_clock.is_some() && root_observation_clock.is_some() {
         return finish_exact_mysql_scenario(
@@ -319,7 +380,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
                 "neutral root source cannot activate an exact MySQL gate owner"
             )),
             Ok(()),
-            scenario.teardown(),
+            settlement.teardown(scenario),
         );
     }
     let bounded_original = exact_mysql_clock.is_some() || root_observation_clock.is_some();
@@ -331,7 +392,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
                     "system original scenario deadline overflow"
                 )),
                 Ok(()),
-                scenario.teardown(),
+                settlement.teardown(scenario),
             );
         }
     };
@@ -366,9 +427,11 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let (fe_binary, be_binaries) = match preparation {
         Ok(binaries) => binaries,
         Err(error) if bounded_original => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
+            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
         }
-        Err(error) => return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown()),
+        Err(error) => {
+            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+        }
     };
     launch_config.resolved_artifacts = Some(crate::scenario::ResolvedScenarioArtifacts {
         frontend: fe_binary.clone().unwrap_or_else(|| config.binary.clone()),
@@ -388,7 +451,9 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         original_deadline,
     ) {
         Ok(plan) => plan,
-        Err(error) => return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown()),
+        Err(error) => {
+            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+        }
     };
 
     let cluster_options = CrossProcessClusterOptions {
@@ -420,9 +485,10 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
                 "original exact/neutral config freeze requires direct original roles"
             )),
             Ok(()),
-            scenario.teardown(),
+            settlement.teardown(scenario),
         );
     }
+    settlement.cluster_launch_attempted();
     let handle = if let Some(plan) = test_sessions {
         let prepared_check =
             |artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence| -> Result<()> {
@@ -480,7 +546,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
                     "exact MySQL prelaunch config freeze requires direct original roles"
                 )),
                 Ok(()),
-                scenario.teardown(),
+                settlement.teardown(scenario),
             )?;
             unreachable!();
         }
@@ -509,7 +575,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
                     "neutral original source requires direct original roles"
                 )),
                 Ok(()),
-                scenario.teardown(),
+                settlement.teardown(scenario),
             );
         }
         let prepared_check =
@@ -566,10 +632,15 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let handle = match handle {
         Ok(handle) => handle,
         Err(error) => {
+            settlement.cluster_launch_failed(&error);
             if bounded_original {
-                return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
+                return finish_exact_mysql_scenario(
+                    Some(error),
+                    Ok(()),
+                    settlement.teardown(scenario),
+                );
             }
-            return match scenario.teardown() {
+            return match settlement.teardown(scenario) {
                 Ok(()) => Err(error),
                 Err(teardown) => Err(anyhow::anyhow!(
                     "{error:#}; fixture teardown failed: {teardown:#}"
@@ -577,6 +648,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             };
         }
     };
+    settlement.cluster_launched();
     let mut context = ScenarioContext::new(
         scenario.name(),
         handle,
@@ -636,7 +708,8 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         } else {
             context.shutdown()
         };
-        let fixture_cleanup = scenario.teardown();
+        settlement.cluster_shutdown(&cluster_cleanup);
+        let fixture_cleanup = settlement.teardown(scenario);
         if bounded_original {
             return finish_exact_mysql_scenario(
                 Some(
@@ -674,7 +747,8 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         context.shutdown()
     }
     .with_context(|| format!("cleanup system scenario {}", context.name()));
-    let fixture_cleanup = scenario.teardown();
+    settlement.cluster_shutdown(&cluster_cleanup);
+    let fixture_cleanup = settlement.teardown(scenario);
     if bounded_original {
         finish_exact_mysql_scenario(None, cluster_cleanup, fixture_cleanup)?;
     } else {
@@ -696,6 +770,9 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let evidence_path = context
         .write_evidence(ScenarioEvidenceOutcome::Passed)
         .with_context(|| format!("write passing scenario evidence for {}", context.name()))?;
+    // The original deadline includes all final durable evidence. The outer
+    // wrapper writes only on paths that have not already published this record.
+    settlement.write()?;
     if let Some(clock) = exact_mysql_clock {
         clock.remaining("settled original role and final evidence completion")?;
     }
@@ -716,6 +793,50 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declarations_cover_native_registry_flags_and_all_explicit_reasons() {
+        let scenarios = crate::scenarios::all();
+        let document = scenario_declarations(&scenarios, &[]).unwrap();
+        let entries = document["scenarios"].as_array().unwrap();
+        assert_eq!(entries.len(), scenarios.len());
+        for (entry, scenario) in entries.iter().zip(&scenarios) {
+            assert_eq!(entry["name"], scenario.name());
+            assert_eq!(entry["explicit"], scenario.is_explicit_stage());
+            assert_eq!(entry["compatibility"], scenario.is_compatibility_stage());
+            assert_eq!(
+                entry["paused"],
+                scenarios::disabled_reason(scenario.name()).is_some()
+            );
+            assert!(
+                !entry["declaration"]["impact"]["paths"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "{}",
+                scenario.name()
+            );
+            if scenario.is_explicit_stage() {
+                assert!(
+                    entry["declaration"]["heavy"]["detail"]
+                        .as_str()
+                        .is_some_and(|detail| !detail.is_empty()),
+                    "{}",
+                    scenario.name()
+                );
+            }
+            if scenarios::disabled_reason(scenario.name()).is_some() {
+                assert!(
+                    entry["paused_reason"]
+                        .as_str()
+                        .is_some_and(|reason| !reason.is_empty())
+                );
+                assert_eq!(entry["default"], false);
+                assert_eq!(scenario_declarations(&scenarios, &[scenario.name().into()]).unwrap()["scenarios"].as_array().unwrap().len(), 1);
+            }
+        }
+        assert!(scenario_declarations(&scenarios, &["missing".into()]).is_err());
+    }
 
     #[test]
     fn registry_listing_preserves_default_selection_and_explicit_opt_in() {
@@ -1281,6 +1402,168 @@ mod neutral_root_prelaunch_tests {
                 failure.primary.is_some() && failure.cluster.is_none() && failure.fixture.is_none()
             );
             assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod settlement_integration_tests {
+    use super::*;
+    use crate::scenario::ScenarioLaunchConfig;
+    use novarocks_cluster_harness::resource_registration::{self, Registration};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct Resource {
+        registration: Registration,
+        fail_cleanup: bool,
+    }
+    impl Drop for Resource {
+        fn drop(&mut self) {
+            self.registration
+                .settle(&if self.fail_cleanup {
+                    Err(anyhow::anyhow!("owner Drop cleanup failed"))
+                } else {
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+    struct Fixture {
+        mode: &'static str,
+        teardown_fails: bool,
+        teardowns: AtomicUsize,
+    }
+    impl Scenario for Fixture {
+        fn name(&self) -> &'static str {
+            "component/settlement-integration"
+        }
+        fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
+            let resource = Resource {
+                registration: resource_registration::register(
+                    root,
+                    "fake",
+                    "new-resource",
+                    "fake-project",
+                )?,
+                fail_cleanup: self.mode == "drop-fails",
+            };
+            if self.mode == "forgotten" {
+                std::mem::forget(resource);
+            } else {
+                drop(resource);
+            }
+            if matches!(
+                self.mode,
+                "drop-fails" | "forgotten" | "launch-config-fails"
+            ) {
+                bail!("launch preparation failed after resource creation");
+            }
+            Ok(ScenarioLaunchConfig::default())
+        }
+        fn root_observation_deadline(&self) -> Result<Option<Instant>> {
+            anyhow::ensure!(
+                self.mode != "clock-fails",
+                "original deadline capture failed"
+            );
+            Ok(None)
+        }
+        fn run(&self, _: &mut ScenarioContext) -> Result<()> {
+            panic!("test never starts a working cluster")
+        }
+        fn teardown(&self) -> Result<()> {
+            self.teardowns.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!self.teardown_fails, "fixture teardown failed");
+            Ok(())
+        }
+    }
+    fn config(root: &Path) -> RunnerConfig {
+        RunnerConfig {
+            build: crate::build_information::BuildInformation::fixture(),
+            binary: root.join("deliberately-missing-binary"),
+            compatible_binary: None,
+            other_island_binary: None,
+            base_config_path: root.join("deliberately-missing-config"),
+            artifact_root: root.to_owned(),
+            cluster_size: 3,
+            timeout: Duration::from_millis(100),
+            launch_profile: novarocks_cluster_harness::LaunchProfile::FaultScenario,
+            exact_mysql_execution_binding: None,
+            held_native_execution_binding: None,
+            held_live_collector_fences: false,
+        }
+    }
+    #[test]
+    fn actual_early_returns_report_owner_cleanup_without_inferring_from_empty_slots() {
+        for mode in [
+            "drop-fails",
+            "forgotten",
+            "launch-config-fails",
+            "clock-fails",
+            "cluster-fails",
+        ] {
+            for teardown_fails in [true, false] {
+                let root = tempfile::tempdir().unwrap();
+                let scenario_root = root.path().join("component-settlement-integration");
+                let _old = resource_registration::register(
+                    &scenario_root,
+                    "fake",
+                    "old-resource",
+                    "old-project",
+                )
+                .unwrap();
+                let fixture = Fixture {
+                    mode,
+                    teardown_fails,
+                    teardowns: AtomicUsize::new(0),
+                };
+                assert!(run_one(&fixture, &config(root.path())).is_err());
+                assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
+                let record: serde_json::Value = serde_json::from_slice(
+                    &fs::read(scenario_root.join("scenario-teardown.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    record["fixture"]["teardown"]["status"],
+                    if teardown_fails { "failed" } else { "ok" }
+                );
+                let resources = record["fixture"]["resources"].as_array().unwrap();
+                assert_eq!(resources.len(), 1, "old registration excluded");
+                assert_eq!(resources[0]["id"], "new-resource");
+                assert_eq!(
+                    resources[0]["state"],
+                    match mode {
+                        "drop-fails" => "cleanup_failed",
+                        "forgotten" => "unsettled",
+                        _ => "released",
+                    }
+                );
+                assert_eq!(
+                    record["fixture"]["launch_config"],
+                    if matches!(mode, "drop-fails" | "forgotten" | "launch-config-fails") {
+                        "failed"
+                    } else {
+                        "ok"
+                    }
+                );
+                assert_eq!(
+                    record["cluster"]["launch"],
+                    if mode == "cluster-fails" {
+                        "failed"
+                    } else {
+                        "not_attempted"
+                    }
+                );
+                assert_eq!(
+                    record["cluster"]["partial_cleanup"],
+                    if mode == "cluster-fails" {
+                        serde_json::json!("monitor")
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
+            }
         }
     }
 }

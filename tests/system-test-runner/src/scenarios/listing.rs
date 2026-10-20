@@ -33,6 +33,15 @@ use std::time::Duration;
 pub struct CatalogListing;
 
 impl Scenario for CatalogListing {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "listing",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "catalog/mem-1-m07-sdk-listing"
     }
@@ -312,6 +321,15 @@ pub struct CatalogListingCancellation;
 pub struct ObjectStoreListingBoundary;
 
 impl Scenario for ObjectStoreListingBoundary {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "listing",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "catalog/mem-1-m07-opendal-listing-boundary"
     }
@@ -383,6 +401,15 @@ impl Scenario for ObjectStoreListingBoundary {
 }
 
 impl Scenario for CatalogListingCancellation {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "listing",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "catalog/mem-1-m07-sdk-listing-cancellation"
     }

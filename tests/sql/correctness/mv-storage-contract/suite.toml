@@ -3,3 +3,12 @@
 # never select it: the chain is only meaningful against a runner-owned
 # 1FE+3BE topology over REST Catalog and MinIO.
 explicit_only = true
+heavy = { reason = "fixture", detail = "Requires private REST Catalog and MinIO, native 1FE+3BE and serial execution; covers MV document/storage recovery and operator continuation." }
+
+[impact]
+paths = ["novarocks/mv-application/**", "novarocks/frontend-application/src/mv/**", "docker/iceberg-rest/spark-sql.sh", "docker/iceberg-rest/spark-shell.sh"]
+
+[reuse]
+scope = "suite"
+# The fixture is private, but external Spark scripts and their environment are not fully bound by the current SQL input contract.
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

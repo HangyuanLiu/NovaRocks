@@ -733,6 +733,15 @@ fn one_split_paimon_table(
 }
 
 impl Scenario for ScanProducerReadiness {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_scan_readiness",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "uea4/scan-producer-readiness"
     }
@@ -976,6 +985,15 @@ fn run_cancel_case(
 }
 
 impl Scenario for ScanProducerCancel {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_scan_readiness",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "uea4/scan-producer-cancel"
     }

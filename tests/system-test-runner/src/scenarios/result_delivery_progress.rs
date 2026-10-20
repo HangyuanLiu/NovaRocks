@@ -51,6 +51,15 @@ pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
 }
 
 impl Scenario for ClientProgress {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "result_delivery_progress",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         match self.0 {
             Mode::Slow => "result-delivery/slow-client-progress",

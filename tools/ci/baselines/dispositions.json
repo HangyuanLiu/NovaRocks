@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "known_failures": [
+    {
+      "unit": "sql-case:decimal/test_decimal256_cast_operations",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.type_mismatch"
+      },
+      "reason": "The existing DECIMAL256 cast case fails at statement 7: no matching declared overload. Retain the raw failure until the missing overload is implemented. Observed on the TST-G15 native 1FE+3BE classification run.",
+      "owner": "NovaRocks SQL decimal owner",
+      "expires": "2026-11-18"
+    }
+  ],
+  "quarantine": []
+}

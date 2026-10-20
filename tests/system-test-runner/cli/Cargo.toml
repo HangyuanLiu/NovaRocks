@@ -14,3 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 novarocks-system-test-runner = { path = ".." }
+
+[package.metadata.novarocks.test]
+runtime-inputs = ["target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
+env-inputs = []

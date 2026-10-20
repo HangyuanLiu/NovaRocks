@@ -181,10 +181,84 @@ Formal contexts are excluded from ordinary release/retention GC.
 The ownership ruling is recorded in
 [ADR-0184](../../docs/adr/ADR-0184-native-test-execution-and-process-monitor-ownership.md).
 
-G15 may store its own selection/reuse decisions beside these inputs. It must not
+G15 stores derived selection/reuse decisions beside these inputs. It must not
 write its conclusions into native results or this G6a-owned index. A path on one
 machine is local evidence until the full referenced materials have an explicit
 shared retention owner.
+
+## Development selection and evidence composition
+
+`dev-verify.sh` consumes canonical preparation, native SQL/System
+`--list-declarations`, Cargo metadata and nextest discovery, plus the named stages
+from `local-full-ci.sh --list-stages`. Rust selection uses native `rdeps()`;
+[impact rules](verification/impact-rules.json) supplement owner declarations.
+Mapping gaps remain visible and expand to a bounded owner domain or broad
+coverage. This selector is development-only. Admission derives the fixed regular
+collection, without consulting the impact graph; G17 owns formal execution,
+merge-commit enforcement, trust, scheduling and shared registration storage.
+
+```bash
+tools/ci/dev-verify.sh plan --base origin/main --root /absolute/local/task-evidence
+tools/ci/dev-verify.sh run --base origin/main --root /absolute/local/task-evidence
+tools/ci/dev-verify.sh resume --base origin/main --root /absolute/local/task-evidence
+tools/ci/dev-verify.sh compose --base origin/main --root /absolute/local/task-evidence
+tools/ci/dev-verify.sh check-declarations --root /absolute/local/declaration-evidence
+tools/ci/dev-verify.sh confirm-cleanup /absolute/local/task-evidence/actual-attempt
+```
+
+Without `--prepared`, these commands first prepare the canonical workspace graph.
+`--prepared /absolute/path/to/inputs` revalidates an existing canonical preparation.
+`plan` reports selection/scopes, reasons, expansion gaps and heavy author
+obligations; `run` creates an exclusive attempt; `resume` recomposes old records
+and executes unsatisfied scopes. `compose` writes a fresh derived record. A root
+can hold multiple independent attempts and compositions; preserve the whole set.
+Actual SQL execution requires `NOVAROCKS_SQL_TEST_CONFIG` and the declared fixture
+publication/dataset inputs. Do not rebuild the same target concurrently.
+
+Development selection retains individual Rust test and workspace doctest
+obligations. The native `workspace nextest and doctests` stage remains in the
+inventory as an admission/full obligation; its development projection is
+explicitly deferred to admission before reading results. Deferred stage failures
+and unresolved cleanup remain visible in `deferred_scopes` and can still block
+the development conclusion. Individual passes never manufacture a stage PASS.
+
+Current G6a batch always includes nextest and independent doctest. If a resume's
+entire unmet target set consists only of workspace doctest, the tool may run one
+normal batch with one already satisfied, identity-matching regular nextest scope.
+Before launch, `selection.json.resume_exception` records the reason, pending and
+repeated scopes, prior qualifying execution, exact filterset and batch output.
+The derived composition retains this reference. New failures in the repeated
+scope enter the normal conflict rules; old cancellation and cleanup facts remain.
+With no eligible regular scope, or another unmet target, the gap stays `not_run`.
+This exception never uses helpers/manual/heavy tests to fill an empty selection,
+creates no doctest executor/index, and does not retry the batch in a loop.
+The CLI's `compose --layer admission` is labelled `local-rehearsal`, never a
+formal admission receipt. A wrapper's formal process-registration context does
+not establish a trusted formal source. Full-layer composition and registration
+are library interfaces for G17; this entry does not schedule full runs.
+
+### G15 retained materials
+
+| Material | Owner facts and consumer boundary |
+|---|---|
+| `identity/source-start.json`, `source-end.json` | Exact commit, dirty/untracked status and source tree snapshots; they establish provenance, not executable identity. Dirty local attempts remain usable only within development rules. |
+| Rust `identity/nextest.json`, `doctest.json` | Per-scope input snapshots at start/end, declared runtime/environment inputs, actual program/test/config hashes, profiles and stability confirmation. Missing declarations prevent historical reuse. The separately executed monitor binary is an explicit runtime input. |
+| `execution-index.json` checkpoints | Atomically committed after nextest and its cleanup/identity confirmation, then after doctest. A killed later domain leaves the earlier independent checkpoint available; missing whole-attempt completion cannot invent the later result. |
+| `invocations/*.started.json`, final `*.json` | Immutable pre-execution selection/argv/cwd/source and start identity; final native exit, end identity/stability, raw log and material references. A started record without a final remains incomplete. |
+| System `scenario-teardown.json` | Schema 1 fixture/cluster cleanup facts, partial startup monitor responsibility and external resources, separate from schema 5 scenario evidence. Total process exit is not cleanup proof. |
+| External resource registration | Atomic pre-side-effect owner/id/label/PID fact and released/cleanup_failed settlement; recursive collection preserves unsettled or corrupt records. Registration is no deletion authority. See [System owner rule](../../tests/system-test-runner/README.md#声明与收束材料). |
+| SQL `--results-file` | Schema 1 JSONL run, full selection, terminal case, suite lifecycle and final end facts. Case identity, declared/executed oracle and policy, effective verification, failure fingerprints and snapshots remain native producer facts. Missing end or required cleanup prevents reuse of the affected scope. |
+| `selection.json`, `compositions/*/composition.json` | Native units and scopes selected before execution; derived source/result/completeness/applicability/disposition, retained counterexamples, deferrals and cleanup obligations. They never modify JUnit, SQL records, scenario evidence or the G6a index. |
+| `cleanup-confirmation.json` | Independent observation of exact recorded resources or monitor facts. `confirm-cleanup` queries containers, networks and volumes with the recorded Compose label; it performs no cleanup. `--observation` preserves supplemental manual material but does not itself discharge obligations. |
+| Registration delta | `verification/registration.py` derives new/still-failing/last-pass-open/closed/infrastructure/quarantine states. A later pass alone does not close a failure; closure needs a linked fix and qualifying revalidation. No shared issue service is created. |
+
+[dispositions.json](baselines/dispositions.json) supplies expiring, owned exact SQL
+failure fingerprints and quarantine records. It does not rewrite raw failures or
+excuse missing execution, diagnostic-only verification or cleanup violations.
+[Layer rules](../../docs/guides/development/test-governance.md#三层验证与证据组合)
+define eligible evidence and conclusion wording. Local paths and local admission
+rehearsals remain local until G17 provides the trusted formal ownership and
+recoverable shared materials.
 
 ## Focused verification
 

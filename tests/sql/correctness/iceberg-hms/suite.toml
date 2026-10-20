@@ -1,2 +1,10 @@
 # Requires the separately started Hive Metastore fixture and a native cluster.
 explicit_only = true
+heavy = { reason = "fixture", detail = "Requires docker/iceberg-hive, Spark-authored HMS inputs, native 1FE+3BE and serial execution; Spark owns writes and cleanup." }
+
+[impact]
+paths = ["novarocks/connector/iceberg/src/catalog/**", "novarocks/connector/iceberg/src/catalog_control/**", "novarocks/connector/iceberg/src/commit/**", "novarocks/frontend-application/src/query_execution/**"]
+
+[reuse]
+scope = "suite"
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

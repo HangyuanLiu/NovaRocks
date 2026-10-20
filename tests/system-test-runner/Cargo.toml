@@ -60,3 +60,32 @@ tonic = { workspace = true, features = ["transport"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = [
+    "tests/system-test-runner/fixtures/**",
+    "target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor",
+    "docs/testing/**",
+    "docker/iceberg-rest/*.sh",
+    "docker/iceberg-rest/*.py",
+    "docker/iceberg-rest/templates/*.yml",
+    "docker/iceberg-rest/shared.env",
+    "docker/iceberg-rest/spark/Dockerfile",
+    "docker/fixture-inputs/*.sh",
+    "docker/fixture-inputs/*.py",
+    "docker/fixture-inputs/lock.json",
+    "tests/fixtures/iceberg-rest-publication/Dockerfile",
+    "tests/fixtures/iceberg-rest-publication/src/**",
+]
+env-inputs = [
+    { name = "NOVA_FIXTURE_STORE", kind = "value" },
+    { name = "HOME", kind = "value" },
+    { name = "XDG_CACHE_HOME", kind = "value" },
+    { name = "UEA7_TEST_CONTROL_URI", kind = "value" },
+    { name = "NOVAROCKS_UEA4G_ORACLE_RECEIPT", kind = "file-content" },
+    { name = "NOVAROCKS_UEA4G_ORACLE_OUTPUT", kind = "value" },
+]
+ignored = [
+    { filter = "test(=actors::catalog::tests::reads_live_fixture_trace_and_metrics)", class = "heavy", requires = ["fixture:iceberg-rest-publication"], reason = "Requires a live isolated publication fixture control endpoint" },
+    { filter = "test(=scenarios::iceberg_delete_oracle::tests::frozen_receipt_replay_without_native)", class = "heavy", requires = ["dataset:iceberg-java-oracle"], reason = "Requires an independently prepared frozen Java oracle receipt and captured output" },
+]

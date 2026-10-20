@@ -1,2 +1,12 @@
 # LNP-3A is a native product-topology acceptance gate, not an all-in-one suite.
 explicit_only = true
+heavy = { reason = "fixture", detail = "Requires private REST Catalog and MinIO, destructive lake wipe/rebuild, native 1FE+3BE and serial execution." }
+
+[impact]
+paths = ["novarocks/mv-application/**"]
+
+[reuse]
+scope = "suite"
+initial_state = "isolated"
+basis = "The SQL runner starts and shuts down a private REST Catalog and MinIO for this suite; its Server and fixture lifecycle is recorded."
+env_inputs = []

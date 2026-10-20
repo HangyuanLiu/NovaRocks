@@ -28,3 +28,7 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 
 [dev-dependencies]
 toml.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

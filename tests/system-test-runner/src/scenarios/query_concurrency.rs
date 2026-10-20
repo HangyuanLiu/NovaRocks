@@ -94,6 +94,15 @@ struct QueryConcurrency;
 struct WarehouseAdmission;
 
 impl Scenario for WarehouseAdmission {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_concurrency",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-concurrency/warehouse-admission"
     }
@@ -128,6 +137,15 @@ struct TerminalReleasesSlot {
 }
 
 impl Scenario for TerminalReleasesSlot {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_concurrency",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-concurrency/terminal-releases-slot"
     }
@@ -237,6 +255,15 @@ struct RemoteCleanupRetires {
 }
 
 impl Scenario for RemoteCleanupRetires {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_concurrency",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-concurrency/remote-cleanup-retires"
     }
@@ -333,6 +360,15 @@ struct LateWorkLeaseExpiry {
 }
 
 impl Scenario for LateWorkLeaseExpiry {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_concurrency",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-concurrency/late-work-lease-expiry"
     }
@@ -421,6 +457,15 @@ impl Scenario for LateWorkLeaseExpiry {
 }
 
 impl Scenario for QueryConcurrency {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_concurrency",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-concurrency/16-64-256-governance"
     }

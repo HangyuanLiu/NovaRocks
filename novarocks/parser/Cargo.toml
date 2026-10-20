@@ -12,3 +12,7 @@ novarocks-user-error.workspace = true
 
 [lib]
 doctest = false
+
+[package.metadata.novarocks.test]
+runtime-inputs = ["tests/sql/correctness/**/*.sql"]
+env-inputs = []

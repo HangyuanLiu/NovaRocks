@@ -34,6 +34,7 @@ export FAKE_SOURCE_ROOT="$real_repo"
 cat >"$tmpdir/bin/cargo" <<'CARGO'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${1:-}" = --version ]; then echo "cargo fixture"; exit 0; fi
 printf '%s|%s\n' "${NOVAROCKS_SERVER_BUILD_IDENTITY:-primary}" "$*" >>"$FAKE_CARGO_CALLS"
 if [ -n "${FAKE_CARGO_FAILURE:-}" ]; then exit "$FAKE_CARGO_FAILURE"; fi
 if [ -n "${FAKE_CARGO_FAIL_VARIANT:-}" ] && [ -n "${NOVAROCKS_SERVER_BUILD_IDENTITY:-}" ]; then exit 17; fi
@@ -68,7 +69,14 @@ fi
 mode="${1:-}"; shift || true
 case "$mode" in
   --list-default) [ -z "${FAKE_EMPTY_REGISTRY:-}" ] || exit 0; [ -z "${FAKE_REGISTRY_FAILURE:-}" ] || exit 19; printf 'alpha/one\nbeta/two\n'; exit ;;
+  --list-declarations)
+    python3 - "${@:2}" <<'DECLARATIONS'
+import json,sys
+print(json.dumps({"schema":1,"scenarios":[{"name":name,"declaration":{"impact":{"paths":[]},"env_inputs":[],"initial_state":"isolated","basis":"fixture","heavy":None}} for name in sys.argv[1:]]}))
+DECLARATIONS
+    exit ;;
   --list-compatibility|--list-binary-requirements)
+    if [ "$mode" = --list-binary-requirements ] && [ -n "${FAKE_REQUIREMENTS_FAILURE:-}" ]; then exit 29; fi
     selection=()
     while [ "$#" -gt 0 ]; do
       [ "$1" = --only ] && [ "$#" -ge 2 ] || exit 2
@@ -88,12 +96,22 @@ set -- "$mode" "$@"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --only) scenario="$2"; shift 2 ;;
+    --artifact-root) artifact_root="$2"; shift 2 ;;
     --binary|--compatible-binary|--other-island-binary) [ -x "$2" ] || exit 4; shift 2 ;;
     *) shift ;;
   esac
 done
+python3 - "$artifact_root/${scenario//\//-}" "${FAKE_SCENARIO_CLEANUP:-ok}" <<'TEARDOWN'
+import json,sys
+from pathlib import Path
+root=Path(sys.argv[1]);root.mkdir(parents=True,exist_ok=True)
+if sys.argv[2]!='missing':
+    resource=[] if sys.argv[2]=='ok' else [{"state":sys.argv[2]}]
+    (root/'scenario-teardown.json').write_text(json.dumps({"fixture":{"launch_config":"ok","teardown":{"status":"ok"},"resources":resource},"cluster":{"launch":"ok","shutdown":"ok","partial_cleanup":None}}))
+(root/'scenario-evidence.json').write_text(json.dumps({"outcome":"Passed"}))
+TEARDOWN
 printf '%s\n' "$scenario" >>"$FAKE_SCENARIO_CALLS"
-if [ "$scenario" = "${FAKE_SCENARIO_FAILURE:-}" ]; then echo 'original scenario error' >&2; exit 23; fi
+if [ "$scenario" = "${FAKE_SCENARIO_FAILURE:-}" ]; then echo 'original scenario error' >&2; exit "${FAKE_SCENARIO_EXIT:-23}"; fi
 RUNNER
 chmod +x "$tmpdir/bin/cargo" "$tmpdir/runner"
 export FAKE_RUNNER_TEMPLATE="$tmpdir/runner"
@@ -254,5 +272,53 @@ export FAKE_SCENARIO_FAILURE=native-compatibility/raw
 code=0; main --only native-compatibility/raw >/dev/null || code=$?
 [ "$code" = 23 ] && [ "$(cat "$CI_RUN_DIR/exit")" = 23 ]
 unset FAKE_SCENARIO_FAILURE
+
+# Invocation facts preserve native failures, panic exits, inferred signals and
+# producer cleanup independently. Fake evidence deliberately says Passed.
+runner="$(ci_bound_binary novarocks-system-tests)"
+binary="$(ci_bound_binary novarocks)"
+printf 'alpha/one\nbeta/two\n' >"$tmpdir/invocation-selection"
+for native_exit in 0 1 101 143; do
+  for cleanup_state in ok missing cleanup_failed unsettled; do
+    CI_RUN_DIR="$tmpdir/invocation-$native_exit-$cleanup_state"
+    mkdir -p "$CI_RUN_DIR"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"
+    ci_init_summary_state
+    export FAKE_SCENARIO_EXIT="$native_exit" FAKE_SCENARIO_CLEANUP="$cleanup_state"
+    if [ "$native_exit" = 0 ]; then unset FAKE_SCENARIO_FAILURE; else export FAKE_SCENARIO_FAILURE=alpha/one; fi
+    code=0
+    ci_run_system_scenarios "$runner" "$binary" '' '' "$tmpdir/base" "$CI_RUN_DIR/artifacts" 3 30 "$tmpdir/invocation-selection" || code=$?
+    [ "$code" = "$native_exit" ]
+    python3 - "$CI_RUN_DIR" "$native_exit" "$cleanup_state" <<'ASSERT_INVOCATION'
+import json,sys
+from pathlib import Path
+root=Path(sys.argv[1]);code=int(sys.argv[2]);state=sys.argv[3]
+files=sorted(p for p in (root/'invocations').glob('*.json') if not p.name.endswith('.started.json'))
+assert len(files)==(2 if code==0 else 1)
+value=json.loads(files[0].read_text())
+assert value['exit']['code']==code
+assert value['exit']['signal_inferred']==('SIGTERM' if code==143 else None)
+assert value['cleanup']['summary']=={'ok':'ok','missing':'unknown','cleanup_failed':'violation','unsettled':'unknown'}[state]
+assert value['inputs_stable']
+assert len(json.loads((root/'selection.json').read_text())['units'])==2
+assert Path(value['materials']['evidence']).is_file()
+ASSERT_INVOCATION
+  done
+done
+unset FAKE_SCENARIO_FAILURE FAKE_SCENARIO_EXIT FAKE_SCENARIO_CLEANUP
+CI_RUN_DIR="$tmpdir/requirements-failure";mkdir -p "$CI_RUN_DIR"
+CI_SUMMARY="$CI_RUN_DIR/summary.md";ci_init_summary_state
+export FAKE_REQUIREMENTS_FAILURE=1
+code=0
+ci_run_system_scenarios "$runner" "$binary" '' '' "$tmpdir/base" "$CI_RUN_DIR/artifacts" 3 30 "$tmpdir/invocation-selection" || code=$?
+[ "$code" = 29 ]
+python3 - "$CI_RUN_DIR/invocations" <<'ASSERT_REQUIREMENT'
+import json,sys
+from pathlib import Path
+records=[json.loads(p.read_text()) for p in Path(sys.argv[1]).glob('*.json') if not p.name.endswith('.started.json')]
+assert len(records)==1 and records[0]['exit']['code']==29
+assert records[0]['cleanup']['summary']=='unknown'
+ASSERT_REQUIREMENT
+unset FAKE_REQUIREMENTS_FAILURE
 
 echo 'system-scenarios-stage-test: PASS'

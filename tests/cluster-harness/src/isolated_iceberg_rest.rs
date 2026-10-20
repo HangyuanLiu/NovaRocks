@@ -47,6 +47,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::resource_registration::{Registration, register};
+
 const FIXTURE_PREFIX: &str = "isolated-rest";
 /// Every Docker project this fixture creates.  Creation always uses this
 /// prefix, and both the per-fixture teardown and the startup sweep refuse to
@@ -230,6 +232,7 @@ pub struct IsolatedIcebergRestFixture {
     vended_s3_identities: Option<IsolatedVendedS3Identities>,
     publication_control_uri: Option<String>,
     profile: FixtureProfile,
+    registration: Registration,
     active: bool,
 }
 
@@ -286,7 +289,6 @@ impl IsolatedIcebergRestFixture {
     /// The returned control URI belongs to this fixture's initial REST container.
     pub fn start_with_publication_hook(scenario_root: impl AsRef<Path>) -> Result<(Self, String)> {
         let repo_root = repository_root()?;
-        let image = build_publication_hook_image(&repo_root)?;
         let reservation = TcpListener::bind("127.0.0.1:0")
             .context("reserve isolated publication control port")?;
         let control_port = reservation.local_addr()?.port();
@@ -297,7 +299,9 @@ impl IsolatedIcebergRestFixture {
             repo_root,
             scenario_root.as_ref(),
             FixtureProfile::PublicationHook {
-                image,
+                // Built after the resource registration is durable, before
+                // any service receives this profile.
+                image: String::new(),
                 control_port,
             },
         )?;
@@ -332,6 +336,12 @@ impl IsolatedIcebergRestFixture {
             &access_key_id,
             &secret_access_key,
         )?;
+        let registration = register(
+            &scenario_root,
+            "isolated-iceberg-rest",
+            &fixture_id,
+            &compose_project,
+        )?;
 
         let mut fixture = Self {
             repo_root,
@@ -355,10 +365,16 @@ impl IsolatedIcebergRestFixture {
             vended_s3_identities: None,
             publication_control_uri: None,
             profile,
+            registration,
             active: true,
         };
 
-        let started = fixture.run_script("up.sh", &[]);
+        let started = (|| {
+            if let FixtureProfile::PublicationHook { image, .. } = &mut fixture.profile {
+                *image = build_publication_hook_image(&fixture.repo_root)?;
+            }
+            fixture.run_script("up.sh", &[])
+        })();
         // Record the generated entry before inspecting the outcome: a partially
         // created environment still has to be reclaimed, and only the manifest
         // knows which entry `up.sh` chose.
@@ -733,6 +749,18 @@ impl IsolatedIcebergRestFixture {
         if !self.active {
             return Ok(());
         }
+        let cleanup = self.shutdown_active();
+        let settlement = self.registration.settle(&cleanup);
+        match (cleanup, settlement) {
+            (result, Ok(())) => result,
+            (Ok(()), Err(error)) => Err(error),
+            (Err(cleanup), Err(settlement)) => Err(cleanup.context(format!(
+                "isolated fixture cleanup registration also failed: {settlement:#}"
+            ))),
+        }
+    }
+
+    fn shutdown_active(&mut self) -> Result<()> {
         self.assert_owned_paths()?;
         // Claim the teardown before running it.  A second attempt against a
         // project that is already gone has nothing to do, and the reclaim below
@@ -2348,6 +2376,8 @@ mod tests {
             "iceberg_rest_mv": {"uri":"http://127.0.0.1:38002", "warehouse":"s3://warehouse/test/rest-mv"},
         });
         let fixture = IsolatedIcebergRestFixture {
+            registration: register(&scenario_root, "isolated-iceberg-rest", env_id, &project)
+                .expect("register manifest test fixture"),
             repo_root,
             scenario_root,
             config_file: workspace_root.join("isolated-compose.env"),

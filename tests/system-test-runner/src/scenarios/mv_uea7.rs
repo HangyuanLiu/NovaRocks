@@ -167,6 +167,15 @@ struct MvManagementReadmission {
 }
 
 impl Scenario for MvManagementReadmission {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_uea7",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/management-readmission"
     }

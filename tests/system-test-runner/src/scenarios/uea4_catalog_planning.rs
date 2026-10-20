@@ -379,6 +379,15 @@ impl CatalogPlanningResponsibility {
 }
 
 impl Scenario for CatalogPlanningResponsibility {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_catalog_planning",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "uea4/catalog-planning-responsibility"
     }
@@ -553,6 +562,15 @@ impl CatalogPlanningNoFeQuota {
 }
 
 impl Scenario for CatalogPlanningNoFeQuota {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_catalog_planning",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "uea4/catalog-planning-no-fe-quota"
     }
@@ -662,6 +680,15 @@ impl IcebergHeldReadCancellation {
 }
 
 impl Scenario for IcebergHeldReadCancellation {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_catalog_planning",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "uea4/iceberg-held-read-cancellation"
     }
@@ -1130,6 +1157,15 @@ struct CatalogPlanningSmoke {
 }
 
 impl Scenario for CatalogPlanningSmoke {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_catalog_planning",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "uea4/catalog-planning-smoke"
     }
@@ -1210,6 +1246,15 @@ struct ProviderReadQueuedProgress {
 }
 
 impl Scenario for ProviderReadQueuedProgress {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "uea4_catalog_planning",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "catalog/provider-read-queued-progress"
     }

@@ -24,3 +24,7 @@ novarocks-workload-control.workspace = true
 bytes.workspace = true
 novarocks-state-store-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

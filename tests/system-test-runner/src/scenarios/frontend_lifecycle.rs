@@ -27,6 +27,15 @@ struct StaticFileDisposableCarrier;
 struct CatalogPartialReadiness;
 
 impl Scenario for CatalogPartialReadiness {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "frontend_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "frontend-lifecycle/catalog-partial-readiness"
     }
@@ -127,6 +136,15 @@ impl Scenario for CatalogPartialReadiness {
 }
 
 impl Scenario for StaticFileDisposableCarrier {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "frontend_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "frontend-lifecycle/static-file-disposable-carrier"
     }
@@ -253,6 +271,15 @@ struct ForcedDrain;
 struct BlueGreenSessionCutover;
 
 impl Scenario for BlueGreenSessionCutover {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "frontend_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "frontend-lifecycle/blue-green-session-cutover"
     }
@@ -288,6 +315,15 @@ impl Scenario for BlueGreenSessionCutover {
 }
 
 impl Scenario for ForcedDrain {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "frontend_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "frontend-lifecycle/forced-drain"
     }
@@ -351,6 +387,15 @@ impl Scenario for ForcedDrain {
 }
 
 impl Scenario for GracefulDrain {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "frontend_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "frontend-lifecycle/graceful-drain"
     }

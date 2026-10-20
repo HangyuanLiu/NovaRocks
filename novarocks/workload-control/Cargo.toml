@@ -12,3 +12,7 @@ tokio = { workspace = true, features = ["sync", "time", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

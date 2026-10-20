@@ -56,6 +56,15 @@ struct NonNegotiatedMultiStatement;
 struct ScalarSession;
 
 impl Scenario for ScalarSession {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_output",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-output/scalar-session"
     }
@@ -116,6 +125,15 @@ impl Scenario for ScalarSession {
 }
 
 impl Scenario for NonNegotiatedMultiStatement {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_output",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-output/non-negotiated-multi-statement"
     }
@@ -149,6 +167,15 @@ impl Scenario for NonNegotiatedMultiStatement {
 }
 
 impl Scenario for NegotiatedMultiResult {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_output",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-output/negotiated-multi-result"
     }
@@ -207,6 +234,15 @@ impl Scenario for NegotiatedMultiResult {
 }
 
 impl Scenario for SchemaOnce {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_output",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-output/schema-once"
     }

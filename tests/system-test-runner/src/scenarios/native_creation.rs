@@ -120,6 +120,15 @@ struct FrozenReplayAndMembership {
 }
 
 impl Scenario for FrozenReplayAndMembership {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_creation",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-creation/frozen-replay-and-membership"
     }
@@ -791,6 +800,15 @@ fn await_count(
 struct CreationPayloadLifetime;
 
 impl Scenario for CreationPayloadLifetime {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_creation",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-creation/creation-payload-lifetime"
     }
@@ -1083,6 +1101,15 @@ impl PendingRead {
 struct FixedPlanRecovery;
 
 impl Scenario for FixedPlanRecovery {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_creation",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-creation/fixed-plan-recovery"
     }
@@ -1174,6 +1201,15 @@ struct NormalCloseCapacity {
 }
 
 impl Scenario for NormalCloseCapacity {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_creation",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         if self.byte_limited {
             "native-creation/normal-close-byte-capacity"
@@ -1436,6 +1472,15 @@ fn assert_normal_close(
 struct AcceptedPreparationControlRaces;
 
 impl Scenario for AcceptedPreparationControlRaces {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_creation",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "native-creation/accepted-preparation-control-races"
     }

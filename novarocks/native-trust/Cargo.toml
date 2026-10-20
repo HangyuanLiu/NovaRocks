@@ -35,3 +35,7 @@ tower.workspace = true
 hex.workspace = true
 http.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

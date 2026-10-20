@@ -65,6 +65,15 @@ struct PreparationCapacity {
 }
 
 impl Scenario for PreparationCapacity {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "preparation_capacity",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         if self.bytes {
             "native-creation/preparation-byte-capacity"
@@ -148,6 +157,15 @@ struct PreparationInterleaving {
 }
 
 impl Scenario for PreparationInterleaving {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "preparation_capacity",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         if self.same_batch {
             "native-creation/preparation-same-batch-fast-slow"

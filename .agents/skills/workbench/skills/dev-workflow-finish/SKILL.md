@@ -14,7 +14,8 @@ description: "Finish a verified change by reviewing evidence and, when explicitl
    `docs/workbench/`。
 3. 读取 `DOC_ROOT` 下适用的 `AGENTS.md`、spec、plan 和相关 ADR。
 4. 检查当前 goal、plan 清单、git diff、分支、本地检查点 commits 和验证结果。
-5. 对变更运行最终的风险相称验证；不要仅引用旧日志。
+5. 按 contract 第 8.8 节复核目标提交的最终组合记录与 plan 必需验证；引用旧结果时核实输入身份、复用范围、
+   初始状态合同、完成级别和实际验证义务，失效范围补跑。开发阶段结论不代表准入或全量通过，不因发布默认重跑本地全量。
 6. 判断是否形成新的长期架构决策或真实妥协；适用 `AGENTS.md` 定义了 ADR 流程时按其执行，否则在现有项目文档中
    记录决定。
 7. 确认没有把无关用户改动混入提交。

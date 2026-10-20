@@ -1,3 +1,12 @@
 # The external physical writer leaves an MV output without a new P attachment.
 # This destructive scenario owns its private REST Catalog for the whole run.
 explicit_only = true
+heavy = { reason = "fixture", detail = "Requires private REST Catalog and MinIO with an external target writer, native 1FE+3BE and serial execution." }
+
+[impact]
+paths = ["novarocks/frontend-application/src/mv/**", "tests/fixtures/iceberg-rest-publication/**", "docker/iceberg-rest/spark-sql.sh", "docker/iceberg-rest/spark-shell.sh"]
+
+[reuse]
+scope = "suite"
+# The fixture is private, but external Spark scripts and their environment are not fully bound by the current SQL input contract.
+# Initial state and environment inputs remain undeclared; historical results are not reusable.

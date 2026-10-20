@@ -65,3 +65,7 @@ novarocks-sql.workspace = true
 novarocks-worker = { workspace = true }
 novarocks-secret.workspace = true
 sha2.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

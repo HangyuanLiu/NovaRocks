@@ -42,3 +42,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 [build-dependencies]
 prost-build.workspace = true
 protoc-bin-vendored.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

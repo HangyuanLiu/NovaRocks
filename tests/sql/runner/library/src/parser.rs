@@ -1160,17 +1160,8 @@ fn load_sql_case_from_file_with_variables(
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?
         .to_string();
-    let content = match fs::read_to_string(sql_path) {
-        Ok(c) => c,
-        Err(exc) => {
-            println!(
-                "Warning: failed to read SQL file {}: {}",
-                sql_path.display(),
-                exc
-            );
-            return Ok(None);
-        }
-    };
+    let content = fs::read_to_string(sql_path)
+        .with_context(|| format!("read SQL case {}", sql_path.display()))?;
     let case_dbs = detect_case_dbs(&content, case_variables);
     let content = substitute_placeholders(
         &content,

@@ -61,6 +61,15 @@ impl Documents {
     }
 }
 impl Scenario for Documents {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_uea7_documents",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         match self.kind {
             Kind::Expiry => "mv/document-expiry-channel",

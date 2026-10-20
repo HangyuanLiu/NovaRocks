@@ -34,3 +34,7 @@ arrow-buffer.workspace = true
 arrow-data.workspace = true
 arrow-schema.workspace = true
 novarocks-type-contract.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

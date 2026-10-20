@@ -52,6 +52,15 @@ struct MvStateStoreRestart {
 }
 
 impl Scenario for MvStateStoreRestart {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/state-store-restart"
     }
@@ -198,6 +207,15 @@ struct MvSchedulerRecovery {
 }
 
 impl Scenario for MvSchedulerRecovery {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/scheduler-recovery"
     }
@@ -468,6 +486,15 @@ struct MvRewriteBindingBarrier {
 }
 
 impl Scenario for MvRewriteBindingBarrier {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/rewrite-final-target-binding"
     }
@@ -640,6 +667,15 @@ struct MvRefreshConfigurationInterleaving {
 }
 
 impl Scenario for MvRefreshConfigurationInterleaving {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/refresh-configuration-interleaving"
     }
@@ -925,6 +961,15 @@ fn rest_configuration_revision(
 }
 
 impl Scenario for MvCurrentDependencyRecheck {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/current-dependency-recheck"
     }
@@ -1059,6 +1104,15 @@ struct MvLegacyInterpretationRebuild {
 }
 
 impl Scenario for MvLegacyInterpretationRebuild {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/legacy-interpretation-rebuild"
     }
@@ -1215,6 +1269,15 @@ struct MvStagedPublishedRecovery {
 }
 
 impl Scenario for MvStagedPublishedRecovery {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/staged-published-recovery"
     }
@@ -1414,6 +1477,15 @@ struct MvFirstRefreshStaging {
 }
 
 impl Scenario for MvFirstRefreshStaging {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/first-refresh-staging"
     }
@@ -1578,6 +1650,15 @@ struct MvBaseIdentityReplacement {
 }
 
 impl Scenario for MvBaseIdentityReplacement {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/base-identity-replacement"
     }
@@ -1693,6 +1774,15 @@ struct MvLakePublicationRestartRebuild {
 }
 
 impl Scenario for MvLakePublicationRestartRebuild {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_recovery",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/lake-publication-restart-rebuild"
     }

@@ -31,6 +31,7 @@ mod publication_catalog;
 mod publication_service;
 mod query_stats_contract;
 mod results;
+mod results_record;
 mod runner;
 mod session;
 mod shell;
@@ -390,7 +391,7 @@ fn expected_engine_error_code_diff_result(
 )]
 pub(crate) struct Cli {
     /// Suite name(s), comma-separated. Use "all" for the default non-explicit suites.
-    #[arg(long, required_unless_present_any = ["list_extensions", "list_suites"])]
+    #[arg(long, required_unless_present_any = ["list_extensions", "list_suites", "list_declarations"])]
     suite: Option<String>,
 
     /// Print the deterministic manifest derived from @nova_extension annotations and exit.
@@ -400,6 +401,14 @@ pub(crate) struct Cli {
     /// Print the deterministic correctness suite names and exit.
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "list_extensions")]
     list_suites: bool,
+
+    /// Print native impact and lifecycle declarations as JSON without starting resources.
+    #[arg(long, conflicts_with_all = ["list_extensions", "list_suites"])]
+    list_declarations: bool,
+
+    /// Append structured native execution facts to a new JSON Lines file.
+    #[arg(long)]
+    results_file: Option<String>,
 
     #[arg(long)]
     config: Option<String>,
@@ -623,6 +632,7 @@ struct SuiteRunContext {
     failure_artifacts: Arc<FailureArtifactRecorder>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
     publication_service_control: Option<publication_service::Control>,
+    results: Option<Arc<results_record::SuiteRecorder>>,
 }
 
 struct CaseOutcome {
@@ -2303,6 +2313,21 @@ fn preserve_suite_failure_snapshot(ctx: &SuiteRunContext, phase: &str, stdout_lo
 }
 
 fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOutcome {
+    let mut evidence = results_record::CaseEvidence::default();
+    let outcome = run_case_observed(ctx, case, abort, &mut evidence);
+    evidence.finish_case(outcome.status == CaseStatus::Fail);
+    if let Some(recorder) = &ctx.results {
+        recorder.case(case, &outcome, &evidence);
+    }
+    outcome
+}
+
+fn run_case_observed(
+    ctx: &SuiteRunContext,
+    case: &SqlCase,
+    abort: &AtomicBool,
+    evidence: &mut results_record::CaseEvidence,
+) -> CaseOutcome {
     let mut log = String::with_capacity(2048);
 
     // Check global abort (fail-fast from another case)
@@ -2666,6 +2691,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         if cleanup_only && !step.meta.cleanup {
             continue;
         }
+        evidence.begin_step(step.query_number, case_failed);
         let order_sensitive = query_order_sensitive(step, ctx.order_sensitive_default);
         let epsilon = query_float_epsilon(step, ctx.float_epsilon);
 
@@ -2861,6 +2887,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 let mut last_failure = String::new();
 
                 for attempt in 0..retry_count {
+                    evidence.begin_attempt();
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
                         shell::execute_shell_step_until(
                             &step.sql,
@@ -2988,6 +3015,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if let Some(expected_result) =
                         evaluate_expected_error_branch(&step.meta, ok, &err_msg)
                     {
+                        evidence.record(
+                            step,
+                            "expected_error",
+                            expected_result.is_ok(),
+                            serde_json::json!({}),
+                        );
+                        if expected_result.is_err() {
+                            evidence.record_failure(
+                                serde_json::json!({"class":"error_code", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)), "statement_index":step.query_number, "actual_digest":null}),
+                            );
+                        }
                         if let Err(reason) = expected_result {
                             last_failure =
                                 annotate_failure_with_engine_error_code(&reason, &err_msg);
@@ -2997,6 +3035,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             break;
                         }
                     } else if !ok || execution.is_none() {
+                        evidence.record_failure(
+                            serde_json::json!({"class":"error_code", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)), "statement_index":step.query_number, "actual_digest":null}),
+                        );
                         last_failure = annotate_failure_with_engine_error_code(
                             &format!("target execute failed: {}", err_msg),
                             &err_msg,
@@ -3007,6 +3048,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         };
                         let (assertions_ok, assertions_reason) =
                             verify_text_assertions(step, &execution);
+                        if results_record::required(step).contains(&"text_assertions") {
+                            evidence.record(
+                                step,
+                                "text_assertions",
+                                assertions_ok,
+                                serde_json::json!({}),
+                            );
+                        }
                         if !assertions_ok {
                             last_failure = format!("VERIFY FAILED: {}", assertions_reason);
                         } else if !ctx.verify_enabled
@@ -3036,6 +3085,16 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 order_sensitive,
                                 epsilon,
                             );
+                            evidence.record(step, "result_set", same, serde_json::json!({"float_epsilon":epsilon,"order_sensitive":order_sensitive,"explain_rewritten":false}));
+                            if !same {
+                                let mut normalized = cmp_actual_rows.clone();
+                                if !order_sensitive {
+                                    normalized.sort();
+                                }
+                                evidence.record_failure(
+                                    serde_json::json!({"class":"mismatch","error_code":null,"statement_index":step.query_number,"actual_digest":results_record::digest(&serde_json::to_vec(&normalized).expect("rows serialize"))}),
+                                );
+                            }
                             if same {
                                 passed_execution = Some(execution);
                                 break;
@@ -3082,6 +3141,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         &be_log_snapshot,
                         &mut log,
                     );
+                    evidence.record_expected_error_log(step, matched_expected_error, expected_ok);
                     if !expected_ok {
                         case_failed = true;
                     } else {
@@ -3106,19 +3166,28 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 let _ = writeln!(log, "    ❌ orphan fixture was not installed");
                                 continue;
                             };
-                            if let Err(error) = fixture.assert_absent() {
+                            let absent_result = fixture.assert_absent();
+                            evidence.record(
+                                step,
+                                "iceberg_orphan_absent",
+                                absent_result.is_ok(),
+                                serde_json::json!({}),
+                            );
+                            if let Err(error) = absent_result {
                                 case_failed = true;
                                 let _ = writeln!(log, "    ❌ {error:#}");
                                 continue;
                             }
                             let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                         }
-                        if let Err(reason) = run_be_log_directives_for_successful_step(
+                        let be_log_result = run_be_log_directives_for_successful_step(
                             step,
                             &ctx.server_handle,
                             &be_log_snapshot,
                             &mut log,
-                        ) {
+                        );
+                        evidence.record_expected_error_log(step, true, be_log_result.is_ok());
+                        if let Err(reason) = be_log_result {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ FAIL: {reason}");
                         }
@@ -3140,7 +3209,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
                             continue;
                         };
-                        if let Err(error) = fixture.assert_absent() {
+                        let absent_result = fixture.assert_absent();
+                        evidence.record(
+                            step,
+                            "iceberg_orphan_absent",
+                            absent_result.is_ok(),
+                            serde_json::json!({}),
+                        );
+                        if let Err(error) = absent_result {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ {error:#}");
                             continue;
@@ -3155,6 +3231,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         &mut log,
                     );
                     case_elapsed += wait_elapsed;
+                    if results_record::required(step).contains(&"wait_alter") {
+                        evidence.record(step, "wait_alter", wait_ok, serde_json::json!({}));
+                    }
                     if !wait_ok {
                         case_failed = true;
                     } else {
@@ -3164,6 +3243,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &be_log_snapshot,
                             &mut log,
                         );
+                        if step.meta.has_be_log_directives() {
+                            evidence.record(
+                                step,
+                                "be_log",
+                                be_log_ok.is_ok(),
+                                serde_json::json!({}),
+                            );
+                        }
                         let be_log_ok = match be_log_ok {
                             Ok(()) => true,
                             Err(reason) => {
@@ -3177,21 +3264,38 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         // face is unchanged. Runs before @imv_equivalence_check so
                         // that, when both directives are present on a step, the
                         // equivalence oracle below validates the rebuilt MV.
-                        if let Some(directive) = step.meta.imv_stateless_rebuild.as_ref()
-                            && let Err(reason) = run_imv_stateless_rebuild_check(
+                        if let Some(directive) = step.meta.imv_stateless_rebuild.as_ref() {
+                            let oracle_result = run_imv_stateless_rebuild_check(
                                 directive,
                                 &mut target_session,
                                 ctx.query_timeout,
                                 step.meta.db.as_deref().or(primary_case_db),
                                 epsilon,
                                 &mut log,
-                            )
-                        {
-                            let _ = writeln!(log, "    ❌ FAIL: {reason}");
-                            case_failed = true;
+                            );
+                            evidence.record(
+                                step,
+                                "imv_stateless_rebuild",
+                                oracle_result.is_ok(),
+                                serde_json::json!({}),
+                            );
+                            if let Err(reason) = oracle_result {
+                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                case_failed = true;
+                            }
                         }
                         if let Some(directive) = step.meta.mv_rest_document_graph.as_deref() {
-                            match mv_rest_document_graph::assert_graph(&ctx.suite_name, directive) {
+                            let graph_result =
+                                mv_rest_document_graph::assert_graph(&ctx.suite_name, directive);
+                            if graph_result.is_err() {
+                                evidence.record(
+                                    step,
+                                    "mv_rest_document_graph",
+                                    false,
+                                    serde_json::json!({}),
+                                );
+                            }
+                            match graph_result {
                                 Ok(summary) => {
                                     let _ =
                                         writeln!(log, "    @mv_rest_document_graph PASS {summary}");
@@ -3230,6 +3334,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                             expected_commits
                                         ))
                                     })();
+                                    evidence.record(
+                                        step,
+                                        "mv_rest_document_graph",
+                                        mutations.is_ok(),
+                                        serde_json::json!({}),
+                                    );
                                     match mutations {
                                         Ok(summary) => {
                                             let _ = writeln!(
@@ -3255,18 +3365,25 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         // Verify-mode only by design: diff mode compares against a
                         // reference engine (no full-recompute oracle here), and the
                         // check needs the MV's own SelectText which only verify drives.
-                        if let Some(mv) = step.meta.imv_equivalence_check.as_deref()
-                            && let Err(reason) = run_imv_equivalence_check(
+                        if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
+                            let oracle_result = run_imv_equivalence_check(
                                 mv,
                                 &mut target_session,
                                 ctx.query_timeout,
                                 step.meta.db.as_deref().or(primary_case_db),
                                 epsilon,
                                 &mut log,
-                            )
-                        {
-                            let _ = writeln!(log, "    ❌ FAIL: {reason}");
-                            case_failed = true;
+                            );
+                            evidence.record(
+                                step,
+                                "imv_equivalence",
+                                oracle_result.is_ok(),
+                                serde_json::json!({}),
+                            );
+                            if let Err(reason) = oracle_result {
+                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                case_failed = true;
+                            }
                         }
                         // @explain_*: issue EXPLAIN VERBOSE and assert substrings.
                         let explain_requested = !step.meta.explain_contains.is_empty()
@@ -3289,6 +3406,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         } else {
                             true
                         };
+                        for kind in ["explain_contains", "explain_not_contains"] {
+                            if results_record::required(step).contains(&kind) {
+                                evidence.record(step, kind, explain_ok, serde_json::json!({"explain_rewritten":!ctx.rewrite_explain_contains_as_not_contains.is_empty()}));
+                            }
+                        }
                         if explain_ok && be_log_ok {
                             if !ctx.verify_enabled {
                                 let _ = writeln!(
@@ -3378,6 +3500,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 let mut last_failure = String::new();
 
                 for attempt in 0..retry_count {
+                    evidence.begin_attempt();
                     let (ok, execution, err_msg) = if ctx.record_from == RecordFrom::Target {
                         if shell::is_shell_step(&step.sql) {
                             shell::execute_shell_step_until(
@@ -3419,6 +3542,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if let Some(expected_result) =
                         evaluate_expected_error_branch(&step.meta, ok, &err_msg)
                     {
+                        evidence.record(
+                            step,
+                            "expected_error",
+                            expected_result.is_ok(),
+                            serde_json::json!({}),
+                        );
+                        if expected_result.is_err() {
+                            evidence.record_failure(
+                                serde_json::json!({"class":"error_code", "error_code":extract_engine_error_code(&err_msg).or_else(|| extract_sql_error_code(&err_msg)), "statement_index":step.query_number, "actual_digest":null}),
+                            );
+                        }
                         if let Err(reason) = expected_result {
                             last_failure = reason;
                         } else {
@@ -3434,6 +3568,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         };
                         let (assertions_ok, assertions_reason) =
                             verify_text_assertions(step, &execution);
+                        if results_record::required(step).contains(&"text_assertions") {
+                            evidence.record(
+                                step,
+                                "text_assertions",
+                                assertions_ok,
+                                serde_json::json!({}),
+                            );
+                        }
                         if !assertions_ok {
                             last_failure = format!("VERIFY FAILED: {}", assertions_reason);
                         } else {
@@ -3505,7 +3647,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             let _ = writeln!(log, "    ❌ orphan fixture was not installed");
                             continue;
                         };
-                        if let Err(error) = fixture.assert_absent() {
+                        let absent_result = fixture.assert_absent();
+                        evidence.record(
+                            step,
+                            "iceberg_orphan_absent",
+                            absent_result.is_ok(),
+                            serde_json::json!({}),
+                        );
+                        if let Err(error) = absent_result {
                             case_failed = true;
                             let _ = writeln!(log, "    ❌ {error:#}");
                             continue;
@@ -3940,6 +4089,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     verify_lifecycle_structured_assertion(&step.meta, &after)?;
                     Ok(after.execution_id)
                 });
+            evidence.record(
+                step,
+                "runtime_lifecycle",
+                assertion_result.is_ok(),
+                serde_json::json!({}),
+            );
             match assertion_result {
                 Ok(execution_id) => {
                     let _ = writeln!(
@@ -3986,6 +4141,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             );
         }
     }
+
+    evidence.finish_execution(case_failed);
 
     if case_failed {
         // Pre-execution failures can break out before the mode dispatch above.
@@ -4082,6 +4239,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             &log,
         ) {
             Ok(path) => {
+                evidence.artifacts.push(path.clone());
                 let _ = writeln!(log, "    case diagnostics retained at {}", path.display());
             }
             Err(error) => {
@@ -4139,6 +4297,41 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
 }
 
 fn run_suite_with_hooks(
+    ps: &PreparedSuite,
+    abort: &AtomicBool,
+    stdout_lock: &Mutex<()>,
+    mut execute_hook: impl FnMut(&ConnectionConfig, u64, &SuiteHook, &str) -> Result<()>,
+) -> SuiteOutcome {
+    let mut init_errors = Vec::new();
+    if let Some(recorder) = &ps.ctx.results {
+        for failure in &ps.load_failures {
+            recorder.load_failure(failure);
+        }
+    }
+    let result =
+        run_suite_with_hooks_observed(ps, abort, stdout_lock, |conn, timeout, hook, role| {
+            let result = execute_hook(conn, timeout, hook, role);
+            if ps
+                .init_hook
+                .as_ref()
+                .is_some_and(|init| init.path == hook.path)
+            {
+                if let Err(error) = &result {
+                    init_errors.push(format!("{error:#}"));
+                    if let Some(recorder) = &ps.ctx.results {
+                        recorder.init_failed(&ps.cases);
+                    }
+                }
+            }
+            result
+        });
+    if let Some(recorder) = &ps.ctx.results {
+        recorder.finish(ps, &result, abort.load(Ordering::Relaxed), &init_errors);
+    }
+    result
+}
+
+fn run_suite_with_hooks_observed(
     ps: &PreparedSuite,
     abort: &AtomicBool,
     stdout_lock: &Mutex<()>,
@@ -4912,10 +5105,27 @@ fn shutdown_server_handle(
     }
 }
 
+#[cfg(test)]
 fn finish_run_with_server_cleanup(
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     primary_result: Result<i32>,
     failure_artifacts: &FailureArtifactRecorder,
+) -> Result<i32> {
+    finish_run_with_server_cleanup_recorded(
+        server_handle,
+        primary_result,
+        failure_artifacts,
+        None,
+        false,
+    )
+}
+
+fn finish_run_with_server_cleanup_recorded(
+    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    primary_result: Result<i32>,
+    failure_artifacts: &FailureArtifactRecorder,
+    results: Option<&Arc<results_record::ResultsWriter>>,
+    external: bool,
 ) -> Result<i32> {
     let primary_failed = !matches!(&primary_result, Ok(0));
     // A real cross-process shutdown removes its runtime directory even when
@@ -4939,6 +5149,9 @@ fn finish_run_with_server_cleanup(
     let retain_runtime_artifacts =
         primary_failed || preserve_result.is_err() || shutdown_failure_candidate.is_err();
     let cleanup_result = shutdown_server_handle(&server_handle, retain_runtime_artifacts);
+    if let Some(results) = results {
+        results.observe(serde_json::json!({"kind":"server","cleanup":{"status":if cleanup_result.is_err(){"failed"}else if external{"external"}else{"ok"},"error":cleanup_result.as_ref().err().map(|e|format!("{e:#}")),"residual_pids":[]}}));
+    }
     if let Err(error) = &cleanup_result {
         failure_artifacts.record_provenance(
             "server-cleanup".to_string(),
@@ -5031,6 +5244,14 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             base_dir.join("tests/sql/correctness").display()
         );
         return Ok(1);
+    }
+
+    if cli.list_declarations {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&results_record::declarations(&suite_configs)?)?
+        );
+        return Ok(0);
     }
 
     if cli.list_suites {
@@ -5127,8 +5348,46 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     }
     // Before the proxy: it forwards to whatever REST Catalog this run uses, and
     // an isolated one has to exist first.
-    let (mut isolated_rest_catalog, publication_control_uri) =
-        start_isolated_rest_catalog(&suite_names)?;
+    let results_writer =
+        results_record::ResultsWriter::create(&base_dir, cli.results_file.as_deref())?;
+    let fixture_root = suite_names
+        .iter()
+        .any(|s| isolated_rest_catalog_suite(s))
+        .then(|| base_dir.join("tests/sql/.runtime/isolated-rest"));
+    let resources_before = match &fixture_root {
+        Some(root) => novarocks_cluster_harness::resource_registration::list(root)?,
+        None => Default::default(),
+    };
+    let effective_config = results_writer.capture_configuration(&cli, &base_dir, &runner_config)?;
+    let run_record = results_record::run_record(
+        &cli,
+        &base_dir,
+        Some(&effective_config),
+        &suite_names,
+        fixture_root.as_deref(),
+    )?;
+    for key in ["runner", "server", "config"] {
+        if let Some(path) = run_record[key]["path"].as_str() {
+            ensure!(
+                results_writer.track_file(std::path::Path::new(path))?
+                    == run_record[key]["sha256"]
+                        .as_str()
+                        .context("recorded input hash absent")?,
+                "execution input {key} changed before launch"
+            );
+        }
+    }
+    results_writer.write(run_record)?;
+    let (mut isolated_rest_catalog, publication_control_uri) = results_record::fixture_start(
+        &results_writer,
+        fixture_root.as_deref(),
+        &resources_before,
+        || start_isolated_rest_catalog(&suite_names),
+    )?;
+    let selection_written = AtomicBool::new(false);
+    let server_recorded = AtomicBool::new(false);
+    let totals = Mutex::new((0usize, 0usize, 0usize));
+    let mut suite_facts = BTreeMap::new();
     let mut publication_catalog_fixture: Option<publication_catalog::FixtureHandle> = None;
     let fixture_primary = (|| -> Result<i32> {
         let fixture_endpoints = if let Some(fixture) = isolated_rest_catalog.as_ref() {
@@ -5217,6 +5476,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         };
 
         let mut prepared_inputs: Vec<PreparedSqlInputs> = Vec::new();
+        let mut all_available_case_ids = HashSet::new();
         for suite_name in &suite_names {
             let suite = suite_configs
                 .get(suite_name)
@@ -5242,6 +5502,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 suite.sql_glob.clone()
             };
 
+            let mut snapshot_config = suite.clone();
+            snapshot_config.sql_dir = sql_dir.clone();
+            snapshot_config.result_dir = result_dir.clone();
+            snapshot_config.sql_glob = sql_glob.clone();
+            let parse_start = results_record::suite_inputs(&snapshot_config)?;
             let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name);
             if let Some(binding) = dataset_bindings.get(suite_name) {
                 placeholder_vars.insert(
@@ -5321,10 +5586,15 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 ) {
                     Ok(Some(case)) => cases.push(case),
                     Ok(None) => {
-                        println!(
-                            "Warning: skipping SQL file without executable steps: {}",
-                            sql_file.display()
-                        );
+                        load_failures.push(CaseLoadFailure {
+                            case_id: sql_file
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("<unnamed>")
+                                .to_owned(),
+                            source_file: sql_file.clone(),
+                            error: "SQL case contains no executable steps".to_owned(),
+                        });
                     }
                     // An unparseable case file is that case failing, not a
                     // suite-level abort: keep loading so the remaining cases
@@ -5350,6 +5620,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 .map(|c| c.case_id.clone())
                 .chain(load_failures.iter().map(|f| f.case_id.clone()))
                 .collect();
+            all_available_case_ids.extend(available_case_ids.iter().cloned());
             let only_set = parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
             let skip_set = parse_selector_list(cli.skip.as_deref(), &available_case_ids, "--skip")?;
 
@@ -5484,6 +5755,13 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
             }
 
+            let parse_end = results_record::suite_inputs(&snapshot_config)?;
+            ensure!(
+                parse_start["inputs_sha256"] == parse_end["inputs_sha256"],
+                "suite {} inputs changed during loading",
+                suite.name
+            );
+            suite_facts.insert(suite.name.clone(), (snapshot_config, parse_start));
             prepared_inputs.push(PreparedSqlInputs {
                 suite_name: suite.name.clone(),
                 sql_dir,
@@ -5500,6 +5778,54 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 suite_cleanup_hook,
             });
         }
+
+        let mut selected_suites = Vec::new();
+        for input in &prepared_inputs {
+            let mut effective = suite_configs[&input.suite_name].clone();
+            effective.sql_dir = input.sql_dir.clone();
+            effective.result_dir = input.result_dir.clone();
+            effective.sql_glob = input.sql_glob.clone();
+            let mut fact = suite_facts[&input.suite_name].1.clone();
+            ensure!(
+                fact["inputs_sha256"] == results_record::suite_inputs(&effective)?["inputs_sha256"],
+                "suite {} inputs changed before selection",
+                input.suite_name
+            );
+            let selected_ids = input
+                .cases
+                .iter()
+                .map(|c| c.case_id.as_str())
+                .chain(input.load_failures.iter().map(|c| c.case_id.as_str()))
+                .collect::<HashSet<_>>();
+            for case in fact["cases"].as_array_mut().expect("suite case array") {
+                let id = case["case"].as_str().unwrap();
+                let failure = input.load_failures.iter().find(|f| f.case_id == id);
+                case["loadable"] = serde_json::json!(failure.is_none());
+                case["load_error"] = serde_json::json!(failure.map(|f| f.error.clone()));
+            }
+            fact["cases"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|c| selected_ids.contains(c["case"].as_str().unwrap()));
+            fact["verify_enabled"] = serde_json::json!(input.verify_enabled);
+            fact["query_timeout_secs"] = serde_json::json!(input.query_timeout);
+            selected_suites.push(fact.clone());
+            suite_facts.insert(input.suite_name.clone(), (effective, fact));
+        }
+        let fixture_env = runner_config
+            .values
+            .get("fixture_env_file")
+            .map(PathBuf::from);
+        if let Some(path) = &fixture_env {
+            results_writer.track_file(path)?;
+        }
+        results_writer.write(serde_json::json!({"kind":"selection",
+            "fixture":{"env_file":fixture_env,"env_file_sha256":results_record::optional_hash(fixture_env.as_deref())?,
+                "isolated_runtime":isolated_rest_catalog.as_ref().map(|f| f.runtime_identity()).transpose()?, "datasets":dataset_bindings},
+            "suites":selected_suites,
+            "unresolved_only":cli.only.as_deref().unwrap_or("").split(',').map(str::trim).filter(|id|!id.is_empty() && !all_available_case_ids.contains(*id)).collect::<Vec<_>>(),
+            "unresolved_skip":cli.skip.as_deref().unwrap_or("").split(',').map(str::trim).filter(|id|!id.is_empty() && !all_available_case_ids.contains(*id)).collect::<Vec<_>>()}))?;
+        selection_written.store(true, Ordering::Relaxed);
 
         let query_lifecycle_faults_enabled = !cli.dry_run
             && prepared_inputs
@@ -5602,13 +5928,18 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             test_sessions,
             cli.physical_wire_candidate_binary.as_deref(),
         )?;
-        if let Some(evidence) = server_handle.actual_build_information_evidence()? {
-            failure_artifacts.record_provenance("actual-role-build-information".into(), evidence);
-        }
         let launched_target_port = server_handle.target_port();
         let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
         let server_handle = Arc::new(Mutex::new(server_handle));
         let primary_result = (|| -> Result<i32> {
+            if let Some(evidence) = server_handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex poisoned"))?
+                .actual_build_information_evidence()?
+            {
+                failure_artifacts
+                    .record_provenance("actual-role-build-information".into(), evidence);
+            }
             // Resolve global connection params
             let reference_required = cli.mode == Mode::Diff
                 || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
@@ -5845,6 +6176,14 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     failure_artifacts: Arc::clone(&failure_artifacts),
                     publication_catalog_control: publication_catalog_control.clone(),
                     publication_service_control: publication_service_control.clone(),
+                    results: Some(Arc::new({
+                        let (config, fact) = &suite_facts[&suite.name];
+                        results_record::SuiteRecorder::new(
+                            Arc::clone(&results_writer),
+                            config.clone(),
+                            fact.clone(),
+                        )
+                    })),
                 };
 
                 prepared_suites.push(PreparedSuite {
@@ -6001,13 +6340,23 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             }
             println!("{}", "=".repeat(72));
 
+            *totals.lock().unwrap() = (grand_passed, grand_failed, grand_skipped);
+            results_writer.check()?;
             if grand_failed > 0 || !all_cleanup_errors.is_empty() {
                 return Ok(1);
             }
 
             Ok(0)
         })();
-        finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref())
+        let result = finish_run_with_server_cleanup_recorded(
+            server_handle,
+            primary_result,
+            failure_artifacts.as_ref(),
+            Some(&results_writer),
+            selected_cluster_mode == ClusterMode::AllInOne,
+        );
+        server_recorded.store(true, Ordering::Relaxed);
+        result
     })();
     let mut fixture_failures = Vec::new();
     if let Some(fixture) = publication_catalog_fixture.as_mut() {
@@ -6032,7 +6381,27 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             Err(error) => fixture_failures.push(format!("stop isolated fixture: {error:#}")),
         }
     }
+    if selection_written.load(Ordering::Relaxed) && !server_recorded.load(Ordering::Relaxed) {
+        results_writer.write(serde_json::json!({"kind":"server","cleanup":{"status":"not_launched","error":null,"residual_pids":[]}}))?;
+    }
+    let resources = match &fixture_root {
+        Some(root) => novarocks_cluster_harness::resource_registration::collect(
+            root,
+            &resources_before,
+            std::process::id(),
+        )?,
+        None => Vec::new(),
+    };
+    results_writer.write(serde_json::json!({"kind":"fixture","start":if isolated_rest_catalog.is_some(){"ok"}else{"not_needed"},"error":null,
+        "shutdown":{"status":if fixture_failures.is_empty(){"ok"}else{"failed"},"errors":fixture_failures},"resources":resources}))?;
+    results_writer.check()?;
     if fixture_failures.is_empty() {
+        let code = match &fixture_primary {
+            Ok(code) => *code,
+            Err(_) => 1,
+        };
+        let (pass, fail, not_run) = *totals.lock().unwrap();
+        results_writer.write(serde_json::json!({"kind":"end","completed":true,"exit_code":code,"totals":{"pass":pass,"fail":fail,"not_run":not_run},"ended_at":results_record::now()}))?;
         return fixture_primary;
     }
     failure_artifacts.record_provenance(
@@ -6040,6 +6409,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         serde_json::json!(&fixture_failures),
     );
     let cleanup = fixture_failures.join("; ");
+    let (pass, fail, not_run) = *totals.lock().unwrap();
+    results_writer.write(serde_json::json!({"kind":"end","completed":true,"exit_code":1,"totals":{"pass":pass,"fail":fail,"not_run":not_run},"ended_at":results_record::now()}))?;
     match fixture_primary {
         Ok(code) => Err(anyhow::anyhow!(
             "run exited with code {code}; fixture cleanup failed: {cleanup}"
@@ -7271,8 +7642,36 @@ mod tests {
             },
         );
 
-        let error = super::finish_run_with_server_cleanup(server, Ok(0), &failure_artifacts)
-            .expect_err("cleanup failure must fail a successful run");
+        let results_path = temp.path().join("results.jsonl");
+        let results =
+            crate::results_record::ResultsWriter::create(temp.path(), results_path.to_str())
+                .unwrap();
+        let error = super::finish_run_with_server_cleanup_recorded(
+            server,
+            Ok(0),
+            &failure_artifacts,
+            Some(&results),
+            false,
+        )
+        .expect_err("cleanup failure must fail a successful run");
+        let records = fs::read_to_string(results_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "server");
+        assert_eq!(records[0]["cleanup"]["status"], "failed");
+        assert!(
+            records[0]["cleanup"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("injected shutdown failure")
+        );
+        assert_eq!(
+            records[0]["cleanup"]["residual_pids"],
+            serde_json::json!([])
+        );
         assert!(
             format!("{error:#}").contains("injected shutdown failure"),
             "{error:#}"
@@ -7482,6 +7881,7 @@ mod tests {
             failure_artifacts: artifacts,
             publication_catalog_control: None,
             publication_service_control: None,
+            results: None,
         };
         let hook = |name: &str| SuiteHook {
             path: temp.path().join(name),

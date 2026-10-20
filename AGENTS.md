@@ -715,7 +715,9 @@ the guide supplies NovaRocks locations and operational responsibilities.
 常规 Rust 由 nextest 逐测试进程执行；定向选择用
 `tools/ci/dev-test.sh test -E 'package(novarocks-memory) & test(=attribution_reconcile)'`，
 原生列举用 `tools/ci/dev-test.sh list -E 'package(novarocks-memory)'`。
-最终按影响面运行 `tools/ci/dev-test.sh test`；doctest 单独 `tools/ci/dev-test.sh doc`。
+开发阶段用 `tools/ci/dev-verify.sh plan|run|resume|compose` 选择、执行和组合影响面证据；
+直接运行 nextest 时使用原生 filter，doctest 单独 `tools/ci/dev-test.sh doc`。
+最终验证是目标提交的组合记录，必跑项仍按 approved plan 执行，未选常规项明确延后给准入。
 默认 4 slots、无重试、非 fail-fast；原生资源组约束重型进程测试，不机械传全局串行。
 nextest 日常最低 0.9.148，正式工具固定 0.9.148；缺工具、缺必要输入或选择为空时明确失败。
 日常准备后前台 exec nextest 保留 TTY；`local-full-ci.sh --cargo-only` 独立调用批处理，
@@ -822,10 +824,30 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 ### 8.5 Test Scope Selection
 
-Run the tests a change can actually break. Targeted verification is the default;
-a full run is a deliberate step with a stated reason, not a safety reflex. Full
-runs belong at milestone convergence, at the final verification before claiming
-completion, and where the blast radius genuinely is the whole repository.
+Run the tests a change can actually break. Targeted verification is the default.
+The workflow contract preserves four checkpoints: milestone convergence; final
+verification of the target commit; changes to shared types, wire or persistent
+formats and public contracts; and changes whose impact cannot be bounded. In
+development, final verification means a composition record for the selected
+scopes, with explicit deferrals and heavy-test author obligations. Known affected
+domains expand the selection; genuinely unbounded impact requires broad coverage.
+An approved plan's explicit required runs remain mandatory.
+
+Development, PR admission and post-merge full verification have different
+collections and evidence rules. Admission uses the fixed regular collection on
+the actual merge commit, with current execution or eligible formal attempts; it
+does not read the impact graph. Full verification runs every maintained unit and
+required mode in the current attempt and registers failures. G17 owns the formal
+platform, merge gate and scheduling. Local runs, including an admission rehearsal,
+do not establish formal admission. See [layer rules](docs/guides/development/test-governance.md#三层验证与证据组合).
+
+Use `tools/ci/dev-verify.sh plan --base origin/main` to inspect native declarations,
+selection reasons and mapping gaps; `run --root <absolute-local-evidence-root>`
+executes the selection, and `resume` with the same root recomposes and reruns
+unsatisfied scopes. `compose` saves a new derived record without rewriting native
+results. These commands prepare the canonical graph unless `--prepared` names
+validated preparation inputs. Details and cleanup confirmation are in the
+[CI README](tools/ci/README.md#development-selection-and-evidence-composition).
 
 **Rust: choose the affected owner for the narrow edit loop.** Every first-party crate lives
 in the single root workspace. Narrow `cargo test -p <crate>` may change feature
@@ -845,11 +867,12 @@ unless you edited them.
 | `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
 | `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
 
-**SQL: choose suites from the suite map** in
-`tests/sql/correctness/README.md`, and narrow further with `--only <case>` when
-a single case covers the change. A change to array function declarations needs
-`complex-type` and `function`, not the corpus; outer-join nullability needs
-`join`; CUBE needs `aggregate`.
+**SQL: choose suites from native declarations** and their generated map in
+`tests/sql/correctness/README.md`. Direct `--only <case>` is useful for diagnosis;
+composition may split a suite only when its owner declares a case-level reuse
+scope and an eligible initial state. A change to array function declarations
+selects `complex-type` and `function`; outer-join nullability selects `join`;
+CUBE selects `aggregate`.
 
 **统计范围与成本。** 测试目标随 workspace 变化；用 `cargo metadata --locked --no-deps --format-version 1`
 统计当前成员和声明目标，用规范准备的 Cargo artifact 统计实际启用的测试与程序，二者不混为 case 数。
@@ -866,10 +889,12 @@ record isolated reruns separately. A pass when run alone means the failure was
 not reproduced in that attempt. Concurrent load, even when observed, does not
 by itself exclude a product race or justify calling the failure noise.
 
-Neither family is in `tools/ci/baselines/known-failures.toml`, which covers
-accepted SQL failures only. Keep an existing approved disposition separate from
-this run's raw failures; targeted passes must not overwrite a full run's raw
-result. See [failure and evidence boundaries](docs/guides/development/test-governance.md#失败与结论边界).
+Dispositions live in `tools/ci/baselines/dispositions.json`. Known failures
+require an exact default SQL case and a supported failure fingerprint, reason,
+owner and expiry; they cannot excuse Rust assertions, timeouts, missing execution
+or cleanup violations. Keep an approved disposition separate from this run's raw
+failures; a same-input failure and pass remain inconsistent, and targeted passes
+must not overwrite a full run's raw result. See [failure and evidence boundaries](docs/guides/development/test-governance.md#失败与结论边界).
 
 For SQL suites, read the first failure rather than the failure count: one
 failing statement can leave the shared server in a state where later cases fail
@@ -1057,7 +1082,10 @@ checkpoints. Explicit user approval promotes the persisted plan from `draft` to
 
 Plan and execute both resolve test scope through section 8.5: a plan task names
 the tests its own change can break, and execution runs those, not the whole
-repository. A full run needs one of the reasons section 8.5 lists.
+repository. The final development checkpoint is the target commit's composition,
+with selection gaps, deferrals and heavy obligations visible. Expand known
+contracts to their affected domains; unbounded impact requires broad coverage.
+Explicit required runs in the approved plan remain required.
 
 Once execution starts, routine implementation difficulties are not reasons to
 stop; pause only for the major decision conditions defined by
@@ -1070,7 +1098,8 @@ authorization in `dev-workflow-finish`.
 
 当前阶段只维护功能与数据正确性；不新增或维护吞吐、延迟分位数、RSS 比较门及持续测量协议。历史报告和 frozen receipt 仅是来源证据，不能成为新采集准入。一次性研究保存在仓库外独占尝试目录；晋升资产前先确定性质、最低充分 owner、独立 oracle、输入和真实退出。先承接性质再删除旧载体。
 
-相关 Rust owner/helper/input 改动沿既有单测链路；结果慢端/并发与 range/delete/planning/DOP 显式功能组由领域维护者每周手工运行，相关 owner/fixture 改动必跑。三套 SSB/TPC correctness 成本较高，runner/输入绑定改动必跑三套，每周手工完整轮次，不扩默认 CI。MV/OPTIMIZE 沿既有 suite。周期调度与共享证据服务尚未交付，G7a/G7b 已取消，不作未来交付承诺。详见 [测试治理](docs/guides/development/test-governance.md)。
+影响选择以原生 Cargo/package/rdeps、SQL/System `--list-declarations` 与具名 stage 声明为来源，
+不维护第二张 stable 集合；README 的 SQL 表由原生声明生成。相关 Rust owner/helper/input 改动沿既有单测链路；结果慢端/并发与 range/delete/planning/DOP 显式功能组由领域维护者每周手工运行，相关 owner/fixture 改动必跑。三套 SSB/TPC correctness 成本较高，runner/输入绑定改动必跑三套，每周手工完整轮次，不扩默认 CI。MV/OPTIMIZE 沿既有 suite。周期调度与共享证据服务尚未交付，G7a/G7b 已取消，不作未来交付承诺。详见 [测试治理](docs/guides/development/test-governance.md)。
 
 FE preparation 只保留带独立 secret 鉴权的 `/statement/{arm,peek,drain}` 功能观测；运行级 `/arm`、`/drain` 与专用计时钩子退出。内部 statement 观测由实际开发 cfg 编入，还需本次实际角色会话的独立观察授权；普通产品没有该内部路由。
 

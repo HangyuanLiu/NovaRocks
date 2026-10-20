@@ -43,6 +43,15 @@ pub(super) struct MvIncarnationMismatch {
 }
 
 impl Scenario for MvIncarnationMismatch {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "mv_uea7_incarnation",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "mv/incarnation-mismatch"
     }

@@ -31,3 +31,7 @@ mysql.workspace = true
 novarocks-test-support.workspace = true
 novarocks-server-application = { path = "library", default-features = false }
 tempfile.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = ["target/debug/novarocks", "target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
+env-inputs = [{ name = "NOVAROCKS_LOG_FILTER", kind = "value" },{ name = "NOVAROCKS_LOG_ROLL_MODE", kind = "value" },{ name = "NOVAROCKS_LOG_ROLL_NUM", kind = "value" }]

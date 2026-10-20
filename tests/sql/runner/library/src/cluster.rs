@@ -200,7 +200,7 @@ pub(crate) fn discover_novarocks_binary_with_override(
     )
 }
 
-fn resolve_base_frontend_config_path(
+pub(crate) fn resolve_base_frontend_config_path(
     repo_root: &Path,
     runner_config: &RunnerConfig,
 ) -> Result<PathBuf> {

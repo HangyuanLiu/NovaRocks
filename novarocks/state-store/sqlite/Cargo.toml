@@ -23,3 +23,7 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 [dev-dependencies]
 novarocks-state-store-testkit.workspace = true
 tempfile.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

@@ -102,6 +102,15 @@ struct NativeTrustPositive {
 }
 
 impl Scenario for NativeTrustPositive {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_trust",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }
@@ -246,6 +255,15 @@ impl NativeTrustNegative {
 }
 
 impl Scenario for NativeTrustNegative {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_trust",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }
@@ -369,6 +387,15 @@ impl VendedCredentialTransportParity {
 }
 
 impl Scenario for VendedCredentialTransportParity {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "native_trust",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }

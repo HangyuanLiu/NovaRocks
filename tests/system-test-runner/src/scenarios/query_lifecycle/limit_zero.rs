@@ -27,6 +27,15 @@ pub(super) struct LimitZeroUnknownSender {
 }
 
 impl Scenario for LimitZeroUnknownSender {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        crate::scenarios::declarations::for_module(
+            "query_lifecycle",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        )
+    }
+
     fn name(&self) -> &'static str {
         "query-lifecycle/limit-zero-unknown-sender"
     }

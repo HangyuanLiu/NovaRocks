@@ -33,3 +33,7 @@ novarocks-query-application.workspace = true
 novarocks-workload-control.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 uuid.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []

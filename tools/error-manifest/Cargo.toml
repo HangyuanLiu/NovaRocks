@@ -33,3 +33,7 @@ novarocks-user-error.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []
