@@ -1930,6 +1930,9 @@ mod array_struct_subfield_actual_sql_source_tests;
 mod legacy_struct_subfield_baseline_tests;
 
 #[cfg(test)]
+mod float_arithmetic_independent_fixture;
+
+#[cfg(test)]
 mod float_arithmetic_required_oracle_tests;
 #[cfg(test)]
 mod float_arithmetic_statistics_actual_sql_tests;
@@ -2042,3 +2045,6 @@ mod regexp_count_source_tests;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+mod f3_project_numeric_root_materialization_tests;

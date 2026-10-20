@@ -127,6 +127,7 @@ struct CaptureState {
     sources: Option<Vec<ConstantValue>>,
     result: DataType,
     captured: Option<FoldRequest>,
+    observed: Vec<FoldRequest>,
 }
 struct Recorder;
 impl SqlConstantEvaluator for Recorder {
@@ -137,6 +138,7 @@ impl SqlConstantEvaluator for Recorder {
     ) -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
         let mut capture_guard = CAPTURE_STATE.lock().unwrap();
         let state = capture_guard.as_mut().expect("active fixture capture");
+        state.observed.push(request.clone());
         let shape = match (&state.node, &request.kind) {
             (FixtureNode::Function { .. }, FrozenFoldNode::Call(_)) => true,
             (FixtureNode::Cast(_), FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast { .. })) => {
@@ -227,6 +229,7 @@ fn capture(
         sources,
         result,
         captured: None,
+        observed: Vec::new(),
     });
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let control = SqlCompileControl::unbounded();
@@ -270,13 +273,27 @@ fn capture(
             compile,
             Err(SqlCompileProgressError::Compile(SqlCompileError::Cancelled))
         ),
-        "fixture must terminate only at its captured SQL node: {compile:?}"
+        "fixture must terminate only at its captured SQL node: {compile:?}; \
+         expected node={:?}, source types={:?}, result={:?}; observed={:?}",
+        state.node,
+        state.sources.as_ref().map(|sources| sources
+            .iter()
+            .map(|source| (
+                source.ordinal(),
+                source.value_type(),
+                source.pool().backing_identity()
+            ))
+            .collect::<Vec<_>>()),
+        state.result,
+        state.observed,
     );
     state
         .captured
         .expect("SQL must have authored the exact request")
 }
-// Bind the original checked CVs to exact root SELECT occurrences. Later
+// Bind each original checked CV to its exact SELECT projection root. The
+// fixture has no syntactic wrapper between this site and its owned source.
+// Later
 // SELECT items use the analyzer's existing alias substitution, so their
 // bindings see the actual source types before any optimizer folding occurs.
 fn statement_with_sources(
@@ -285,11 +302,10 @@ fn statement_with_sources(
     sources: &[ConstantValue],
 ) -> novarocks_sql::compiler::SqlStatementInput {
     use novarocks_sql::compiler::{
-        SqlConstantExpressionSite, SqlConstantExpressionStep, SqlExpressionConstant,
-        SqlStatementInput,
+        SqlConstantExpressionSite, SqlExpressionConstant, SqlStatementInput,
     };
     let projections = (0..sources.len())
-        .map(|i| format!("(NULL) AS v{i}"))
+        .map(|i| format!("NULL AS v{i}"))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT {hint}{projections}, {expression} AS result");
@@ -306,7 +322,6 @@ fn statement_with_sources(
                 SqlConstantExpressionSite::SelectProjection { column },
                 value.clone(),
             )
-            .with_expression_path(vec![SqlConstantExpressionStep::Nested])
         })
         .collect::<Vec<_>>()
         .into();

@@ -381,26 +381,30 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
             Ok(())
         }
     }
-    for (source, result, op) in [
+    for (source, result, op, expected_error) in [
         (
             DataType::Float64,
             FunctionValueType::new(DataType::Decimal128(38, i8::MIN), true),
             CastOperation::Carrier,
+            None,
         ),
         (
             DataType::Float64,
             FunctionValueType::new(DataType::Decimal128(18, 4), false),
             CastOperation::Carrier,
+            Some(CastPrepareError::TypeMismatch),
         ),
         (
             DataType::Float32,
             FunctionValueType::new(DataType::Decimal128(18, 4), true),
             CastOperation::Carrier,
+            None,
         ),
         (
             DataType::Float64,
             FunctionValueType::new(DataType::Decimal128(18, 4), true),
             CastOperation::Time,
+            Some(CastPrepareError::Unsupported),
         ),
     ] {
         let source = FunctionValueType::from_legacy_declared_projection(source, true);
@@ -416,12 +420,17 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
             true,
             &baseline,
         );
-        assert_eq!(
-            original.is_ok(),
-            op == CastOperation::Carrier
-                && result.nullable()
-                && source.data_type() == &DataType::Float64
-        );
+        // Both floating carriers are admitted; malformed result nullability
+        // and the unrelated time operation retain their exact refusal kinds.
+        match expected_error {
+            Some(expected) => assert_eq!(original, Err(expected)),
+            None => {
+                let prepared = original.unwrap();
+                assert_eq!(prepared.operation(), op);
+                assert_eq!(prepared.source_type(), &source);
+                assert_eq!(prepared.result_type(), &result);
+            }
+        }
         let trace = baseline.calls.lock().unwrap().clone();
         assert!(!trace.is_empty());
         for at in 0..trace.len() {

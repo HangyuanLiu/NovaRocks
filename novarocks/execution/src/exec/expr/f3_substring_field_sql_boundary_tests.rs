@@ -225,7 +225,8 @@ fn c12_p3_substring_index_actual_compiled_slots_constants_strict_null_and_explic
                 vec![Some("a"), None, Some("你好::\0"), Some("")],
             ),
             ("-1", None, vec![Some("a"), None, Some("\0"), Some("")]),
-            ("0", None, vec![Some(""), None, Some(""), Some("")]),
+            // The frozen SUBSTRING_INDEX owner returns SQL NULL for zero count.
+            ("0", None, vec![None, None, None, None]),
         ] {
             let (program, site, batch) = sql_frame(
                 &format!("SELECT substring_index(txt,delim,{count_sql}) FROM t"),

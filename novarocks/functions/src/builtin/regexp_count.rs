@@ -134,7 +134,13 @@ pub fn evaluate_selected<'a>(
                     errors
                         .try_reserve(1)
                         .map_err(|_| KernelFailure::ResourceExhausted)?;
-                    errors.push(RowDataError::new(ordinal, &message));
+                    // Retain the actual SDK syntax source and its originating Data
+                    // fact in the selected journal; the message is only a
+                    // bounded diagnostic, never the row failure's author.
+                    errors.push(RowDataError::from_domain(
+                        ordinal,
+                        super::string_failure::required_row(ordinal, cause),
+                    )?);
                     work.flush()?;
                     out.push(None);
                     continue;

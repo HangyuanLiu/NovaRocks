@@ -18,7 +18,6 @@
 //! Actual original LIKE source FVT and permanent Frame success oracles.
 //! Before preparation these are RED at UnsupportedExpression(Like).
 use super::compiled_program::CompiledExpressionInstance;
-use super::legacy_like_required_baseline_tests::original;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source as original_source_programs;
 use super::sql_test_source::{
     sql_source_with_single_field, sql_source_with_single_field_and_core_residuals,
@@ -99,8 +98,7 @@ fn evaluate(
     sql: &str,
     field: Field,
     input: ArrayRef,
-    pattern: ArrayRef,
-    negated: bool,
+    expected_rows: Vec<Option<bool>>,
     truth: bool,
 ) {
     // Same original SQL's legitimate optimizer variant, not a claim that
@@ -176,7 +174,10 @@ fn evaluate(
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).data_type(), input.data_type());
     let data = RecordBatch::try_new(schema, vec![input.clone()]).unwrap();
-    let old = original(input.clone(), pattern, negated).unwrap();
+    // These fixed truth/NULL vectors come from the explicit SQL patterns and
+    // inputs below. No expression evaluator authors the expected values.
+    assert_eq!(expected_rows.len(), input.len());
+    let expected_full: ArrayRef = Arc::new(BooleanArray::from(expected_rows));
     for rows in [
         (0..input.len()).collect::<Vec<_>>(),
         (0..input.len()).filter(|r| r % 2 == 0).collect(),
@@ -193,7 +194,7 @@ fn evaluate(
                 .map(|r| u64::try_from(*r).unwrap())
                 .collect::<Vec<_>>(),
         );
-        let expected = arrow::compute::take(old.as_ref(), &indices, None).unwrap();
+        let expected = arrow::compute::take(expected_full.as_ref(), &indices, None).unwrap();
         let wanted = if truth {
             Arc::new(BooleanArray::from(
                 expected
@@ -224,49 +225,75 @@ fn input() -> ArrayRef {
 }
 #[test]
 fn like_actual_compiler_value_original_required_prefix() {
-    let input = input();
     evaluate(
         "SELECT name LIKE 'a%' FROM t_filter_in_between_like",
         Field::new("name", DataType::Utf8, true),
-        input.clone(),
-        Arc::new(StringArray::from(vec!["a%"; input.len()])),
-        false,
+        input(),
+        vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+        ],
         false,
     );
 }
 #[test]
 fn like_actual_compiler_notlike_dynamic_source_value() {
-    let input = input();
+    // Every non-NULL input matches its own pattern, including '%' and the
+    // historical literal terminal backslash. NOT LIKE therefore yields false.
     evaluate(
         "SELECT name NOT LIKE name FROM t_filter_in_between_like",
         Field::new("name", DataType::Utf8, true),
-        input.clone(),
-        input,
-        true,
+        input(),
+        vec![
+            Some(false),
+            Some(false),
+            None,
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        ],
         false,
     );
 }
 #[test]
 fn like_actual_compiler_truthonly_original_required_prefix() {
-    let input = input();
     evaluate(
         "SELECT name FROM t_filter_in_between_like WHERE name LIKE 'a%'",
         Field::new("name", DataType::Utf8, true),
-        input.clone(),
-        Arc::new(StringArray::from(vec!["a%"; input.len()])),
-        false,
+        input(),
+        vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+        ],
         true,
     );
 }
 #[test]
 fn like_actual_compiler_notlike_truthonly_original_required_prefix() {
-    let input = input();
     evaluate(
         "SELECT name FROM t_filter_in_between_like WHERE name NOT LIKE 'a%'",
         Field::new("name", DataType::Utf8, true),
-        input.clone(),
-        Arc::new(StringArray::from(vec!["a%"; input.len()])),
-        true,
+        input(),
+        vec![
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+        ],
         true,
     );
 }
@@ -274,29 +301,18 @@ fn like_actual_compiler_notlike_truthonly_original_required_prefix() {
 #[test]
 fn like_actual_compiler_explicit_escape_keeps_original_ignored_escape_author() {
     // Analyzer currently drops AST.escape; the original core still uses its
-    // backslash author. This is a legacy bug witness, not a correction.
+    // backslash author. This is a recorded bug witness, not a correction.
     let input: ArrayRef = Arc::new(StringArray::from(vec![
         Some("a!x"),
         Some("a%"),
         None,
         Some("a!"),
     ]));
-    let pattern: ArrayRef = Arc::new(StringArray::from(vec!["a!%"; 4]));
-    let raw = original(input.clone(), pattern.clone(), false).unwrap();
-    assert_eq!(
-        raw.as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .iter()
-            .collect::<Vec<_>>(),
-        vec![Some(true), Some(false), None, Some(true)]
-    );
     evaluate(
         "SELECT name LIKE 'a!%' ESCAPE '!' FROM t_filter_in_between_like",
         Field::new("name", DataType::Utf8, true),
         input,
-        pattern,
-        false,
+        vec![Some(true), Some(false), None, Some(true)],
         false,
     );
 }

@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Independent original v1 versus exact Physical LARGEINT text recipe.
-use super::cast::cast_with_special_rules;
+//! Exact Physical LARGEINT text recipe with fixed signed decimal literals.
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
@@ -56,9 +55,19 @@ fn largeint_text_original_v1_all_policy_nullability_min_max_slice_and_empty() {
             values.push(None);
         }
         let input = novarocks_types::largeint::array_from_i128(&values).unwrap();
-        for source in [input.clone(), input.slice(1, 3), input.slice(0, 0)] {
-            let old = cast_with_special_rules(&source, &DataType::Utf8).unwrap();
-            let old = old.as_any().downcast_ref::<StringArray>().unwrap();
+        let fixed = [
+            Some("-170141183460469231731687303715884105728"),
+            Some("170141183460469231731687303715884105727"),
+            Some("-1"),
+            Some("0"),
+            Some("42"),
+            None,
+        ];
+        for (source, expected_rows) in [
+            (input.clone(), &fixed[..input.len()]),
+            (input.slice(1, 3), &fixed[1..4]),
+            (input.slice(0, 0), &[][..]),
+        ] {
             for policy in [
                 DecimalOverflowPolicy::OutputNull,
                 DecimalOverflowPolicy::ReportError,
@@ -74,11 +83,8 @@ fn largeint_text_original_v1_all_policy_nullability_min_max_slice_and_empty() {
                     )
                     .unwrap();
                     for row in 0..source.len() {
-                        let expected = if old.is_null(row) {
-                            CastRowResult::Null
-                        } else {
-                            CastRowResult::Text(old.value(row).into())
-                        };
+                        let expected = expected_rows[row]
+                            .map_or(CastRowResult::Null, |text| CastRowResult::Text(text.into()));
                         assert_eq!(
                             r.evaluate_row(EvaluatedArgument::Column(&source), row, row, &Control)
                                 .unwrap(),
@@ -106,8 +112,6 @@ fn largeint_text_shared_raw_adapter_retains_original_full_errors() {
         novarocks_functions::largeint_text::cast_array(&arr)
             .unwrap()
             .to_data(),
-        cast_with_special_rules(&arr, &DataType::Utf8)
-            .unwrap()
-            .to_data()
+        StringArray::from(vec!["-1"]).to_data()
     );
 }

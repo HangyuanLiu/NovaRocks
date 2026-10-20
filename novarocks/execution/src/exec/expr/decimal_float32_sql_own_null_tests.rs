@@ -17,20 +17,17 @@
 //! Actual non-NULL Connector SQL source -> owned transaction -> LocalCompiler -> Frame.
 //! The original declaration is a public obligation, not the internal Cast admission.
 use super::compiled_program::CompiledExpressionInstance;
-use super::legacy_decimal_float32_cast_baseline_tests::{actual, assert_same, input};
 use super::numeric_unary_owned_transaction_tests::{batch, producer_root, programs};
 use super::sql_test_source::sql_source;
-use arrow::array::{Array, Float32Array, UInt32Array};
+use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Float32Array};
 use arrow::datatypes::DataType;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_physical_plan::ExprKind;
 use novarocks_query_application::api::QueryExecutionKind;
 use novarocks_query_application::preparation::{CompletedPhysicalPlanCandidate, OutputContract};
 use novarocks_sql::compiler::SqlCompileControl;
-use novarocks_type_contract::{
-    CompileControlError, CompilePhase, DecimalOverflowPolicy, PureCompileControl,
-};
-use std::time::Duration;
+use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+use std::{sync::Arc, time::Duration};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -47,6 +44,62 @@ impl KernelEvaluationControl for Control {
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
         panic!("Decimal Float32 SQL cast never waits")
     }
+}
+
+// Pure carrier construction, with no conversion or evaluator call.
+fn input(wide: bool, precision: u8, scale: i8, raw: Vec<Option<i128>>) -> ArrayRef {
+    if wide {
+        Arc::new(
+            Decimal256Array::from(
+                raw.into_iter()
+                    .map(|value| value.map(arrow_buffer::i256::from_i128))
+                    .collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(precision, scale)
+            .unwrap(),
+        )
+    } else {
+        Arc::new(
+            Decimal128Array::from(raw)
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        )
+    }
+}
+
+// Corpus coefficients are [0, 4, -4, 1]. Their decimal values are r*10^-s.
+// IEEE-754 round-to-nearest-even gives 1e38 -> 0x7e967699;
+// |4e38| exceeds binary32's finite range. The preserved Decimal128 author
+// projects its non-finite results to SQL NULL, whereas Decimal256 retains
+// infinities. Neither NULL below is an i128 intermediate scaling overflow.
+// The independent exact-rational midpoint worksheet lives with this draft.
+fn expected_bits(wide: bool, scale: i8) -> [Option<u32>; 4] {
+    match (wide, scale) {
+        (false, 0) | (true, 0) => [
+            Some(0x00000000),
+            Some(0x40800000),
+            Some(0xc0800000),
+            Some(0x3f800000),
+        ],
+        (false, -38) => [Some(0x00000000), None, None, Some(0x7e967699)],
+        (true, -38) => [
+            Some(0x00000000),
+            Some(0x7f800000),
+            Some(0xff800000),
+            Some(0x7e967699),
+        ],
+        _ => panic!("SQL corpus needs an explicit independent IEEE table"),
+    }
+}
+
+fn assert_bits(array: &ArrayRef, expected: &[Option<u32>]) {
+    assert_eq!(array.data_type(), &DataType::Float32);
+    let values = array.as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(values.len(), expected.len());
+    let actual = (0..values.len())
+        .map(|row| (!values.is_null(row)).then(|| values.value(row).to_bits()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
 
 fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
@@ -116,8 +169,9 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
     let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
     let selected = frame.evaluate(&data, Selection::all(4), &Control).unwrap();
     assert!(selected.errors().is_empty());
-    let old = actual(&values, DecimalOverflowPolicy::OutputNull, false).unwrap();
-    assert_same(selected.values(), &old);
+    let expected = expected_bits(wide, scale);
+    assert_eq!(selected.selection(), Selection::all(4));
+    assert_bits(selected.values(), &expected);
     let floats = selected
         .values()
         .as_any()
@@ -136,21 +190,14 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
     let sparse = frame
         .evaluate(&data, Selection::try_sparse(4, &rows).unwrap(), &Control)
         .unwrap();
-    let taken = arrow::compute::take(
-        old.as_ref(),
-        &UInt32Array::from(rows.map(|r| r as u32).to_vec()),
-        None,
-    )
-    .unwrap();
-    assert_same(sparse.values(), &taken);
-    assert_eq!(
-        frame
-            .evaluate(&data, Selection::try_sparse(4, &[]).unwrap(), &Control)
-            .unwrap()
-            .values()
-            .len(),
-        0
-    );
+    assert_eq!(sparse.selection(), Selection::try_sparse(4, &rows).unwrap());
+    assert!(sparse.errors().is_empty());
+    assert_bits(sparse.values(), &rows.map(|row| expected[row]));
+    let empty_selection = Selection::try_sparse(4, &[]).unwrap();
+    let empty = frame.evaluate(&data, empty_selection, &Control).unwrap();
+    assert_eq!(empty.selection(), empty_selection);
+    assert!(empty.errors().is_empty());
+    assert_bits(empty.values(), &[]);
 }
 
 #[test]

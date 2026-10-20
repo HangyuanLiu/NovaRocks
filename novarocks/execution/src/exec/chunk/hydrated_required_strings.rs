@@ -290,63 +290,44 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
 
-    fn masked_assertion(chunk: &Chunk) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
-        use crate::exec::expr::function::FunctionKind;
-        use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-        use novarocks_functions::FunctionValueType;
-        let mut arena = ExprArena::default();
-        let slot = arena.push_value_typed(
-            ExprNode::SlotId(SlotId::new(1)),
-            FunctionValueType::try_from_typed_binding(
-                chunk.chunk_schema().slots()[0].typed_binding().clone(),
-            )
-            .unwrap(),
-        );
-        let arg = arena.push_value_typed(
-            ExprNode::SlotId(SlotId::new(77)),
-            FunctionValueType::new(DataType::Utf8, false),
-        );
-        let expected = arena.push_value_typed(
-            ExprNode::Literal(LiteralValue::Utf8("kept".into())),
-            FunctionValueType::new(DataType::Utf8, false),
-        );
-        let eq = arena.push_value_typed(
-            ExprNode::Eq(arg, expected),
-            FunctionValueType::new(DataType::Boolean, false),
-        );
-        let assertion = arena.push_value_typed(
-            ExprNode::FunctionCall {
-                kind: FunctionKind::AssertTrue,
-                args: vec![eq],
-            },
-            FunctionValueType::new(DataType::Boolean, false),
-        );
-        let lambda = arena.push_value_typed(
-            ExprNode::LambdaFunction {
-                body: assertion,
-                arg_slots: vec![SlotId::new(77)],
-                common_sub_exprs: vec![],
-                is_nondeterministic: false,
-            },
-            FunctionValueType::new(DataType::Null, true),
-        );
-        let output = arena.push_value_typed(
-            ExprNode::FunctionCall {
-                kind: FunctionKind::ArrayMap,
-                args: vec![lambda, slot],
-            },
-            FunctionValueType::new(
-                DataType::List(Arc::new(Field::new("item", DataType::Boolean, false))),
-                true,
-            ),
-        );
-        arena.eval(output, chunk)
-    }
-
     #[test]
-    fn array_map_row_effect_preserves_ancestor_mask_for_plain_and_hydrated_dictionary() {
+    fn hydration_preserves_ancestor_mask_required_strings_and_rejects_visible_dictionary_null() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_functions::array_projection::{
+            ArrayProjectionFailure, ArrayProjectionViolation,
+        };
+        use std::error::Error;
+
+        // This fixture protects hydration and typed ingress only. The retired
+        // arena ArrayMap/assert_true side effect has no installed pure owner;
+        // these explicit Arrow inputs do not claim higher-order evaluation.
         let source = encoded_source(false, false);
-        let tracker = MemTracker::new_root("masked lambda dictionary");
+        let original = source.columns()[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(original.len(), 2);
+        assert_eq!(original.value_offsets(), &[0, 1, 2]);
+        assert_eq!(original.nulls(), Some(&NullBuffer::from(vec![false, true])));
+        let dictionary = original
+            .values()
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        assert_eq!(dictionary.keys().values().as_ref(), &[1, 0, 1]);
+        assert_eq!(dictionary.keys().null_count(), 0);
+        let dictionary_values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(dictionary_values.value(0), "kept");
+        assert!(dictionary_values.is_null(1));
+        // Physical bytes under the logical dictionary NULL remain the actual
+        // source bytes. Neither our input author nor hydration invents them.
+        assert_eq!(dictionary_values.value(1), "shadow");
+
+        let tracker = MemTracker::new_root("hydration ancestor-mask contract");
         let factory = factory(&tracker);
         let scope = factory.begin_input_construction(&source).unwrap();
         let hydrated = hydrate_dictionary_columns_owned_observed(
@@ -367,29 +348,161 @@ mod tests {
             .unwrap(),
         );
         let plain = typed_source(plain_array, false);
-        let actual = masked_assertion(&hydrated).unwrap();
-        let reference = masked_assertion(&plain).unwrap();
-        assert_eq!(actual.to_data(), reference.to_data());
-        assert!(actual.is_null(0));
-        assert!(!actual.is_null(1));
-        let unmasked: ArrayRef = Arc::new(
-            ListArray::try_new(
-                Arc::new(Field::new("item", DataType::Utf8, false)),
-                arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into()),
-                Arc::new(StringArray::from(vec!["would fail", "kept"])),
-                None,
-            )
-            .unwrap(),
+        for input in [&hydrated, &plain] {
+            let list = input.columns()[0]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert_eq!(list.len(), 2);
+            assert_eq!(list.nulls(), original.nulls());
+            assert!(list.is_null(0));
+            assert!(list.is_valid(1));
+            assert_eq!(list.value_offsets(), original.value_offsets());
+            let DataType::List(item) = list.data_type() else {
+                unreachable!()
+            };
+            assert_eq!(item.name(), "item");
+            assert_eq!(item.data_type(), &DataType::Utf8);
+            assert!(!item.is_nullable());
+            assert_eq!(list.values().null_count(), 0);
+            let visible = list.value(1);
+            let visible = visible.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(visible.iter().collect::<Vec<_>>(), vec![Some("kept")]);
+            let binding = input.chunk_schema().slots()[0].typed_binding();
+            assert_eq!(
+                binding.value_type(),
+                source.chunk_schema().slots()[0]
+                    .typed_binding()
+                    .value_type()
+            );
+            assert!(binding.value_type().nullable());
+            let ValueKind::List(item) = binding.value_type().kind() else {
+                unreachable!()
+            };
+            assert!(!item.nullable());
+        }
+        let plain_values = plain.columns()[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .values();
+        assert_eq!(
+            plain_values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "would fail"
         );
-        assert!(
-            masked_assertion(&typed_source(unmasked, false))
-                .unwrap_err()
-                .to_string()
-                .contains("assert_true")
+        let hydrated_values = hydrated.columns()[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .values();
+        let hydrated_values = hydrated_values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            hydrated_values.iter().collect::<Vec<_>>(),
+            vec![Some(""), Some("kept"), Some("")]
         );
-        drop(hydrated);
+        // Dictionary values/keys are borrowed unchanged by the input fixture.
+        assert!(matches!(
+            source.columns()[0]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .values()
+                .data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(dictionary_values.value(1), "shadow");
+        assert!(dictionary_values.is_null(1));
+
+        // A visible ordinary non-NULL string remains legal even when its text
+        // was a failing value for the retired assertion lambda. This is a
+        // required-NULL contract, not a replacement string predicate.
+        let unmasked_plain: ArrayRef = Arc::new(ListArray::from(
+            plain.columns()[0]
+                .to_data()
+                .into_builder()
+                .nulls(None)
+                .build()
+                .unwrap(),
+        ));
+        let unmasked_plain = typed_source(unmasked_plain, false);
+        let list = unmasked_plain.columns()[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.null_count(), 0);
+        assert_eq!(list.values().null_count(), 0);
+        assert_eq!(
+            list.values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("would fail"), Some("kept")]
+        );
+        drop(unmasked_plain);
+
+        // Removing only the parent validity exposes key 1's logical NULL at
+        // the required child. Use the actual typed-ingress owner to reject it,
+        // rather than a test-authored lambda or a manufactured assertion error.
+        let unmasked: ArrayRef = Arc::new(ListArray::from(
+            original
+                .to_data()
+                .into_builder()
+                .nulls(None)
+                .build()
+                .unwrap(),
+        ));
+        assert_eq!(unmasked.data_type(), source.columns()[0].data_type());
+        assert_eq!(unmasked.null_count(), 0);
+        let failure = Chunk::try_new_typed_with_columns_owned_observed::<ExecutionFailure, _>(
+            source.chunk_schema_ref(),
+            vec![unmasked],
+            source.len(),
+            source.batch_projection().array_type_storage_lifetime(),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        let expected =
+            ArrayProjectionFailure::Contract(ArrayProjectionViolation::UnmaskedRequiredNull);
+        assert_eq!(failure.failure_fact(), expected.failure_fact());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            failure.detail(),
+            "typed required dictionary child contains an unmasked logical null"
+        );
+        let mut cause: &(dyn Error + 'static) = &failure;
+        loop {
+            if let Some(original) = cause.downcast_ref::<ArrayProjectionFailure>() {
+                assert!(matches!(
+                    original,
+                    ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::UnmaskedRequiredNull
+                    )
+                ));
+                break;
+            }
+            cause = cause
+                .source()
+                .expect("typed ingress retains its actual projection source");
+        }
+        drop(failure);
+        drop(source);
+        drop(plain);
         drop(scope);
         drop(factory);
+        assert!(
+            tracker.current() > 0,
+            "hydrated output retains its real creator"
+        );
+        drop(hydrated);
         assert_eq!(tracker.current(), 0);
     }
 }

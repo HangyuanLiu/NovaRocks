@@ -139,7 +139,10 @@ pub(super) fn prepare(
         }
         return Ok(Some(Body::ArrowScalar));
     }
-    if structural(
+    if matches!(
+        source.data_type(),
+        DataType::Struct(_) | DataType::List(_) | DataType::LargeList(_)
+    ) && structural(
         source.value_type(),
         source.data_type(),
         result.value_type(),

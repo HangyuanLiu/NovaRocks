@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Permanent complete Date32 float profile differential and separate unchanged reverse mismatches.
-use super::legacy_date_float_cast_baseline_tests::{actual, assert_literal, day, original};
-use arrow::array::{Array, ArrayRef, Date32Array, Float32Array, Float64Array};
+//! Complete Date32 float profiles with independent fixture-authored calendar literals.
+use arrow::array::{Array, ArrayRef, Date32Array};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     CastOperation, CastRowResult, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
@@ -43,6 +42,23 @@ impl KernelEvaluationControl for Control {
         panic!("date float does not wait")
     }
 }
+// Pure date fixture author. Expected YYYYMMDD literals are authored alongside
+// the original calendar inputs below, never by converting a Date32 back.
+pub(super) fn day(year: i32, month: u32, day: u32) -> i32 {
+    use chrono::{Datelike, NaiveDate};
+    NaiveDate::from_ymd_opt(year, month, day)
+        .unwrap()
+        .num_days_from_ce()
+        - 719163
+}
+fn expected_float(target: &DataType, literal: i64) -> CastRowResult {
+    match target {
+        DataType::Float32 => CastRowResult::Float32(literal as f32),
+        DataType::Float64 => CastRowResult::Float64(literal as f64),
+        _ => panic!("exact floating target required"),
+    }
+}
+
 fn recipe(
     source: DataType,
     target: DataType,
@@ -63,6 +79,7 @@ fn recipe(
 }
 fn compare(
     input: &ArrayRef,
+    expected: &[Option<i64>],
     target: DataType,
     source_nullable: bool,
     result_nullable: bool,
@@ -77,59 +94,53 @@ fn compare(
         policy,
         allow,
     );
-    let old = actual(input, target.clone(), policy, allow).unwrap();
-    for row in 0..input.len() {
-        let got = r
-            .evaluate_row(EvaluatedArgument::Column(input), row, row, &Control)
-            .unwrap();
-        if old.is_null(row) {
-            assert_eq!(got, CastRowResult::Null);
-            continue;
-        }
-        match got {
-            CastRowResult::Float32(v) => assert_eq!(
-                v.to_bits(),
-                old.as_any()
-                    .downcast_ref::<Float32Array>()
-                    .unwrap()
-                    .value(row)
-                    .to_bits()
-            ),
-            CastRowResult::Float64(v) => assert_eq!(
-                v.to_bits(),
-                old.as_any()
-                    .downcast_ref::<Float64Array>()
-                    .unwrap()
-                    .value(row)
-                    .to_bits()
-            ),
-            other => panic!("wrong exact float output {other:?}"),
-        }
+    assert_eq!(input.len(), expected.len());
+    for (row, literal) in expected.iter().enumerate() {
+        let expected = literal.map_or(CastRowResult::Null, |literal| {
+            expected_float(&target, literal)
+        });
+        assert_eq!(
+            r.evaluate_row(EvaluatedArgument::Column(input), row, row, &Control)
+                .unwrap(),
+            expected
+        );
     }
 }
+
 fn complete_profile(target: DataType) {
     // Sample across the whole valid chrono span, including both arithmetic overflow classes below.
     // This fixture is evidence, not a narrower admitted source type or runtime filter.
-    let mut values = vec![
-        Some(0),
-        Some(-1),
-        Some(day(0, 1, 1)),
-        Some(day(-1, 12, 31)),
-        Some(day(1900, 2, 28)),
-        Some(day(2000, 2, 29)),
-        Some(day(2024, 2, 29)),
-        Some(day(214748, 12, 31)),
-        Some(day(-214748, 12, 31)),
+    let mut corpus = vec![
+        (0, 19700101_i64),
+        (-1, 19691231),
+        (day(0, 1, 1), 101),
+        (day(-1, 12, 31), -8769),
+        (day(1900, 2, 28), 19000228),
+        (day(2000, 2, 29), 20000229),
+        (day(2024, 2, 29), 20240229),
+        (day(214748, 12, 31), 2147481231),
+        (day(-214748, 12, 31), -2147478769),
     ];
     for year in (-214748..=214748).step_by(4093) {
         for (month, date) in [(1, 1), (6, 30), (12, 31)] {
-            values.push(Some(day(year, month, date)));
+            corpus.push((
+                day(year, month, date),
+                i64::from(year) * 10000 + i64::from(month) * 100 + i64::from(date),
+            ));
         }
     }
     for source_nullable in [false, true] {
-        let mut rows = values.clone();
+        let mut rows = corpus
+            .iter()
+            .map(|(days, _)| Some(*days))
+            .collect::<Vec<_>>();
+        let mut expected = corpus
+            .iter()
+            .map(|(_, literal)| Some(*literal))
+            .collect::<Vec<_>>();
         if source_nullable {
             rows.push(None);
+            expected.push(None);
         }
         let input: ArrayRef = Arc::new(Date32Array::from(rows));
         for result_nullable in [false, true] {
@@ -143,6 +154,7 @@ fn complete_profile(target: DataType) {
                 for allow in [false, true] {
                     compare(
                         &input,
+                        &expected,
                         target.clone(),
                         source_nullable,
                         result_nullable,
@@ -151,6 +163,7 @@ fn complete_profile(target: DataType) {
                     );
                     compare(
                         &input.slice(1, input.len() - 1),
+                        &expected[1..],
                         target.clone(),
                         source_nullable,
                         result_nullable,
@@ -159,6 +172,7 @@ fn complete_profile(target: DataType) {
                     );
                     compare(
                         &input.slice(0, 0),
+                        &[],
                         target.clone(),
                         source_nullable,
                         result_nullable,
@@ -204,6 +218,7 @@ fn complete_profile(target: DataType) {
     ));
     compare(
         &hidden,
+        &[None, Some(19700101)],
         target.clone(),
         true,
         true,
@@ -224,7 +239,7 @@ fn complete_profile(target: DataType) {
         DecimalOverflowPolicy::OutputNull,
         false,
     );
-    // Genuine demand skips the first original panic; selected error uses selected ordinal, not logical row.
+    // Genuine demand skips the outside-calendar rows; selected error uses selected ordinal, not logical row.
     for (ordinal, row) in Selection::try_sparse(4, &[1, 3])
         .unwrap()
         .iter()
@@ -236,15 +251,15 @@ fn complete_profile(target: DataType) {
             CastRowResult::Float32(_) | CastRowResult::Float64(_)
         ));
     }
-    let bad = input.slice(2, 1);
-    let message = original(&bad, target.clone()).unwrap_err();
+    let expected_bad_message =
+        format!("CAST failed: from Date32 to {target:?}: invalid Date32 value -2147483648");
     match r
         .evaluate_row(EvaluatedArgument::Column(&input), 7, 2, &Control)
         .unwrap()
     {
         CastRowResult::RowError(e) => {
             assert_eq!(e.selected_ordinal(), 7);
-            assert_eq!(e.message(), (message).detail());
+            assert_eq!(e.message(), expected_bad_message);
         }
         other => panic!("expected preserved original Date32 error, got {other:?}"),
     }
@@ -257,41 +272,13 @@ fn complete_profile(target: DataType) {
         (day(-214749, 1, 1), -2_147_489_899),
     ] {
         let input: ArrayRef = Arc::new(Date32Array::from(vec![days]));
-        let actual = original(&input, target.clone()).unwrap();
         let pure = r
             .evaluate_row(EvaluatedArgument::Column(&input), 0, 0, &Control)
             .unwrap();
-        if target == DataType::Float32 {
-            assert_eq!(
-                actual
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .unwrap()
-                    .value(0)
-                    .to_bits(),
-                (literal as f32).to_bits()
-            );
-            assert_eq!(pure, CastRowResult::Float32(literal as f32));
-        } else {
-            assert_eq!(
-                actual
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .unwrap()
-                    .value(0)
-                    .to_bits(),
-                (literal as f64).to_bits()
-            );
-            assert_eq!(pure, CastRowResult::Float64(literal as f64));
-        }
+        assert_eq!(pure, expected_float(&target, literal));
     }
     let outside: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
-    let failure = original(&outside, target.clone()).unwrap_err();
     use novarocks_failure_contract::FailureProjection;
-    assert_eq!(
-        failure.failure_fact(),
-        novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
-    );
     let CastRowResult::RowError(error) = r
         .evaluate_row(EvaluatedArgument::Column(&outside), 3, 0, &Control)
         .unwrap()
@@ -299,8 +286,14 @@ fn complete_profile(target: DataType) {
         panic!("out-of-calendar Date32 must be a row Data error");
     };
     assert_eq!(error.selected_ordinal(), 3);
-    assert_eq!(error.failure_fact(), failure.failure_fact());
-    assert_eq!(error.message(), failure.detail());
+    assert_eq!(
+        error.failure_fact(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    assert_eq!(
+        error.message(),
+        format!("CAST failed: from Date32 to {target:?}: invalid Date32 value 2147483647")
+    );
 }
 #[test]
 fn date_float_oracle_complete_date32_float32_profile() {

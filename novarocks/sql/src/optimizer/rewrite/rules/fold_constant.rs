@@ -2641,10 +2641,24 @@ mod complete_fold_type_tests {
             );
             let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
             let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
-            assert!(matches!(
-                try_fold_node(&mut arena, root, &EVALUATOR, &mut work),
-                Err(SqlCompileError::InvalidRequest(_))
-            ));
+            let failure = try_fold_node(&mut arena, root, &EVALUATOR, &mut work)
+                .expect_err("an invalid value-domain conversion must remain fatal");
+            let SqlCompileError::CompilationSource(source) = failure else {
+                panic!("invalid conversion must retain its typed binding source: {failure:?}");
+            };
+            use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+            assert_eq!(
+                source.downcast_ref::<novarocks_functions::FunctionBindingError>(),
+                Some(&novarocks_functions::FunctionBindingError::InvalidBinding(
+                    "invalid value conversion domain".into()
+                ))
+            );
+            assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(
+                source.failure_fact().reason().domain(),
+                domain::FUNCTION_BINDING.get()
+            );
+            assert_eq!(source.failure_fact().reason().code(), 10);
             assert_eq!(EVALUATOR.0.lock().unwrap().len(), root_types.len() + 1);
             assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
         }

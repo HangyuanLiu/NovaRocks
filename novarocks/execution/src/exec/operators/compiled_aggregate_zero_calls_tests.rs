@@ -17,7 +17,6 @@
 
 //! Genuine zero-call Physical aggregate; no invented LocalProgram or call token.
 use super::*;
-use crate::exec::operators::aggregate::{AggregateProcessorFactory, empty_execution_function_set};
 fn zero_program() -> Arc<LocalProgram> {
     let catalog = aggregate_catalog(&[("ds_hll_count_distinct", PureKernelAbi::AggregateV1)]);
     let fragment = FragmentId::new(1);
@@ -71,116 +70,46 @@ fn zero_factory(program: &Arc<LocalProgram>) -> CompiledAggregateProcessorFactor
     assert!(factory.requires_local_update_stages());
     factory
 }
-fn original_zero(partial: bool, direct: bool, inputs: &[Chunk]) -> (Chunk, Arc<MemTracker>) {
-    // Zero calls and zero grouping columns explicitly declare an empty typed output.
-    let schema = Arc::new(
-        ChunkSchema::try_new_typed(
-            vec![],
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-        )
-        .expect("explicit zero-column aggregate declaration"),
-    );
-    let factory = AggregateProcessorFactory::new_native(
-        7,
-        Arc::new(crate::exec::expr::ExprArena::default()),
-        vec![],
-        vec![],
-        empty_execution_function_set(),
-        vec![],
-        partial,
-        direct,
-        schema,
-        vec![],
-        None,
-        1,
-        None,
-    )
-    .unwrap();
-    let state = RuntimeState::default();
-    // Each original witness is one complete local driver, without a final-domain session.
-    let tracker = MemTracker::new_root("OriginalZeroCalls");
-    let mut operator = factory.create(1, 0);
-    operator.set_mem_tracker(tracker.clone());
-    operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
-        tracker.clone(),
-        state.error_state(),
-    ));
-    operator.prepare().expect("prepare original aggregate");
-    let mut processor =
-        crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
-    for input in inputs {
-        processor.input_without_output(input.clone()).unwrap();
-    }
-    processor.signal_eos().unwrap();
-    let result = processor
-        .advance_to_boundary()
-        .map(|step| step.output)
-        .unwrap()
-        .unwrap();
-    assert_eq!(result.len(), 1);
-    assert!(result.record_batch().columns().is_empty());
-    assert!(
-        processor
-            .advance_to_boundary()
-            .map(|step| step.output)
-            .unwrap()
-            .is_none()
-    );
-    drop(processor);
-    drop(operator);
-    assert!(
-        tracker.current() > 0,
-        "the live original typed output retains its actual creator"
-    );
-    (result, tracker)
-}
 #[test]
 fn compiled_aggregate_zero_calls_original_and_real_compiled_before() {
-    // Original row-count evidence precedes the real package/compiler boundary.
-    let (empty, empty_tracker) = original_zero(false, false, &[]);
-    assert_eq!(empty.len(), 1);
-    let (left, left_tracker) = original_zero(true, false, &[]);
-    let (right, right_tracker) = original_zero(true, false, &[]);
-    let (final_result, final_tracker) = original_zero(false, true, &[left, right]);
-    assert_eq!(left_tracker.current(), 0);
-    assert_eq!(right_tracker.current(), 0);
-    assert_eq!(final_result.len(), 1);
+    // A complete global grouping has one unit group, even with no calls and
+    // no input. Two local partial unit groups merge into that same one group.
+    // The explicit zero-column output schema above pins relational cardinality
+    // independently of the retired processor's result.
     let program = zero_program();
     let source = input(&program);
-    let (original, original_tracker) = original_zero(false, false, &[source.clone()]);
-    assert_eq!(original.len(), 1);
+    let factory = zero_factory(&program);
+    let raw_tracker = MemTracker::new_root("zero calls actual raw creator");
+    let empty_tracker = MemTracker::new_root("zero calls actual empty creator");
+    let left_tracker = MemTracker::new_root("zero calls actual left creator");
+    let right_tracker = MemTracker::new_root("zero calls actual right creator");
+    let final_tracker = MemTracker::new_root("zero calls actual final creator");
+    let raw = run(&factory, &[source], raw_tracker.clone());
+    let empty = run(&factory, &[], empty_tracker.clone());
+    let (partial, final_stage) = factory.into_local_update_stages().unwrap();
+    let left = run(&partial, &[], left_tracker.clone());
+    let right = run(&partial, &[], right_tracker.clone());
+    for output in [&raw, &empty, &left, &right] {
+        assert_eq!(output.len(), 1);
+        assert!(output.record_batch().columns().is_empty());
+    }
+    assert!(left_tracker.current() > 0);
+    assert!(right_tracker.current() > 0);
+    let out = run(&final_stage, &[left, right], final_tracker.clone());
+    assert_eq!(out.len(), 1);
+    assert!(out.record_batch().columns().is_empty());
+    assert_eq!(left_tracker.current(), 0);
+    assert_eq!(right_tracker.current(), 0);
     for (output, tracker) in [
+        (raw, raw_tracker),
         (empty, empty_tracker),
-        (final_result, final_tracker),
-        (original, original_tracker),
+        (out, final_tracker),
     ] {
         assert!(
             tracker.current() > 0,
-            "live original output retains its creator"
+            "live typed output retains its actual creator"
         );
         drop(output);
         assert_eq!(tracker.current(), 0);
     }
-    // The assertion is permanently the actual original row-count behavior.
-    // Before correction this genuine pure factory returns its original Arrow error.
-    let tracker = MemTracker::new_root("ZeroCallsOriginalAndCompiled");
-    let factory = zero_factory(&program);
-    let raw = run(&factory, &[source], tracker.clone());
-    assert_eq!(raw.len(), 1);
-    let empty = run(&factory, &[], tracker.clone());
-    assert_eq!(empty.len(), 1);
-    let (partial, final_stage) = factory.into_local_update_stages().unwrap();
-    let left = run(&partial, &[], tracker.clone());
-    let right = run(&partial, &[], tracker.clone());
-    let out = run(&final_stage, &[left, right], tracker.clone());
-    assert_eq!(out.len(), 1);
-    assert!(out.record_batch().columns().is_empty());
-    assert!(
-        tracker.current() > 0,
-        "live typed output keeps its actual creator"
-    );
-    drop(raw);
-    drop(empty);
-    drop(out);
-    assert_eq!(tracker.current(), 0);
 }

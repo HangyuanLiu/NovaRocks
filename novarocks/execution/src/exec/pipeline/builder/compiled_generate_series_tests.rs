@@ -21,7 +21,7 @@
 use super::family_fixture::{
     FixtureControl, cell, compile, constant_policy, int64_rows, package, run, try_run,
 };
-use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
+use crate::exec::pipeline::test_driver::TestDriver;
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_functions::{ConstantPool, largeint};
@@ -174,113 +174,132 @@ pub(super) fn pooled_source(
     package(builder, SOURCE, constants, 8)
 }
 
-/// Invoke the real original dispatcher over the same exact Frame-opened bounds.
-fn original_dispatcher(
-    program: &Arc<LocalProgram>,
-) -> Result<Vec<crate::exec::chunk::Chunk>, Box<dyn std::error::Error>> {
-    use crate::exec::chunk::ChunkSchema;
-    use crate::exec::node::table_function::TableFunctionOutputSlot;
-    use crate::exec::operators::TableFunctionFixtureFactory;
+// Pure expected-data construction: callers supply fixed values/ranges. This
+// helper only packs those values in the declared fixture's Arrow carrier.
+fn integer_array(data_type: &DataType, values: &[Option<i128>]) -> ArrayRef {
+    macro_rules! ints {
+        ($array:ty, $int:ty) => {
+            Arc::new(<$array>::from(
+                values
+                    .iter()
+                    .map(|value| value.map(|value| <$int>::try_from(value).unwrap()))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef
+        };
+    }
+    match data_type {
+        DataType::Int8 => ints!(arrow::array::Int8Array, i8),
+        DataType::Int16 => ints!(arrow::array::Int16Array, i16),
+        DataType::Int32 => ints!(arrow::array::Int32Array, i32),
+        DataType::Int64 => ints!(arrow::array::Int64Array, i64),
+        DataType::FixedSizeBinary(16) => largeint::array_from_i128(values).unwrap(),
+        other => panic!("expected fixture has no output carrier {other:?}"),
+    }
+}
+
+// Read only an observed Arrow scalar; no series core or value calculator is
+// used to produce expected bounds. NULL masks its original hidden payload.
+fn observed_integer(array: &ArrayRef, row: usize) -> Option<i128> {
+    if array.is_null(row) {
+        return None;
+    }
+    macro_rules! read {
+        ($array:ty) => {
+            Some(i128::from(
+                array.as_any().downcast_ref::<$array>().unwrap().value(row),
+            ))
+        };
+    }
+    match array.data_type() {
+        DataType::Int8 => read!(arrow::array::Int8Array),
+        DataType::Int16 => read!(arrow::array::Int16Array),
+        DataType::Int32 => read!(arrow::array::Int32Array),
+        DataType::Int64 => read!(arrow::array::Int64Array),
+        DataType::UInt8 => read!(arrow::array::UInt8Array),
+        DataType::UInt16 => read!(arrow::array::UInt16Array),
+        DataType::UInt32 => read!(arrow::array::UInt32Array),
+        DataType::UInt64 => read!(arrow::array::UInt64Array),
+        DataType::FixedSizeBinary(16) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+                .unwrap();
+            Some(i128::from_be_bytes(array.value(row).try_into().unwrap()))
+        }
+        other => panic!("observed fixture has no input carrier {other:?}"),
+    }
+}
+
+/// Keep the actual compiled Values/Frame opening probe separately from value
+/// expectations: exactly one bound row is emitted and never replayed.
+fn assert_opened_bounds_once(program: &Arc<LocalProgram>, expected: &[Option<i128>]) {
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
     let nodes = program.graph().nodes();
     let input = nodes[0].output_layout();
-    let output = nodes[program.graph().root().index()].output_layout();
     let mut source = super::values_source::CompiledValuesSourceFactory::try_new(
         Arc::clone(program),
         ProgramNodeId::new(0),
         Arc::new(RuntimeErrorState::default()),
-    )?
+    )
+    .unwrap()
     .create(8, 0);
     let state = RuntimeState::default();
     let tracker =
-        crate::runtime::mem_tracker::MemTracker::new_root("series original bounds creator");
+        crate::runtime::mem_tracker::MemTracker::new_root("series compiled bounds creator");
     source.set_mem_tracker(tracker.clone());
     source.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
         tracker,
         Arc::new(RuntimeErrorState::default()),
     ));
-    source.prepare()?;
-    source.bind_runtime_state(&state)?;
+    source.prepare().unwrap();
+    source.bind_runtime_state(&state).unwrap();
     let chunk = TestDriver::new(source.as_mut(), &state)
         .advance_to_boundary()
-        .map(|step| step.output)?
+        .map(|step| step.output)
+        .unwrap()
         .unwrap();
     assert!(
         TestDriver::new(source.as_mut(), &state)
             .advance_to_boundary()
-            .map(|step| step.output)?
+            .map(|step| step.output)
+            .unwrap()
             .is_none(),
         "opening evaluates once"
     );
-    let factory = TableFunctionFixtureFactory::new(
-        43,
-        "generate_series".to_owned(),
-        input.slots().to_vec(),
-        vec![],
-        output.slots().to_vec(),
-        true,
-        false,
-        input
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| field.data_type().clone())
-            .collect(),
-        vec![output.schema().field(0).data_type().clone()],
-        // This adapter compares the original array computation, not runtime
-        // typed-storage ownership. Its legacy slicing API needs a legacy schema.
-        ChunkSchema::try_ref_from_schema_and_slot_ids(output.schema().as_ref(), output.slots())?,
-        vec![TableFunctionOutputSlot::Result { index: 0 }],
-    );
-    let mut operator = factory.create(8, 0);
-    operator.bind_runtime_state(&state)?;
-    let mut processor = TestDriver::new(operator.as_mut(), &state);
-    processor.accept_without_output(chunk)?;
-    processor.signal_eos()?;
-    let mut output = vec![];
-    while matches!(processor.next(), NextStep::Runnable | NextStep::Yield) {
-        if let Some(chunk) = processor.advance_to_boundary().map(|step| step.output)? {
-            output.push(chunk);
-        }
+    assert_eq!(chunk.len(), 1);
+    assert_eq!(chunk.record_batch().num_columns(), expected.len());
+    for (column, expected) in expected.iter().enumerate() {
+        let array = chunk.record_batch().column(column);
+        assert_eq!(array.data_type(), input.schema().field(column).data_type());
+        assert_eq!(observed_integer(array, 0), *expected);
     }
-    Ok(output)
 }
-fn assert_original(program: &Arc<LocalProgram>) {
-    let original = original_dispatcher(program);
-    let selected = try_run(program);
-    match (original, selected) {
-        (Ok(original), Ok(selected)) => {
-            let data_type = program.graph().nodes()[program.graph().root().index()]
-                .output_layout()
-                .schema()
-                .field(0)
-                .data_type();
-            let join = |chunks: &[crate::exec::chunk::Chunk]| {
-                if chunks.is_empty() {
-                    arrow::array::new_empty_array(data_type)
-                } else {
-                    arrow::compute::concat(
-                        &chunks
-                            .iter()
-                            .map(|chunk| chunk.record_batch().column(0).as_ref())
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap()
-                }
-            };
-            assert_eq!(
-                join(&original).to_data(),
-                join(&selected).to_data(),
-                "raw original dispatcher byte/value/null equality"
-            );
+
+fn assert_series_values(
+    program: &Arc<LocalProgram>,
+    data_type: &DataType,
+    expected: &[Option<i128>],
+) {
+    let chunks = run(program);
+    let actual = if chunks.is_empty() {
+        arrow::array::new_empty_array(data_type)
+    } else {
+        for chunk in &chunks {
+            assert_eq!(chunk.record_batch().column(0).data_type(), data_type);
         }
-        (Err(original), Err(selected)) => assert!(
-            selected.contains(&original.to_string()),
-            "original={original:?} selected={selected:?}"
-        ),
-        (original, selected) => panic!("original={original:?} selected={selected:?}"),
-    }
+        arrow::compute::concat(
+            &chunks
+                .iter()
+                .map(|chunk| chunk.record_batch().column(0).as_ref())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        actual.to_data(),
+        integer_array(data_type, expected).to_data()
+    );
 }
 
 fn roots_preserved(source: &FragmentPackage, program: &LocalProgram, width: usize) {
@@ -333,7 +352,20 @@ fn compiled_generate_series_source_literal_bounds_are_original_uses_once_and_pub
         let source = literal_source([Some(-3), Some(3), Some(1)], explicit, false);
         let program = compile(Arc::clone(&source), 8);
         roots_preserved(&source, &program, if explicit { 3 } else { 2 });
-        assert_original(&program);
+        assert_opened_bounds_once(
+            &program,
+            if explicit {
+                &[Some(-3), Some(3), Some(1)]
+            } else {
+                &[Some(-3), Some(3)]
+            },
+        );
+        // Default or explicit +1 over the inclusive interval [-3, 3].
+        assert_series_values(
+            &program,
+            &DataType::Int64,
+            &(-3_i128..=3).map(Some).collect::<Vec<_>>(),
+        );
         let result = run(&program);
         assert_eq!(
             int64_rows(&result),
@@ -387,31 +419,20 @@ fn compiled_generate_series_source_pooled_complete_reader_domain_and_original_re
             let source = pooled_source(ty, &[Some(2), Some(1), Some(5)], true);
             let program = compile(Arc::clone(&source), 8);
             roots_preserved(&source, &program, 3);
-            assert_original(&program);
+            assert_opened_bounds_once(&program, &[Some(1), Some(5), Some(2)]);
             match dtype {
                 DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    let original = novarocks_functions::generate_series_core::result_column(
-                        vec![Some(1), Some(3), Some(5)],
-                        &[dtype.clone()],
-                    )
-                    .unwrap_err();
-                    let actual = try_run(&program).unwrap_err();
-                    assert!(
-                        actual.contains(&original.to_string()),
-                        "{actual:?} vs {original:?}"
+                    // All four unsigned carriers are admitted by the bound
+                    // reader but are outside the declared result converter.
+                    let expected = format!(
+                        "table function generate_series return type expects TINYINT/SMALLINT/INT/BIGINT/LARGEINT, got {dtype:?}"
                     );
+                    let actual = try_run(&program).unwrap_err();
+                    assert!(actual.contains(&expected), "{actual:?} vs {expected:?}");
                 }
                 _ => {
-                    let out = run(&program);
-                    let arrays = out
-                        .iter()
-                        .map(|chunk| chunk.record_batch().column(0).as_ref())
-                        .collect::<Vec<_>>();
-                    let array = arrow::compute::concat(&arrays).unwrap();
-                    for (row, expected) in [1, 3, 5].into_iter().enumerate() {
-                        assert_eq!(novarocks_functions::generate_series_core::integer_argument(&array,row,0,
-                            novarocks_functions::generate_series_core::IntegerDiagnosticContext::GenerateSeries).unwrap(),Some(expected));
-                    }
+                    // Inclusive start=1, stop=5, step=2 has exactly [1,3,5].
+                    assert_series_values(&program, &dtype, &[Some(1), Some(3), Some(5)]);
                 }
             }
         }
@@ -468,7 +489,14 @@ fn compiled_generate_series_source_complete_signed_endpoints_nonzero_pool_and_hi
                     ),
                     8,
                 );
-                assert_original(&program);
+                let bounds = if explicit {
+                    vec![Some(endpoint), Some(endpoint), Some(1)]
+                } else {
+                    vec![Some(endpoint), Some(endpoint)]
+                };
+                assert_opened_bounds_once(&program, &bounds);
+                // Equal endpoints yield the singleton without incrementing it.
+                assert_series_values(&program, &dtype, &[Some(endpoint)]);
             }
         }
     }
@@ -479,7 +507,7 @@ fn compiled_generate_series_source_complete_signed_endpoints_nonzero_pool_and_hi
             pooled_source(FunctionValueType::new(DataType::Int64, true), &values, true),
             8,
         );
-        assert_original(&program);
+        assert_opened_bounds_once(&program, &[values[1], values[2], values[0]]);
         assert!(run(&program).is_empty());
     }
     let ty = FunctionValueType::try_with_logical_type(
@@ -492,9 +520,10 @@ fn compiled_generate_series_source_complete_signed_endpoints_nonzero_pool_and_hi
         pooled_source(ty, &[Some(1), Some(i128::MAX), Some(i128::MAX)], true),
         2,
     );
-    let original = original_dispatcher(&program).unwrap();
-    assert_eq!(original.iter().map(|chunk| chunk.len()).sum::<usize>(), 1);
-    let values = original[0].record_batch();
+    assert_opened_bounds_once(&program, &[Some(i128::MAX), Some(i128::MAX), Some(1)]);
+    let actual = run(&program);
+    assert_eq!(actual.iter().map(|chunk| chunk.len()).sum::<usize>(), 1);
+    let values = actual[0].record_batch();
     let value = values
         .column(0)
         .as_any()
@@ -504,7 +533,7 @@ fn compiled_generate_series_source_complete_signed_endpoints_nonzero_pool_and_hi
         largeint::i128_from_be_bytes(value.value(0)).unwrap(),
         i128::MAX
     );
-    assert_original(&program);
+    assert_series_values(&program, &DataType::FixedSizeBinary(16), &[Some(i128::MAX)]);
 }
 
 #[test]

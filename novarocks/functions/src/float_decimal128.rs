@@ -16,7 +16,7 @@
 // under the License.
 
 //! Original actual Types Float64/Float32 -> Decimal128 value and array author.
-//! Preserve relaxed precision, signed-abs and i8-negation bugs; no cast policy is inferred here.
+//! Preserve relaxed precision with checked signed magnitudes; no cast policy is inferred here.
 use crate::decimal128_rescale::DecimalCastFailure;
 use arrow_array::{ArrayRef, Decimal128Array};
 use std::fmt;

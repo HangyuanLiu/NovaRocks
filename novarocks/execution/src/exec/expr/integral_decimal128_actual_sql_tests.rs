@@ -17,10 +17,9 @@
 
 //! Actual required signed source binding; no name-based re-resolution or fake provider.
 use super::compiled_program::CompiledExpressionInstance;
-use super::legacy_integral_decimal128_baseline_tests::{actual, integral_input, values};
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
 use super::sql_test_source::sql_source;
-use arrow::array::{Array, ArrayRef};
+use arrow::array::{Array, Decimal128Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
@@ -29,7 +28,7 @@ use novarocks_local_program::{ProgramRootInput, StaticExprKind, root_input_layou
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, PureCompileControl,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 struct Control;
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, n: u32) -> Result<(), CompileControlError> {
@@ -75,7 +74,6 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
     assert_eq!(count, 1);
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
-    // Permanent RED before the genuine integral Decimal recipe is installed.
     let programs = programs_with_catalogue(&source, &functions);
     let mut found = None;
     for program in programs.values() {
@@ -113,8 +111,11 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
         .clone();
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-    let input = integral_input(&DataType::Int64, vec![Some(-100), Some(0), Some(150)]);
-    let data = RecordBatch::try_new(schema, vec![input.clone()]).unwrap();
+    // Pure input data. For target scale zero, the stored coefficient is the
+    // signed input itself; all three magnitudes are below 10^4.
+    let input = Arc::new(Int64Array::from(vec![-100, 0, 150]));
+    let expected = [Some(-100_i128), Some(0), Some(150)];
+    let data = RecordBatch::try_new(schema, vec![input]).unwrap();
     for rows in [vec![0, 1, 2], vec![0, 2], Vec::new()] {
         let mut frame =
             CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
@@ -123,20 +124,17 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
             .unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(output.values().data_type(), &target);
-        let expected = rows
-            .iter()
-            .map(|row| {
-                values(
-                    &actual(
-                        input.slice(*row, 1),
-                        target.clone(),
-                        DecimalOverflowPolicy::OutputNull,
-                        false,
-                    )
-                    .unwrap(),
-                )[0]
-            })
+        assert_eq!(output.selection(), Selection::try_sparse(3, &rows).unwrap());
+        let values = output
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(values.len(), rows.len());
+        let actual = (0..values.len())
+            .map(|ordinal| (!values.is_null(ordinal)).then(|| values.value(ordinal)))
             .collect::<Vec<_>>();
-        assert_eq!(values(output.values()), expected);
+        let selected_expected = rows.iter().map(|row| expected[*row]).collect::<Vec<_>>();
+        assert_eq!(actual, selected_expected);
     }
 }

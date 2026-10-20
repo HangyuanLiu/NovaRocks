@@ -14,19 +14,102 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Permanent recipe differential against the original real arena TIME shell.
-//! Before installation each of three independent tests fails at exact preparation.
-use super::legacy_text_time_cast_baseline_tests::{actual, corpus, input, modes, values};
-use arrow::array::{Array, ArrayRef};
+//! Exact prepared TIME profiles with independent duration and Arrow parser values.
+use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::{
     CastOperation, CastRowResult, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
     PreparedCastRecipe, Selection,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+    CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType, PureCompileControl,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+pub(super) fn modes() -> impl Iterator<Item = (bool, DecimalOverflowPolicy)> {
+    [false, true].into_iter().flat_map(|allow| {
+        [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ]
+        .into_iter()
+        .map(move |policy| (allow, policy))
+    })
+}
+pub(super) fn input(dtype: &DataType, strings: &[Option<&str>]) -> ArrayRef {
+    match dtype {
+        DataType::Utf8 => Arc::new(StringArray::from(strings.to_vec())),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::from(strings.to_vec())),
+        DataType::Utf8View => Arc::new(StringViewArray::from(strings.to_vec())),
+        _ => panic!("fixture requires one actual text carrier"),
+    }
+}
+pub(super) fn corpus(dtype: &DataType) -> ArrayRef {
+    input(
+        dtype,
+        &[
+            Some("00:00:00"),
+            Some("25:00:00"),
+            Some("+01:02:03"),
+            Some("-01:02:03"),
+            Some("01:02:03.456789"),
+            Some("1"),
+            Some("+1"),
+            Some("-1"),
+            Some("12:10"),
+            Some("23:59:60"),
+            Some("1970-01-01 01:01:01"),
+            Some(" 12 : 34 : 56 "),
+            Some(""),
+            Some("9223372036854775807:00:00"),
+            Some("2562047788015:00:00"),
+            None,
+        ],
+    )
+}
+// UTF8 duration parsing accepts whole unsigned h:m:s (hours may exceed 24).
+// Large/view carriers use the locked Arrow microsecond parser; literal numbers
+// are microseconds. These tables are independent of any execution evaluator.
+fn expected(dtype: &DataType) -> Vec<Option<i64>> {
+    if dtype == &DataType::Utf8 {
+        vec![
+            Some(0),
+            Some(90_000_000_000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(45_296_000_000),
+            None,
+            None,
+            None,
+            None,
+        ]
+    } else {
+        vec![
+            Some(0),
+            None,
+            None,
+            None,
+            Some(3_723_456_789),
+            Some(1),
+            Some(1),
+            Some(-1),
+            Some(43_800_000_000),
+            Some(86_400_000_000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
+    }
+}
 struct Control;
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, n: u32) -> Result<(), CompileControlError> {
@@ -73,12 +156,12 @@ fn compare(dtype: DataType) {
                 &Control,
             )
             .unwrap();
-            for array in [
-                corpus(&dtype),
-                corpus(&dtype).slice(1, 7),
-                input(&dtype, &[]),
+            let expected = expected(&dtype);
+            for (array, expected) in [
+                (corpus(&dtype), expected.clone()),
+                (corpus(&dtype).slice(1, 7), expected[1..8].to_vec()),
+                (input(&dtype, &[]), vec![]),
             ] {
-                let expected = values(&actual(array.clone(), allow, policy, false).unwrap());
                 for (ordinal, row) in Selection::all(array.len()).iter().enumerate() {
                     if !nullable && array.is_null(row) {
                         continue;
@@ -100,7 +183,7 @@ fn compare(dtype: DataType) {
                 }
             }
             let scalar: ArrayRef = input(&dtype, &[Some("01:02:03")]);
-            let expected = values(&actual(scalar.clone(), allow, policy, false).unwrap())[0];
+            let expected = Some(3_723_000_000); // 1 hour + 2 minutes + 3 seconds.
             for row in 0..17 {
                 assert_eq!(
                     row_value(&recipe, EvaluatedArgument::Scalar(&scalar), row, row),

@@ -241,11 +241,15 @@ fn compiled_slot_program(
             .unwrap();
         projections.push((literal, value));
         values.push(value);
-        args.push(
-            builder
-                .add_expression(output, ty.clone(), ExprKind::Value(value))
-                .unwrap(),
-        );
+        args.push(if constant.is_some_and(|(index, _)| index == i) {
+            None
+        } else {
+            Some(
+                builder
+                    .add_expression(output, ty.clone(), ExprKind::Value(value))
+                    .unwrap(),
+            )
+        });
         requests.push(FunctionArgument::Value {
             value_type: ty,
             constant: None,
@@ -282,21 +286,27 @@ fn compiled_slot_program(
         }
         .unwrap();
         // The request exporter encounters this sole checked backing first.
-        args[index] = builder
-            .add_expression(
-                output,
-                ty.clone(),
-                ExprKind::Constant(ConstantReference {
-                    pool: ConstantPoolId::new(0),
-                    ordinal: value.ordinal(),
-                }),
-            )
-            .unwrap();
+        args[index] = Some(
+            builder
+                .add_expression(
+                    output,
+                    ty.clone(),
+                    ExprKind::Constant(ConstantReference {
+                        pool: ConstantPoolId::new(0),
+                        ordinal: value.ordinal(),
+                    }),
+                )
+                .unwrap(),
+        );
         requests[index] = FunctionArgument::Value {
             value_type: ty,
             constant: Some(value),
         };
     }
+    let mut args = args
+        .into_iter()
+        .map(|argument| argument.expect("every argument has its actual slot or constant source"))
+        .collect::<Vec<_>>();
     if trim_child {
         assert_eq!(name, "concat");
         let child_author = host::author(
