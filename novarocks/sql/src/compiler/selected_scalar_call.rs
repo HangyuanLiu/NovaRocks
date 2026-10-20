@@ -290,37 +290,28 @@ pub(crate) fn scalar_shape(control: ArgumentControl, count: usize) -> Option<Con
 }
 
 fn compile_specialization_error(error: FunctionSpecializationFailure) -> super::SqlCompileError {
-    use novarocks_functions::KernelFailure;
     match error {
         FunctionSpecializationFailure::Control(c)
-        | FunctionSpecializationFailure::Binding(FunctionBindingError::Control(c)) => c.into(),
-        FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
-            CompileControlError::Cancelled.into()
-        }
-        FunctionSpecializationFailure::Kernel(KernelFailure::DeadlineExceeded) => {
-            CompileControlError::DeadlineExceeded.into()
-        }
-        FunctionSpecializationFailure::Kernel(KernelFailure::ResourceExhausted) => {
-            CompileControlError::ResourceExhausted.into()
-        }
-        FunctionSpecializationFailure::Kernel(error @ KernelFailure::InvalidProgram(_)) => {
-            super::SqlCompileError::InvalidRequest(error.to_string())
-        }
-        other => super::SqlCompileError::Compilation(other.to_string()),
+        | FunctionSpecializationFailure::Binding(FunctionBindingError::Control(c))
+        | FunctionSpecializationFailure::Kernel(
+            novarocks_functions::KernelFailure::CompileControl(c),
+        ) => c.into(),
+        other => super::SqlCompileError::CompilationSource(
+            novarocks_failure_contract::SharedFailureCause::new(other),
+        ),
     }
 }
 fn compile_binding_error(error: FunctionBindingError) -> super::SqlCompileError {
-    match error {
-        FunctionBindingError::Control(c) => c.into(),
-        other => super::SqlCompileError::InvalidRequest(other.to_string()),
-    }
+    error.into()
 }
 fn compile_flow_error(
     error: novarocks_type_contract::ExpressionControlFlowError,
 ) -> super::SqlCompileError {
     match error {
         novarocks_type_contract::ExpressionControlFlowError::Control(c) => c.into(),
-        other => super::SqlCompileError::InvalidRequest(other.to_string()),
+        other => super::SqlCompileError::CompilationSource(
+            novarocks_failure_contract::SharedFailureCause::new(other),
+        ),
     }
 }
 struct SingleCallDefinitions(usize);
@@ -418,7 +409,16 @@ pub(crate) fn freeze_fold_call(
     let mut canonical_args = Vec::new();
     canonical_args
         .try_reserve_exact(source_args.len())
-        .map_err(|_| CompileControlError::ResourceExhausted)?;
+        .map_err(|source| {
+            super::SqlCompileError::CompilationSource(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_functions::allocation_failure::AllocationRefusal::new(
+                        "frozen fold canonical arguments",
+                        source,
+                    ),
+                ),
+            )
+        })?;
     for argument in source_args {
         canonical_args.push(argument.clone());
         control.checkpoint(CompilePhase::FunctionSpecialization, 1)?;
@@ -450,7 +450,16 @@ pub(crate) fn freeze_fold_call(
     let mut request_args = Vec::new();
     request_args
         .try_reserve_exact(args.len())
-        .map_err(|_| CompileControlError::ResourceExhausted)?;
+        .map_err(|source| {
+            super::SqlCompileError::CompilationSource(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_functions::allocation_failure::AllocationRefusal::new(
+                        "frozen fold request arguments",
+                        source,
+                    ),
+                ),
+            )
+        })?;
     for (arg, expected) in args.iter_mut().zip(binding.selected.argument_types.iter()) {
         if let Some(target) = canonical_null_target(&arg.value_type, expected) {
             arg.value = crate::constant::admit_syntax_constant(
@@ -976,7 +985,7 @@ mod tests {
                 let call = self.calls.fetch_add(1, Ordering::SeqCst);
                 assert!(call <= self.at, "callback after the original refusal");
                 if call == self.at {
-                    Err(self.cause)
+                    Err(self.cause.clone())
                 } else {
                     Ok(())
                 }
@@ -1024,7 +1033,7 @@ mod tests {
                     &refusal,
                 )
                 .unwrap_err();
-                assert_eq!(error, super::super::SqlCompileError::from(cause));
+                assert_eq!(error, super::super::SqlCompileError::from(cause.clone()));
                 assert_eq!(refusal.calls.load(Ordering::SeqCst), at + 1);
             }
         }

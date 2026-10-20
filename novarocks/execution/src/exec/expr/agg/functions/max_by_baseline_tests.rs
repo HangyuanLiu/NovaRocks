@@ -190,7 +190,7 @@ fn legacy_by_empty_and_all_null_key_keep_nullable_binding_and_binary_null_state(
                     logical_argument_count: 2,
                     expected_result_type: None,
                 },
-                &crate::exec::expr::pure_differential::HarnessControl,
+                &crate::exec::expr::test_support::HarnessControl,
             )
             .unwrap();
         let FunctionResultType::Scalar(out) = bound.selected.result_type else {

@@ -37,7 +37,7 @@ pub(super) fn logical(sql: &str, raw_limit: Option<i64>) -> Result<(), SqlCompil
         builtin_sql_function_catalog(),
         &EVALUATOR,
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
     ))?
     .into_complete()?;

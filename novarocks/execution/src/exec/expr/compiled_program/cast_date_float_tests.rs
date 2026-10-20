@@ -17,8 +17,56 @@
 
 //! Real LocalCompiler Date32 float profiles, native literal projection and host first-failure evidence.
 use super::*;
-use crate::exec::expr::legacy_date_float_cast_baseline_tests::{actual, day, original};
 use arrow::array::{Date32Array, Float32Array, Float64Array, UInt32Array};
+// Proleptic Gregorian day offsets from 1970-01-01: 2024-02-29 is
+// 19_723 + 31 + 28 = 19_782; astronomical -0001-12-31 is -719_529.
+// The date -> float contract encodes year*10000 + month*100 + day, so the
+// latter date has coefficient -10_000 + 1_200 + 31 = -8_769. Day 71 is
+// 1970-03-13 (31 January days + 28 February days + 12).
+// Expected IEEE bits are independently rounded from those integer
+// coefficients. At these positive Float32 magnitudes the ULP is 2: ties
+// round to even, giving 19700100, 20240228, 19691232 and 19700312.
+// -8769 is exact in both formats; all coefficients are exact in Float64.
+// No runtime conversion, Arrow cast, or retired evaluator generates them.
+fn expected_date_floats(target: &DataType, coefficients: &[Option<i32>]) -> ArrayRef {
+    match target {
+        DataType::Float32 => Arc::new(Float32Array::from(
+            coefficients
+                .iter()
+                .map(|value| {
+                    value.map(|value| {
+                        f32::from_bits(match value {
+                            19_700_101 => 0x4b96_4cc2,
+                            20_240_229 => 0x4b9a_6bb2,
+                            19_691_231 => 0x4b96_3b70,
+                            -8_769 => 0xc609_0400,
+                            19_700_313 => 0x4b96_4d2c,
+                            _ => panic!("coefficient absent from independent IEEE table"),
+                        })
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )),
+        DataType::Float64 => Arc::new(Float64Array::from(
+            coefficients
+                .iter()
+                .map(|value| {
+                    value.map(|value| {
+                        f64::from_bits(match value {
+                            19_700_101 => 0x4172_c998_5000_0000,
+                            20_240_229 => 0x4173_4d76_5000_0000,
+                            19_691_231 => 0x4172_c76d_f000_0000,
+                            -8_769 => 0xc0c1_2080_0000_0000,
+                            19_700_313 => 0x4172_c9a5_9000_0000,
+                            _ => panic!("coefficient absent from independent IEEE table"),
+                        })
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )),
+        _ => panic!("exact date-to-float profile"),
+    }
+}
 fn date_batch(program: &LocalProgram, dates: ArrayRef) -> RecordBatch {
     let count = dates.len();
     let schema = program.graph().nodes()[1].output_layout().schema().clone();
@@ -41,18 +89,18 @@ fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants()
                     Some(-7),
                     Some(0),
                     None,
-                    Some(day(2024, 2, 29)),
+                    Some(19_782),
                     Some(-1),
-                    Some(day(-1, 12, 31)),
+                    Some(-719_529),
                 ]
             } else {
                 vec![
                     Some(-7),
                     Some(0),
                     Some(0),
-                    Some(day(2024, 2, 29)),
+                    Some(19_782),
                     Some(-1),
-                    Some(day(-1, 12, 31)),
+                    Some(-719_529),
                 ]
             }));
             let source = source.slice(1, 5);
@@ -91,9 +139,18 @@ fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants()
                             .may_raise_row_error
                     );
                     let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
-                    let old = actual(&source, target.clone(), policy, allow).unwrap();
+                    let full_expected = expected_date_floats(
+                        &target,
+                        &[
+                            Some(19_700_101),
+                            if nullable { None } else { Some(19_700_101) },
+                            Some(20_240_229),
+                            Some(19_691_231),
+                            Some(-8_769),
+                        ],
+                    );
                     let expected = arrow::compute::take(
-                        old.as_ref(),
+                        full_expected.as_ref(),
                         &UInt32Array::from(rows.map(|r| r as u32).to_vec()),
                         None,
                     )
@@ -119,10 +176,9 @@ fn date_float_actual_compiler_profiles_sparse_slice_empty_and_native_constants()
                     let output = instance(&constant)
                         .evaluate(&batch, selection, &Control)
                         .unwrap();
-                    let expanded: ArrayRef = Arc::new(Date32Array::from(vec![71; 4]));
                     assert_eq!(
                         output.values().to_data(),
-                        original(&expanded, target.clone()).unwrap().to_data()
+                        expected_date_floats(&target, &[Some(19_700_313); 4]).to_data()
                     );
                     assert!(output.errors().is_empty());
                 }
@@ -159,21 +215,8 @@ fn date_float_actual_compiler_selected_error_origin_null_placeholder_and_unselec
             result.errors()[0].message(),
             format!("CAST failed: from Date32 to {target:?}: invalid Date32 value -2147483648")
         );
-        let expected: ArrayRef = if target == DataType::Float32 {
-            Arc::new(Float32Array::from(vec![
-                Some(19700101_i32 as f32),
-                None,
-                None,
-                Some(19691231_i32 as f32),
-            ]))
-        } else {
-            Arc::new(Float64Array::from(vec![
-                Some(19700101.0),
-                None,
-                None,
-                Some(19691231.0),
-            ]))
-        };
+        let expected =
+            expected_date_floats(&target, &[Some(19_700_101), None, None, Some(19_691_231)]);
         assert_eq!(result.values().to_data(), expected.to_data());
     }
 }

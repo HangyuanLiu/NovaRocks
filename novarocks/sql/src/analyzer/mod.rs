@@ -43,6 +43,7 @@ mod logical_output;
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
+pub(crate) mod root_output_declaration;
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
 mod value_conversion;

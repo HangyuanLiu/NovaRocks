@@ -249,9 +249,9 @@ fn legacy_bitmap_to_string_original_actual_constant_broadcast_and_nonzero_pool()
         Arc::new(ty.try_to_field("constant").unwrap()),
         ty,
         backing.to_data(),
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         CompilePhase::FunctionSpecialization,
-        &super::pure_differential::HarnessControl,
+        &super::test_support::HarnessControl,
     )
     .unwrap();
     assert_eq!(pool.value(1).unwrap().ordinal(), 1);

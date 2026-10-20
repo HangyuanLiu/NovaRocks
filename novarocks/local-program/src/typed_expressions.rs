@@ -515,9 +515,9 @@ impl ProgramTypedExpressions {
                                 return Err(ProgramExpressionTypeError::WrongKind.into());
                             };
                             if matches!(definition.kind(), StaticExprKind::Not(_)) {
-                                if *operand.data_type() != arrow_schema::DataType::Boolean
-                                    || operand.logical_type() != ValueLogicalType::Physical
-                                    || (!value.nullable() && operand.nullable())
+                                if !novarocks_type_contract::supports_boolean_negation_value_type(
+                                    operand,
+                                ) || (!value.nullable() && operand.nullable())
                                 {
                                     return Err(ProgramExpressionTypeError::TypeMismatch.into());
                                 }

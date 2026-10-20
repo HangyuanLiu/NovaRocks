@@ -199,6 +199,8 @@ pub(super) fn frozen_reads_with_explicit_source_shape(
                     DataType::Int16 => ConnectorValueType::SmallInt,
                     DataType::Int32 => ConnectorValueType::Integer,
                     DataType::Int64 => ConnectorValueType::BigInt,
+                    DataType::Float32 => ConnectorValueType::Real,
+                    DataType::Float64 => ConnectorValueType::Double,
                     DataType::Utf8 if admit_required_inlist_shape => connector_type_for_value_type(
                         &field.ty,
                     )

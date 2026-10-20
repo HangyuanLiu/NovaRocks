@@ -275,7 +275,7 @@ pub(crate) fn validate_expression(
                             && widens
                     }
                     crate::UnaryOperator::Not => {
-                        *input.ty.data_type() == DataType::Boolean
+                        novarocks_type_contract::supports_boolean_negation_value_type(&input.ty)
                             && *expression.ty.data_type() == DataType::Boolean
                             && widens
                     }
@@ -1666,5 +1666,56 @@ mod value_arithmetic_tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn numeric_not_keeps_the_original_successful_domain_and_nullability() {
+        for carrier in [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Decimal128(18, 4),
+        ] {
+            for nullable in [true] {
+                assert!(
+                    unary_fragment(
+                        ValueType::new(carrier.clone(), nullable),
+                        ValueType::new(DataType::Boolean, nullable),
+                        UnaryOperator::Not,
+                        false
+                    )
+                    .is_ok()
+                );
+            }
+            assert!(
+                unary_fragment(
+                    ValueType::new(carrier, true),
+                    ValueType::new(DataType::Boolean, false),
+                    UnaryOperator::Not,
+                    false
+                )
+                .is_err()
+            );
+        }
+        for carrier in [
+            DataType::UInt64,
+            DataType::Decimal256(50, 4),
+            DataType::Date32,
+            DataType::Null,
+            DataType::FixedSizeBinary(16),
+        ] {
+            assert!(
+                unary_fragment(
+                    ValueType::new(carrier, true),
+                    ValueType::new(DataType::Boolean, true),
+                    UnaryOperator::Not,
+                    false
+                )
+                .is_err()
+            );
+        }
     }
 }

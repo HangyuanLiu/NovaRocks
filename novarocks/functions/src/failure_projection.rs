@@ -442,7 +442,7 @@ impl FailureProjection for crate::ArithmeticPrepareError {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Kernel(source) => source.failure_fact(),
-            Self::Unsupported => fact(FailureClass::Dependency, 604),
+            Self::Unsupported => fact(FailureClass::Unsupported, 604),
             Self::TypeMismatch => fact(FailureClass::Invariant, 605),
         }
     }
@@ -453,7 +453,7 @@ impl FailureProjection for crate::CastPrepareError {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Kernel(source) => source.failure_fact(),
-            Self::Unsupported => fact(FailureClass::Dependency, 606),
+            Self::Unsupported => fact(FailureClass::Unsupported, 606),
             Self::TypeMismatch => fact(FailureClass::Invariant, 607),
         }
     }
@@ -565,6 +565,68 @@ mod comparison_failure_tests {
         assert_eq!(
             error.source().unwrap().downcast_ref::<KernelFailure>(),
             Some(&kernel)
+        );
+    }
+}
+
+#[cfg(test)]
+mod primitive_failure_tests {
+    use super::*;
+    use crate::{ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B};
+
+    #[test]
+    fn primitive_capabilities_are_unsupported_with_the_original_owner_reasons() {
+        for (actual, code) in [
+            (B::Unsupported.failure_fact(), 602),
+            (A::Unsupported.failure_fact(), 604),
+            (C::Unsupported.failure_fact(), 606),
+        ] {
+            assert_eq!(actual, fact(FailureClass::Unsupported, code));
+        }
+        for (actual, code) in [
+            (B::TypeMismatch.failure_fact(), 603),
+            (A::TypeMismatch.failure_fact(), 605),
+            (C::TypeMismatch.failure_fact(), 607),
+        ] {
+            assert_eq!(actual, fact(FailureClass::Invariant, code));
+        }
+    }
+
+    #[test]
+    fn primitive_wrappers_delegate_full_kernel_and_caller_control_facts() {
+        let control = novarocks_type_contract::CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+        );
+        for error in [
+            KernelFailure::Capacity(crate::KernelCapacityRefusal::new(
+                FailureReason::new(domain::MEMORY, NonZeroU16::new(8).unwrap()),
+                16,
+                8,
+                16,
+            )),
+            KernelFailure::from(novarocks_type_contract::ValueTypeError::TooDeep),
+            KernelFailure::CompileControl(control.clone()),
+            KernelFailure::Cancelled,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(crate::KernelDiagnostic::new("unsupported")),
+            KernelFailure::Operational(crate::KernelDiagnostic::new("unsupported")),
+        ] {
+            let original = error.failure_fact();
+            assert_eq!(B::Kernel(error.clone()).failure_fact(), original);
+            assert_eq!(A::Kernel(error.clone()).failure_fact(), original);
+            assert_eq!(C::Kernel(error).failure_fact(), original);
+        }
+        assert_eq!(
+            B::Control(control.clone()).failure_fact(),
+            control.failure_fact()
+        );
+        assert_eq!(
+            A::Control(control.clone()).failure_fact(),
+            control.failure_fact()
+        );
+        assert_eq!(
+            C::Control(control.clone()).failure_fact(),
+            control.failure_fact()
         );
     }
 }

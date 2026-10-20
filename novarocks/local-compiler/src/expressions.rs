@@ -89,6 +89,9 @@ impl ExpressionLoweringError {
             self,
             Self::UnsupportedExpression(_)
                 | Self::UnsupportedCall(_)
+                | Self::Cast(novarocks_functions::CastPrepareError::Unsupported)
+                | Self::Arithmetic(novarocks_functions::ArithmeticPrepareError::Unsupported)
+                | Self::Comparison(novarocks_functions::ComparisonPrepareError::Unsupported)
                 | Self::Binding(FunctionBindingError::UnavailableImplementation(_))
                 | Self::Specialization(FunctionSpecializationFailure::MissingPureImplementation(_))
                 | Self::Specialization(FunctionSpecializationFailure::Binding(

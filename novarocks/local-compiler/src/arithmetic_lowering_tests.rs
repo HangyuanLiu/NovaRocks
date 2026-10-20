@@ -696,6 +696,11 @@ fn nested_signed_arithmetic_preserves_independent_scoped_switches_and_child_row_
 }
 
 fn assert_arithmetic_failure(error: FragmentCompileError, expected: ArithmeticPrepareError) {
+    assert_eq!(
+        error.is_unsupported(),
+        expected == ArithmeticPrepareError::Unsupported,
+        "the actual compilation path must preserve the typed capability category"
+    );
     let FragmentCompileError::Owner {
         phase: "expressions",
         error,

@@ -38,62 +38,90 @@ impl super::AnalyzerContext<'_> {
         target: FunctionValueType,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
-        super::helpers::validate_value_type(&source.value_type, self.control)?;
-        super::helpers::validate_value_type(&target, self.control)?;
-        self.check_control()?;
-        if source.value_type == target {
-            return Ok(source);
-        }
-        // The semantic cast walk observes the actual caller's control; its
-        // checked owner preserves nested nominal domains across carrier casts.
-        if constant_is_null(&source, self.constant_policy, self.control)? {
-            return typed_null_conversion(source, target, self.constant_policy, self.control);
-        }
-        let carrier_cast = preserves_value_domains_observed(
-            source.value_type.value_type(),
-            target.value_type(),
-            |units| {
-                self.control
-                    .checkpoint(
-                        novarocks_type_contract::CompilePhase::Validate,
-                        u32::try_from(units).expect("one checked semantic node"),
-                    )
-                    .map_err(AnalyzeError::control)
-            },
-        )?;
-        self.check_control()?;
-        if carrier_cast
-            || novarocks_type_contract::is_default_json_structure_cast(&source.value_type, &target)
-        {
-            // This exact existing intrinsic consumes the complete target,
-            // including JSON children; it is not a same-shape domain bridge.
-            return Ok(TypedExpr {
-                kind: ExprKind::Cast {
-                    target: target.data_type().clone(),
-                    expr: Box::new(source),
-                    decimal_overflow_policy: self
-                        .sql_semantics
-                        .sql_mode()
-                        .decimal_overflow_policy(),
-                },
-                value_type: target,
-            });
-        }
-        self.check_control()?;
-        // Resolver internals are a bounded owner operation, not a claim of
-        // cooperative traversal or runtime resource authorization.
-        let result = convert_value_domain_with_catalog(
-            self.function_catalog,
+        cast_to_value_type(
             source,
             target,
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            span,
+            self.function_catalog,
+            &self.sql_semantics,
             self.constant_policy,
             self.control,
         )
-        .map_err(|error| error.at_type_mismatch(span))?;
-        self.check_control()?;
-        Ok(result)
     }
+}
+
+/// The sole assignment/CAST conversion author, also consumed by exact internal
+/// root-output declarations after ordinary query analysis has completed.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn cast_to_value_type(
+    source: TypedExpr,
+    target: FunctionValueType,
+    span: Span,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    super::helpers::validate_value_type(&source.value_type, control)?;
+    super::helpers::validate_value_type(&target, control)?;
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
+    if source.value_type == target {
+        return Ok(source);
+    }
+    // The semantic cast walk observes the actual caller's control; its
+    // checked owner preserves nested nominal domains across carrier casts.
+    if constant_is_null(&source, constant_policy, control)? {
+        return typed_null_conversion(source, target, constant_policy, control);
+    }
+    let carrier_cast = preserves_value_domains_observed(
+        source.value_type.value_type(),
+        target.value_type(),
+        |units| {
+            control
+                .checkpoint(
+                    novarocks_type_contract::CompilePhase::Validate,
+                    u32::try_from(units).expect("one checked semantic node"),
+                )
+                .map_err(AnalyzeError::control)
+        },
+    )?;
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
+    if carrier_cast
+        || novarocks_type_contract::is_default_json_structure_cast(&source.value_type, &target)
+    {
+        // This exact existing intrinsic consumes the complete target,
+        // including JSON children; it is not a same-shape domain bridge.
+        return Ok(TypedExpr {
+            kind: ExprKind::Cast {
+                target: target.data_type().clone(),
+                expr: Box::new(source),
+                decimal_overflow_policy: sql_semantics.sql_mode().decimal_overflow_policy(),
+            },
+            value_type: target,
+        });
+    }
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
+    // Resolver internals are a bounded owner operation, not a claim of
+    // cooperative traversal or runtime resource authorization.
+    let result = convert_value_domain_with_catalog(
+        function_catalog,
+        source,
+        target,
+        sql_semantics.sql_mode().decimal_overflow_policy(),
+        constant_policy,
+        control,
+    )
+    .map_err(|error| error.at_type_mismatch(span))?;
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
+    Ok(result)
 }
 
 /// A narrow existing binder adapter: the caller owns request observation and

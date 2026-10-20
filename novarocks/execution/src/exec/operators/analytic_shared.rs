@@ -55,8 +55,8 @@ use novarocks_functions::AggregateInputBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::agg::{
-    AggScalarValue, AggStateArena, SealedExecutionFunctionSet, agg_scalar_from_array,
-    build_agg_scalar_array, build_kernel_set, compare_agg_scalar_values,
+    AggScalarValue, AggStateArena, agg_scalar_from_array, build_agg_scalar_array, build_kernel_set,
+    compare_agg_scalar_values,
 };
 use crate::exec::expr::decimal::{div_round_i128, div_round_i256, pow10_i128, pow10_i256};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
@@ -67,6 +67,7 @@ use crate::exec::node::analytic::{
 };
 use crate::exec::operators::aggregate::AnalyticAggregateRetainedMemory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::runtime::function_set::SealedExecutionFunctionSet;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 

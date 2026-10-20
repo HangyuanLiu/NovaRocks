@@ -327,12 +327,8 @@ fn compile_core<H>(
                         .into());
                     }
                     work.flush()?;
-                    let recipe = PreparedComparisonRecipe::try_new(
-                        operator,
-                        value(left)?,
-                        value(right)?,
-                        control,
-                    )?;
+                    let recipe =
+                        prepare_comparison_node(operator, value(left)?, value(right)?, control)?;
                     let result = value(invocation.definition)?;
                     if *result.data_type() != arrow_schema::DataType::Boolean
                         || result.logical_type() != ValueLogicalType::Physical
@@ -388,7 +384,7 @@ fn compile_core<H>(
                     }
                     for arm in 0..arms {
                         work.flush()?;
-                        let recipe = PreparedComparisonRecipe::try_new(
+                        let recipe = prepare_comparison_node(
                             ComparisonOperator::Eq,
                             value(children[0])?,
                             value(children[1 + arm as usize * 2])?,
@@ -495,7 +491,7 @@ pub(crate) fn compile_arithmetic_with_factory<H, F: ValueSchemaCreationFactory<H
                         )
                         .map_err(arithmetic_creation_failure)?
                     }
-                    None => novarocks_functions::PreparedArithmeticRecipe::try_new(
+                    None => prepare_arithmetic_node(
                         *operator,
                         value(*left)?,
                         value(*right)?,
@@ -596,7 +592,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedCastRecipe::try_new(
+                let recipe = prepare_cast_node(
                     *operation,
                     value(*child)?,
                     value(invocation.definition)?,
@@ -692,11 +688,8 @@ pub(crate) fn compile_null_safe_comparisons_with_factory<H, F: ValueSchemaCreati
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
-                    value(*left)?,
-                    value(*right)?,
-                    control,
-                )?;
+                let recipe =
+                    prepare_null_safe_comparison_node(value(*left)?, value(*right)?, control)?;
                 before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
@@ -774,7 +767,7 @@ pub(crate) fn compile_native_negate_with_factory<H, F: ValueSchemaCreationFactor
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
+                let recipe = prepare_native_negate_node(
                     value(*child)?,
                     value(invocation.definition)?,
                     control,
@@ -856,7 +849,7 @@ pub(crate) fn compile_native_bitnot_with_factory<H, F: ValueSchemaCreationFactor
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedNativeBitNotRecipe::try_new(
+                let recipe = prepare_native_bitnot_node(
                     value(*child)?,
                     value(invocation.definition)?,
                     control,
@@ -1098,4 +1091,77 @@ pub(crate) fn compile_native_like_with_factory<H, F: ValueSchemaCreationFactory<
         entries: result?,
         _storage: retained.storage(),
     })
+}
+
+/// Prepare one ordinary comparison with the same exact domains as a program use.
+pub fn prepare_comparison_node(
+    operator: ComparisonOperator,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<PreparedComparisonRecipe, ProgramPrimitiveError> {
+    Ok(PreparedComparisonRecipe::try_new(
+        operator, left, right, control,
+    )?)
+}
+pub fn prepare_null_safe_comparison_node(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedNullSafeComparisonRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(left, right, control)?)
+}
+pub fn prepare_cast_node(
+    operation: novarocks_functions::CastOperation,
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    allow_throw_exception: bool,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedCastRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedCastRecipe::try_new(
+        operation,
+        source,
+        result,
+        policy,
+        allow_throw_exception,
+        control,
+    )?)
+}
+pub fn prepare_arithmetic_node(
+    operator: novarocks_type_contract::ArithmeticOperator,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    result: &FunctionValueType,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    allow_throw_exception: bool,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedArithmeticRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedArithmeticRecipe::try_new(
+        operator,
+        left,
+        right,
+        result,
+        policy,
+        allow_throw_exception,
+        control,
+    )?)
+}
+pub fn prepare_native_negate_node(
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedNativeNegateRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedNativeNegateRecipe::try_new(
+        source, result, control,
+    )?)
+}
+pub fn prepare_native_bitnot_node(
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedNativeBitNotRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedNativeBitNotRecipe::try_new(
+        source, result, control,
+    )?)
 }

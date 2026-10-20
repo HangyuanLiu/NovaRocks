@@ -116,7 +116,7 @@ fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuse
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             &EVALUATOR,
-            super::pure_differential::constant_policy(),
+            super::test_support::constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

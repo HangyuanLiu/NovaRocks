@@ -398,6 +398,17 @@ fn percentile_raw_owner_qnull_skips_bad_json_and_sparse_excludes_bad_rows() {
         .unwrap();
     assert!(output.errors().is_empty());
     assert!(output.values().is_null(0));
+    // Independent median: the fixture has equal-weight [1,2,3,4], so q=0.5
+    // lies midway between 2 and 3. Do not ask the core to author the oracle.
+    assert_eq!(
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(1),
+        2.5
+    );
     assert!(output.values().is_null(2));
     drop(output);
     drop(kernel);

@@ -19,6 +19,7 @@
 //! frame. Kernel calls temporarily borrow one stable domain, then erase that
 //! borrow into owned values before resuming the parent continuation.
 use super::boolean_region::BooleanRows;
+use super::node_recipes::{ComparisonPosition, NodeRecipes, ProgramNodeRecipes};
 use super::*;
 use arrow::array::{Array, BooleanArray};
 use novarocks_local_program::ProgramNodeId;
@@ -236,8 +237,8 @@ struct Child {
     ordinals: Vec<usize>,
     value: OwnedValue,
 }
-struct Frame {
-    occurrence: ProgramUseRef,
+pub(super) struct Frame<K = ProgramUseRef> {
+    occurrence: K,
     activation: novarocks_functions::ScalarInvocationActivation,
     rows: Vec<usize>,
     output_rows: Vec<usize>,
@@ -255,9 +256,9 @@ struct Frame {
     temporal: Option<TemporalValues>,
     membership: Option<novarocks_functions::native_inlist::InRows>,
 }
-impl Frame {
+impl<K> Frame<K> {
     fn new(
-        occurrence: ProgramUseRef,
+        occurrence: K,
         shape: ControlShape,
         result_type: &DataType,
         mut rows: Vec<usize>,
@@ -563,7 +564,7 @@ impl Frame {
     fn attach_between(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::ExpressionProgram,
+        recipes: &dyn NodeRecipes,
         negated: bool,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
@@ -642,11 +643,11 @@ impl Frame {
             work,
         )?;
         let site = if ordinal == 1 {
-            novarocks_local_program::ProgramComparisonSite::BetweenLower(self.occurrence)
+            ComparisonPosition::BetweenLower
         } else {
-            novarocks_local_program::ProgramComparisonSite::BetweenUpper(self.occurrence)
+            ComparisonPosition::BetweenUpper
         };
-        let recipe = program
+        let recipe = recipes
             .comparison_recipe(site)
             .ok_or_else(|| invalid("missing exact BETWEEN bound comparison recipe"))?;
         let output = evaluate_comparison(
@@ -682,7 +683,7 @@ impl Frame {
     fn attach_membership(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::ExpressionProgram,
+        recipes: &dyn NodeRecipes,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
@@ -691,8 +692,8 @@ impl Frame {
             .next
             .checked_sub(1)
             .ok_or_else(|| internal("IN completed before its source phase"))?;
-        let recipe = program
-            .native_inlist_recipe(self.occurrence)
+        let recipe = recipes
+            .native_inlist_recipe()
             .ok_or_else(|| invalid("missing exact IN recipe"))?;
         let mut rows = Vec::with_capacity(child.ordinals.len());
         for &parent in &child.ordinals {
@@ -768,7 +769,7 @@ impl Frame {
             &mut |event| in_event(event, work),
         ))?;
         let equalities = if expected.data_type() == &DataType::Utf8 {
-            in_observed(crate::exec::expr::in_pred::utf8_equality_observed(
+            in_observed(super::utf8_inlist::utf8_equality_observed(
                 left.values(),
                 right.values(),
                 &mut |event| in_event(event, work),
@@ -801,7 +802,7 @@ impl Frame {
     fn attach(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::ExpressionProgram,
+        recipes: &dyn NodeRecipes,
         shape: ControlShape,
         demand: EvaluationDemand,
         child_is_pure: bool,
@@ -809,10 +810,10 @@ impl Frame {
         work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
         if let ControlShape::Membership { .. } = shape {
-            return self.attach_membership(child, program, batch_rows, work);
+            return self.attach_membership(child, recipes, batch_rows, work);
         }
         if let ControlShape::Between { negated } = shape {
-            return self.attach_between(child, program, negated, batch_rows, work);
+            return self.attach_between(child, recipes, negated, batch_rows, work);
         }
         if let ControlShape::TemporalSource(source_shape) = shape {
             return self.attach_temporal(child, source_shape, batch_rows, work);
@@ -909,13 +910,10 @@ impl Frame {
                 };
                 let recipe = if simple {
                     Some(
-                        program
-                            .comparison_recipe(
-                                novarocks_local_program::ProgramComparisonSite::CaseWhen {
-                                    occurrence: self.occurrence,
-                                    arm: ((ordinal - offset) / 2) as u32,
-                                },
-                            )
+                        recipes
+                            .comparison_recipe(ComparisonPosition::CaseWhen(
+                                ((ordinal - offset) / 2) as u32,
+                            ))
                             .ok_or_else(|| invalid("missing exact CASE WHEN comparison recipe"))?,
                     )
                 } else {
@@ -1075,6 +1073,423 @@ impl Frame {
         });
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CompletionKind {
+    Like {
+        negated: bool,
+    },
+    InList {
+        is_not_in: bool,
+    },
+    Between {
+        plan: novarocks_type_contract::NativeBetweenPlan,
+    },
+    Boolean,
+    Cast,
+    Negate,
+    BitNot,
+    Arithmetic,
+    Comparison {
+        null_safe: bool,
+    },
+    Case,
+    Unary(super::unary::UnaryIntrinsic),
+    Call,
+}
+impl CompletionKind {
+    fn from_static(kind: &StaticExprKind) -> Option<Self> {
+        Some(match kind {
+            StaticExprKind::PreparedLike { negated, .. } => Self::Like { negated: *negated },
+            StaticExprKind::PreparedInList { is_not_in, .. } => Self::InList {
+                is_not_in: *is_not_in,
+            },
+            StaticExprKind::PreparedBetween { plan, .. } => Self::Between { plan: *plan },
+            StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => Self::Boolean,
+            StaticExprKind::PreparedCast { .. } => Self::Cast,
+            StaticExprKind::PreparedNativeNegate(_) => Self::Negate,
+            StaticExprKind::PreparedNativeBitNot(_) => Self::BitNot,
+            StaticExprKind::PreparedArithmetic { .. } => Self::Arithmetic,
+            StaticExprKind::PreparedNullSafeComparison { .. } => {
+                Self::Comparison { null_safe: true }
+            }
+            kind if kind.ordinary_comparison().is_some() => Self::Comparison { null_safe: false },
+            StaticExprKind::Case { .. } => Self::Case,
+            StaticExprKind::Not(_) => Self::Unary(super::unary::UnaryIntrinsic::Not),
+            StaticExprKind::IsNull(_) => Self::Unary(super::unary::UnaryIntrinsic::IsNull),
+            StaticExprKind::IsNotNull(_) => Self::Unary(super::unary::UnaryIntrinsic::IsNotNull),
+            StaticExprKind::BoundCall { .. } => Self::Call,
+            _ => return None,
+        })
+    }
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The node's recipes, row demand and evaluation owner remain explicit"
+)]
+fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+    kind: &CompletionKind,
+    frame: &mut Frame<K>,
+    recipes: &dyn NodeRecipes,
+    shape: ControlShape,
+    demand: EvaluationDemand,
+    result_type: &novarocks_functions::FunctionValueType,
+    local_selection: Selection<'a>,
+    original_domain: bool,
+    instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, E> {
+    Ok(match kind {
+        CompletionKind::Like { negated } => {
+            if frame.children.len() != 2 {
+                return Err(invalid("LIKE requires its original ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let text = children
+                .next()
+                .ok_or_else(|| internal("missing original LIKE source"))?
+                .value
+                .into_value(local_selection, work)?;
+            let pattern = children
+                .next()
+                .ok_or_else(|| internal("missing original LIKE pattern"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_like_recipe()
+                .ok_or_else(|| invalid("missing exact LIKE recipe"))?;
+            if recipe.negated() != *negated {
+                return Err(invalid("LIKE negative expansion differs from original source").into());
+            }
+            work.flush()?;
+            let output = recipe.evaluate_selected(
+                text.argument(),
+                pattern.argument(),
+                local_selection,
+                demand == EvaluationDemand::TruthOnly,
+                work.control,
+            )?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::InList { is_not_in } => {
+            let recipe = recipes
+                .native_inlist_recipe()
+                .ok_or_else(|| invalid("missing IN completion recipe"))?;
+            if recipe.negated() != *is_not_in || frame.children.len() != 1 {
+                return Err(invalid("IN completion differs from its ordered source").into());
+            }
+            let source = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing original IN source"))?;
+            let source = source.value.into_value(local_selection, work)?;
+            let output =
+                source.materialize(local_selection, &recipe.source_type().data_type(), work)?;
+            let mut failed = Vec::with_capacity(frame.errors.len());
+            for &row in frame.errors.keys() {
+                failed.push(row);
+                work.step()?;
+            }
+            let state = frame
+                .membership
+                .take()
+                .ok_or_else(|| internal("missing IN state at completion"))?;
+            let result = in_observed(state.finish_selected_observed(
+                output.values(),
+                *is_not_in,
+                demand == EvaluationDemand::TruthOnly,
+                &failed,
+                &mut |event| in_event(event, work),
+            ))?;
+            let mut errors = Vec::with_capacity(frame.errors.len());
+            for (_, error) in std::mem::take(&mut frame.errors) {
+                errors.push(error);
+                work.step()?;
+            }
+            work.flush()?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                &result_type.data_type(),
+                Arc::new(result),
+                errors.into_boxed_slice(),
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Between { plan } => {
+            if !frame.children.is_empty() {
+                return Err(invalid("BETWEEN comparison phase was not completed").into());
+            }
+            let state = frame
+                .boolean
+                .take()
+                .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?;
+            let (array, errors) = state.finish(
+                plan.connective(),
+                demand,
+                std::mem::take(&mut frame.errors),
+                work,
+            )?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                &result_type.data_type(),
+                array,
+                errors,
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Boolean => {
+            let state = frame
+                .boolean
+                .take()
+                .ok_or_else(|| internal("missing Boolean continuation"))?;
+            let (array, errors) =
+                state.finish(shape, demand, std::mem::take(&mut frame.errors), work)?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                &result_type.data_type(),
+                array,
+                errors,
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Cast => {
+            if frame.children.len() != 1 {
+                return Err(invalid("cast requires its exact operand").into());
+            }
+            let child = std::mem::take(&mut frame.children)
+                .into_iter()
+                .next()
+                .ok_or_else(|| internal("missing cast operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .cast_recipe()
+                .ok_or_else(|| invalid("missing exact cast recipe"))?;
+            if recipe.is_identity() {
+                // The value passes unchanged, with its row errors;
+                // only the frozen nullability widens.
+                OwnedValue::from_materialized(child.materialize(
+                    local_selection,
+                    &recipe.result_type().data_type(),
+                    work,
+                )?)
+            } else {
+                OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
+            }
+        }
+        CompletionKind::Negate => {
+            if frame.children.len() != 1 {
+                return Err(invalid("native negate requires its exact ordered operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing native negate operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_negate_recipe()
+                .ok_or_else(|| invalid("missing exact native negate recipe"))?;
+            work.flush()?;
+            let output =
+                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::BitNot => {
+            if frame.children.len() != 1 {
+                return Err(invalid("native BitwiseNot requires its exact ordered operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing native BitwiseNot operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_bitnot_recipe()
+                .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
+            work.flush()?;
+            let output =
+                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::Arithmetic => {
+            if frame.children.len() != 2 {
+                return Err(invalid("arithmetic requires its exact ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let left = children
+                .next()
+                .ok_or_else(|| internal("missing arithmetic left operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let right = children
+                .next()
+                .ok_or_else(|| internal("missing arithmetic right operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .arithmetic_recipe()
+                .ok_or_else(|| invalid("missing exact arithmetic recipe"))?;
+            OwnedValue::from_selected(evaluate_arithmetic(
+                recipe,
+                &left,
+                &right,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Comparison { null_safe } => {
+            if frame.children.len() != 2 {
+                return Err(invalid("comparison requires its exact ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let left = children
+                .next()
+                .ok_or_else(|| internal("missing comparison left operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let right = children
+                .next()
+                .ok_or_else(|| internal("missing comparison right operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = if *null_safe {
+                ComparisonRecipe::NullSafe(
+                    recipes
+                        .null_safe_comparison_recipe()
+                        .ok_or_else(|| invalid("missing exact null-safe comparison recipe"))?,
+                )
+            } else {
+                ComparisonRecipe::Ordinary(
+                    recipes
+                        .comparison_recipe(ComparisonPosition::Binary)
+                        .ok_or_else(|| invalid("missing exact comparison recipe"))?,
+                )
+            };
+            OwnedValue::from_selected(evaluate_comparison(
+                recipe,
+                &left,
+                &right,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Case => assemble(
+            &frame.children,
+            &frame.choices,
+            &mut frame.errors,
+            &result_type.data_type(),
+            local_selection,
+            work,
+        )?,
+        CompletionKind::Unary(kind) => {
+            if frame.children.len() != 1 {
+                return Err(invalid("unary occurrence requires its exact operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing actual unary operand"))?;
+            let value = child.value.into_value(local_selection, work)?;
+            OwnedValue::from_selected(super::unary::evaluate(
+                *kind,
+                &value,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Call => {
+            let prepared_call = recipes
+                .prepared_call()
+                .ok_or_else(|| invalid("missing prepared node call"))?;
+            match prepared_call {
+                PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
+                    let prepared = match prepared_call {
+                        PreparedPureKernel::Scalar(p) => scalar_invocation::PreparedCall::Kernel(p),
+                        PreparedPureKernel::ScalarInvocation(p) => {
+                            scalar_invocation::PreparedCall::Invocation(p)
+                        }
+                        _ => {
+                            return Err(E::from(invalid(
+                                "ordinary call changed its prepared lifecycle",
+                            )));
+                        }
+                    };
+                    if original_domain {
+                        let result = evaluate_original_invocation::<E, K>(
+                            frame.occurrence.clone(),
+                            prepared,
+                            &frame.children,
+                            &frame.domain,
+                            local_selection,
+                            frame.activation,
+                            instances,
+                            allocator,
+                            work,
+                        )?;
+                        OwnedValue::from_selected(result)
+                    } else {
+                        let mut children = Vec::with_capacity(frame.children.len());
+                        for child in std::mem::take(&mut frame.children) {
+                            children.push(child.value.into_value(local_selection, work)?);
+                            work.step()?;
+                        }
+                        OwnedValue::from_selected(evaluate_scalar::<E, K>(
+                            frame.occurrence.clone(),
+                            prepared,
+                            &children,
+                            local_selection,
+                            frame.activation,
+                            instances,
+                            allocator,
+                            work,
+                        )?)
+                    }
+                }
+                PreparedPureKernel::ControlIntrinsic(_)
+                    if matches!(shape, ControlShape::TemporalSource(_)) =>
+                {
+                    let state = frame
+                        .temporal
+                        .take()
+                        .ok_or_else(|| internal("missing temporal continuation at completion"))?;
+                    state.finish(shape, &mut frame.errors, local_selection, work)?
+                }
+                PreparedPureKernel::ControlIntrinsic(_) => {
+                    if shape == ControlShape::If {
+                        finish_if(
+                            &frame.children,
+                            &frame.choices,
+                            &mut frame.errors,
+                            &frame.routes,
+                            local_selection.is_empty(),
+                            &result_type.data_type(),
+                            local_selection,
+                            work,
+                        )?
+                    } else {
+                        assemble(
+                            &frame.children,
+                            &frame.choices,
+                            &mut frame.errors,
+                            &result_type.data_type(),
+                            local_selection,
+                            work,
+                        )?
+                    }
+                }
+                _ => {
+                    return Err(invalid("compiled occurrence has a different lifecycle").into());
+                }
+            }
+        }
+    })
 }
 
 #[expect(
@@ -1251,35 +1666,8 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         if let Some(ordinals) = next {
             let child_use = invocation.arguments[frame.next];
             frame.next += 1;
-            let mut rows = Vec::with_capacity(if original_domain {
-                frame.domain.rows().len()
-            } else {
-                ordinals.len()
-            });
-            if original_domain {
-                for &row in frame.domain.rows() {
-                    rows.push(row);
-                    work.step()?;
-                }
-            } else {
-                for &ordinal in &ordinals {
-                    rows.push(frame.rows[ordinal]);
-                    work.step()?;
-                }
-            }
-            // A control author supplies its actual phase mask. Eager required
-            // children retain the parent source domain; no leaf guesses it.
-            let child_domain = if invocation.control == ControlShape::If
-                && frame.next > 1
-                && (!rows.is_empty() || frame.rows.is_empty())
-            {
-                frame.domain.filtered(&rows, work.control)?
-            } else {
-                // Other control/selected owners keep their existing logical
-                // demand and inherit the actual carrier. Only their own typed
-                // policy may demand a full original-domain child invocation.
-                frame.domain.clone()
-            };
+            let (rows, child_domain, child_activation) =
+                child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
             let child = Frame::new(
                 ProgramUseRef {
                     arena: frame.occurrence.arena,
@@ -1293,16 +1681,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 rows,
                 child_domain,
                 needs_original.contains(&child_use),
-                if original_domain && !frame.domain.rows().is_empty()
-                    || !ordinals.is_empty()
-                    || frame.activation
-                        == novarocks_functions::ScalarInvocationActivation::Activated
-                        && frame.rows.is_empty()
-                {
-                    novarocks_functions::ScalarInvocationActivation::Activated
-                } else {
-                    novarocks_functions::ScalarInvocationActivation::ValidateOnly
-                },
+                child_activation,
                 ordinals,
                 work,
             )?;
@@ -1310,10 +1689,17 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
             frames.push(child);
             continue;
         }
+        // Row domains are immutable once traversal finishes this frame. Move
+        // their existing vectors out so completion can mutate the other state
+        // without cloning rows or adding observation callbacks.
+        let completion_rows = std::mem::take(&mut frame.rows);
+        let completion_output_rows = std::mem::take(&mut frame.output_rows);
         let local_selection =
-            Selection::try_sparse_observed(input.num_rows(), &frame.rows, || work.step())?;
+            Selection::try_sparse_observed(input.num_rows(), &completion_rows, || work.step())?;
         let output_selection =
-            Selection::try_sparse_observed(input.num_rows(), &frame.output_rows, || work.step())?;
+            Selection::try_sparse_observed(input.num_rows(), &completion_output_rows, || {
+                work.step()
+            })?;
         // Clone only explicit finite continuations of actually evaluated
         // children. No host request occurs before the original leaf outcome.
         let child_sources = frame
@@ -1321,24 +1707,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
             .iter()
             .filter_map(|child| child.value.continuation())
             .collect();
-        let value = if frame.rows.is_empty()
+        let value = if completion_rows.is_empty()
             && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
         {
-            work.flush()?;
-            let array = new_empty_array(&result_type.data_type());
-            work.flush()?;
-            OwnedValue::Selected(array, Box::default())
+            complete_undemanded_leaf(result_type.data_type(), work)?
         } else {
             match definition.kind() {
                 StaticExprKind::Constant(constant) => {
-                    work.flush()?;
-                    validate_evaluated_argument_observed(
-                        EvaluatedArgument::Constant(constant),
-                        local_selection,
-                        result_type,
-                        work.control,
-                    )?;
-                    OwnedValue::Constant(constant.clone())
+                    complete_constant_leaf(constant, result_type, local_selection, work)?
                 }
                 StaticExprKind::SlotId(_) => {
                     let Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
@@ -1382,408 +1758,33 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                         .transpose()?;
                     OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
                 }
-                StaticExprKind::PreparedLike { negated, .. } => {
-                    if frame.children.len() != 2 {
-                        return Err(invalid("LIKE requires its original ordered operands").into());
-                    }
-                    let mut children = std::mem::take(&mut frame.children).into_iter();
-                    let text = children
-                        .next()
-                        .ok_or_else(|| internal("missing original LIKE source"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let pattern = children
-                        .next()
-                        .ok_or_else(|| internal("missing original LIKE pattern"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .native_like_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact LIKE recipe"))?;
-                    if recipe.negated() != *negated {
-                        return Err(invalid(
-                            "LIKE negative expansion differs from original source",
-                        )
-                        .into());
-                    }
-                    work.flush()?;
-                    let output = recipe.evaluate_selected(
-                        text.argument(),
-                        pattern.argument(),
-                        local_selection,
-                        invocation.context.demand == EvaluationDemand::TruthOnly,
-                        work.control,
-                    )?;
-                    work.flush()?;
-                    OwnedValue::from_selected(output)
-                }
-                StaticExprKind::PreparedInList { is_not_in, .. } => {
-                    let recipe = program
-                        .native_inlist_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing IN completion recipe"))?;
-                    if recipe.negated() != *is_not_in || frame.children.len() != 1 {
-                        return Err(invalid("IN completion differs from its ordered source").into());
-                    }
-                    let source = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing original IN source"))?;
-                    let source = source.value.into_value(local_selection, work)?;
-                    let output = source.materialize(
-                        local_selection,
-                        &recipe.source_type().data_type(),
-                        work,
-                    )?;
-                    let mut failed = Vec::with_capacity(frame.errors.len());
-                    for &row in frame.errors.keys() {
-                        failed.push(row);
-                        work.step()?;
-                    }
-                    let state = frame
-                        .membership
-                        .take()
-                        .ok_or_else(|| internal("missing IN state at completion"))?;
-                    let result = in_observed(state.finish_selected_observed(
-                        output.values(),
-                        *is_not_in,
-                        invocation.context.demand == EvaluationDemand::TruthOnly,
-                        &failed,
-                        &mut |event| in_event(event, work),
-                    ))?;
-                    let mut errors = Vec::with_capacity(frame.errors.len());
-                    for (_, error) in std::mem::take(&mut frame.errors) {
-                        errors.push(error);
-                        work.step()?;
-                    }
-                    work.flush()?;
-                    OwnedValue::from_selected(SelectedValues::try_new_observed(
-                        local_selection,
-                        &result_type.data_type(),
-                        Arc::new(result),
-                        errors.into_boxed_slice(),
-                        || work.step(),
-                    )?)
-                }
-                StaticExprKind::PreparedBetween { plan, .. } => {
-                    if !frame.children.is_empty() {
-                        return Err(invalid("BETWEEN comparison phase was not completed").into());
-                    }
-                    let state = frame
-                        .boolean
-                        .take()
-                        .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?;
-                    let (array, errors) = state.finish(
-                        plan.connective(),
-                        invocation.context.demand,
-                        std::mem::take(&mut frame.errors),
-                        work,
-                    )?;
-                    OwnedValue::from_selected(SelectedValues::try_new_observed(
-                        local_selection,
-                        &result_type.data_type(),
-                        array,
-                        errors,
-                        || work.step(),
-                    )?)
-                }
-                StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => {
-                    let state = frame
-                        .boolean
-                        .take()
-                        .ok_or_else(|| internal("missing Boolean continuation"))?;
-                    let (array, errors) = state.finish(
+                kind => {
+                    let recipes = ProgramNodeRecipes {
+                        program,
+                        occurrence: frame.occurrence,
+                    };
+                    complete_node::<E, _>(
+                        &CompletionKind::from_static(kind)
+                            .ok_or_else(|| invalid("unsupported compiled root definition"))?,
+                        &mut frame,
+                        &recipes,
                         invocation.control,
                         invocation.context.demand,
-                        std::mem::take(&mut frame.errors),
+                        result_type,
+                        local_selection,
+                        original_domain,
+                        instances,
+                        allocator,
                         work,
-                    )?;
-                    OwnedValue::from_selected(SelectedValues::try_new_observed(
-                        local_selection,
-                        &result_type.data_type(),
-                        array,
-                        errors,
-                        || work.step(),
-                    )?)
+                    )?
                 }
-                StaticExprKind::PreparedCast { .. } => {
-                    if frame.children.len() != 1 {
-                        return Err(invalid("cast requires its exact operand").into());
-                    }
-                    let child = std::mem::take(&mut frame.children)
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| internal("missing cast operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .cast_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact cast recipe"))?;
-                    if recipe.is_identity() {
-                        // The value passes unchanged, with its row errors;
-                        // only the frozen nullability widens.
-                        OwnedValue::from_materialized(child.materialize(
-                            local_selection,
-                            &recipe.result_type().data_type(),
-                            work,
-                        )?)
-                    } else {
-                        OwnedValue::from_selected(evaluate_cast(
-                            recipe,
-                            &child,
-                            local_selection,
-                            work,
-                        )?)
-                    }
-                }
-                StaticExprKind::PreparedNativeNegate(_) => {
-                    if frame.children.len() != 1 {
-                        return Err(
-                            invalid("native negate requires its exact ordered operand").into()
-                        );
-                    }
-                    let child = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing native negate operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .native_negate_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact native negate recipe"))?;
-                    work.flush()?;
-                    let output = recipe.evaluate_selected(
-                        child.argument(),
-                        local_selection,
-                        work.control,
-                    )?;
-                    work.flush()?;
-                    OwnedValue::from_selected(output)
-                }
-                StaticExprKind::PreparedNativeBitNot(_) => {
-                    if frame.children.len() != 1 {
-                        return Err(invalid(
-                            "native BitwiseNot requires its exact ordered operand",
-                        )
-                        .into());
-                    }
-                    let child = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing native BitwiseNot operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .native_bitnot_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
-                    work.flush()?;
-                    let output = recipe.evaluate_selected(
-                        child.argument(),
-                        local_selection,
-                        work.control,
-                    )?;
-                    work.flush()?;
-                    OwnedValue::from_selected(output)
-                }
-                StaticExprKind::PreparedArithmetic { .. } => {
-                    if frame.children.len() != 2 {
-                        return Err(
-                            invalid("arithmetic requires its exact ordered operands").into()
-                        );
-                    }
-                    let mut children = std::mem::take(&mut frame.children).into_iter();
-                    let left = children
-                        .next()
-                        .ok_or_else(|| internal("missing arithmetic left operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let right = children
-                        .next()
-                        .ok_or_else(|| internal("missing arithmetic right operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .arithmetic_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact arithmetic recipe"))?;
-                    OwnedValue::from_selected(evaluate_arithmetic(
-                        recipe,
-                        &left,
-                        &right,
-                        local_selection,
-                        work,
-                    )?)
-                }
-                kind if kind.ordinary_comparison().is_some()
-                    || matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) =>
-                {
-                    if frame.children.len() != 2 {
-                        return Err(
-                            invalid("comparison requires its exact ordered operands").into()
-                        );
-                    }
-                    let mut children = std::mem::take(&mut frame.children).into_iter();
-                    let left = children
-                        .next()
-                        .ok_or_else(|| internal("missing comparison left operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let right = children
-                        .next()
-                        .ok_or_else(|| internal("missing comparison right operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe =
-                        if matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) {
-                            ComparisonRecipe::NullSafe(
-                                program
-                                    .null_safe_comparison_recipe(frame.occurrence)
-                                    .ok_or_else(|| {
-                                        invalid("missing exact null-safe comparison recipe")
-                                    })?,
-                            )
-                        } else {
-                            ComparisonRecipe::Ordinary(
-                                program
-                                    .comparison_recipe(
-                                        novarocks_local_program::ProgramComparisonSite::Binary(
-                                            frame.occurrence,
-                                        ),
-                                    )
-                                    .ok_or_else(|| invalid("missing exact comparison recipe"))?,
-                            )
-                        };
-                    OwnedValue::from_selected(evaluate_comparison(
-                        recipe,
-                        &left,
-                        &right,
-                        local_selection,
-                        work,
-                    )?)
-                }
-                StaticExprKind::Case { .. } => assemble(
-                    &frame.children,
-                    &frame.choices,
-                    &mut frame.errors,
-                    &result_type.data_type(),
-                    local_selection,
-                    work,
-                )?,
-                StaticExprKind::Not(_)
-                | StaticExprKind::IsNull(_)
-                | StaticExprKind::IsNotNull(_) => {
-                    if frame.children.len() != 1 {
-                        return Err(invalid("unary occurrence requires its exact operand").into());
-                    }
-                    let child = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing actual unary operand"))?;
-                    let value = child.value.into_value(local_selection, work)?;
-                    OwnedValue::from_selected(super::unary::evaluate(
-                        definition.kind(),
-                        &value,
-                        local_selection,
-                        work,
-                    )?)
-                }
-                StaticExprKind::BoundCall { .. } => {
-                    let call = &resolved.calls()[&ProgramCallSite::Expression(frame.occurrence)];
-                    match call.specialization().prepared() {
-                        PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
-                            let prepared = match call.specialization().prepared() {
-                                PreparedPureKernel::Scalar(p) => {
-                                    scalar_invocation::PreparedCall::Kernel(p)
-                                }
-                                PreparedPureKernel::ScalarInvocation(p) => {
-                                    scalar_invocation::PreparedCall::Invocation(p)
-                                }
-                                _ => {
-                                    return Err(E::from(invalid(
-                                        "ordinary call changed its prepared lifecycle",
-                                    )));
-                                }
-                            };
-                            if original_domain {
-                                let result = evaluate_original_invocation::<E>(
-                                    frame.occurrence,
-                                    prepared,
-                                    &frame.children,
-                                    &frame.domain,
-                                    local_selection,
-                                    frame.activation,
-                                    instances,
-                                    allocator,
-                                    work,
-                                )?;
-                                OwnedValue::from_selected(result)
-                            } else {
-                                let mut children = Vec::with_capacity(frame.children.len());
-                                for child in std::mem::take(&mut frame.children) {
-                                    children.push(child.value.into_value(local_selection, work)?);
-                                    work.step()?;
-                                }
-                                OwnedValue::from_selected(evaluate_scalar::<E>(
-                                    frame.occurrence,
-                                    prepared,
-                                    &children,
-                                    local_selection,
-                                    frame.activation,
-                                    instances,
-                                    allocator,
-                                    work,
-                                )?)
-                            }
-                        }
-                        PreparedPureKernel::ControlIntrinsic(_)
-                            if matches!(invocation.control, ControlShape::TemporalSource(_)) =>
-                        {
-                            let state = frame.temporal.take().ok_or_else(|| {
-                                internal("missing temporal continuation at completion")
-                            })?;
-                            state.finish(
-                                invocation.control,
-                                &mut frame.errors,
-                                local_selection,
-                                work,
-                            )?
-                        }
-                        PreparedPureKernel::ControlIntrinsic(_) => {
-                            if invocation.control == ControlShape::If {
-                                finish_if(
-                                    &frame.children,
-                                    &frame.choices,
-                                    &mut frame.errors,
-                                    &frame.routes,
-                                    frame.rows.is_empty(),
-                                    &result_type.data_type(),
-                                    local_selection,
-                                    work,
-                                )?
-                            } else {
-                                assemble(
-                                    &frame.children,
-                                    &frame.choices,
-                                    &mut frame.errors,
-                                    &result_type.data_type(),
-                                    local_selection,
-                                    work,
-                                )?
-                            }
-                        }
-                        _ => {
-                            return Err(
-                                invalid("compiled occurrence has a different lifecycle").into()
-                            );
-                        }
-                    }
-                }
-                _ => return Err(invalid("unsupported compiled root definition").into()),
             }
         };
-        let value = if frame.output_rows != frame.rows {
+        let value = if completion_output_rows != completion_rows {
             project_owned(
                 value,
-                &frame.rows,
-                &frame.output_rows,
+                &completion_rows,
+                &completion_output_rows,
                 input.num_rows(),
                 work,
             )?
@@ -1833,7 +1834,10 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     ordinals: frame.parent_ordinals,
                     value,
                 },
-                program,
+                &ProgramNodeRecipes {
+                    program,
+                    occurrence: parent.occurrence,
+                },
                 shape,
                 parent_invocation.context.demand,
                 child_is_pure,
@@ -1870,14 +1874,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     clippy::too_many_arguments,
     reason = "Keep actual source scope and outer demand explicit"
 )]
-fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure>(
-    occurrence: ProgramUseRef,
+fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+    occurrence: K,
     prepared: scalar_invocation::PreparedCall<'_>,
     children: &[Child],
     domain: &Arc<input_source::ActualInvocationDomain>,
     demand: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
+    instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, E> {
@@ -1898,7 +1902,7 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure>(
         work.step()?;
     }
     work.flush()?;
-    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence.clone()) {
         let instance = match prepared.instantiate(allocator.cloned()) {
             Ok(instance) => instance,
             Err(cause) => {
@@ -2409,9 +2413,9 @@ fn evaluate_cast<'a>(
     };
     use novarocks_functions::CastRowResult as R;
     let ty = &recipe.result_type().data_type();
-    if recipe.is_collection() {
+    if recipe.uses_selected_array() {
         work.flush()?;
-        return recipe.evaluate_collection(
+        return recipe.evaluate_selected_array(
             child.argument(),
             selection,
             child.errors(),
@@ -3078,6 +3082,90 @@ fn validate_membership_phase(
 #[cfg(test)]
 #[path = "copy_continuation_tests.rs"]
 mod copy_continuation_tests;
+
+#[path = "constant_driver.rs"]
+pub(super) mod constant_driver;
+
+fn complete_constant_leaf(
+    constant: &novarocks_functions::ConstantValue,
+    result: &novarocks_functions::FunctionValueType,
+    selection: Selection<'_>,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, KernelFailure> {
+    work.flush()?;
+    validate_evaluated_argument_observed(
+        EvaluatedArgument::Constant(constant),
+        selection,
+        result,
+        work.control,
+    )?;
+    Ok(OwnedValue::Constant(constant.clone()))
+}
+fn child_context<K>(
+    frame: &Frame<K>,
+    shape: ControlShape,
+    ordinals: &[usize],
+    original_domain: bool,
+    work: &mut Work<'_, '_>,
+) -> Result<
+    (
+        Vec<usize>,
+        Arc<input_source::ActualInvocationDomain>,
+        novarocks_functions::ScalarInvocationActivation,
+    ),
+    KernelFailure,
+> {
+    let mut rows = Vec::with_capacity(if original_domain {
+        frame.domain.rows().len()
+    } else {
+        ordinals.len()
+    });
+    if original_domain {
+        for &row in frame.domain.rows() {
+            rows.push(row);
+            work.step()?;
+        }
+    } else {
+        for &ordinal in ordinals {
+            rows.push(frame.rows[ordinal]);
+            work.step()?;
+        }
+    }
+    // A control author supplies its actual phase mask. Eager required
+    // children retain the parent source domain; no leaf guesses it.
+    let child_domain = if shape == ControlShape::If
+        && frame.next > 1
+        && (!rows.is_empty() || frame.rows.is_empty())
+    {
+        frame.domain.filtered(&rows, work.control)?
+    } else {
+        // Other control/selected owners keep their existing logical
+        // demand and inherit the actual carrier. Only their own typed
+        // policy may demand a full original-domain child invocation.
+        frame.domain.clone()
+    };
+
+    let activation = if original_domain && !frame.domain.rows().is_empty()
+        || !ordinals.is_empty()
+        || frame.activation == novarocks_functions::ScalarInvocationActivation::Activated
+            && frame.rows.is_empty()
+    {
+        novarocks_functions::ScalarInvocationActivation::Activated
+    } else {
+        novarocks_functions::ScalarInvocationActivation::ValidateOnly
+    };
+    Ok((rows, child_domain, activation))
+}
+
+fn complete_undemanded_leaf(
+    ty: &DataType,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, KernelFailure> {
+    work.flush()?;
+    let array = new_empty_array(ty);
+    work.flush()?;
+    Ok(OwnedValue::Selected(array, Box::default()))
+}
 
 #[cfg(test)]
 mod result_creator_continuation_tests {

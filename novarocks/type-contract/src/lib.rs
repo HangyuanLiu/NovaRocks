@@ -82,7 +82,9 @@ pub use arithmetic::{
 };
 pub use array_generate::array_generate_item_type;
 pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_parameters_observed};
-pub use coercion::{wider_type, wider_type_with_construction};
+pub use coercion::{
+    supports_boolean_negation_value_type, wider_type, wider_type_with_construction,
+};
 pub use comparison::{ComparisonOperator, OrderedComparisonAlgorithm};
 pub use comparison_coercion::{
     ComparisonCoercionFailure, comparison_common_type, comparison_common_value_type,

@@ -38,7 +38,7 @@ pub(super) fn optimize(sql: &str, max_len: Option<i64>) -> Result<(), SqlCompile
         builtin_sql_function_catalog(),
         &EVALUATOR,
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         control.clone(),
     ))?
     .into_pending()?;

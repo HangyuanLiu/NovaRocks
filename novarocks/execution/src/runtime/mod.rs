@@ -32,3 +32,5 @@ pub use execution_runtime::{
 
 #[cfg(test)]
 mod kernel_memory_observation_tests;
+
+pub mod function_set;

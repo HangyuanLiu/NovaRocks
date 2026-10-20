@@ -927,6 +927,66 @@ fn cow_selection_layout(
     Ok((Arc::new(Schema::new(fields)), roles))
 }
 
+fn cow_selection_execution_types(
+    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+) -> Result<Vec<novarocks_type_contract::FunctionValueType>, String> {
+    let (_, roles) = cow_selection_layout(preparation)?;
+    roles
+        .into_iter()
+        .map(|role| {
+            let ty = match role {
+                CowSelectionFieldRole::Identity(field) => field.execution_type(),
+                CowSelectionFieldRole::Before(field) | CowSelectionFieldRole::After(field) => {
+                    field.execution_type()
+                }
+                CowSelectionFieldRole::Effect(_) => {
+                    return Ok(novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int8,
+                        false,
+                    ));
+                }
+            };
+            ty.cloned().ok_or_else(|| {
+                "COW selection has no complete provider execution declaration".to_string()
+            })
+        })
+        .collect()
+}
+
+fn check_cow_root_output_types(
+    fields: &[novarocks_query_application::api::ResultField],
+    declaration: &[novarocks_type_contract::FunctionValueType],
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
+    use novarocks_sql::compiler::SqlCompileError;
+    if fields.len() != declaration.len() {
+        return Err(SqlCompileError::InvalidRequest(
+            "COW root output width differs from its signed declaration".into(),
+        ));
+    }
+    for (ordinal, declared) in declaration.iter().enumerate() {
+        let name = format!("__nr_sel_{ordinal}");
+        let mut matches = fields.iter().filter(|field| field.name() == name);
+        let actual = matches.next().ok_or_else(|| {
+            SqlCompileError::InvalidRequest(format!(
+                "COW root output is missing signed ordinal {ordinal}"
+            ))
+        })?;
+        if matches.next().is_some()
+            || !novarocks_sql::compiler::root_output_type_matches(
+                actual.value_type(),
+                declared,
+                control,
+            )?
+        {
+            return Err(SqlCompileError::InvalidRequest(format!(
+                "COW root output ordinal {ordinal} differs from its signed type"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn cow_selection_from_query_result(
     result: QueryResult,
@@ -943,7 +1003,7 @@ fn cow_selection_from_query_result(
         .map_err(|error| format!("create bounded COW match collector: {error}"))?;
     for batch in result.batches {
         let batch =
-            crate::query_execution::row_mutation::cast_to_signed_selection(&schema, &batch)?;
+            crate::query_execution::row_mutation::normalize_to_signed_selection(&schema, &batch)?;
         collector
             .push(batch)
             .map_err(|error| format!("collect bounded COW match batch: {error}"))?;
@@ -3252,13 +3312,10 @@ fn cow_selection_from_matched_and_insert(
                     )
                 })?;
             columns.push(
-                novarocks_execution::exec::expr::cast_array_to_target(
-                    old_rows.column(ordinal),
-                    field.field().data_type(),
-                )
+                crate::query_execution::row_mutation::normalize_signed_column(old_rows.column(ordinal), field.field())
                 .map_err(|error| {
                     format!(
-                        "cast provider COW before-image field `{}` to its sealed contract: {error}",
+                        "normalize provider COW before-image field `{}` to its sealed contract: {error}",
                         field.field().name()
                     )
                 })?,
@@ -3276,13 +3333,10 @@ fn cow_selection_from_matched_and_insert(
                     )
                 })?;
             columns.push(
-                novarocks_execution::exec::expr::cast_array_to_target(
-                    new_rows.column(ordinal),
-                    field.field().data_type(),
-                )
+                crate::query_execution::row_mutation::normalize_signed_column(new_rows.column(ordinal), field.field())
                 .map_err(|error| {
                     format!(
-                        "cast provider COW after-image field `{}` to its sealed contract: {error}",
+                        "normalize provider COW after-image field `{}` to its sealed contract: {error}",
                         field.field().name()
                     )
                 })?,
@@ -3329,13 +3383,10 @@ fn cow_selection_from_matched_and_insert(
                     )
                 })?;
             columns.push(
-                novarocks_execution::exec::expr::cast_array_to_target(
-                    insert_batch.column(ordinal),
-                    field.field().data_type(),
-                )
+                crate::query_execution::row_mutation::normalize_signed_column(insert_batch.column(ordinal), field.field())
                 .map_err(|error| {
                     format!(
-                        "cast provider COW MERGE INSERT field `{}` to its sealed contract: {error}",
+                        "normalize provider COW MERGE INSERT field `{}` to its sealed contract: {error}",
                         field.field().name()
                     )
                 })?,
@@ -3421,6 +3472,7 @@ fn execute_exact_cow_match_query(
         &capacity.window_alias(),
     )?;
     let (schema, _) = cow_selection_layout(preparation)?;
+    let declaration = cow_selection_execution_types(preparation)?;
     let consumer =
         crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_with_capacity(
             connector_context.clone(),
@@ -3462,7 +3514,9 @@ fn execute_exact_cow_match_query(
         None,
         state.constant_policy(),
         compile_control.clone(),
-    );
+    )
+    .with_root_output_declaration(declaration.clone())
+    .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?
         .into_pending()
@@ -3533,6 +3587,8 @@ fn execute_exact_cow_match_query(
             novarocks_query_application::api::QueryExecutionKind::Read,
             &candidate,
         )?;
+    check_cow_root_output_types(output.fields(), &declaration, &completion_control)
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -7832,6 +7888,44 @@ mod generated_query_transfer_tests {
                 parse_generated_query(sql, "COW rewrite branch").unwrap_err(),
                 expected
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_output_declaration_tests {
+    use super::check_cow_root_output_types;
+    use arrow::datatypes::DataType;
+    use novarocks_query_application::api::ResultField;
+    use novarocks_sql::compiler::{SqlCompileControl, SqlCompileError};
+    use novarocks_type_contract::FunctionValueType;
+    #[test]
+    fn cow_root_output_check_uses_signed_alias_and_complete_width_before_execution() {
+        let declaration = vec![
+            FunctionValueType::new(DataType::FixedSizeBinary(4), false),
+            FunctionValueType::new(DataType::Int8, false),
+        ];
+        let fields = vec![
+            ResultField::new("__nr_sel_1", FunctionValueType::new(DataType::Int8, true)),
+            ResultField::new(
+                "__nr_sel_0",
+                FunctionValueType::new(DataType::FixedSizeBinary(4), true),
+            ),
+        ];
+        let control = SqlCompileControl::unbounded();
+        check_cow_root_output_types(&fields, &declaration, &control).unwrap();
+        for bad in [
+            vec![
+                fields[0].clone(),
+                ResultField::new("__nr_sel_0", FunctionValueType::new(DataType::Binary, true)),
+            ],
+            vec![fields[0].clone(), fields[0].clone()],
+            vec![fields[0].clone()],
+        ] {
+            assert!(matches!(
+                check_cow_root_output_types(&bad, &declaration, &control),
+                Err(SqlCompileError::InvalidRequest(_))
+            ));
         }
     }
 }

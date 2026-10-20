@@ -959,6 +959,9 @@ fn try_fold_node_with_services(
                 return Err(SqlCompileError::CompilationSource(source));
             }
         }
+        Err(SqlConstantEvaluationError::Outer(source)) => {
+            return Err(SqlCompileError::CompilationSource(source));
+        }
         Err(SqlConstantEvaluationError::Evaluation(error)) => Err(error),
         Err(SqlConstantEvaluationError::Control(error)) => return Err(error.into()),
         Err(SqlConstantEvaluationError::Constant(error)) => return Err(error.into()),
@@ -2784,6 +2787,62 @@ mod complete_fold_type_tests {
                     class
                 );
             }
+            assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
+        }
+    }
+
+    struct OuterFoldEvaluator(Mutex<Option<novarocks_failure_contract::SharedFailureCause>>);
+    impl SqlConstantEvaluator for OuterFoldEvaluator {
+        fn eval_scalar(
+            &self,
+            _: &FoldRequest,
+            _: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+        {
+            Err(SqlConstantEvaluationError::Outer(
+                self.0.lock().unwrap().as_ref().unwrap().clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn outer_data_is_fatal_while_row_data_declines_with_the_same_diagnostic() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        static EVALUATOR: OuterFoldEvaluator = OuterFoldEvaluator(Mutex::new(None));
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            FunctionValueType::new(DataType::Int64, false),
+        );
+        let root = arena.intern(
+            ScalarNode::Cast {
+                child,
+                target: DataType::Int32,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            FunctionValueType::new(DataType::Int32, true),
+        );
+        // Class describes the producer fact. The actual error channel owns
+        // maskability, independently of these identical diagnostics.
+        for class in [
+            FailureClass::Data,
+            FailureClass::Resource,
+            FailureClass::Invariant,
+        ] {
+            let source = SharedFailureCause::new(ProjectedFoldSource(class));
+            *EVALUATOR.0.lock().unwrap() = Some(source.clone());
+            let mut work = CompileCheckpoints::try_new(
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                CompilePhase::Validate,
+            )
+            .unwrap();
+            let Err(SqlCompileError::CompilationSource(actual)) =
+                try_fold_node(&mut arena, root, &EVALUATOR, &mut work)
+            else {
+                panic!("an outer failure cannot be an optional fold miss");
+            };
+            assert_eq!(actual, source);
+            assert_eq!(actual.failure_fact(), source.failure_fact());
             assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
         }
     }

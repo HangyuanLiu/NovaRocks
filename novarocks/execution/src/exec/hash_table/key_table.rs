@@ -21,7 +21,7 @@ use hashbrown::raw::RawTable;
 use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
-use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
+use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::exec::hash_table::hash::seed_from_hasher;
 use crate::exec::hash_table::key_builder::{
     GroupKeyArrayView, build_compressed_flags, build_group_key_hashes, build_one_number_hashes,

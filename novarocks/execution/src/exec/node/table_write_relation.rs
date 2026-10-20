@@ -904,7 +904,7 @@ mod tests {
                     .collect(),
                 ValueTypeStorageLifetime::pure(),
                 |_| Ok(()),
-                &crate::exec::expr::pure_differential::HarnessControl,
+                &crate::exec::expr::test_support::HarnessControl,
             )
         };
         let writer_layout = layout(

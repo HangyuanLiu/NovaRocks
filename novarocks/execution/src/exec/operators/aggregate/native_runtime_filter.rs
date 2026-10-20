@@ -19,7 +19,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::exec::expr::agg::AggregateVec;
+use crate::exec::hash_table::allocation::AggregateVec;
 use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 use crate::exec::operators::aggregate::topn_boundary::{

@@ -281,8 +281,9 @@ fn is_low_cardinality_exchange_dictionary(data_type: &DataType) -> bool {
 // Hash partition implementation (vectorized, no row conversion)
 mod data_stream_sink_hash_partition {
     use super::{
-        Chunk, ExprArena, ExprId, StreamDictionaryKeyFailure, check_partition_row_extent,
-        is_low_cardinality_exchange_dictionary, partition_arrow, stream_contract,
+        Chunk, ExprArena, ExprId, RuntimeKernelControl, StreamDictionaryKeyFailure,
+        check_partition_row_extent, is_low_cardinality_exchange_dictionary, partition_arrow,
+        stream_contract,
     };
     use crate::exec::hash_table::hash::{canonical_f32_bits, canonical_f64_bits};
     use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
@@ -1160,10 +1161,10 @@ mod data_stream_sink_hash_partition {
         source: &Chunk,
         rows: &[u32],
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &dyn crate::exec::expr::ExprEvaluationControl,
+        control: &RuntimeKernelControl,
     ) -> crate::runtime::fragment::ExecutionResult<Chunk> {
         use crate::exec::pipeline::operator::ConstructionFailure;
-        control.checkpoint()?;
+        control.checkpoint_execution()?;
         let owner = factory.begin_input_construction(source)?;
         for layout in [
             std::alloc::Layout::array::<u32>(rows.len()),
@@ -1206,7 +1207,7 @@ mod data_stream_sink_hash_partition {
                 )?)
             },
         )?;
-        control.checkpoint()?;
+        control.checkpoint_execution()?;
         Ok(output)
     }
 
@@ -1232,9 +1233,9 @@ mod data_stream_sink_hash_partition {
         partitions: usize,
         crc: bool,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &dyn crate::exec::expr::ExprEvaluationControl,
+        control: &RuntimeKernelControl,
     ) -> ExecutionResult<Vec<Chunk>> {
-        control.checkpoint()?;
+        control.checkpoint_execution()?;
         let out = partition_chunk_by_hash_with(
             chunk,
             exprs,
@@ -1243,7 +1244,7 @@ mod data_stream_sink_hash_partition {
             crc,
             |source, rows| take_partition_rows_created(source, rows, factory, control),
         )?;
-        control.checkpoint()?;
+        control.checkpoint_execution()?;
         Ok(out)
     }
     fn partition_chunk_by_hash_with<E: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -1282,14 +1283,14 @@ mod data_stream_sink_hash_partition {
         partitions: usize,
         crc: bool,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &dyn crate::exec::expr::ExprEvaluationControl,
+        control: &RuntimeKernelControl,
     ) -> ExecutionResult<Vec<Chunk>> {
-        control.checkpoint()?;
+        control.checkpoint_execution()?;
         let output =
             partition_chunk_by_hash_arrays_with(chunk, keys, partitions, crc, |source, rows| {
                 take_partition_rows_created(source, rows, factory, control)
             })?;
-        control.checkpoint()?;
+        control.checkpoint_execution()?;
         Ok(output)
     }
     fn partition_chunk_by_hash_arrays_with(

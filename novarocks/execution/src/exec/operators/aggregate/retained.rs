@@ -20,9 +20,8 @@ use std::sync::Arc;
 
 use novarocks_functions::AggregateInputBatch;
 
-use crate::exec::expr::agg::{
-    AggKernelEntry, AggStatePtr, AggregateAllocator, AggregateVec, RetainedMemoryPolicy,
-};
+use crate::exec::expr::agg::{AggKernelEntry, AggStatePtr, RetainedMemoryPolicy};
+use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};

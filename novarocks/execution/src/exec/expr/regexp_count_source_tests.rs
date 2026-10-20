@@ -50,9 +50,9 @@ fn fixture(pattern: Option<&str>, complete: bool) -> (ExprArena, ExprId) {
             )),
             ty.clone(),
             array.to_data(),
-            super::pure_differential::constant_policy(),
+            super::test_support::constant_policy(),
             novarocks_type_contract::CompilePhase::FunctionSpecialization,
-            &super::pure_differential::HarnessControl,
+            &super::test_support::HarnessControl,
         )
         .unwrap();
         let selected = pool.value(1).unwrap();
@@ -289,9 +289,9 @@ fn regexp_count_receipt_rejects_actual_json_pool_even_when_complete_physical_typ
         Arc::new(json.try_to_field("checked json pattern").unwrap()),
         json,
         array.to_data(),
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         novarocks_type_contract::CompilePhase::FunctionSpecialization,
-        &super::pure_differential::HarnessControl,
+        &super::test_support::HarnessControl,
     )
     .unwrap();
     let value = pool.value(1).unwrap();

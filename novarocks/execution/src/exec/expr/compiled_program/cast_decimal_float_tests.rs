@@ -15,10 +15,97 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual LocalCompiler -> checked LocalProgram -> Frame Decimal Float64 profile witnesses.
+//! Actual LocalCompiler -> checked LocalProgram -> Frame with independent IEEE bits.
+//! Fixed corpus tables replace the removed evaluator/reference calculator.
 use super::*;
-use crate::exec::expr::legacy_decimal_float_cast_baseline_tests::{actual, input};
-use arrow::array::{Float64Array, UInt32Array};
+use arrow::array::{Decimal128Array, Decimal256Array, Float64Array};
+
+// Pure type/data construction only; this helper never evaluates a CAST.
+fn input(wide: bool, p: u8, s: i8, raw: Vec<Option<i128>>) -> ArrayRef {
+    if wide {
+        Arc::new(
+            Decimal256Array::from(
+                raw.into_iter()
+                    .map(|x| x.map(arrow_buffer::i256::from_i128))
+                    .collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(p, s)
+            .unwrap(),
+        )
+    } else {
+        Arc::new(
+            Decimal128Array::from(raw)
+                .with_precision_and_scale(p, s)
+                .unwrap(),
+        )
+    }
+}
+
+// Mathematical worksheet: raw1, raw0, raw-1, rawMAX, at the profile's scale.
+// Raw r denotes r*10^-scale; precision is a frozen declaration and does not
+// silently trim full physical carrier payloads supplied by this corpus.
+// The independent integer-rational IEEE worksheet is retained with the draft.
+// Float64 entries preserve the historical sequence of binary64 rounding,
+// rather than claiming correctly rounded exact decimal-to-binary conversion.
+// MAX first rounds to 2^127. Scale38 uses P38=0x47d2ced32a16a1b1 and its
+// rounded reciprocal 0x380b38fb9daa78e4. Scale76's standard powi witness is
+// P76=0x4fb61bcca7119917, one ULP above nearest exact 10^76. Reciprocal and
+// final multiply/divide are separately rounded. Every listed output is finite.
+fn expected_bits(wide: bool, scale: i8) -> [Option<u64>; 4] {
+    match (wide, scale) {
+        (false, -38) => [
+            Some(0x47d2ced32a16a1b1),
+            Some(0),
+            Some(0xc7d2ced32a16a1b1),
+            Some(0x4fc2ced32a16a1b1),
+        ],
+        (false, -3) | (true, -3) => [
+            Some(0x408f400000000000),
+            Some(0),
+            Some(0xc08f400000000000),
+            Some(0x487f400000000000),
+        ],
+        (false, 0) | (true, 0) => [
+            Some(0x3ff0000000000000),
+            Some(0),
+            Some(0xbff0000000000000),
+            Some(0x47e0000000000000),
+        ],
+        (false, 1) | (true, 1) => [
+            Some(0x3fb999999999999a),
+            Some(0),
+            Some(0xbfb999999999999a),
+            Some(0x47a999999999999a),
+        ],
+        (false, 38) => [
+            Some(0x380b38fb9daa78e4),
+            Some(0),
+            Some(0xb80b38fb9daa78e4),
+            Some(0x3ffb38fb9daa78e4),
+        ],
+        (true, -76) => [
+            Some(0x4fb61bcca7119917),
+            Some(0),
+            Some(0xcfb61bcca7119917),
+            Some(0x57a61bcca7119917),
+        ],
+        (true, 76) => [
+            Some(0x3027288e1271f512),
+            Some(0),
+            Some(0xb027288e1271f512),
+            Some(0x3817288e1271f512),
+        ],
+        _ => panic!("the fixed corpus must have an explicit handwritten IEEE table"),
+    }
+}
+fn assert_bits(array: &ArrayRef, expected: &[Option<u64>]) {
+    assert_eq!(array.data_type(), &DataType::Float64);
+    let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+    let actual = (0..array.len())
+        .map(|row| (!array.is_null(row)).then(|| array.value(row).to_bits()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
 fn batch(program: &LocalProgram, a: ArrayRef) -> RecordBatch {
     let len = a.len();
     RecordBatch::try_new(
@@ -33,8 +120,8 @@ fn batch(program: &LocalProgram, a: ArrayRef) -> RecordBatch {
 }
 fn full(wide: bool) {
     for p in [1, if wide { 76 } else { 38 }] {
-        // PhysicalPlan resource.rs admits -max_scale..max_scale;
-        // the wider original Arrow/FVT domain stays covered by direct recipe oracles.
+        // Retain the original physical precision/scale domain and repeated
+        // precision-one scale1 profile; these are not inferred from displays.
         let max_scale = if wide { 76 } else { 38 };
         for scale in [-max_scale, -3, 0, 1, p as i8] {
             for nullable in [false, true] {
@@ -54,6 +141,10 @@ fn full(wide: bool) {
                             },
                         )
                         .slice(1, 4);
+                        let mut expected = expected_bits(wide, scale);
+                        if nullable {
+                            expected[1] = None;
+                        }
                         let program = compiled(
                             FunctionValueType::new(a.data_type().clone(), nullable),
                             FunctionValueType::new(DataType::Float64, nullable),
@@ -62,23 +153,26 @@ fn full(wide: bool) {
                             policy,
                             allow,
                         );
-                        let rows = [0, 1, 3];
                         let b = batch(&program, a.clone());
-                        let out = instance(&program)
-                            .evaluate(&b, Selection::try_sparse(4, &rows).unwrap(), &Control)
-                            .unwrap();
-                        let old = actual(&a, policy, allow).unwrap();
-                        let expected = arrow::compute::take(
-                            old.as_ref(),
-                            &UInt32Array::from(rows.map(|r| r as u32).to_vec()),
-                            None,
-                        )
-                        .unwrap();
-                        assert_eq!(out.values().to_data(), expected.to_data());
+                        let rows = [0, 1, 3];
+                        let selected = Selection::try_sparse(4, &rows).unwrap();
+                        let out = instance(&program).evaluate(&b, selected, &Control).unwrap();
+                        assert_eq!(out.selection(), selected);
+                        assert_bits(out.values(), &[expected[0], expected[1], expected[3]]);
                         assert!(out.errors().is_empty());
-                        let empty = instance(&program)
-                            .evaluate(&b, Selection::try_sparse(4, &[]).unwrap(), &Control)
+                        // Full selection also covers raw-1, including wide
+                        // Float32 -infinity and negative-underflow-zero cases.
+                        let all = instance(&program)
+                            .evaluate(&b, Selection::all(4), &Control)
                             .unwrap();
+                        assert_eq!(all.selection(), Selection::all(4));
+                        assert_bits(all.values(), &expected);
+                        assert!(all.errors().is_empty());
+                        let empty_selected = Selection::try_sparse(4, &[]).unwrap();
+                        let empty = instance(&program)
+                            .evaluate(&b, empty_selected, &Control)
+                            .unwrap();
+                        assert_eq!(empty.selection(), empty_selected);
                         assert_eq!(empty.values().data_type(), &DataType::Float64);
                         assert_eq!(empty.values().len(), 0);
                         assert!(empty.errors().is_empty());
@@ -91,20 +185,21 @@ fn full(wide: bool) {
                             allow,
                         );
                         let cb = batch(&constant, input(wide, p, scale, vec![Some(0); 4]));
-                        let expanded = input(wide, p, scale, vec![Some(1); 3]);
                         let out = instance(&constant)
-                            .evaluate(&cb, Selection::try_sparse(4, &rows).unwrap(), &Control)
+                            .evaluate(&cb, selected, &Control)
                             .unwrap();
-                        assert_eq!(
-                            out.values().to_data(),
-                            actual(&expanded, policy, allow).unwrap().to_data()
-                        );
+                        assert_eq!(out.selection(), selected);
+                        // The genuine compiled fixture authors raw1, so its
+                        // fixed expected bit is the first entry of this table.
+                        assert_bits(out.values(), &[expected_bits(wide, scale)[0]; 3]);
+                        assert!(out.errors().is_empty());
                     }
                 }
             }
         }
     }
 }
+
 #[test]
 fn decimal_float_actual_compiler_decimal128_float64() {
     full(false);

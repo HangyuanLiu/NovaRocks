@@ -117,7 +117,6 @@ use novarocks_spi::connector::write_stack::{
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, record_batch_additional_bytes, record_batch_bytes};
-use crate::exec::expr::agg::SealedExecutionFunctionSet;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 use crate::exec::node::table_write_relation::{
@@ -147,6 +146,7 @@ use crate::exec::pipeline::{
     step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
     step_context::StepContext,
 };
+use crate::runtime::function_set::SealedExecutionFunctionSet;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::observable::ObserverSubscription;
 use crate::runtime::profile::OperatorProfiles;

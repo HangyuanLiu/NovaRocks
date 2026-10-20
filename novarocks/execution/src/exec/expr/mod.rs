@@ -1766,9 +1766,6 @@ mod numeric_unary_narrow_state_source_tests;
 mod map_entries_copy_edge_tests;
 
 #[cfg(test)]
-mod sql_fold_dependency_observation_tests;
-
-#[cfg(test)]
 mod sql_published_source_observation_tests;
 
 #[cfg(test)]
@@ -1835,9 +1832,6 @@ mod percentile_hash_original_sql_source_tests;
 mod legacy_observed_list_cast_baseline_tests;
 
 #[cfg(test)]
-mod sql_dependency_resolved_binding_source_tests;
-
-#[cfg(test)]
 mod between_actual_sql_compiler_tests;
 #[cfg(test)]
 mod legacy_between_observed_baseline_tests;
@@ -1846,9 +1840,6 @@ mod legacy_between_observed_baseline_tests;
 mod integral_decimal128_actual_sql_tests;
 #[cfg(test)]
 mod legacy_integral_decimal128_baseline_tests;
-
-#[cfg(test)]
-mod percentile_hash_original_fold_tests;
 
 #[cfg(test)]
 mod between_actual_after_tests;
@@ -2039,3 +2030,6 @@ mod signed_cast_nullability_sql_tests;
 
 #[cfg(test)]
 mod regexp_count_source_tests;
+
+#[cfg(test)]
+pub(crate) mod test_support;

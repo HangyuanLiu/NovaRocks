@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Observation probes, not a claim of whole-invocation equivalence.
+//! Compiled invocation-order probes with independent values and diagnostics.
+//! SEP-1 checks both epoch-offset addition and the calendar literal width.
+//! Extreme carriers produce row errors under every build profile, never panics.
+//! The legacy arena's first-error String return was a historical shell contract,
+//! not the compiled row-journal contract; no old evaluator runs in these tests.
 //! Mount as a child of compiled_program/cast_tests.rs. Each case owns a fresh
 //! actual compiler instance; a caught panic is never followed by reuse.
 use super::*;
-use crate::exec::expr::legacy_date_float_cast_baseline_tests::actual;
-use arrow::array::{Date32Array, Float32Array, Float64Array, UInt32Array};
+use arrow::array::{Date32Array, Float32Array, Float64Array};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +34,6 @@ struct FloatSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Observation {
     Rows(FloatSnapshot, Vec<(usize, String)>),
-    Data(String),
     Kernel(String),
     Panic(String),
 }
@@ -65,37 +67,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "unknown panic payload".to_owned()
-    }
-}
-fn arena_observation(
-    source: &ArrayRef,
-    selected_rows: &[usize],
-    target: DataType,
-    policy: DecimalOverflowPolicy,
-    allow: bool,
-) -> Observation {
-    // This is the real reference invocation domain: no inactive carrier enters
-    // arena.eval. take preserves the selected Arrow NULL bitmap and order.
-    let indices = UInt32Array::from(
-        selected_rows
-            .iter()
-            .map(|r| u32::try_from(*r).unwrap())
-            .collect::<Vec<_>>(),
-    );
-    let demanded = arrow::compute::take(source.as_ref(), &indices, None).unwrap();
-    match catch_unwind(AssertUnwindSafe(|| {
-        actual(&demanded, target.clone(), policy, allow)
-    })) {
-        Ok(Ok(values)) => Observation::Rows(snapshot(&values), Vec::new()),
-        Ok(Err(error)) => {
-            use novarocks_failure_contract::{FailureClass, FailureProjection};
-            if error.failure_fact().class() == FailureClass::Data {
-                Observation::Data(error.detail().to_owned())
-            } else {
-                Observation::Kernel(format!("{error:?}"))
-            }
-        }
-        Err(payload) => Observation::Panic(panic_message(payload)),
     }
 }
 fn compiled_observation(
@@ -229,6 +200,48 @@ fn cases() -> Vec<Case> {
         },
     ]
 }
+fn expected_compiled(case: &Case, target: &DataType) -> Observation {
+    let min = format!("CAST failed: from Date32 to {target:?}: invalid Date32 value -2147483648");
+    let max = format!("CAST failed: from Date32 to {target:?}: invalid Date32 value 2147483647");
+    // Epoch day zero encodes decimal date 19700101. IEEE nearest-even gives
+    // f32 19700100 (ULP 2) and exact f64 19700101. These fixed bits do not
+    // invoke a cast implementation or derive an expectation from its output.
+    let epoch = match target {
+        DataType::Float32 => 0x4b96_4cc2,
+        DataType::Float64 => 0x4172_c998_5000_0000,
+        _ => panic!("probe expected float target"),
+    };
+    let rows = |bits, errors| {
+        Observation::Rows(
+            FloatSnapshot {
+                dtype: target.clone(),
+                bits,
+            },
+            errors,
+        )
+    };
+    // Epoch-offset and calendar bounds are checked by the production owner.
+    // Both extremes are row errors; inactive and NULL carriers are untouched.
+    match case.label {
+        "MIN_MAX_all" => rows(vec![None, None], vec![(0, min), (1, max)]),
+        "MAX_MIN_all" => rows(vec![None, None], vec![(0, max), (1, min)]),
+        "MIN_isolated" | "MIN_MAX_only_MIN" | "MAX_MIN_only_MIN" => {
+            rows(vec![None], vec![(0, min)])
+        }
+        "MAX_isolated" | "MIN_MAX_only_MAX" => rows(vec![None], vec![(0, max)]),
+        "empty_demand" => rows(vec![], vec![]),
+        "MIN_hidden_MAX_NULL" => rows(vec![None, None], vec![(0, min)]),
+        "hidden_MIN_NULL_MAX" => rows(vec![None, None], vec![(1, max)]),
+        "MAX_hidden_MIN_NULL" => rows(vec![None, None], vec![(0, max)]),
+        "hidden_MAX_NULL_MIN" => rows(vec![None, None], vec![(1, min)]),
+        "safe_hidden_MAX_NULL" => rows(vec![Some(epoch), None], vec![]),
+        "safe_inactive_MAX" => rows(vec![Some(epoch)], vec![]),
+        _ => panic!(
+            "unmapped independently authored probe shape: {}",
+            case.label
+        ),
+    }
+}
 fn run_probe(target: DataType) {
     for policy in [
         DecimalOverflowPolicy::OutputNull,
@@ -243,74 +256,54 @@ fn run_probe(target: DataType) {
                 policy,
                 allow,
             );
-            let max: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
-            let max_raw = arena_observation(&max, &[0], target.clone(), policy, allow);
-            let max_compiled = compiled_observation(&program, &max, &[0]);
-            let arithmetic_panics = matches!(max_raw, Observation::Panic(_));
             for case in cases() {
+                let expected = expected_compiled(&case, &target);
                 let source: ArrayRef = Arc::new(Date32Array::new(
                     case.carriers.into(),
                     Some(arrow_buffer::NullBuffer::from(case.valid)),
                 ));
-                let raw = arena_observation(&source, &case.selected, target.clone(), policy, allow);
-                let compiled = compiled_observation(&program, &source, &case.selected);
+                let observed = compiled_observation(&program, &source, &case.selected);
                 eprintln!(
-                    "DATE_FLOAT_INVOCATION_PROBE target={target:?} policy={policy:?} allow={allow} case={} selected={:?} arena={raw:?} compiled={compiled:?}",
+                    "DATE_FLOAT_INVOCATION_PROBE target={target:?} policy={policy:?} allow={allow} case={} selected={:?} expected={expected:?} compiled={observed:?}",
                     case.label, case.selected,
                 );
-                match (&raw, &compiled) {
-                    (Observation::Rows(a, ae), Observation::Rows(b, be)) => {
-                        assert!(ae.is_empty() && be.is_empty(), "{}", case.label);
-                        assert_eq!(a, b, "{}", case.label);
-                    }
-                    (Observation::Data(message), Observation::Rows(_, errors)) => {
-                        // Row diagnostics are the compiled API, whereas the
-                        // old arena returns its first full-batch String.
-                        assert_eq!(
-                            errors.first().map(|(_, e)| e.as_str()),
-                            Some(message.as_str()),
-                            "{}",
-                            case.label
-                        );
-                        if case.label == "MIN_MAX_only_MIN" || case.label == "MAX_MIN_only_MIN" {
-                            assert_eq!(errors[0].0, 0);
-                            assert_eq!(errors.len(), 1);
-                        }
-                    }
-                    (Observation::Panic(a), Observation::Panic(b)) => {
-                        assert_eq!(a, b, "{}", case.label)
-                    }
-                    (Observation::Data(message), Observation::Panic(_)) => {
-                        // This assertion freezes the observed discrepancy; it
-                        // deliberately does not call the paths equivalent.
-                        assert_eq!(case.label, "MIN_MAX_all");
-                        assert!(arithmetic_panics);
-                        assert_eq!(compiled, max_compiled);
-                        assert_eq!(
-                            message,
-                            &format!(
-                                "CAST failed: from Date32 to {target:?}: invalid Date32 value -2147483648"
-                            )
-                        );
-                    }
-                    _ => panic!(
-                        "unexpected probe classification {}: arena={raw:?}, compiled={compiled:?}",
-                        case.label
-                    ),
+                // Exact values, NULL placeholders, error order/selected ordinal,
+                // full diagnostics are pinned. Any caught panic fails this
+                // expected Rows result; every observation owns a fresh instance.
+                assert_eq!(observed, expected, "{}", case.label);
+                if matches!(case.label, "MIN_MAX_only_MIN" | "MAX_MIN_only_MIN") {
+                    let Observation::Rows(_, errors) = &observed else {
+                        panic!("MIN must be a recoverable selected-row error")
+                    };
+                    assert_eq!(errors.len(), 1);
+                    assert_eq!(errors[0].0, 0);
+                    assert_eq!(
+                        errors[0].1,
+                        format!(
+                            "CAST failed: from Date32 to {target:?}: invalid Date32 value -2147483648"
+                        )
+                    );
                 }
-                if case.label == "MIN_MAX_all" && arithmetic_panics {
-                    assert!(matches!(raw, Observation::Data(_)));
-                    assert!(matches!(compiled, Observation::Panic(_)));
+                if matches!(
+                    case.label,
+                    "empty_demand" | "safe_hidden_MAX_NULL" | "safe_inactive_MAX"
+                ) {
+                    let Observation::Rows(values, errors) = &observed else {
+                        panic!("inactive or NULL extreme cannot panic")
+                    };
+                    assert_eq!(values.dtype, target);
+                    assert_eq!(values.bits.len(), case.selected.len());
+                    assert!(errors.is_empty());
                 }
             }
         }
     }
 }
 #[test]
-fn date_float_review_probe_real_arena_actual_compiler_f32_invocation_order() {
+fn date_float_review_probe_checked_compiler_f32_invocation_order() {
     run_probe(DataType::Float32);
 }
 #[test]
-fn date_float_review_probe_real_arena_actual_compiler_f64_invocation_order() {
+fn date_float_review_probe_checked_compiler_f64_invocation_order() {
     run_probe(DataType::Float64);
 }

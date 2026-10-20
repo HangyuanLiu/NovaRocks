@@ -300,9 +300,9 @@ fn legacy_hll_hash_original_constant_broadcast_nonzero_pool_and_ignored_target()
         Arc::new(ty.try_to_field("constant").unwrap()),
         ty,
         backing.to_data(),
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         CompilePhase::FunctionSpecialization,
-        &super::pure_differential::HarnessControl,
+        &super::test_support::HarnessControl,
     )
     .unwrap();
     for node in [

@@ -65,6 +65,7 @@ pub use mv_rewrite::{
 
 // The request profile has one owner; application test fixtures may author
 // their explicit ceiling without a second default or translation vocabulary.
+pub use crate::analyzer::root_output_declaration::root_output_type_matches;
 pub use novarocks_functions::ConstantPolicy;
 
 /// SQL's read-only observation of statement cancellation.
@@ -628,10 +629,23 @@ pub enum SqlConstantEvaluationError {
     Control(novarocks_type_contract::CompileControlError),
     Constant(novarocks_functions::ConstantError),
     Source(novarocks_failure_contract::SharedFailureCause),
+    /// An outer evaluator failure is fatal even when its producer fact is Data.
+    Outer(novarocks_failure_contract::SharedFailureCause),
     Evaluation(String),
 }
 
 impl SqlConstantEvaluationError {
+    pub fn outer_domain<E>(source: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::Outer(novarocks_failure_contract::SharedFailureCause::new(source))
+    }
+
     pub fn from_domain<E>(source: E) -> Self
     where
         E: std::error::Error
@@ -682,7 +696,7 @@ impl fmt::Display for SqlConstantEvaluationError {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
-            Self::Source(error) => error.fmt(f),
+            Self::Source(error) | Self::Outer(error) => error.fmt(f),
             Self::Evaluation(error) => f.write_str(error),
         }
     }
@@ -693,7 +707,7 @@ impl std::error::Error for SqlConstantEvaluationError {
         match self {
             Self::Control(source) => Some(source),
             Self::Constant(source) => Some(source),
-            Self::Source(source) => Some(source),
+            Self::Source(source) | Self::Outer(source) => Some(source),
             Self::Evaluation(_) => None,
         }
     }
@@ -975,6 +989,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
+    pub(crate) root_output_declaration: Option<Vec<novarocks_type_contract::FunctionValueType>>,
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
@@ -1004,6 +1019,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             mv_rewrite,
             imv_rewrite: None,
             control,
+            root_output_declaration: None,
         }
     }
 
@@ -1038,7 +1054,29 @@ impl<'a> SqlAnalyzeRequest<'a> {
             mv_rewrite: None,
             imv_rewrite: None,
             control,
+            root_output_declaration: None,
         }
+    }
+
+    /// Exact target domains for the root projection of an internal DML read.
+    /// SQL text cannot supply this input; no type is reconstructed from spelling.
+    pub fn with_root_output_declaration(
+        mut self,
+        declaration: Vec<novarocks_type_contract::FunctionValueType>,
+    ) -> Result<Self, SqlCompileError> {
+        self.check_control()?;
+        if self.intent != SqlCompileIntent::DmlInternalRead
+            || matches!(
+                &self.statement.kind,
+                SqlStatementInputKind::LogicalPlan { .. }
+            )
+        {
+            return Err(SqlCompileError::InvalidRequest(
+                "root output declarations require an analyzed internal DML read".into(),
+            ));
+        }
+        self.root_output_declaration = Some(declaration);
+        Ok(self)
     }
 
     fn freeze_scalar_presence_scope(&mut self) {
@@ -1621,7 +1659,7 @@ impl SqlCompiler {
                         "SQL analysis requires a function catalog".to_string(),
                     )
                 })?;
-                let (resolved, ctes, mut factory) =
+                let (mut resolved, ctes, mut factory) =
                     crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
                         &query,
                         catalog,
@@ -1639,6 +1677,15 @@ impl SqlCompiler {
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
+                crate::analyzer::root_output_declaration::apply_root_output_declaration(
+                    &mut resolved,
+                    &mut factory,
+                    request.root_output_declaration.as_deref(),
+                    functions,
+                    &request.session.sql_semantics,
+                    request.constant_policy,
+                    &request.control,
+                )?;
                 let logical_plan =
                     crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;
                 let consumer_requires_semantic_snapshot =

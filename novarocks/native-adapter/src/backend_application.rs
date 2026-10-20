@@ -41,10 +41,10 @@ use crate::{
     backend_readiness::wait_for_backend_native_endpoint_ready,
     runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
 };
-use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
 };
+use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::creation::TaskCreationInput;
 #[cfg(test)]
@@ -1325,8 +1325,8 @@ mod tests {
         compose_backend_application_services,
     };
     use crate::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress;
-    use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
     use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
+    use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
     use novarocks_native_adapter::backend_test_support::test_backend_native_trust;
     use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
@@ -1370,10 +1370,11 @@ mod tests {
     }
 
     fn test_execution_function_set() -> Arc<SealedExecutionFunctionSet> {
-        let mut builder = novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+        let mut builder =
+            novarocks_execution::runtime::function_set::ExecutionFunctionSetBuilder::new();
         novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
             .expect("builtin function metadata");
-        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+        novarocks_execution::runtime::function_set::contribute_builtin_aggregate_implementations(
             &mut builder,
         )
         .expect("builtin aggregate implementations");

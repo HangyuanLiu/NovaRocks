@@ -28,7 +28,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use crate::exec::expr::agg::AggregateVec;
+use crate::exec::hash_table::allocation::AggregateVec;
 use crate::runtime_filter::contribution::{
     ControlledOrderedTupleError, OrderedScalarRef, OrderedTuple, OrderedTupleError,
     RuntimeOrderContract,

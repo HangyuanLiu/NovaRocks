@@ -33,7 +33,7 @@ use super::contribution::{
     RuntimeOrderNullOrder, RuntimeOrderSortDirection, borrowed_ordered_bound_encoded_len,
     visit_borrowed_ordered_bound,
 };
-use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
+use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::tracked_state_allocator::expression_allocation_host;

@@ -393,7 +393,7 @@ fn original_bitmap_union_int_actual_catalogue_fixed_arity_and_layout_memory_poli
                 arguments: &args,
                 logical_argument_count: n,
             },
-            &crate::exec::expr::pure_differential::HarnessControl,
+            &crate::exec::expr::test_support::HarnessControl,
         );
         assert_eq!(resolved.is_ok(), n == 1);
     }

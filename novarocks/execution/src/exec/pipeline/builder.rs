@@ -82,7 +82,6 @@ pub(crate) use compiled::{CompiledOrderedFilterContext, build_compiled_pipeline_
 use crate::runtime_filter as execution;
 
 use super::operator_factory::OperatorFactory;
-use crate::exec::expr::agg::SealedExecutionFunctionSet;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::assert::AssertNumRowsMode;
 use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinSharedState;
@@ -96,6 +95,7 @@ use crate::exec::operators::{
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
+use crate::runtime::function_set::SealedExecutionFunctionSet;
 
 /// Pipeline-level plan metadata produced by pipeline graph construction.
 pub struct PipelinePlan {

@@ -24,7 +24,7 @@
 
 // Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
 
-use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
+use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
 use novarocks_native_adapter::backend_application::CompiledStaticPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use novarocks_version::StaticPlanInterpreter;

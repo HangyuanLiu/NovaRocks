@@ -511,17 +511,7 @@ impl CompiledExpressionInstance {
             let node = definitions
                 .node(invocation.definition)
                 .ok_or_else(|| invalid("missing actual expression definition"))?;
-            // Error-placeholder NULLs require an outer validity carrier. These
-            // encoded result protocols need their dedicated representation;
-            // never fabricate error bitmaps or change a frozen result type.
-            if matches!(
-                node.data_type(),
-                DataType::Union(..) | DataType::RunEndEncoded(..)
-            ) {
-                return Err(invalid(
-                    "encoded root result requires its dedicated error carrier",
-                ));
-            }
+            admit_node_result(node.data_type())?;
             match node.kind() {
                 StaticExprKind::Constant(_) | StaticExprKind::SlotId(_)
                     if invocation.control == ControlShape::Eager
@@ -609,33 +599,11 @@ impl CompiledExpressionInstance {
                         .calls()
                         .get(&ProgramCallSite::Expression(occurrence))
                         .ok_or_else(|| invalid("missing actual prepared scalar occurrence"))?;
-                    let supported = match (invocation.control, call.specialization().prepared()) {
-                        (
-                            ControlShape::Eager
-                            | ControlShape::TypeOnly
-                            | ControlShape::NoArguments,
-                            PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_),
-                        ) => {
-                            call.call_contract().effects().null_behavior
-                                != FunctionNullBehavior::ControlDefined
-                        }
-                        (
-                            ControlShape::If
-                            | ControlShape::Coalesce
-                            | ControlShape::TemporalSource(_),
-                            PreparedPureKernel::ControlIntrinsic(_),
-                        ) => {
-                            call.call_contract().effects().null_behavior
-                                == FunctionNullBehavior::ControlDefined
-                                && guarded::supports_result(node.data_type())
-                        }
-                        _ => false,
-                    };
-                    if !supported {
-                        return Err(invalid(
-                            "expression requires its dedicated control or carrier protocol",
-                        ));
-                    }
+                    admit_call_protocol(
+                        invocation.control,
+                        call.specialization().prepared(),
+                        node.data_type(),
+                    )?;
                 }
                 _ => {
                     return Err(invalid(
@@ -978,48 +946,54 @@ impl CompiledExpressionInstance {
         else {
             return Err(invalid("actual root is not a value").into());
         };
-        let result = result.materialize(selection, &ty.data_type(), work)?;
-        let (_, array, errors) = result.into_parts();
-        let array =
-            input_source::retain_result_type(array, ty, self.allocator.as_ref(), work.control)?;
-        let result =
-            SelectedValues::try_new_observed(selection, ty.data_type(), array, errors, || {
-                work.step()
-            })?;
-        if !ty.nullable() {
-            let mut errors = result.errors().iter().peekable();
-            work.flush()?;
-            visit_selected_nulls(
-                EvaluatedArgument::SelectedColumn(&result),
-                selection,
-                work.control,
-                |ordinal, _, is_null| {
-                    if errors
-                        .peek()
-                        .is_some_and(|error| error.selected_ordinal() == ordinal)
-                    {
-                        errors.next();
-                    } else if is_null {
-                        return Err(internal(
-                            "non-null compiled root returned a successful SQL NULL",
-                        )
-                        .into());
-                    }
-                    Ok(())
-                },
-            )?;
-        }
-        Ok(result)
+        finish_root_value::<E>(result, ty, selection, self.allocator.as_ref(), work)
     }
 }
 
-fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
-    occurrence: ProgramUseRef,
+fn finish_root_value<'a, E: scalar_invocation::FrameFailure>(
+    result: Value<'a>,
+    ty: &novarocks_functions::FunctionValueType,
+    selection: Selection<'a>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_>,
+) -> Result<SelectedValues<'a>, E> {
+    let result = result.materialize(selection, &ty.data_type(), work)?;
+    let (_, array, errors) = result.into_parts();
+    let array = input_source::retain_result_type(array, ty, allocator, work.control)?;
+    let result =
+        SelectedValues::try_new_observed(selection, ty.data_type(), array, errors, || work.step())?;
+    if !ty.nullable() {
+        let mut errors = result.errors().iter().peekable();
+        work.flush()?;
+        visit_selected_nulls(
+            EvaluatedArgument::SelectedColumn(&result),
+            selection,
+            work.control,
+            |ordinal, _, is_null| {
+                if errors
+                    .peek()
+                    .is_some_and(|error| error.selected_ordinal() == ordinal)
+                {
+                    errors.next();
+                } else if is_null {
+                    return Err(
+                        internal("non-null compiled root returned a successful SQL NULL").into(),
+                    );
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(result)
+}
+
+fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+    occurrence: K,
     prepared: scalar_invocation::PreparedCall<'_>,
     children: &[Value<'a>],
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
+    instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, E> {
@@ -1134,7 +1108,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
         work.step()?;
     }
     work.flush()?;
-    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence.clone()) {
         // The actual host must authorize this instance's immutable lifetime
         // bound before entry. Representability/postchecks are not that grant.
         let instance = match prepared.instantiate(allocator.cloned()) {
@@ -1257,7 +1231,9 @@ pub(crate) mod tests;
 mod copy_tests;
 
 mod guarded;
+mod node_recipes;
 mod scalar_invocation;
+pub(crate) mod utf8_inlist;
 
 #[cfg(test)]
 pub(crate) mod guarded_tests;
@@ -1455,3 +1431,49 @@ mod first_cause_settlement_footer_tests {
         assert!(!domain.snapshot().active);
     }
 }
+
+pub mod constant_node;
+
+fn admit_node_result(ty: &DataType) -> Result<(), KernelFailure> {
+    // Error-placeholder NULLs require an outer validity carrier.
+    if matches!(ty, DataType::Union(..) | DataType::RunEndEncoded(..)) {
+        return Err(invalid(
+            "encoded root result requires its dedicated error carrier",
+        ));
+    }
+    Ok(())
+}
+fn admit_call_protocol(
+    shape: ControlShape,
+    call: &PreparedPureKernel,
+    result: &DataType,
+) -> Result<(), KernelFailure> {
+    let supported = match (shape, call) {
+        (
+            ControlShape::Eager | ControlShape::TypeOnly | ControlShape::NoArguments,
+            PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_),
+        ) => call.call_contract().effects().null_behavior != FunctionNullBehavior::ControlDefined,
+        (
+            ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_),
+            PreparedPureKernel::ControlIntrinsic(_),
+        ) => {
+            call.call_contract().effects().null_behavior == FunctionNullBehavior::ControlDefined
+                && guarded::supports_result(result)
+        }
+        _ => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(invalid(
+            "expression requires its dedicated control or carrier protocol",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod constant_node_tests;
+
+#[cfg(test)]
+#[path = "compiled_program/constant_entry_parity_tests.rs"]
+mod constant_entry_parity_tests;

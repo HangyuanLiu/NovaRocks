@@ -29,7 +29,8 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::agg::{AggKernelEntry, AggregateAllocator, AggregateVec, aggregate_bytes};
+use crate::exec::expr::agg::AggKernelEntry;
+use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec, aggregate_bytes};
 #[cfg(test)]
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 use novarocks_types::largeint;

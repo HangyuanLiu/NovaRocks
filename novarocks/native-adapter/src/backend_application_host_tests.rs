@@ -33,11 +33,12 @@ fn unused_port() -> u16 {
 }
 
 fn test_execution_function_set()
--> Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet> {
-    let mut builder = novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+-> Arc<novarocks_execution::runtime::function_set::SealedExecutionFunctionSet> {
+    let mut builder =
+        novarocks_execution::runtime::function_set::ExecutionFunctionSetBuilder::new();
     novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
         .expect("builtin function metadata");
-    novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+    novarocks_execution::runtime::function_set::contribute_builtin_aggregate_implementations(
         &mut builder,
     )
     .expect("builtin aggregate implementations");

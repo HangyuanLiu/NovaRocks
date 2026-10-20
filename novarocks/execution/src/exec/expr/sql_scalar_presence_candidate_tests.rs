@@ -47,7 +47,7 @@ fn analyze(sql: &str) -> Result<(), SqlCompileError> {
         builtin_sql_function_catalog(),
         &EVALUATOR,
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
     );
     SqlCompiler::analyze(request)?.into_pending()?;
@@ -225,7 +225,7 @@ fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_pub
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
         &EVALUATOR,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
             min: 1,

@@ -15,29 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend adapter that answers the SQL compiler's constant-evaluation port
-//! with the real execution kernels.
-//!
-//! The Frontend is the only owner allowed to bridge these two crates:
-//! `novarocks-sql` must never depend on `novarocks-execution`, so a folded
-//! literal can only stay bit-identical to runtime output if the Frontend
-//! builds a one-node `ExprArena` and runs it through `ExprArena::eval`.
-//!
-//! This adapter is a dumb per-node calculator. Recursion, volatility gating,
-//! foldable-shape policy, and the fail-open decision all live on the SQL side;
-//! here the only decisions are "can this literal/node shape be represented
-//! faithfully?" (`Ok(None)` when not) and "what did the kernel return?".
-
-use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch, RecordBatchOptions,
-};
+//! Frontend projection of SQL's frozen fold facts to the shared compiled core.
+//! SQL owns traversal and fold policy; Execution owns every calculated value.
+use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array};
 use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
-use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-use novarocks_execution::exec::expr::function::lookup_function;
-use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks_functions::{ConstantPool, ConstantValue, validate_function_value_type_observed};
+use novarocks_execution::exec::expr::compiled_program::constant_node::{
+    ConstantCarrierStep, ConstantConversion, ConstantNode, ConstantNodeFailure,
+    ConstantNodeOutcome, evaluate_constant_node,
+};
+use novarocks_functions::{
+    ConstantPool, ConstantValue, KernelDiagnostic, KernelFailure,
+    validate_function_value_type_observed,
+};
 use novarocks_sql::compiler::{
-    BinOp, FoldNodeKind, FoldRequest, SqlConstantEvaluationError, SqlConstantEvaluator, UnOp,
+    CarrierStep, ConversionPlan, FoldArg, FoldRequest, FrozenFoldIntrinsic, FrozenFoldNode,
+    SqlConstantEvaluationError, SqlConstantEvaluator,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, ValueKind,
@@ -45,20 +37,9 @@ use novarocks_type_contract::{
 };
 use std::sync::Arc;
 
-/// Zero-sized, stateless evaluator: it owns no session, catalog, or runtime
-/// state, so one process-lifetime instance serves every compilation.
 #[derive(Debug)]
 struct ExecutionConstantEvaluator;
-
 static EXECUTION_CONSTANT_EVALUATOR: ExecutionConstantEvaluator = ExecutionConstantEvaluator;
-
-/// The Frontend-owned constant evaluator handed to the SQL compiler.
-///
-/// Frontend is the only crate that sees both the SQL compiler boundary and the
-/// execution kernels, so it owns this adapter. Every compile request built here
-/// passes it, which is what lets the optimizer fold constants with exactly the
-/// semantics the runtime would have produced.
-// Design: ADR-0100 (docs/adr/ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
 pub(crate) fn constant_evaluator() -> &'static dyn SqlConstantEvaluator {
     &EXECUTION_CONSTANT_EVALUATOR
 }
@@ -70,63 +51,92 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
         control: &dyn PureCompileControl,
     ) -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let evaluated = (|| -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
-            // Validate all frozen source facts even when a supported-domain
-            // check will decline an earlier argument. No payload enum is read.
-            let mut supported = legacy_value_type_supported(&request.result_type, &mut work)?;
+        let evaluated = (|| {
+            let mut supported = fold_value_type_supported(&request.result_type, &mut work)?;
             for arg in &request.args {
-                supported &= legacy_value_type_supported(&arg.value_type, &mut work)?;
-                if !arg
-                    .value_type
-                    .exactly_equals_observed(arg.value.value_type(), || {
-                        work.step().map_err(SqlConstantEvaluationError::from)
-                    })?
-                {
-                    return Err(novarocks_functions::ConstantError::Invalid(
-                        "fold constant source differs from its exact frozen value type",
-                    )
-                    .into());
+                supported &= validate_argument(arg, &mut work)?;
+            }
+            let (arguments, result_for_entry) = match &request.kind {
+                FrozenFoldNode::Call(call) => (call.arguments(), call.prepared_result_type()),
+                _ => (request.args.as_slice(), &request.result_type),
+            };
+            if let FrozenFoldNode::Call(_) = &request.kind {
+                supported &= fold_value_type_supported(result_for_entry, &mut work)?;
+                for arg in arguments {
+                    supported &= validate_argument(arg, &mut work)?;
                 }
-                work.step()?;
             }
             if !supported {
                 return Ok(None);
             }
-            work.flush()?;
-            let mut arena = ExprArena::default();
-            let mut arg_ids: Vec<ExprId> = Vec::with_capacity(request.args.len());
-            for arg in &request.args {
-                arg_ids.push(arena.push_typed(
-                    ExprNode::Constant(arg.value.clone()),
-                    arg.value_type.data_type().clone(),
-                ));
-                work.step()?;
+            // Preserve the established optional-fold boundary for two bare
+            // NULL carriers. Typed NULL comparisons still use the shared core.
+            if matches!(
+                request.kind,
+                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::NullSafeEq { .. })
+            ) && arguments.len() == 2
+                && arguments
+                    .iter()
+                    .all(|arg| arg.value_type.data_type() == &DataType::Null)
+            {
+                return Ok(None);
             }
-            work.step()?;
-            let Some(root_node) = root_node_for(&request.kind, &arg_ids) else {
+            if let FrozenFoldNode::Call(call) = &request.kind {
+                let effects = call.prepared().call_contract().effects();
+                if effects.value_stability.is_volatile()
+                    || effects.instance_state
+                        != novarocks_type_contract::FunctionInstanceState::None
+                    || !effects.observable_effects.is_empty()
+                {
+                    return Ok(None);
+                }
+            }
+            let Some(node) = project_node(&request.kind) else {
                 return Ok(None);
             };
-            let root = arena.push_typed(root_node, request.result_type.data_type().clone());
-            if let Some(source) = request.regexp_count_pattern_source {
-                arena
-                    .set_regexp_count_pattern_source(root, source)
-                    .map_err(SqlConstantEvaluationError::from_domain)?;
+            let mut children = Vec::with_capacity(arguments.len());
+            for arg in arguments {
+                children.push(arg.value.clone());
+                work.step()?;
             }
             work.flush()?;
-            let chunk = single_row_chunk()?;
-            work.flush()?;
-            // This staged adapter reuses the legacy runtime. Its opaque
-            // internal loops/allocations are not a pure-kernel or MEM proof.
-            let output = arena
-                .eval(root, &chunk)
-                .map_err(SqlConstantEvaluationError::from_domain)?;
+            let outcome = evaluate_constant_node(
+                node,
+                &children,
+                result_for_entry,
+                control,
+                CompilePhase::FunctionSpecialization,
+            )
+            .map_err(|error| match error {
+                ConstantNodeFailure::Control(error) => SqlConstantEvaluationError::Control(error),
+                ConstantNodeFailure::InvalidFrozenNode(message) => {
+                    SqlConstantEvaluationError::outer_domain(KernelFailure::InvalidProgram(
+                        KernelDiagnostic::new(message),
+                    ))
+                }
+                ConstantNodeFailure::Kernel(error) => {
+                    SqlConstantEvaluationError::outer_domain(error)
+                }
+                ConstantNodeFailure::Primitive(error) => {
+                    SqlConstantEvaluationError::outer_domain(error)
+                }
+            })?;
+            let output = match outcome {
+                ConstantNodeOutcome::Value(output) => output,
+                ConstantNodeOutcome::RowError(error) => {
+                    work.flush()?;
+                    return Err(SqlConstantEvaluationError::from_domain(error));
+                }
+                ConstantNodeOutcome::Declined(_) => return Ok(None),
+            };
             work.flush()?;
             if output.len() != 1 {
-                return Err(format!(
-                    "constant folding produced {} rows, expected exactly 1",
-                    output.len()
-                )
-                .into());
+                return Err(SqlConstantEvaluationError::outer_domain(
+                    KernelFailure::InvalidProgram(KernelDiagnostic::new(&format!(
+                        "constant folding produced {} rows, expected exactly 1",
+                        output.len()
+                    ))),
+                ));
             }
             if !novarocks_type_contract::arrow_data_types_exact_observed::<
                 SqlConstantEvaluationError,
@@ -134,24 +144,22 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
                 work.step()?;
                 Ok(())
             })? {
-                return Err("constant folding output differs from its frozen carrier"
-                    .to_owned()
-                    .into());
+                return Err(SqlConstantEvaluationError::outer_domain(
+                    KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                        "constant folding output differs from its frozen carrier",
+                    )),
+                ));
             }
             if output.is_null(0) && !request.result_type.nullable() {
                 return Ok(None);
             }
-            // Preserve the old optional fold refusal for decimal results that
-            // the runtime emits outside their declared precision. CV creation
-            // must not reinterpret that result or truncate a display string.
-            work.flush()?;
-            let utf8_fits = utf8_output_fits(&output, &mut work)?;
-            if !utf8_fits {
+            if !utf8_output_fits(&output, &mut work)? {
                 return Ok(None);
             }
-            let decimal_fits = decimal_output_fits(&output)?;
             work.flush()?;
-            if !decimal_fits {
+            let fits = decimal_output_fits(&output)?;
+            work.flush()?;
+            if !fits {
                 return Ok(None);
             }
             let field = Arc::new(arrow::datatypes::Field::new(
@@ -172,18 +180,81 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
             work.step()?;
             Ok(Some(pool.value(0)?))
         })();
-        if matches!(
-            &evaluated,
-            Err(SqlConstantEvaluationError::Control(_))
-                | Err(SqlConstantEvaluationError::Constant(
-                    novarocks_functions::ConstantError::Limit(_)
-                ))
-        ) {
-            return evaluated;
-        }
-        work.finish()?;
-        evaluated
+        work.finish_result(evaluated, SqlConstantEvaluationError::from)
     }
+}
+fn validate_argument(
+    arg: &FoldArg,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlConstantEvaluationError> {
+    let supported = fold_value_type_supported(&arg.value_type, work)?;
+    if !arg
+        .value_type
+        .exactly_equals_observed(arg.value.value_type(), || {
+            work.step().map_err(SqlConstantEvaluationError::from)
+        })?
+    {
+        return Err(novarocks_functions::ConstantError::Invalid(
+            "fold constant source differs from its exact frozen value type",
+        )
+        .into());
+    }
+    work.step()?;
+    Ok(supported)
+}
+fn project_carrier(step: &CarrierStep) -> ConstantCarrierStep<'_> {
+    ConstantCarrierStep {
+        target: step.target(),
+        decimal_overflow_policy: step.decimal_overflow_policy(),
+        allow_throw_exception: step.allow_throw_exception(),
+    }
+}
+fn project_conversion(plan: &ConversionPlan) -> ConstantConversion<'_> {
+    match plan {
+        ConversionPlan::Identity => ConstantConversion::Identity,
+        ConversionPlan::Carrier(step) => ConstantConversion::Carrier(project_carrier(step)),
+        ConversionPlan::ValueConversion { call, tail } => ConstantConversion::ValueConversion {
+            call: call.prepared().prepared(),
+            call_result: call.prepared_result_type(),
+            tail: tail.as_ref().map(project_carrier),
+        },
+    }
+}
+fn project_node(node: &FrozenFoldNode) -> Option<ConstantNode<'_>> {
+    Some(match node {
+        FrozenFoldNode::Call(call) => ConstantNode::Call(call.prepared().prepared()),
+        FrozenFoldNode::Intrinsic(intrinsic) => match intrinsic {
+            FrozenFoldIntrinsic::Arithmetic {
+                operator,
+                decimal_overflow_policy,
+                allow_throw_exception,
+            } => ConstantNode::Arithmetic {
+                operator: *operator,
+                decimal_overflow_policy: *decimal_overflow_policy,
+                allow_throw_exception: *allow_throw_exception,
+            },
+            FrozenFoldIntrinsic::Comparison {
+                operator,
+                left,
+                right,
+            } => ConstantNode::Comparison {
+                operator: *operator,
+                left: project_conversion(left),
+                right: project_conversion(right),
+            },
+            FrozenFoldIntrinsic::NullSafeEq { left, right } => ConstantNode::NullSafeEquality {
+                left: project_conversion(left),
+                right: project_conversion(right),
+            },
+            FrozenFoldIntrinsic::Conjunction => ConstantNode::Conjunction,
+            FrozenFoldIntrinsic::Disjunction => ConstantNode::Disjunction,
+            FrozenFoldIntrinsic::Not => ConstantNode::Not,
+            FrozenFoldIntrinsic::Cast { plan } => {
+                ConstantNode::Conversion(project_conversion(plan))
+            }
+            FrozenFoldIntrinsic::Negate | FrozenFoldIntrinsic::BitNot => return None,
+        },
+    })
 }
 
 // Inspect bytes before any StringArray::value call can form an invalid &str.
@@ -262,10 +333,9 @@ fn decimal_output_fits(output: &ArrayRef) -> Result<bool, String> {
     }
 }
 
-/// The legacy arena carries Arrow types only. Its one exact non-Physical
-/// scalar representation is the existing LARGEINT literal/kernel protocol;
-/// all other semantic domains need the full-value evaluator migration.
-fn legacy_value_type_supported(
+/// Preserve the existing fold coverage: only root LARGEINT may be nominal;
+/// nested nominal values and physical FixedSizeBinary remain outside this port.
+fn fold_value_type_supported(
     value_type: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, SqlConstantEvaluationError> {
@@ -300,81 +370,18 @@ fn legacy_value_type_supported(
     supported(value_type.value_type(), true, work)
 }
 
-/// A schemaless chunk with exactly one row.
-///
-/// Constant folding never reads a slot, so the chunk carries no columns; the
-/// explicit row count is what makes every literal kernel materialize a
-/// length-1 array.
-fn single_row_chunk() -> Result<Chunk, SqlConstantEvaluationError> {
-    let chunk_schema = Arc::new(ChunkSchema::empty());
-    let batch = RecordBatch::try_new_with_options(
-        chunk_schema.arrow_schema_ref(),
-        Vec::new(),
-        &RecordBatchOptions::new().with_row_count(Some(1)),
-    )
-    .map_err(novarocks_functions::ConstantError::arrow_validation)?;
-    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
-        .map_err(SqlConstantEvaluationError::from_domain)
-}
-
-/// Maps one SQL fold node onto the execution expression it must reuse.
-///
-/// Returns `None` for any shape without a direct execution counterpart: the
-/// adapter must never emulate a missing kernel.
-fn root_node_for(kind: &FoldNodeKind, args: &[ExprId]) -> Option<ExprNode> {
-    match kind {
-        FoldNodeKind::BinaryOp(op, decimal_overflow_policy) => {
-            let [lhs, rhs] = args else {
-                return None;
-            };
-            let (lhs, rhs) = (*lhs, *rhs);
-            Some(match op {
-                BinOp::Add => ExprNode::Add(lhs, rhs, *decimal_overflow_policy),
-                BinOp::Sub => ExprNode::Sub(lhs, rhs, *decimal_overflow_policy),
-                BinOp::Mul => ExprNode::Mul(lhs, rhs, *decimal_overflow_policy),
-                BinOp::Div => ExprNode::Div(lhs, rhs, *decimal_overflow_policy),
-                BinOp::Mod => ExprNode::Mod(lhs, rhs, *decimal_overflow_policy),
-                BinOp::Eq => ExprNode::Eq(lhs, rhs),
-                BinOp::Ne => ExprNode::Ne(lhs, rhs),
-                BinOp::Lt => ExprNode::Lt(lhs, rhs),
-                BinOp::Le => ExprNode::Le(lhs, rhs),
-                BinOp::Gt => ExprNode::Gt(lhs, rhs),
-                BinOp::Ge => ExprNode::Ge(lhs, rhs),
-                BinOp::EqForNull => ExprNode::EqForNull(lhs, rhs),
-                BinOp::And => ExprNode::And(lhs, rhs),
-                BinOp::Or => ExprNode::Or(lhs, rhs),
-            })
-        }
-        FoldNodeKind::UnaryOp(op) => {
-            let [child] = args else {
-                return None;
-            };
-            match op {
-                UnOp::Not => Some(ExprNode::Not(*child)),
-                // Execution has no negation or bitwise-not expression node.
-                // Emulating either here would reimplement semantics the
-                // Frontend does not own, so decline instead.
-                UnOp::Negate | UnOp::BitwiseNot => None,
-            }
-        }
-        FoldNodeKind::Cast(decimal_overflow_policy) => {
-            let [child] = args else {
-                return None;
-            };
-            // The cast target is the node's own data type, which the caller
-            // attaches through `push_typed(.., out_type)`.
-            Some(ExprNode::Cast(*child, *decimal_overflow_policy))
-        }
-        FoldNodeKind::Function { name } => {
-            let kind = lookup_function(name)?;
-            Some(ExprNode::FunctionCall {
-                kind,
-                args: args.to_vec(),
-            })
-        }
-    }
-}
-
 #[cfg(test)]
 #[path = "constant_eval/cv_tests.rs"]
 mod cv_tests;
+
+#[cfg(test)]
+#[path = "constant_eval/sql_fold_dependency_observation_tests.rs"]
+mod sql_fold_dependency_observation_tests;
+
+#[cfg(test)]
+#[path = "constant_eval/sql_dependency_resolved_binding_source_tests.rs"]
+mod sql_dependency_resolved_binding_source_tests;
+
+#[cfg(test)]
+#[path = "constant_eval/percentile_hash_original_fold_tests.rs"]
+mod percentile_hash_original_fold_tests;

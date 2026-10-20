@@ -27,8 +27,8 @@ use arrow::datatypes::DataType;
 
 use super::search::{JoinSelection, ProbeMask, SearchStats};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::agg::IntArrayView;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::hash_table::array_views::IntArrayView;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
 use crate::exec::hash_table::key_builder::{

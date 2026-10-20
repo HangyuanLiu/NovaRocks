@@ -135,42 +135,7 @@ const ANCHOR_SLOT: u32 = 60_000;
 // Controls and constants
 // ---------------------------------------------------------------------------
 
-/// Unbounded compile and evaluation control. Waiting returns immediately so a
-/// sleeping kernel cannot stall a differential run.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct HarnessControl;
-
-impl PureCompileControl for HarnessControl {
-    fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-}
-
-impl KernelEvaluationControl for HarnessControl {
-    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
-        Ok(())
-    }
-
-    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        Ok(())
-    }
-}
-
-/// Generous admission limits for harness constants.
-pub(crate) fn constant_policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 1024,
-        max_array_nodes: 4096,
-        max_logical_elements: 1_000_000,
-        max_retained_buffer_bytes: 4_194_304,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 16,
-        max_metadata_bytes: 1_048_576,
-        max_library_validation_work: 16_777_216,
-        max_library_validation_bytes: 16_777_216,
-    }
-}
+pub(crate) use super::test_support::{HarnessControl, constant_policy};
 
 /// Admit one SQL constant from a one-row array of exactly `value_type`.
 pub(crate) fn constant(value_type: FunctionValueType, single_row: ArrayRef) -> ConstantValue {

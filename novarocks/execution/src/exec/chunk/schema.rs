@@ -1499,9 +1499,7 @@ impl ChunkSchema {
                         field,
                         layout.metadata_materializations(),
                     ),
-                    Some(crate::exec::expr::static_program::thaw_field_schema(
-                        field_schema,
-                    )),
+                    Some(ChunkFieldSchema::from_value_type(field_schema.clone())),
                     unique_id,
                 )
             })
@@ -1642,9 +1640,7 @@ impl ChunkSchema {
                             )
                         })?;
                     (
-                        Some(crate::exec::expr::static_program::thaw_field_schema(
-                            metadata,
-                        )),
+                        Some(ChunkFieldSchema::from_value_type(metadata.clone())),
                         unique_id,
                     )
                 } else {

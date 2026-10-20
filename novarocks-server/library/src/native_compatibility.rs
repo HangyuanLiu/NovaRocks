@@ -75,14 +75,12 @@ fn native_carrier_from_contract(
 pub fn resolve_native_compatibility_material(
     provider_registry: &SealedProviderRegistry,
     function_catalog_digest: [u8; 32],
-    execution_implementation_manifest_digest: [u8; 32],
     static_plan_interpreter: StaticPlanInterpreter,
 ) -> anyhow::Result<NativeCompatibilityMaterial> {
     let declarations = native_carrier_declarations(provider_registry)?;
     derive_repository_native_compatibility_material(
         declarations,
         function_catalog_digest,
-        execution_implementation_manifest_digest,
         PLAN_CONTRACT_REVISION,
         static_plan_interpreter,
     )
@@ -116,19 +114,14 @@ mod tests {
     #[test]
     fn legacy_raw_text_temporal_peer_has_a_distinct_plan_contract_digest() {
         let manifest = server_manifest();
-        let current = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            COMPILED,
-        )
-        .unwrap();
-        // Catalog declarations and implementation profiles are identical here.
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        // Catalog declarations and the composed pure interpreter are identical here.
         // Revision 1 admitted raw UTF8 bounds; the normalized contract must not.
         let legacy = novarocks_version::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
         )
@@ -209,7 +202,6 @@ mod tests {
             novarocks_version::derive_repository_native_compatibility_material(
                 carriers,
                 [0x31; 32],
-                [0x41; 32],
                 novarocks_physical_plan::PLAN_CONTRACT_REVISION,
                 COMPILED,
             )
@@ -224,10 +216,6 @@ mod tests {
             revised.function_catalog_digest()
         );
         assert_eq!(
-            original.execution_implementation_manifest_digest(),
-            revised.execution_implementation_manifest_digest()
-        );
-        assert_eq!(
             original.plan_contract_digest(),
             revised.plan_contract_digest()
         );
@@ -236,20 +224,9 @@ mod tests {
     #[test]
     fn repository_material_is_nonempty_and_uses_the_server_manifest() {
         let manifest = server_manifest();
-        let material = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            COMPILED,
-        )
-        .expect("compatibility material");
-        let implementation_only_change = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x42; 32],
-            COMPILED,
-        )
-        .expect("implementation-only compatibility material");
+        let material =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .expect("compatibility material");
 
         assert_eq!(
             material.carriers(),
@@ -260,7 +237,6 @@ mod tests {
             material.plan_contract_revision(),
             novarocks_physical_plan::PLAN_CONTRACT_REVISION
         );
-        assert_ne!(material.id(), implementation_only_change.id());
 
         let next_plan_revision = novarocks_physical_plan::PLAN_CONTRACT_REVISION
             .checked_add(1)
@@ -268,7 +244,6 @@ mod tests {
         let plan_only_change = novarocks_version::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
-            [0x41; 32],
             next_plan_revision,
             COMPILED,
         )
@@ -359,18 +334,13 @@ mod tests {
     #[test]
     fn peer_without_decimal_largeint_pair_rule_has_a_distinct_plan_digest() {
         let manifest = server_manifest();
-        let current = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            COMPILED,
-        )
-        .unwrap();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
         // Revision 2 has normalized temporal casts but lacks this exact pair.
         let legacy = novarocks_version::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
-            [0x41; 32],
             2,
             COMPILED,
         )
@@ -389,21 +359,16 @@ mod tests {
     #[test]
     fn prior_intrinsic_binding_peer_has_a_distinct_plan_contract_digest() {
         let manifest = server_manifest();
-        let current = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            COMPILED,
-        )
-        .unwrap();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
         // Revision 2 predates intrinsic facts; revision 3 is reserved for the
         // independent Add/Sub semantic root. Both peers lack this closed fact.
-        // Equal catalog and implementation digests isolate the plan revision.
+        // Equal catalogue and pure-interpreter digests isolate the plan revision.
         for revision in [2, 3] {
             let prior = novarocks_version::derive_repository_native_compatibility_material(
                 native_carrier_declarations(manifest.contracts()).unwrap(),
                 [0x31; 32],
-                [0x41; 32],
                 revision,
                 COMPILED,
             )
@@ -416,28 +381,19 @@ mod tests {
                 current.function_catalog_digest(),
                 prior.function_catalog_digest()
             );
-            assert_eq!(
-                current.execution_implementation_manifest_digest(),
-                prior.execution_implementation_manifest_digest()
-            );
         }
     }
 
     #[test]
     fn peers_without_expression_policy_or_bounded_root_have_distinct_plan_digests() {
         let manifest = server_manifest();
-        let current = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            COMPILED,
-        )
-        .unwrap();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
         for prior_revision in [4, 5] {
             let prior = novarocks_version::derive_repository_native_compatibility_material(
                 native_carrier_declarations(manifest.contracts()).unwrap(),
                 [0x31; 32],
-                [0x41; 32],
                 prior_revision,
                 COMPILED,
             )
@@ -454,10 +410,6 @@ mod tests {
                 current.function_catalog_digest(),
                 prior.function_catalog_digest()
             );
-            assert_eq!(
-                current.execution_implementation_manifest_digest(),
-                prior.execution_implementation_manifest_digest()
-            );
         }
     }
 
@@ -470,7 +422,6 @@ mod tests {
         let production = resolve_native_compatibility_material(
             manifest.contracts(),
             [0x31; 32],
-            [0x41; 32],
             StaticPlanInterpreter::CompiledPackage {
                 pure_function_catalog_digest: [0x51; 32],
             },
@@ -479,7 +430,6 @@ mod tests {
         let production_again = resolve_native_compatibility_material(
             manifest.contracts(),
             [0x31; 32],
-            [0x41; 32],
             StaticPlanInterpreter::CompiledPackage {
                 pure_function_catalog_digest: [0x51; 32],
             },
@@ -488,7 +438,6 @@ mod tests {
         let other_catalog = resolve_native_compatibility_material(
             manifest.contracts(),
             [0x31; 32],
-            [0x41; 32],
             StaticPlanInterpreter::CompiledPackage {
                 pure_function_catalog_digest: [0x52; 32],
             },
@@ -510,10 +459,6 @@ mod tests {
             other_catalog.function_catalog_digest()
         );
         assert_eq!(
-            production.execution_implementation_manifest_digest(),
-            other_catalog.execution_implementation_manifest_digest()
-        );
-        assert_eq!(
             production.plan_contract_digest(),
             other_catalog.plan_contract_digest()
         );
@@ -523,17 +468,12 @@ mod tests {
     #[test]
     fn prior_peer_without_to_base64_source_receipt_has_a_distinct_plan_digest() {
         let manifest = server_manifest();
-        let current = resolve_native_compatibility_material(
-            manifest.contracts(),
-            [0x31; 32],
-            [0x41; 32],
-            COMPILED,
-        )
-        .unwrap();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
         let prior = novarocks_version::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
-            [0x41; 32],
             11,
             COMPILED,
         )
@@ -543,10 +483,6 @@ mod tests {
         assert_eq!(
             current.function_catalog_digest(),
             prior.function_catalog_digest()
-        );
-        assert_eq!(
-            current.execution_implementation_manifest_digest(),
-            prior.execution_implementation_manifest_digest()
         );
         assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
         assert_ne!(current.id(), prior.id());

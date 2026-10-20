@@ -631,7 +631,7 @@ pub(super) fn run_with_denied_loan(
             catalog: &tables,
             functions: &functions,
             constant_evaluator: noop_constant_evaluator(),
-            constant_policy: super::pure_differential::constant_policy(),
+            constant_policy: super::test_support::constant_policy(),
             control: SqlCompileControl::unbounded(),
         })
         .map(|_| ())
@@ -647,7 +647,7 @@ pub(super) fn run_with_denied_loan(
             catalog: &tables,
             functions: &functions,
             constant_evaluator: noop_constant_evaluator(),
-            constant_policy: super::pure_differential::constant_policy(),
+            constant_policy: super::test_support::constant_policy(),
             control: SqlCompileControl::unbounded(),
             sink,
         })

@@ -184,7 +184,7 @@ fn float_arithmetic_required_original_equality_nonzero_constant_pool_and_hidden_
             Arc::new(ty.try_to_field("original-float-pool").unwrap()),
             ty,
             backing.to_data(),
-            super::pure_differential::constant_policy(),
+            super::test_support::constant_policy(),
             CompilePhase::FunctionSpecialization,
             &Control,
         )

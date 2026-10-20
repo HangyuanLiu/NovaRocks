@@ -50,7 +50,7 @@ fn analyze(sql: &str) -> Result<(), SqlCompileError> {
         builtin_sql_function_catalog(),
         &EVALUATOR,
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
     );
     SqlCompiler::analyze(request)?.into_pending()?;

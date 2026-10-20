@@ -27,7 +27,8 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use novarocks_failure_contract::FailureProjection;
 use std::sync::Arc;
 
-use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, FloatArrayView, IntArrayView};
+use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
+use crate::exec::hash_table::array_views::{FloatArrayView, IntArrayView};
 use novarocks_types::largeint;
 
 use super::hash::{

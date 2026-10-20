@@ -86,7 +86,7 @@ fn source(
         &functions,
         novarocks_sql::compiler::noop_constant_evaluator(),
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         control.clone(),
     ))
     .unwrap()
@@ -228,7 +228,7 @@ fn assert_writer_selections(
     let control = SqlCompileControl::unbounded();
     let semantics = novarocks_sql::compiler::author_fragment_package_semantics(
         source,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         &control,
     )
     .unwrap();

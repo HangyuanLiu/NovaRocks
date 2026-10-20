@@ -17,7 +17,6 @@
 //! Actual Physical source author -> frozen contract -> LocalCompiler -> controller witnesses.
 //! This executes that checked layer, not the separate native protobuf emitter/BE decoder.
 use super::*;
-use crate::exec::expr::legacy_to_base64_source_baseline_tests::{Source as RawSource, raw, values};
 use arrow::array::{ArrayRef, StringArray};
 use novarocks_type_contract::{
     SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
@@ -263,8 +262,24 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
     };
     compile_checked_fragment_with_parameters(&functions, fragment, &authors, result, parameters)
 }
+// RFC 4648 section 4 uses the standard alphabet and '=' padding. These
+// values are independent byte derivations, not output from either evaluator:
+// UTF-8 U+00FF = c3 bf -> w78=; U+0100 = c4 80 -> xIA=;
+// ff -> /w==; ff 00 -> /wA=; UTF-8 U+00FF + NUL = c3 bf 00 -> w78A.
+// The sealed NovaRocks TO_BASE64 contract maps empty bytes and SQL NULL to
+// successful NULL. That NULL rule is separate from RFC 4648's empty encoding.
+fn independent_expected(shape: Shape) -> Vec<Option<String>> {
+    let rows = match shape {
+        Shape::Slot => [Some("w78="), Some("xIA="), None, None],
+        Shape::Constant => [Some("w78="); 4],
+        Shape::FromBase64 => [Some("/w=="), Some("/wA="), None, None],
+        Shape::CastFromBase64 | Shape::ConcatFromBase64 => [Some("w78="), Some("w78A"), None, None],
+    };
+    rows.into_iter().map(|row| row.map(str::to_owned)).collect()
+}
+
 #[test]
-fn to_base64_actual_compiler_source_sensitive_full_profile_matches_unchanged_raw_oracle() {
+fn to_base64_actual_compiler_source_sensitive_full_profile_matches_rfc4648_vectors() {
     for shape in [
         Shape::Slot,
         Shape::Constant,
@@ -310,14 +325,7 @@ fn to_base64_actual_compiler_source_sensitive_full_profile_matches_unchanged_raw
         let mut evaluator = instance(&program);
         let selection = Selection::try_sparse(4, &[0, 1, 2, 3]).unwrap();
         let out = evaluator.evaluate(&batch, selection, &Control).unwrap();
-        let raw_source = match shape {
-            Shape::Slot => RawSource::Slot,
-            Shape::Constant => RawSource::Literal,
-            Shape::FromBase64 => RawSource::FromBase64,
-            Shape::CastFromBase64 => RawSource::CastFromBase64,
-            Shape::ConcatFromBase64 => RawSource::ConcatFromBase64,
-        };
-        let expected = values(raw(input.clone(), raw_source, DataType::Utf8).unwrap());
+        let expected = independent_expected(shape);
         assert_eq!(
             out.values()
                 .as_any()
@@ -376,33 +384,36 @@ fn to_base64_actual_compiler_source_sensitive_full_profile_matches_unchanged_raw
     }
 }
 #[test]
-fn to_base64_actual_native_identity_projection_matches_original_v1_dispatch_family() {
-    for name in [
-        "aes_encrypt",
-        "AES_ENCRYPT",
-        "from_base64",
-        "FROM_BASE64",
-        "base64_decode_binary",
-        "BASE64_DECODE_STRING",
-        "to_binary",
-        "TO_BINARY",
-        "concat",
-        "md5",
-        "upper",
+fn to_base64_actual_native_identity_projection_matches_independent_source_table() {
+    // The frozen native-v1 source contract canonicalizes wire names and
+    // aliases case-insensitively before testing three exact encryption tags.
+    // Expected facts are pinned independently; do not call a registry lookup
+    // (or the classifier being tested) to calculate their own expected value.
+    for (name, expected) in [
+        ("aes_encrypt", Source::NativeV1EncryptionLatin1),
+        ("AES_ENCRYPT", Source::NativeV1EncryptionLatin1),
+        ("from_base64", Source::NativeV1EncryptionLatin1),
+        ("FROM_BASE64", Source::NativeV1EncryptionLatin1),
+        ("base64_decode_binary", Source::NativeV1EncryptionLatin1),
+        ("BASE64_DECODE_STRING", Source::NativeV1EncryptionLatin1),
+        ("to_binary", Source::NativeV1EncryptionLatin1),
+        ("TO_BINARY", Source::NativeV1EncryptionLatin1),
+        ("concat", Source::Ordinary),
+        ("md5", Source::Ordinary),
+        ("upper", Source::Ordinary),
     ] {
         let id = FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap();
         let emitted = novarocks_physical_plan::native_v1_function_name(&id).unwrap();
         assert_eq!(emitted, name);
-        let original = crate::exec::expr::function::lookup_function(emitted).unwrap();
-        let original_prefers = matches!(
-            original,
-            crate::exec::expr::function::FunctionKind::Encryption(
-                "aes_encrypt" | "from_base64" | "to_binary"
-            )
+        assert_eq!(
+            Source::from_immediate_native_function_name(Some(emitted)),
+            expected,
+            "the complete source fact follows the actual emitted native name"
         );
         assert_eq!(
             Source::from_immediate_native_function_name(Some(emitted)).prefers_latin1(),
-            original_prefers
+            matches!(expected, Source::NativeV1EncryptionLatin1),
+            "the source fact also retains its byte interpretation"
         );
     }
     for raw_tag in [
@@ -413,7 +424,7 @@ fn to_base64_actual_native_identity_projection_matches_original_v1_dispatch_fami
         assert_eq!(
             Source::from_immediate_encryption_identity(Some(raw_tag)),
             Source::Ordinary,
-            "a raw FunctionKind tag is not a wire alias lookup"
+            "a raw encryption identity does not resolve a wire alias"
         );
     }
 }
@@ -498,7 +509,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
             Source::Ordinary
         );
     }
-    assert!(
+    assert!(matches!(
         classify(
             vec![leaf(
                 0,
@@ -506,23 +517,35 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
                 utf8.clone()
             )],
             &[ExprId::new(0)]
+        ),
+        Err(
+            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                "to_base64 requires checked native-v1 source; unchecked Literal is not emitted"
+            )
         )
-        .is_err()
-    );
-    assert!(
+    ));
+    assert!(matches!(
         classify(
             vec![leaf(0, ExprKind::Value(ValueId::new(91)), utf8.clone())],
             &[]
+        ),
+        Err(
+            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                "to_base64 source requires one argument"
+            )
         )
-        .is_err()
-    );
-    assert!(
+    ));
+    assert!(matches!(
         classify(
             vec![leaf(0, ExprKind::Value(ValueId::new(91)), utf8.clone())],
             &[ExprId::new(8)]
+        ),
+        Err(
+            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                "to_base64 source definition is absent"
+            )
         )
-        .is_err()
-    );
+    ));
     for (name, count, expected) in [
         ("aes_encrypt", 2, Source::NativeV1EncryptionLatin1),
         ("from_base64", 1, Source::NativeV1EncryptionLatin1),
@@ -580,8 +603,15 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
         if name == "to_binary" {
             assert_eq!(result.data_type().clone(), DataType::Binary);
             assert!(
-                direct.is_err(),
-                "actual Binary declaration is not the raw typed-Utf8 shell domain"
+                matches!(
+                    direct,
+                    Err(
+                        novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                            "to_base64 emitted source is not exact Physical Utf8"
+                        )
+                    )
+                ),
+                "the actual Binary declaration is rejected before runtime NULL handling"
             );
         } else {
             assert_eq!(result.data_type().clone(), DataType::Utf8);

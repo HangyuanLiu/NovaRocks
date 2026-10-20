@@ -94,9 +94,27 @@ impl FragmentCompileError {
     pub fn is_unsupported(&self) -> bool {
         match self {
             Self::Unsupported { .. } => true,
-            Self::Owner { error, .. } => error
-                .downcast_ref::<ExpressionLoweringError>()
-                .is_some_and(ExpressionLoweringError::is_unsupported),
+            Self::Owner { error, .. } => {
+                error
+                    .downcast_ref::<ExpressionLoweringError>()
+                    .is_some_and(ExpressionLoweringError::is_unsupported)
+                    || error
+                        .downcast_ref::<LocalProgramCompileError>()
+                        .is_some_and(|error| {
+                            matches!(
+                                error,
+                                LocalProgramCompileError::Primitive(
+                                    novarocks_local_program::ProgramPrimitiveError::Cast(
+                                        novarocks_functions::CastPrepareError::Unsupported
+                                    ) | novarocks_local_program::ProgramPrimitiveError::Arithmetic(
+                                        novarocks_functions::ArithmeticPrepareError::Unsupported
+                                    ) | novarocks_local_program::ProgramPrimitiveError::Comparison(
+                                        novarocks_functions::ComparisonPrepareError::Unsupported
+                                    )
+                                )
+                            )
+                        })
+            }
             _ => false,
         }
     }

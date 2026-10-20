@@ -1962,8 +1962,8 @@ impl CompiledWriterFinalAggregate {
         // Group indices are temporary; their real allocator releases them after
         // emit, independently of the returned target array's late lifetime.
         let tracker = bound_tracker(self.tracker.as_ref(), "CompiledWriterFinalAggregate")?;
-        let allocator = crate::exec::expr::agg::AggregateAllocator::new(tracker);
-        let mut indices = crate::exec::expr::agg::AggregateVec::new_in(allocator);
+        let allocator = crate::exec::hash_table::allocation::AggregateAllocator::new(tracker);
+        let mut indices = crate::exec::hash_table::allocation::AggregateVec::new_in(allocator);
         indices
             .try_reserve_exact(count)
             .map_err(|_| KernelFailure::ResourceExhausted)?;

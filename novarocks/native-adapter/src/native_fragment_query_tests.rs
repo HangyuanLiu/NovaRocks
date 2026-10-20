@@ -4,11 +4,11 @@ mod tests {
     use std::time::Duration;
 
     use crate::native_fragment_query::NativeFragmentQueryRuntime;
-    use novarocks_execution::exec::expr::agg::{
-        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
-    };
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntime, ExecutionRuntimeConfig,
+    };
+    use novarocks_execution::runtime::function_set::{
+        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     };
     use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
     use novarocks_execution::runtime::runtime_state::RuntimeState;
@@ -42,7 +42,7 @@ mod tests {
         let mut builder = ExecutionFunctionSetBuilder::new();
         novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
             .expect("builtin function metadata");
-        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+        novarocks_execution::runtime::function_set::contribute_builtin_aggregate_implementations(
             &mut builder,
         )
         .expect("builtin aggregate implementations");

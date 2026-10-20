@@ -1110,10 +1110,6 @@ mod statistics {
     use novarocks_types::SlotId;
 
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::agg::{
-        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
-        contribute_builtin_aggregate_implementations,
-    };
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::table_write_aggregate::{
         WriterFinalAggregateCall, WriterFinalAggregatePlan,
@@ -1131,6 +1127,10 @@ mod statistics {
     use crate::exec::operators::table_finish::FinishStatisticsFactory;
     use crate::exec::operators::{TableFinishOperatorFactory, TableWriterOperatorFactory};
     use crate::exec::pipeline::operator::Operator;
+    use crate::runtime::function_set::{
+        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
+        contribute_builtin_aggregate_implementations,
+    };
     use crate::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 
     const THETA_OVERLOADS: [&str; 17] = [

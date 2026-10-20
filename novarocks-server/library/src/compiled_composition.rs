@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use novarocks_connector_contract::PureProviderProgramCatalog;
-use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
+use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
 use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionDefinition,
     InstalledPureKernel, PureEngineFunctionCatalog,

@@ -32,7 +32,7 @@ use super::aggregate::topn_boundary::{
     AggregateTopNBoundaryError, OwnedAggregateTopNBoundaryState, borrowed_key_from_group_array,
 };
 use super::compiled_expression::RuntimeKernelControl;
-use crate::exec::expr::agg::AggregateVec;
+use crate::exec::hash_table::allocation::AggregateVec;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter::{
     OrderedTopNAllocationHost, RuntimeFilterProducerFailure, RuntimeFilterSessionRef,

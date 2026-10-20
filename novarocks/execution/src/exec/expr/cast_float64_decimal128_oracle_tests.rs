@@ -198,7 +198,7 @@ fn float64_decimal128_permanent_policy_selected_slice_scalar_constant_and_origin
             Arc::new(ty.try_to_field("exact-pool").unwrap()),
             ty.clone(),
             a.to_data(),
-            super::pure_differential::constant_policy(),
+            super::test_support::constant_policy(),
             CompilePhase::FunctionSpecialization,
             &Control,
         )

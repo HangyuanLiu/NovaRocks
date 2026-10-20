@@ -14,10 +14,106 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Actual LocalCompiler recipe + Frame equality against the original arena TIME shell.
+//! LocalCompiler text-to-TIME recipes checked against independent duration/clock tables.
 use super::*;
-use crate::exec::expr::legacy_text_time_cast_baseline_tests::{actual, corpus, values};
-use arrow::array::{BooleanArray, Int64Array};
+use arrow::array::{
+    BooleanArray, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    Time64MicrosecondArray,
+};
+// These fixtures contain only authored input data. No retired evaluator is used.
+fn input(dtype: &DataType, strings: &[Option<&str>]) -> ArrayRef {
+    match dtype {
+        DataType::Utf8 => Arc::new(StringArray::from(strings.to_vec())),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::from(strings.to_vec())),
+        DataType::Utf8View => Arc::new(StringViewArray::from(strings.to_vec())),
+        _ => panic!("fixture requires one actual text carrier"),
+    }
+}
+fn corpus(dtype: &DataType) -> ArrayRef {
+    input(
+        dtype,
+        &[
+            Some("00:00:00"),
+            Some("25:00:00"),
+            Some("+01:02:03"),
+            Some("-01:02:03"),
+            Some("01:02:03.456789"),
+            Some("1"),
+            Some("+1"),
+            Some("-1"),
+            Some("12:10"),
+            Some("23:59:60"),
+            Some("1970-01-01 01:01:01"),
+            Some(" 12 : 34 : 56 "),
+            Some(""),
+            Some("9223372036854775807:00:00"),
+            Some("2562047788015:00:00"),
+            None,
+        ],
+    )
+}
+fn values(array: &ArrayRef) -> Vec<Option<i64>> {
+    assert_eq!(
+        array.data_type(),
+        &DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+    );
+    array
+        .as_any()
+        .downcast_ref::<Time64MicrosecondArray>()
+        .unwrap()
+        .iter()
+        .collect()
+}
+fn expected(dtype: &DataType) -> Vec<Option<i64>> {
+    match dtype {
+        // UTF8 uses duration grammar: trim fields; unsigned integer hours are
+        // unbounded; minutes/seconds are 0..59; checked seconds * 1_000_000.
+        // Thus 25h is 90_000s and 12:34:56 is 45_296s. Signs, fractions,
+        // incomplete clocks, leap seconds and overflowing durations are NULL.
+        DataType::Utf8 => vec![
+            Some(0),
+            Some(90_000_000_000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(45_296_000_000),
+            None,
+            None,
+            None,
+            None,
+        ],
+        // Arrow 58.4 Time64Microsecond parsing uses a wall clock, then an i64
+        // raw-microsecond fallback. 01:02:03.456789 is 3_723_456_789us;
+        // 12:10 is 43_800s and the leap second 23:59:60 is 86_400s.
+        // Whole signed numbers are raw micros; whitespace and 25h are invalid.
+        // These literals are derived from that grammar, never an evaluator run.
+        DataType::LargeUtf8 | DataType::Utf8View => vec![
+            Some(0),
+            None,
+            None,
+            None,
+            Some(3_723_456_789),
+            Some(1),
+            Some(1),
+            Some(-1),
+            Some(43_800_000_000),
+            Some(86_400_000_000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+        _ => panic!("fixture requires one actual text carrier"),
+    }
+}
 fn batch(program: &LocalProgram, source: ArrayRef) -> RecordBatch {
     let n = source.len();
     RecordBatch::try_new(
@@ -47,12 +143,12 @@ fn check(dtype: DataType) {
                 policy,
                 allow,
             );
-            for source in [
-                corpus(&dtype),
-                corpus(&dtype).slice(1, 7),
-                corpus(&dtype).slice(0, 0),
+            let expected = expected(&dtype);
+            for (source, expected) in [
+                (corpus(&dtype), expected.as_slice()),
+                (corpus(&dtype).slice(1, 7), &expected[1..8]),
+                (corpus(&dtype).slice(0, 0), &expected[0..0]),
             ] {
-                let expected = values(&actual(source.clone(), allow, policy, false).unwrap());
                 let batch = batch(&program, source.clone());
                 for rows in [
                     (0..source.len()).collect::<Vec<_>>(),
@@ -100,10 +196,7 @@ fn text_time_actual_compiler_all_seven_runtime_causes_stop_and_latch_without_rep
             true,
         );
         let long = format!("{}:00:00", "0".repeat(777));
-        let source = crate::exec::expr::legacy_text_time_cast_baseline_tests::input(
-            &dtype,
-            &[Some(long.as_str()), None, Some("+01:02:03")],
-        );
+        let source = input(&dtype, &[Some(long.as_str()), None, Some("+01:02:03")]);
         let batch = batch(&program, source);
         let recorder = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
         assert!(

@@ -144,7 +144,7 @@ fn legacy_any_value_empty_and_all_null_keep_nullable_result_for_nonnullable_inpu
                 logical_argument_count: 1,
                 expected_result_type: None,
             },
-            &crate::exec::expr::pure_differential::HarnessControl,
+            &crate::exec::expr::test_support::HarnessControl,
         )
         .unwrap();
     let FunctionResultType::Scalar(output) = binding.selected.result_type else {

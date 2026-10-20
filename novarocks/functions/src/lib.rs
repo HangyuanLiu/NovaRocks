@@ -2872,3 +2872,12 @@ compile_error!("novarocks_dev_controls must match debug_assertions");
 pub use evaluation::DataFailureReason;
 
 pub mod array_generate;
+
+#[cfg(test)]
+mod n_largeint_declaration_tests;
+
+#[cfg(test)]
+mod f3_aggregate_independent_tests;
+
+#[cfg(test)]
+mod f3_recipe_independent_tests;

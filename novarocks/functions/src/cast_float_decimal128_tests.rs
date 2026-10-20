@@ -138,7 +138,7 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
             .is_err()
         );
     }
-    for source in [DataType::Float32, DataType::Utf8] {
+    for source in [DataType::Float16] {
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,

@@ -514,3 +514,20 @@ mod tests {
         );
     }
 }
+
+/// Exact successful scalar NOT domain inherited from the original SQL kernel.
+/// Physical carrier membership never establishes a nominal logical domain.
+pub fn supports_boolean_negation_value_type(value: &crate::FunctionValueType) -> bool {
+    value.logical_type() == crate::ValueLogicalType::Physical
+        && matches!(
+            value.data_type(),
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(..)
+        )
+}

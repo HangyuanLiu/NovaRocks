@@ -34,7 +34,7 @@ use std::sync::Arc;
 use arrow::array::Array;
 use arrow::datatypes::DataType;
 
-use crate::exec::expr::agg::AggregateVec;
+use crate::exec::hash_table::allocation::AggregateVec;
 use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};

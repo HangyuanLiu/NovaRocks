@@ -71,7 +71,7 @@ use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
 use crate::static_plan::ServerStaticPlan;
-use novarocks_execution::exec::expr::agg::{
+use novarocks_execution::runtime::function_set::{
     ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     contribute_builtin_aggregate_implementations,
 };
@@ -352,7 +352,9 @@ pub fn compose_backend_server_config(
     native_trust: &NativeTrustSnapshot,
     native_compatibility_id: NativeCompatibilityId,
     static_plan: &ServerStaticPlan,
-    function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
+    function_set: std::sync::Arc<
+        novarocks_execution::runtime::function_set::SealedExecutionFunctionSet,
+    >,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,

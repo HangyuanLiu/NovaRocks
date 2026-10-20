@@ -74,7 +74,11 @@ pub use novarocks_connector_contract::{
 // The partition vocabulary of `StaticStreamBranch`, re-exported so a compiler
 // can author a stream sink without a second execution-contract dependency.
 pub use novarocks_execution_contract::DataStreamPartitionType;
-pub use primitives::{ProgramComparisonSite, ProgramPrimitiveError};
+pub use primitives::{
+    ProgramComparisonSite, ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
+    prepare_comparison_node, prepare_native_bitnot_node, prepare_native_negate_node,
+    prepare_null_safe_comparison_node,
+};
 mod frozen_aggregate;
 pub use frozen_aggregate::{FrozenAggregateSelection, FrozenAggregateSelectionError};
 

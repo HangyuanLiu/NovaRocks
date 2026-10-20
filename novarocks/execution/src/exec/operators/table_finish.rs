@@ -1278,7 +1278,7 @@ impl TableFinishOperator {
 fn build_final_aggregate(
     plan: &WriterFinalAggregatePlan,
     arena: &Arc<ExprArena>,
-    function_set: Arc<crate::exec::expr::agg::SealedExecutionFunctionSet>,
+    function_set: Arc<crate::runtime::function_set::SealedExecutionFunctionSet>,
     node_id: i32,
 ) -> ExecutionResult<Box<dyn Operator>> {
     let unpivot = plan.unpivot.as_ref().ok_or_else(|| {
@@ -3208,7 +3208,7 @@ mod tests {
     }
 
     fn composite_runtime_state(
-        function_set: Arc<crate::exec::expr::agg::SealedExecutionFunctionSet>,
+        function_set: Arc<crate::runtime::function_set::SealedExecutionFunctionSet>,
         tracker: Option<Arc<MemTracker>>,
     ) -> RuntimeState {
         let runtime = Arc::new(

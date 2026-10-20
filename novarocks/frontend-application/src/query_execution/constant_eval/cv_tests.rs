@@ -21,7 +21,9 @@ use super::*;
 use arrow::array::{Date32Array, Float32Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::Field;
 use novarocks_functions::{ConstantError, ConstantPolicy};
-use novarocks_sql::compiler::FoldArg;
+use novarocks_sql::compiler::{
+    BinOp, ConversionPlan, FoldArg, FrozenFoldIntrinsic, FrozenFoldNode, UnOp,
+};
 use novarocks_type_contract::{
     CompileControlError, DecimalOverflowPolicy, NR_LOGICAL_TYPE_KEY, ValueLayout,
     ValueTypeStorageLifetime,
@@ -108,29 +110,360 @@ fn decimal(value: i128, precision: u8, scale: i8) -> FoldArg {
         false,
     )
 }
-fn request(kind: FoldNodeKind, args: Vec<FoldArg>, result: DataType) -> FoldRequest {
-    FoldRequest {
-        regexp_count_pattern_source: None,
-        kind,
-        args,
-        constant_policy: policy(),
-        result_type: FunctionValueType::new(result, true),
+// Test-only SQL syntax requests. This enum never dispatches an implementation.
+// Exact binding, control and conversion facts are captured from SqlCompiler.
+#[derive(Clone, Debug)]
+enum FixtureNode {
+    BinaryOp(BinOp, DecimalOverflowPolicy),
+    UnaryOp(UnOp),
+    Cast(DecimalOverflowPolicy),
+    Function { name: String },
+}
+static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+static CAPTURE_STATE: Mutex<Option<CaptureState>> = Mutex::new(None);
+static RECORDER: Recorder = Recorder;
+struct CaptureState {
+    node: FixtureNode,
+    sources: Option<Vec<ConstantValue>>,
+    result: DataType,
+    captured: Option<FoldRequest>,
+}
+struct Recorder;
+impl SqlConstantEvaluator for Recorder {
+    fn eval_scalar(
+        &self,
+        request: &FoldRequest,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
+        let mut capture_guard = CAPTURE_STATE.lock().unwrap();
+        let state = capture_guard.as_mut().expect("active fixture capture");
+        let shape = match (&state.node, &request.kind) {
+            (FixtureNode::Function { .. }, FrozenFoldNode::Call(_)) => true,
+            (FixtureNode::Cast(_), FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast { .. })) => {
+                true
+            }
+            (
+                FixtureNode::UnaryOp(UnOp::Not),
+                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Not),
+            ) => true,
+            (
+                FixtureNode::UnaryOp(UnOp::Negate),
+                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Negate),
+            ) => true,
+            (
+                FixtureNode::UnaryOp(UnOp::BitwiseNot),
+                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::BitNot),
+            ) => true,
+            (
+                FixtureNode::BinaryOp(_, _),
+                FrozenFoldNode::Intrinsic(
+                    FrozenFoldIntrinsic::Arithmetic { .. }
+                    | FrozenFoldIntrinsic::Comparison { .. }
+                    | FrozenFoldIntrinsic::NullSafeEq { .. }
+                    | FrozenFoldIntrinsic::Conjunction
+                    | FrozenFoldIntrinsic::Disjunction,
+                ),
+            ) => true,
+            _ => false,
+        };
+        let sources_match = state.sources.as_ref().is_none_or(|sources| {
+            sources.len() == request.args.len()
+                && sources.iter().zip(&request.args).all(|(expected, actual)| {
+                    expected.ordinal() == actual.value.ordinal()
+                        && Arc::ptr_eq(expected.pool().array(), actual.value.pool().array())
+                        && expected.value_type() == actual.value.value_type()
+                })
+        });
+        if shape && sources_match && request.result_type.data_type() == &state.result {
+            assert!(
+                state.captured.is_none(),
+                "capture terminates at the first exact authored node"
+            );
+            state.captured = Some(request.clone());
+            // Stop fixture construction before final plan sealing or execution.
+            // This sentinel is asserted by the helper and is never used in the
+            // evaluator assertions or as an optional-fold expected result.
+            return Err(SqlConstantEvaluationError::Control(
+                CompileControlError::Cancelled,
+            ));
+        }
+        drop(capture_guard);
+        constant_evaluator().eval_scalar(request, control)
     }
+    fn admit_fold_parent_observed(
+        &self,
+        binding: &novarocks_sql::binding::SqlFunctionBinding,
+        lifecycle: novarocks_functions::PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        constant_evaluator().admit_fold_parent_observed(binding, lifecycle, control)
+    }
+    fn before_fold_dependency_observed(
+        &self,
+        input: novarocks_sql::compiler::SqlFoldDependencyInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), CompileControlError> {
+        constant_evaluator().before_fold_dependency_observed(input, control)
+    }
+    fn after_fold_dependency_observed(
+        &self,
+        input: novarocks_sql::compiler::SqlFoldDependencyInput<'_>,
+        outcome: novarocks_sql::compiler::SqlFoldEvaluationOutcome<'_>,
+    ) {
+        constant_evaluator().after_fold_dependency_observed(input, outcome)
+    }
+}
+fn capture(
+    statement: novarocks_sql::compiler::SqlStatementInput,
+    node: FixtureNode,
+    sources: Option<Vec<ConstantValue>>,
+    result: DataType,
+) -> FoldRequest {
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
+    use novarocks_sql::compiler::*;
+    let _serial = CAPTURE_SERIAL.lock().unwrap();
+    *CAPTURE_STATE.lock().unwrap() = Some(CaptureState {
+        node,
+        sources,
+        result,
+        captured: None,
+    });
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let control = SqlCompileControl::unbounded();
+    let compile = SqlFinalPlanCompileRequest::new(
+        PlanVersionId::try_new([87; 16]).unwrap(),
+        statement,
+        SqlCompileIntent::Query,
+        SqlSessionContext {
+            sql_semantics: Default::default(),
+            current_catalog: None,
+            current_database: "fixture".into(),
+            optimizer_settings: SessionOptimizerSettings {
+                enable_materialized_view_rewrite: Some(false),
+                ..Default::default()
+            },
+        },
+        SqlPlanningEnvironment::Distributed,
+        catalog.snapshot(),
+        &RECORDER,
+        policy(),
+        control.clone(),
+        PipelineDopDomain {
+            min: 1,
+            max: 8,
+            requires_power_of_two: true,
+        },
+        ScanReadBudget {
+            max_batch_rows: 64,
+            max_batch_bytes: 1 << 20,
+        },
+        DEFAULT_COMPLETION_LIMITS,
+    )
+    .try_into_completion()
+    .map_err(SqlCompileProgressError::Compile)
+    .and_then(|request| SqlCompiler::start(request, &control))
+    .and_then(|progress| progress.into_complete())
+    .map(|_| ());
+    let state = CAPTURE_STATE.lock().unwrap().take().unwrap();
+    assert!(
+        matches!(
+            compile,
+            Err(SqlCompileProgressError::Compile(SqlCompileError::Cancelled))
+        ),
+        "fixture must terminate only at its captured SQL node: {compile:?}"
+    );
+    state
+        .captured
+        .expect("SQL must have authored the exact request")
+}
+// Bind the original checked CVs to exact root SELECT occurrences. Later
+// SELECT items use the analyzer's existing alias substitution, so their
+// bindings see the actual source types before any optimizer folding occurs.
+fn statement_with_sources(
+    expression: &str,
+    hint: &str,
+    sources: &[ConstantValue],
+) -> novarocks_sql::compiler::SqlStatementInput {
+    use novarocks_sql::compiler::{
+        SqlConstantExpressionSite, SqlConstantExpressionStep, SqlExpressionConstant,
+        SqlStatementInput,
+    };
+    let projections = (0..sources.len())
+        .map(|i| format!("(NULL) AS v{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT {hint}{projections}, {expression} AS result");
+    let statements = novarocks_parser::parse(&sql).unwrap();
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+        panic!("one query")
+    };
+    let constants = sources
+        .iter()
+        .enumerate()
+        .map(|(column, value)| {
+            SqlExpressionConstant::new(
+                vec![],
+                SqlConstantExpressionSite::SelectProjection { column },
+                value.clone(),
+            )
+            .with_expression_path(vec![SqlConstantExpressionStep::Nested])
+        })
+        .collect::<Vec<_>>()
+        .into();
+    SqlStatementInput::query_with_expression_constants(
+        Box::new(query.clone()),
+        constants,
+        &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap()
+}
+fn identity(arg: FoldArg) -> FoldRequest {
+    // A same-type root CAST is removed by analyzer::value_conversion. Obtain
+    // the real shared conversion author's Identity from a same-type SQL
+    // comparison instead; unlike a Carrier/Call it has no hidden receipt.
+    let sources = vec![i64(1).value, i64(2).value];
+    let mut request = capture(
+        statement_with_sources("v0 = v1", "", &sources),
+        FixtureNode::BinaryOp(BinOp::Eq, DecimalOverflowPolicy::OutputNull),
+        Some(sources),
+        DataType::Boolean,
+    );
+    let FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Comparison { left, right, .. }) =
+        &request.kind
+    else {
+        panic!("the real SQL comparison must publish both conversion plans")
+    };
+    assert!(matches!(left, ConversionPlan::Identity));
+    assert!(matches!(right, ConversionPlan::Identity));
+    let plan = left.clone();
+    // Compose only the receipt-free authored intrinsic plan. No bound call or
+    // prepared kernel is forged; both complete identity types are identical.
+    request.kind = FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast { plan });
+    request.result_type = arg.value_type.clone();
+    request.args = vec![arg];
+    request
+}
+fn sql_target(target: &DataType) -> String {
+    match target {
+        DataType::Boolean => "BOOLEAN".into(),
+        DataType::Int8 => "TINYINT".into(),
+        DataType::Int16 => "SMALLINT".into(),
+        DataType::Int32 => "INT".into(),
+        DataType::Int64 => "BIGINT".into(),
+        DataType::Float32 => "FLOAT".into(),
+        DataType::Float64 => "DOUBLE".into(),
+        DataType::Utf8 => "VARCHAR".into(),
+        DataType::Date32 => "DATE".into(),
+        DataType::Decimal128(p, s) if *s >= 0 => format!("DECIMAL({p},{s})"),
+        other => panic!("this conversion has no SQL fixture spelling: {other:?}"),
+    }
+}
+fn request(kind: FixtureNode, args: Vec<FoldArg>, result: DataType) -> FoldRequest {
+    if matches!(kind, FixtureNode::Cast(_))
+        && args.len() == 1
+        && args[0].value.value_type().data_type()
+            == FunctionValueType::new(result.clone(), true).data_type()
+    {
+        let mut request = identity(FoldArg {
+            value: args[0].value.clone(),
+            value_type: args[0].value.value_type().clone(),
+        });
+        // Deliberate declared-source mutations in forgery tests must remain
+        // visible to the exact-source gate, never to SQL binding selection.
+        request.args = args;
+        return request;
+    }
+    let vars = (0..args.len()).map(|i| format!("v{i}")).collect::<Vec<_>>();
+    let expression = match &kind {
+        FixtureNode::Function { name } => format!("{name}({})", vars.join(",")),
+        FixtureNode::Cast(_) => {
+            assert_eq!(vars.len(), 1);
+            format!("CAST({} AS {})", vars[0], sql_target(&result))
+        }
+        FixtureNode::UnaryOp(op) => {
+            assert_eq!(vars.len(), 1);
+            format!(
+                "{}({})",
+                match op {
+                    UnOp::Not => "NOT ",
+                    UnOp::Negate => "-",
+                    UnOp::BitwiseNot => "~",
+                },
+                vars[0]
+            )
+        }
+        FixtureNode::BinaryOp(op, _) => {
+            assert_eq!(vars.len(), 2);
+            format!(
+                "{} {} {}",
+                vars[0],
+                match op {
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
+                    BinOp::Mod => "%",
+                    BinOp::Eq => "=",
+                    BinOp::Ne => "!=",
+                    BinOp::Lt => "<",
+                    BinOp::Le => "<=",
+                    BinOp::Gt => ">",
+                    BinOp::Ge => ">=",
+                    BinOp::EqForNull => "<=>",
+                    BinOp::And => "AND",
+                    BinOp::Or => "OR",
+                },
+                vars[1]
+            )
+        }
+    };
+    let hint = if matches!(
+        kind,
+        FixtureNode::BinaryOp(_, DecimalOverflowPolicy::ReportError)
+            | FixtureNode::Cast(DecimalOverflowPolicy::ReportError)
+    ) {
+        "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ "
+    } else {
+        ""
+    };
+    let sources = args.iter().map(|arg| arg.value.clone()).collect::<Vec<_>>();
+    let statement = statement_with_sources(&expression, hint, &sources);
+    let mut request = capture(
+        statement,
+        kind,
+        Some(sources),
+        FunctionValueType::new(result, true).data_type().clone(),
+    );
+    for (actual, supplied) in request.args.iter().zip(&args) {
+        assert_eq!(actual.value.ordinal(), supplied.value.ordinal());
+        assert!(Arc::ptr_eq(
+            actual.value.pool().array(),
+            supplied.value.pool().array()
+        ));
+        assert_eq!(actual.value.value_type(), supplied.value.value_type());
+        assert!(Arc::ptr_eq(
+            actual.value.pool().field_ref(),
+            supplied.value.pool().field_ref()
+        ));
+    }
+    request.args = args;
+    request
 }
 fn cast(args: Vec<FoldArg>, target: DataType) -> FoldRequest {
     request(
-        FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
+        FixtureNode::Cast(DecimalOverflowPolicy::OutputNull),
         args,
         target,
     )
 }
 fn binary(op: BinOp, args: Vec<FoldArg>, result: DataType) -> FoldRequest {
     request(
-        FoldNodeKind::BinaryOp(op, DecimalOverflowPolicy::OutputNull),
+        FixtureNode::BinaryOp(op, DecimalOverflowPolicy::OutputNull),
         args,
         result,
     )
 }
+
 fn evaluate(request: &FoldRequest) -> ConstantValue {
     let value = constant_evaluator()
         .eval_scalar(request, &TestControl)
@@ -158,13 +491,21 @@ fn decimal_value(value: &ConstantValue) -> i128 {
 
 #[test]
 fn folds_int32_addition_without_an_integer_carrier_roundtrip() {
-    let output = evaluate(&binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int32));
+    let request = binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int64);
+    assert!(
+        request
+            .args
+            .iter()
+            .all(|arg| arg.value_type.data_type() == &DataType::Int32)
+    );
+    assert_eq!(request.result_type.data_type(), &DataType::Int64);
+    let output = evaluate(&request);
     assert_eq!(
         output
             .pool()
             .array()
             .as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
             .value(0),
         2
@@ -174,7 +515,7 @@ fn folds_int32_addition_without_an_integer_carrier_roundtrip() {
 fn folds_date_format_and_utf8_to_date32_through_real_kernels() {
     let date = arg(Arc::new(Date32Array::from(vec![18262])), false);
     let output = evaluate(&request(
-        FoldNodeKind::Function {
+        FixtureNode::Function {
             name: "date_format".into(),
         },
         vec![date, text("%Y-%m-%d")],
@@ -221,13 +562,10 @@ fn folds_decimal_multiplication_and_checked_rounding_cast_with_exact_coefficient
     );
 }
 #[test]
-fn declines_unknown_and_unmapped_unary_shapes_without_a_fake_kernel() {
+fn declines_unmapped_unary_shapes_without_a_fake_kernel() {
     for kind in [
-        FoldNodeKind::Function {
-            name: "no_such_novarocks_function".into(),
-        },
-        FoldNodeKind::UnaryOp(UnOp::Negate),
-        FoldNodeKind::UnaryOp(UnOp::BitwiseNot),
+        FixtureNode::UnaryOp(UnOp::Negate),
+        FixtureNode::UnaryOp(UnOp::BitwiseNot),
     ] {
         assert!(matches!(
             constant_evaluator()
@@ -241,7 +579,7 @@ fn declines_unknown_and_unmapped_unary_shapes_without_a_fake_kernel() {
     );
     assert_eq!(
         evaluate(&request(
-            FoldNodeKind::UnaryOp(UnOp::Not),
+            FixtureNode::UnaryOp(UnOp::Not),
             vec![boolean],
             DataType::Boolean
         ))
@@ -249,9 +587,76 @@ fn declines_unknown_and_unmapped_unary_shapes_without_a_fake_kernel() {
         .unwrap(),
         Some(false)
     );
+    // Unknown names are rejected by SQL analysis; no valid FrozenFoldCall can
+    // be manufactured for a name that has no binding or installed owner.
+    use novarocks_sql::compiler::*;
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let control = SqlCompileControl::unbounded();
+    let result = SqlFinalPlanCompileRequest::new(
+        novarocks_physical_plan::PlanVersionId::try_new([88; 16]).unwrap(),
+        SqlStatementInput::sql("SELECT no_such_novarocks_function(1)"),
+        SqlCompileIntent::Query,
+        SqlSessionContext {
+            sql_semantics: Default::default(),
+            current_catalog: None,
+            current_database: "fixture".into(),
+            optimizer_settings: Default::default(),
+        },
+        SqlPlanningEnvironment::Distributed,
+        catalog.snapshot(),
+        constant_evaluator(),
+        policy(),
+        control.clone(),
+        novarocks_physical_plan::PipelineDopDomain {
+            min: 1,
+            max: 8,
+            requires_power_of_two: true,
+        },
+        novarocks_physical_plan::ScanReadBudget {
+            max_batch_rows: 64,
+            max_batch_bytes: 1 << 20,
+        },
+        DEFAULT_COMPLETION_LIMITS,
+    )
+    .try_into_completion()
+    .map_err(SqlCompileProgressError::Compile)
+    .and_then(|request| SqlCompiler::start(request, &control))
+    .and_then(|progress| progress.into_complete());
+    let error = result
+        .err()
+        .expect("unbound function must fail before a frozen-call request exists");
+    assert!(
+        matches!(
+            error,
+            SqlCompileProgressError::Compile(SqlCompileError::Analyze(_))
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("no_such_novarocks_function"),
+        "{error}"
+    );
+}
+
+fn assert_invalid_arithmetic(result: &Result<Option<ConstantValue>, SqlConstantEvaluationError>) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let Err(SqlConstantEvaluationError::Outer(source)) = result else {
+        panic!("invalid frozen arithmetic must retain its outer producer: {result:?}")
+    };
+    assert_eq!(
+        source.failure_fact(),
+        novarocks_functions::ArithmeticPrepareError::TypeMismatch.failure_fact()
+    );
+    assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+    assert!(matches!(
+        source.downcast_ref::<novarocks_local_program::ProgramPrimitiveError>(),
+        Some(novarocks_local_program::ProgramPrimitiveError::Arithmetic(
+            novarocks_functions::ArithmeticPrepareError::TypeMismatch
+        ))
+    ));
 }
 #[test]
-fn division_by_zero_is_successful_typed_null_and_nonnullable_output_declines() {
+fn division_by_zero_is_typed_null_and_forged_nonnullable_arithmetic_is_invalid() {
     let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
     assert!(
         evaluate(&request)
@@ -259,10 +664,7 @@ fn division_by_zero_is_successful_typed_null_and_nonnullable_output_declines() {
             .unwrap()
     );
     request.result_type = request.result_type.with_nullable(false).unwrap();
-    assert!(matches!(
-        constant_evaluator().eval_scalar(&request, &TestControl),
-        Ok(None)
-    ));
+    assert_invalid_arithmetic(&constant_evaluator().eval_scalar(&request, &TestControl));
 }
 #[test]
 fn exact_source_gate_rejects_carrier_domain_and_nullable_forgery() {
@@ -336,13 +738,10 @@ fn authored_nominal_and_nested_domains_decline_without_carrier_retagging() {
         let value = pool(array, ty.clone()).value(0).unwrap();
         assert!(matches!(
             constant_evaluator().eval_scalar(
-                &cast(
-                    vec![FoldArg {
-                        value,
-                        value_type: ty
-                    }],
-                    DataType::Utf8
-                ),
+                &identity(FoldArg {
+                    value,
+                    value_type: ty
+                }),
                 &TestControl
             ),
             Ok(None)
@@ -358,8 +757,7 @@ fn authored_nominal_and_nested_domains_decline_without_carrier_retagging() {
         null.value_type.child_at(0).unwrap().logical_type(),
         ValueLogicalType::Json
     );
-    let mut request = cast(vec![null], ty.data_type().clone());
-    request.result_type = ty;
+    let request = identity(null);
     assert!(matches!(
         constant_evaluator().eval_scalar(&request, &TestControl),
         Ok(None)
@@ -380,9 +778,14 @@ fn checked_type_refusal_and_later_source_forgery_are_not_hidden_by_domain_declin
     // A malformed complete declaration cannot enter the evaluator. A later
     // legitimate JSON declaration with a forged source still fails before an
     // earlier argument's domain decline hides it.
-    let mut invalid = i64(1);
-    invalid.value_type = json.clone();
-    let request = cast(
+    let invalid = FoldArg {
+        value: value.clone(),
+        value_type: FunctionValueType::new(DataType::Int64, false),
+    };
+    let request = request(
+        FixtureNode::Function {
+            name: "coalesce".into(),
+        },
         vec![
             FoldArg {
                 value,
@@ -460,7 +863,27 @@ fn float32_signaling_nan_and_signed_zero_never_widen_through_float64_syntax() {
 }
 #[test]
 fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv() {
-    let output = evaluate(&cast(vec![i32(7)], DataType::UInt32));
+    // The optimizer does not admit UInt32 root folding. Preserve both
+    // independent properties: the cast owner converts Int32 to UInt32, then
+    // the FE port materializes an exact CV through a valid Identity node.
+    let target = FunctionValueType::new(DataType::UInt32, true);
+    let source = i32(7);
+    let converted = novarocks_execution::exec::expr::compiled_program::constant_node::evaluate_constant_node(
+        novarocks_execution::exec::expr::compiled_program::constant_node::ConstantNode::Conversion(
+            novarocks_execution::exec::expr::compiled_program::constant_node::ConstantConversion::Carrier(
+                novarocks_execution::exec::expr::compiled_program::constant_node::ConstantCarrierStep {
+                    target: &target,
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    allow_throw_exception: false,
+                }
+            )
+        ),
+        &[source.value], &target, &TestControl, CompilePhase::FunctionSpecialization,
+    ).unwrap();
+    let novarocks_execution::exec::expr::compiled_program::constant_node::ConstantNodeOutcome::Value(converted) = converted else {
+        panic!("the existing Int32-to-UInt32 cast must produce a value");
+    };
+    let output = evaluate(&identity(typed_arg(converted, target)));
     assert_eq!(
         output
             .pool()
@@ -509,7 +932,7 @@ fn checked_decimal_error_remains_ordinary_evaluation_while_policy_null_is_succes
         DecimalOverflowPolicy::ReportError,
     ] {
         let request = request(
-            FoldNodeKind::BinaryOp(BinOp::Add, policy),
+            FixtureNode::BinaryOp(BinOp::Add, policy),
             vec![
                 decimal(99_999_999_999_999_999_999_999_999_999_999_999_999, 38, 0),
                 i64(1),
@@ -538,7 +961,7 @@ fn checked_decimal_error_remains_ordinary_evaluation_while_policy_null_is_succes
             );
             assert!(
                 source
-                    .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
+                    .downcast_ref::<novarocks_functions::RowDataError>()
                     .is_some()
             );
         }
@@ -578,6 +1001,9 @@ fn assert_all_callbacks(
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
+        CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+            KernelFailure::ResourceExhausted,
+        )),
     ] {
         for at in 0..trace.len() {
             let refusing = Control {
@@ -592,15 +1018,15 @@ fn assert_all_callbacks(
     }
 }
 #[test]
-fn real_wide_argument_decline_keeps_entry_quantum_tail_and_all_three_original_causes() {
+fn real_wide_prepared_call_keeps_entry_quantum_tail_and_all_three_original_causes() {
     let request = request(
-        FoldNodeKind::Function {
-            name: "no_such_novarocks_function".into(),
+        FixtureNode::Function {
+            name: "coalesce".into(),
         },
         vec![i64(7); 320],
         DataType::Int64,
     );
-    assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
+    assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(Some(_)))));
     let good = Control::default();
     constant_evaluator().eval_scalar(&request, &good).unwrap();
     assert!(good.checks.lock().unwrap().contains(&256));
@@ -633,14 +1059,14 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
     request.result_type = complete;
     assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
     assert_all_callbacks(
-        &binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int32),
+        &binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int64),
         |result| assert!(matches!(result, Ok(Some(_)))),
     );
 }
 #[test]
-fn ordinary_kernel_error_and_nonnullable_decline_observe_exact_original_completion() {
+fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion() {
     let request = request(
-        FoldNodeKind::BinaryOp(BinOp::Add, DecimalOverflowPolicy::ReportError),
+        FixtureNode::BinaryOp(BinOp::Add, DecimalOverflowPolicy::ReportError),
         vec![
             decimal(99_999_999_999_999_999_999_999_999_999_999_999_999, 38, 0),
             i64(1),
@@ -656,10 +1082,10 @@ fn ordinary_kernel_error_and_nonnullable_decline_observe_exact_original_completi
     });
     let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
     request.result_type = request.result_type.with_nullable(false).unwrap();
-    assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
+    assert_all_callbacks(&request, |result| assert_invalid_arithmetic(result));
 }
 #[test]
-fn shared_type_resource_refusal_cannot_be_replaced_or_fail_open() {
+fn source_annotations_do_not_mint_a_type_resource_refusal() {
     let field = Field::new("item", DataType::Utf8, true).with_metadata(
         [(
             "provider.fact".into(),
@@ -668,11 +1094,13 @@ fn shared_type_resource_refusal_cannot_be_replaced_or_fail_open() {
         .into(),
     );
     let annotated = DataType::List(Arc::new(field));
-    let request = request(
-        FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
-        vec![],
-        annotated.clone(),
+    let target = FunctionValueType::new(annotated.clone(), true);
+    let source = typed_arg(
+        arrow::array::new_null_array(target.data_type(), 1),
+        target.clone(),
     );
+    let mut request = identity(source);
+    request.result_type = target;
     let plain = FunctionValueType::new(
         DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         true,
@@ -692,11 +1120,11 @@ fn shared_type_resource_refusal_cannot_be_replaced_or_fail_open() {
     );
     // Preserve every actual callback's first cause, including ResourceExhausted,
     // rather than inventing an annotation-driven execution validation boundary.
-    assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
+    assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(Some(_)))));
 }
 #[test]
 fn explicit_result_policy_refusal_is_typed_preparation_and_has_no_later_callback() {
-    let mut request = binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int32);
+    let mut request = binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int64);
     request.constant_policy.max_rows = 0;
     let good = Control::default();
     assert!(matches!(
@@ -757,8 +1185,8 @@ fn assert_regexp_count_literal_regex_syntax_source(error: &SqlConstantEvaluation
         "literal regex syntax keeps its exact originating data fact"
     );
     let original = source
-        .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
-        .expect("the FE bridge retains the original execution failure");
+        .downcast_ref::<novarocks_functions::RowDataError>()
+        .expect("the FE bridge retains the original selected row failure");
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(original);
     let mut has_regex_syntax = false;
     while let Some(current) = cause {
@@ -779,6 +1207,7 @@ fn assert_regexp_count_literal_regex_syntax_source(error: &SqlConstantEvaluation
 
 #[test]
 fn regexp_count_fold_receipt_reuses_literal_error_null_and_selected_pool_contract() {
+    use novarocks_sql::compiler::FrozenFoldArgumentSource;
     use novarocks_type_contract::RegexpCountPatternSource as Source;
     let selected = pool(
         Arc::new(StringArray::from(vec!["a", "[0-9"])),
@@ -786,21 +1215,39 @@ fn regexp_count_fold_receipt_reuses_literal_error_null_and_selected_pool_contrac
     )
     .value(1)
     .unwrap();
-    let pattern = FoldArg {
-        value: selected,
-        value_type: FunctionValueType::new(DataType::Utf8, false),
+    let make = |text_arg: FoldArg, pattern: FoldArg| {
+        request(
+            FixtureNode::Function {
+                name: "regexp_count".into(),
+            },
+            vec![text_arg, pattern],
+            DataType::Int64,
+        )
     };
-    let mut request = request(
-        FoldNodeKind::Function {
-            name: "regexp_count".into(),
+    let request = make(
+        text("aaa"),
+        FoldArg {
+            value: selected.clone(),
+            value_type: selected.value_type().clone(),
         },
-        vec![text("aaa"), pattern],
-        DataType::Int64,
     );
-    // The same raw pooled calculator input without emitted provenance remains
-    // Dynamic. Installing the existing fact is the behavior-changing seam.
-    assert_eq!(evaluate(&request).try_i64().unwrap(), None);
-    request.regexp_count_pattern_source = Some(Source::NativeV1Utf8LiteralWhenPresent);
+    let FrozenFoldNode::Call(call) = &request.kind else {
+        panic!("real regexp call")
+    };
+    assert_eq!(
+        call.source(),
+        FrozenFoldArgumentSource::RegexpCountPattern(Source::NativeV1Utf8LiteralWhenPresent)
+    );
+    assert_eq!(request.args[1].value.ordinal(), 1);
+    assert_eq!(call.arguments()[1].value.ordinal(), 1);
+    assert!(Arc::ptr_eq(
+        request.args[1].value.pool().array(),
+        selected.pool().array()
+    ));
+    assert!(Arc::ptr_eq(
+        call.arguments()[1].value.pool().array(),
+        selected.pool().array()
+    ));
     let error = constant_evaluator()
         .eval_scalar(&request, &TestControl)
         .unwrap_err();
@@ -814,22 +1261,22 @@ fn regexp_count_fold_receipt_reuses_literal_error_null_and_selected_pool_contrac
             .starts_with("Invalid regex expression: [0-9."),
         "{error:?}"
     );
-    request.args[0] = arg(Arc::new(StringArray::from(vec![None::<&str>])), true);
-    assert_eq!(evaluate(&request).try_i64().unwrap(), None);
-    request.args[0] = text("aaa");
-    request.args[1] = arg(Arc::new(StringArray::from(vec![None::<&str>])), true);
-    assert_eq!(evaluate(&request).try_i64().unwrap(), None);
-    request.args[1] = text("a");
-    assert_eq!(evaluate(&request).try_i64().unwrap(), Some(3));
-    request.kind = FoldNodeKind::Function {
-        name: "concat".into(),
-    };
-    assert!(
-        constant_evaluator()
-            .eval_scalar(&request, &TestControl)
-            .is_err(),
-        "a foreign call cannot consume a regexp source fact"
+    let null = || arg(Arc::new(StringArray::from(vec![None::<&str>])), true);
+    assert_eq!(
+        evaluate(&make(null(), text("[0-9"))).try_i64().unwrap(),
+        None
     );
+    assert_eq!(
+        evaluate(&make(text("aaa"), null())).try_i64().unwrap(),
+        None
+    );
+    assert_eq!(
+        evaluate(&make(text("aaa"), text("a"))).try_i64().unwrap(),
+        Some(3)
+    );
+    // A frozen receipt cannot be relabeled or attached to another function:
+    // FrozenFoldCall fields are private, and SQL source-author tests own the
+    // foreign-binding rejection. No mutated concat fixture is constructed.
 }
 
 #[test]
@@ -846,7 +1293,7 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
             control: &dyn PureCompileControl,
         ) -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
             let result = constant_evaluator().eval_scalar(request, control);
-            if matches!(&request.kind, FoldNodeKind::Function { name } if name.eq_ignore_ascii_case("regexp_count"))
+            if matches!(&request.kind, FrozenFoldNode::Call(call) if call.binding().function_id.as_str()=="builtin.scalar/regexp_count/v1")
             {
                 let failed = if let Err(error) = &result {
                     assert_regexp_count_literal_regex_syntax_source(error);
@@ -860,7 +1307,12 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
                 };
                 SEEN.lock()
                     .unwrap()
-                    .push((request.regexp_count_pattern_source, failed));
+                    .push((match &request.kind {
+                        FrozenFoldNode::Call(call) => match call.source() {
+                            novarocks_sql::compiler::FrozenFoldArgumentSource::RegexpCountPattern(source) => Some(source),
+                            _ => None,
+                        }, _ => None,
+                    }, failed));
             }
             result
         }
@@ -919,7 +1371,7 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
 }
 
 #[test]
-fn variant_typeof_preserves_the_staged_nominal_json_fold_decline_without_retagging() {
+fn nominal_json_policy_decline_is_payload_independent_without_retagging() {
     let json_type =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
@@ -933,15 +1385,12 @@ fn variant_typeof_preserves_the_staged_nominal_json_fold_decline_without_retaggi
         None,
     ] {
         let argument = typed_arg(Arc::new(StringArray::from(vec![input])), json_type.clone());
-        let request = request(
-            FoldNodeKind::Function {
-                name: "variant_typeof".into(),
-            },
-            vec![argument],
-            DataType::Utf8,
-        );
-        // This adapter intentionally declines non-Physical domains. The real
-        // typed Native call must remain, rather than a fabricated folded NULL.
+        // The old fixture used a name-only JSON-to-Variant call that is not a
+        // valid catalog binding. A valid authored Identity isolates the same
+        // payload-independent nominal-domain decline without a fake call.
+        let request = identity(argument);
+        // The port declines the authored nominal domain for every payload;
+        // it must neither retag the source nor fabricate a folded NULL.
         assert!(
             constant_evaluator()
                 .eval_scalar(&request, &TestControl)
@@ -950,4 +1399,29 @@ fn variant_typeof_preserves_the_staged_nominal_json_fold_decline_without_retaggi
         );
         assert_eq!(request.args[0].value.value_type(), &json_type);
     }
+}
+
+#[test]
+fn call_prepared_result_nullability_is_checked_before_the_arena_nonnull_decline() {
+    let mut request = request(
+        FixtureNode::Function {
+            name: "nullif".into(),
+        },
+        vec![i64(1), i64(1)],
+        DataType::Int64,
+    );
+    let FrozenFoldNode::Call(call) = &request.kind else {
+        panic!("real nullif")
+    };
+    assert!(call.prepared_result_type().nullable());
+    assert!(
+        evaluate(&request)
+            .is_null_observed(CompilePhase::FunctionSpecialization, &TestControl)
+            .unwrap()
+    );
+    request.result_type = request.result_type.with_nullable(false).unwrap();
+    assert!(matches!(
+        constant_evaluator().eval_scalar(&request, &TestControl),
+        Ok(None)
+    ));
 }

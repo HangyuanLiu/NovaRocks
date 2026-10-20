@@ -568,7 +568,6 @@ fn unsupported_operations_domains_and_foreign_runtime_addresses_are_never_null_f
     for source in [
         ty(DataType::Binary, true),
         ty(DataType::Float16, true),
-        ty(DataType::Decimal128(10, 0), true),
         ty(DataType::FixedSizeBinary(16), true),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),

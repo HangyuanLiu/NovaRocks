@@ -3392,10 +3392,10 @@ pub(crate) mod tests {
         memory_authority: Arc<novarocks_memory::MemoryAuthority>,
     ) -> Arc<ExecutionRuntime> {
         let mut function_set =
-            novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+            novarocks_execution::runtime::function_set::ExecutionFunctionSetBuilder::new();
         novarocks_sql::compiler::contribute_builtin_functions(function_set.catalog_builder_mut())
             .expect("builtin function metadata");
-        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+        novarocks_execution::runtime::function_set::contribute_builtin_aggregate_implementations(
             &mut function_set,
         )
         .expect("builtin aggregate implementations");

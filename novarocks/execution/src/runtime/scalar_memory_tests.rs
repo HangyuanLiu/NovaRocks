@@ -990,7 +990,7 @@ fn actual_prepared(
         arguments: &arguments,
         logical_argument_count: arguments.len(),
     };
-    let compile = &crate::exec::expr::pure_differential::HarnessControl;
+    let compile = &crate::exec::expr::test_support::HarnessControl;
     let bound = catalog
         .resolve_bound_user(name, FunctionKind::Scalar, request, compile)
         .unwrap();

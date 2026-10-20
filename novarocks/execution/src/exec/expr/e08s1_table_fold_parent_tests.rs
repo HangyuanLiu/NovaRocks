@@ -304,7 +304,7 @@ fn optimize(catalog: &TableParentCatalog) -> Result<(), SqlCompileError> {
         catalog,
         &EVALUATOR,
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         control.clone(),
     ))?
     .into_pending()?;

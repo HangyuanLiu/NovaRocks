@@ -69,9 +69,14 @@ fn largeint_text_actual_compiler_sparse_slice_null_empty_and_effects() {
                 .unwrap();
             assert_eq!(
                 result.values().to_data(),
-                crate::exec::expr::cast::cast_with_special_rules(&input, &DataType::Utf8)
-                    .unwrap()
-                    .to_data()
+                // Signed big-endian physical bytes represent MIN, 42, NULL.
+                // Decimal spelling is independent of either cast evaluator.
+                StringArray::from(vec![
+                    Some("-170141183460469231731687303715884105728"),
+                    Some("42"),
+                    None
+                ])
+                .to_data()
             );
             assert!(result.errors().is_empty());
             let output = evaluator

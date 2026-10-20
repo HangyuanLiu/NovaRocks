@@ -18,7 +18,8 @@ use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResul
 use arrow::array::Array;
 use arrow::datatypes::DataType;
 
-use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, IntArrayView};
+use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
+use crate::exec::hash_table::array_views::IntArrayView;
 
 use super::key_builder::GroupKeyArrayView;
 use super::key_strategy::is_compressible_key_type;

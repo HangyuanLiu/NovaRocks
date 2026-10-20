@@ -164,15 +164,23 @@ impl RuntimeKernelControl {
         Ok(host)
     }
 }
-impl crate::exec::expr::ExprEvaluationControl for RuntimeKernelControl {
-    fn checkpoint(&self) -> ExecutionResult<()> {
+impl RuntimeKernelControl {
+    pub(crate) fn checkpoint_execution(&self) -> ExecutionResult<()> {
         match self.error.error() {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
-    fn wait(&self, duration: Duration) -> ExecutionResult<()> {
+    pub(crate) fn wait_execution(&self, duration: Duration) -> ExecutionResult<()> {
         self.error.wait_interruptibly(duration)
+    }
+}
+impl crate::exec::expr::ExprEvaluationControl for RuntimeKernelControl {
+    fn checkpoint(&self) -> ExecutionResult<()> {
+        self.checkpoint_execution()
+    }
+    fn wait(&self, duration: Duration) -> ExecutionResult<()> {
+        self.wait_execution(duration)
     }
 }
 impl KernelEvaluationControl for RuntimeKernelControl {

@@ -263,7 +263,7 @@ fn field_original_arity_before_children_and_match_does_not_skip_tail() {
 }
 #[test]
 fn field_original_pool_nonzero_ordinal_broadcast_preserves_first_candidate() {
-    use super::pure_differential::constant_policy;
+    use super::test_support::constant_policy;
     struct Control;
     impl novarocks_type_contract::PureCompileControl for Control {
         fn checkpoint(
