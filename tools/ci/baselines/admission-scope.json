@@ -1,0 +1,168 @@
+{
+  "schema": 1,
+  "enabled": {
+    "stage": [
+      "CI build inputs",
+      "locked Cargo metadata",
+      "Cargo dependency policy",
+      "generated artifact hygiene",
+      "JSONObject resource profiles",
+      "JSONObject resource profile mutations",
+      "DataSketches resolved source",
+      "DataSketches source mutations",
+      "native wire dependency boundary",
+      "native wire dependency boundary mutations",
+      "application domain dependency boundary",
+      "application domain dependency boundary mutations",
+      "native trust dependency boundary",
+      "native trust dependency boundary mutations",
+      "connector role binding boundary",
+      "connector role binding boundary mutations",
+      "Iceberg provider dependency boundary",
+      "Iceberg provider dependency boundary mutations",
+      "StateStore dependency boundary",
+      "StateStore dependency boundary mutations",
+      "SPI dependency boundary",
+      "SPI dependency boundary mutations",
+      "memory dependency boundary",
+      "memory dependency boundary mutations",
+      "physical plan dependency boundary",
+      "physical plan dependency boundary mutations",
+      "local program dependency boundary",
+      "local program dependency boundary mutations",
+      "NCP-8 statistics boundary",
+      "NCP-8 statistics boundary mutations",
+      "legacy branding",
+      "legacy branding tests",
+      "system scenario stage tests",
+      "Rust executor regression tests",
+      "SQL helper environment binding",
+      "shared benchmark environment guard",
+      "isolated fixture current link",
+      "shared benchmark fixture lifecycle",
+      "shared benchmark fixture contract",
+      "cargo fmt",
+      "cargo clippy",
+      "joint tests and binaries preparation",
+      "main binary build information",
+      "SQL error manifest freshness",
+      "workspace nextest and doctests",
+      "identity snapshot tests",
+      "invocation record tests",
+      "verification composition tests",
+      "local CI classification tests",
+      "disabled SQL suite tests"
+    ],
+    "rust-test": "all",
+    "rust-doctest": "all",
+    "sql-suite": [],
+    "system-scenario": []
+  },
+  "pending": [
+    {
+      "selector": {
+        "kind": "sql-suite"
+      },
+      "owner": "SQL suite domain owners",
+      "enable_when": "Pass on main in the admission environment or receive a valid G15 disposition."
+    },
+    {
+      "selector": {
+        "kind": "system-scenario"
+      },
+      "owner": "System scenario domain owners",
+      "enable_when": "Pass on main in the admission environment or receive a valid G15 disposition."
+    },
+    {
+      "selector": {
+        "kind": "stage",
+        "names": [
+          "functional default scenario selection",
+          "selected system program preparation"
+        ]
+      },
+      "owner": "System execution owner",
+      "enable_when": "Enable with the corresponding System admission scenarios."
+    }
+  ],
+  "enumeration_gaps": [
+    {
+      "name": "exact-native-resident-cut-1048575",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-1048576",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-1048577",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-missing-tail-cut-1048577",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-1",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-2",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-3",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-4",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-5",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "exact-native-resident-cut-6",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "result-delivery/held-response-late-ack",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "catalog/mem-1-m07-hms-classification-preflight",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    },
+    {
+      "name": "catalog/mem-1-m07-real-hms-readonly-bulk",
+      "kind": "system-scenario",
+      "reason": "Constructed from an original execution binding outside the native scenario registry.",
+      "closes_with": "TST-G5"
+    }
+  ]
+}

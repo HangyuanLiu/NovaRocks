@@ -202,8 +202,10 @@ from `local-full-ci.sh --list-stages`. Rust selection uses native `rdeps()`;
 [impact rules](verification/impact-rules.json) supplement owner declarations.
 Mapping gaps remain visible and expand to a bounded owner domain or broad
 coverage. This selector is development-only. Admission derives the fixed regular
-collection, without consulting the impact graph; G17 owns formal execution,
-merge-commit enforcement, trust, scheduling and shared registration storage.
+collection, without consulting the impact graph. Admission activates a declared
+subset of that collection; current-attempt provenance and the merge-queue check
+are supplied by the Admission workflow. Post-merge full scheduling and shared
+registration storage remain separate deliveries.
 
 ```bash
 tools/ci/dev-verify.sh plan --base origin/main --root /absolute/local/task-evidence
@@ -265,8 +267,65 @@ failure fingerprints and quarantine records. It does not rewrite raw failures or
 excuse missing execution, diagnostic-only verification or cleanup violations.
 [Layer rules](../../docs/guides/development/test-governance.md#三层验证与证据组合)
 define eligible evidence and conclusion wording. Local paths and local admission
-rehearsals remain local until G17 provides the trusted formal ownership and
-recoverable shared materials.
+rehearsals remain local. Formal current-attempt evidence comes only from the
+Admission workflow and its GitHub check; cross-run formal reuse is not enabled.
+
+## PR admission
+
+```bash
+tools/ci/admission.sh --output /absolute/new/admission-output
+```
+
+The output must be an absent absolute directory. This entry runs the existing
+cargo-only native chain once, then composes its current attempt. Exit 0 means the
+enabled scope passed; 1 means it did not; 2 means an entry/configuration error.
+The native exit is retained independently, including when no attempt directory
+was produced. Failed preparation/enumeration writes a blocking composition with
+explicit unavailable kinds and preserves observations obtained before failure.
+
+`summary.md`, `composition.json` and `entry.json` retain the verdict, current
+attempt path, raw exit, scope declaration digest and run provenance. Native logs
+remain in `logs/ci-full/<attempt>`; composition never rewrites them. The workflow
+uploads both roots, including hidden diagnostics, under a run/attempt-specific
+artifact with a configured 90-day retention. Arrange recoverable handoff before
+expiry for unresolved failures and formally referenced evidence.
+
+`baselines/admission-scope.json` activates named stages and regular Rust test /
+workspace doctest scopes. It does not change native identities. SQL suites and
+System scenarios initially remain pending. Unknown names are rejected against
+fresh native declarations; pending scopes and enumeration gaps remain visible.
+Deleting the file restores the original complete regular admission collection.
+To enable a unit, first establish its main baseline in the admission environment
+or obtain a valid disposition, then submit the declaration change through PR.
+
+`verification.admission.compose_attempt` has formal and rehearsal modes. Formal
+mode requires the exact head SHA, clean and matching source start/end records,
+and a run identity supplied by the designated hosted Admission workflow on
+`merge_group` or a main dispatch. Only the current attempt is read. Other GitHub
+contexts are diagnostic; local calls are rehearsal and never acquire formal
+provenance. Environment fields in downloaded materials do not grant authority.
+The existing `dev-verify.sh compose --layer admission` interface remains local.
+
+Admission/full derive the Rust aggregate verdict from member outcomes plus
+complete, uncancelled batch and cleanup facts, retaining its native exit.
+Admission quarantine can exclude member assertions; full still gates every
+member. Nextest exit 100 can represent ordinary test failure. Cargo doctest
+nonzero exits cannot distinguish assertions from infrastructure and therefore
+cannot establish aggregate success. Development's deferred aggregate is unchanged.
+Internal prepare/error-manifest/final-prepare records supply the registered
+preparation, error manifest and build-info stage observations.
+
+The workflow runs `admission` for merge groups and dispatches, skips it on PRs,
+and runs a separate non-required PR precheck. Required-check/merge-queue settings
+need explicit rollout authorization after a successful formal main baseline.
+Real successful, rejected and repaired/re-enqueued PRs are required activation
+evidence; local validation alone does not mean the gate is active.
+The entry and composition tests run in the existing `verification-*-test.py`
+CI stage. For focused validation:
+
+```bash
+for test in tools/ci/tests/verification-*-test.py; do python3 "$test" || exit 1; done
+```
 
 ## Focused verification
 

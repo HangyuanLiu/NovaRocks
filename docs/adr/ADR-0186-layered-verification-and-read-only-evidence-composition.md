@@ -5,6 +5,9 @@ domain: [test-capabilities]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0187
+    scope: "admission activation, formal provenance and Rust aggregate verdict"
 date: 2026-10-20
 provenance:
   - "discussion: 2026-10-19 to 2026-10-20, layered verification, input-bound reuse and native execution ownership"

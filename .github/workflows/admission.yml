@@ -1,0 +1,109 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Admission
+
+on:
+  merge_group:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  admission:
+    name: admission
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "4"
+      NOVA_CI_CARGO_PROFILE: dev
+      NOVA_ADMISSION_RUNNER_LABEL: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake libclang-dev libssl-dev pkg-config
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Install pinned nextest
+        run: cargo install cargo-nextest --version 0.9.148 --locked
+
+      - name: Run admission
+        run: tools/ci/admission.sh --output "$RUNNER_TEMP/admission"
+
+      - name: Publish admission summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/admission/summary.md" ]; then
+            cat "$RUNNER_TEMP/admission/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Admission summary was not produced; inspect the preceding steps.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload admission materials
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-${{ github.run_id }}-${{ github.run_attempt }}
+          # A fresh checkout owns only this job's native attempts. Preserve them
+          # even if the entry fails before recording its attempt_root.
+          path: |
+            ${{ runner.temp }}/admission
+            logs/ci-full
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  precheck:
+    name: precheck
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: precheck-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Run fast repository prechecks
+        run: |
+          # These registered stages never consume a prepared artifact receipt.
+          stages=(
+            'cargo fmt'
+            'generated artifact hygiene'
+            'legacy branding'
+            'legacy branding tests'
+          )
+          for stage in "${stages[@]}"; do
+            tools/ci/local-full-ci.sh --run-stage "$stage" \
+              "$RUNNER_TEMP/precheck-no-artifacts.json" "$RUNNER_TEMP/precheck"
+          done

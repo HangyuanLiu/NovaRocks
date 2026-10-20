@@ -850,9 +850,12 @@ domains expand the selection; genuinely unbounded impact requires broad coverage
 An approved plan's explicit required runs remain mandatory.
 
 Development, PR admission and post-merge full verification have different
-collections and evidence rules. Admission uses the fixed regular collection on
-the actual merge commit, with current execution or eligible formal attempts; it
-does not read the impact graph. Full verification runs every maintained unit and
+collections and evidence rules. Admission uses the enabled subset of the fixed regular collection on
+the merge-group commit, from the current formal attempt; it does not read the
+impact graph. `tools/ci/baselines/admission-scope.json` declares activation and
+reports pending/enumeration gaps. The Admission workflow supplies the required
+`admission` check once the merge-queue ruleset is separately authorized and enabled;
+local rehearsals do not establish activation. Full verification runs every maintained unit and
 required mode in the current attempt and registers failures. G17 owns the formal
 platform, merge gate and scheduling. Local runs, including an admission rehearsal,
 do not establish formal admission. See [layer rules](docs/guides/development/test-governance.md#三层验证与证据组合).
