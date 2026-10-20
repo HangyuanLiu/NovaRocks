@@ -69,6 +69,7 @@ pub(crate) mod runtime_scalar_memory_test_support;
 #[derive(Clone)]
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
+    observed_stop: std::sync::OnceLock<ExecutionFailure>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     allocator: Option<Arc<crate::runtime::tracked_state_allocator::TrackedStateAllocator>>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
@@ -77,6 +78,7 @@ impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
         Self {
             error,
+            observed_stop: std::sync::OnceLock::new(),
             query_memory: None,
             allocator: None,
             construction: None,
@@ -90,6 +92,7 @@ impl RuntimeKernelControl {
     pub(crate) fn for_receiver(&self) -> Self {
         Self {
             error: Arc::clone(&self.error),
+            observed_stop: std::sync::OnceLock::new(),
             query_memory: self.query_memory.clone(),
             allocator: None,
             construction: self.construction.clone(),
@@ -165,6 +168,27 @@ impl RuntimeKernelControl {
     }
 }
 impl RuntimeKernelControl {
+    // The hot kernel port carries only a stop signal. Retain the exact
+    // originating fact only when that port actually observes its owner stop;
+    // an unrelated kernel failure must not adopt a later fragment failure.
+    fn observe_stop_cause(&self) {
+        if self.observed_stop.get().is_none() {
+            if let Some(error) = self.error.error() {
+                let _ = self.observed_stop.set(error);
+            }
+        }
+    }
+    fn project_required_failure(&self, failure: ExecutionFailure) -> ExecutionFailure {
+        if matches!(
+            failure.cause(),
+            crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+        ) {
+            if let Some(original) = self.observed_stop.get() {
+                return original.clone();
+            }
+        }
+        failure
+    }
     pub(crate) fn checkpoint_execution(&self) -> ExecutionResult<()> {
         match self.error.error() {
             Some(error) => Err(error),
@@ -187,12 +211,14 @@ impl crate::exec::expr::ExprEvaluationControl for RuntimeKernelControl {
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {
         if self.error.is_stopped() {
+            self.observe_stop_cause();
             return Err(KernelFailure::Cancelled);
         }
         Ok(())
     }
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
         if self.error.wait_until_stopped(duration) {
+            self.observe_stop_cause();
             Err(KernelFailure::Cancelled)
         } else {
             Ok(())
@@ -292,8 +318,9 @@ fn evaluate_selection(
     let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
     let mut scope =
         crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
-    let result =
-        instance.evaluate_input_runtime(input, selection, activation, control, &mut scope)?;
+    let result = instance
+        .evaluate_input_runtime(input, selection, activation, control, &mut scope)
+        .map_err(|cause| control.project_required_failure(cause.into()))?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
@@ -314,12 +341,15 @@ pub(crate) fn instances(
     }
     let mut created = Vec::with_capacity(sites.len());
     for site in sites {
-        created.push(CompiledExpressionInstance::try_new_with_allocator(
-            Arc::clone(program),
-            *site,
-            control,
-            control.allocator(),
-        )?);
+        created.push(
+            CompiledExpressionInstance::try_new_with_allocator(
+                Arc::clone(program),
+                *site,
+                control,
+                control.allocator(),
+            )
+            .map_err(|cause| control.project_required_failure(cause.into()))?,
+        );
     }
     *slot = Some(created);
     Ok(())
@@ -890,7 +920,7 @@ impl CompiledFilterBody {
             };
             self.instance = Some(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new_with_allocator(
                 Arc::clone(&self.program), node, control, control.allocator(),
-            )?);
+            ).map_err(|cause| control.project_required_failure(cause.into()))?);
         }
         let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
         let mut scope =
@@ -904,7 +934,8 @@ impl CompiledFilterBody {
                 Selection::all(input.batch().num_rows()),
                 control,
                 &mut scope,
-            )?;
+            )
+            .map_err(|cause| control.project_required_failure(cause))?;
         let truth = truth
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -1057,5 +1088,48 @@ mod controlled_wait_tests {
             Err(KernelFailure::Cancelled)
         ));
         assert_eq!(error.waiting_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod runtime_stop_source_tests {
+    use super::*;
+
+    #[test]
+    fn required_stop_projection_keeps_only_the_cause_observed_by_its_control_port() {
+        for wait in [false, true] {
+            let state = Arc::new(RuntimeErrorState::default());
+            let control = RuntimeKernelControl::new(state.clone());
+            let original = ExecutionFailure::from(KernelFailure::Operational(
+                KernelDiagnostic::new("original fragment failure"),
+            ));
+            let independent = ExecutionFailure::from(KernelFailure::Cancelled);
+            state.set_error(original.clone());
+            // A kernel refusal before this port observes a stop cannot adopt
+            // an already-published or later-published fragment cause.
+            assert!(
+                control
+                    .project_required_failure(independent.clone())
+                    .same_occurrence(&independent)
+            );
+            let signal = if wait {
+                KernelEvaluationControl::wait(&control, Duration::ZERO)
+            } else {
+                KernelEvaluationControl::checkpoint(&control, 1)
+            }
+            .expect_err("this actual control port observes its owner stop");
+            let projected = control.project_required_failure(signal.into());
+            assert_eq!(projected, original);
+            assert!(projected.same_occurrence(&original));
+            let different = ExecutionFailure::from(KernelFailure::Internal(KernelDiagnostic::new(
+                "independent kernel invariant",
+            )));
+            assert!(
+                control
+                    .project_required_failure(different.clone())
+                    .same_occurrence(&different),
+                "a different kernel failure keeps its own cause"
+            );
+        }
     }
 }

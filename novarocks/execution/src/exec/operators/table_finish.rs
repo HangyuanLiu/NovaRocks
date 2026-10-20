@@ -5917,10 +5917,30 @@ mod tests {
                     let right = second.graph().expressions().node(*expr_id).unwrap();
                     assert_eq!(left.value_type(), right.value_type());
                     assert_eq!(*nullable, *first_nullable);
-                    assert!(matches!((left.kind(), right.kind()),
-                        (lp::StaticExprKind::Literal(lp::StaticLiteral::Utf8(a)),
-                         lp::StaticExprKind::Literal(lp::StaticLiteral::Utf8(b)))
-                            if a == b && a.as_ref() == BLOB_TYPE));
+                    let (
+                        lp::StaticExprKind::Constant(left_value),
+                        lp::StaticExprKind::Constant(right_value),
+                    ) = (left.kind(), right.kind())
+                    else {
+                        panic!("LocalCompiler admits physical literals as checked constants")
+                    };
+                    assert!(
+                        left_value
+                            .equals_observed(right_value, CompilePhase::Validate, &FixtureControl)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        left_value
+                            .try_utf8_borrowed_observed(CompilePhase::Validate, &FixtureControl)
+                            .unwrap(),
+                        Some(BLOB_TYPE)
+                    );
+                    assert_eq!(
+                        right_value
+                            .try_utf8_borrowed_observed(CompilePhase::Validate, &FixtureControl)
+                            .unwrap(),
+                        Some(BLOB_TYPE)
+                    );
                     *expr_id = *first_id;
                     let role = |mapping| lp::ProgramExpressionRootSite::Node {
                         node,

@@ -39,20 +39,37 @@ use std::sync::Arc;
 // LocalCompiler author. The numeric-unary fixture intentionally admits only a
 // single nonnull column and is not an author for these multi/nullable sources.
 fn programs(
-    source: &novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+    source: novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
     fields: &[Field],
 ) -> std::collections::BTreeMap<novarocks_physical_plan::FragmentId, Arc<LocalProgram>> {
-    compiler_results_with_declared_read_fields(source, fields, &installed_builtin_owner_catalogue())
-        .into_iter()
-        .map(|(fragment, result)| {
-            (
-                fragment,
-                Arc::new(result.expect(
+    // Freeze the real application's root purpose from this same SQL result
+    // declaration before the compiler publishes aliases to the source plan.
+    let render =
+        novarocks_sql::compiler::client_render_schema_from_port(source.plan().result_port(), 0)
+            .expect("the original SQL result declares its client render schema");
+    let source = source
+        .with_root_output(novarocks_result_contract::RootOutputContract::new(
+            novarocks_result_contract::RootProfileId::V1,
+            novarocks_result_contract::FrozenRootOutput::ClientRows(render),
+        ))
+        .expect("the same SQL source freezes its actual RootResult purpose");
+    compiler_results_with_declared_read_fields(
+        &source,
+        fields,
+        &installed_builtin_owner_catalogue(),
+    )
+    .into_iter()
+    .map(|(fragment, result)| {
+        (
+            fragment,
+            Arc::new(
+                result.expect(
                     "the original SQL Project must compile with its exact input declaration",
-                )),
-            )
-        })
-        .collect()
+                ),
+            ),
+        )
+    })
+    .collect()
 }
 
 fn run_project(program: Arc<LocalProgram>, node: Option<ProgramNodeId>, input: Chunk) -> Chunk {
@@ -128,7 +145,7 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
                     .data_type(),
                 &output_type
             );
-            let programs = programs(&source, &fields);
+            let programs = programs(source, &fields);
             // Select the actual computing Project by its frozen two-column
             // input port. A result alias/gather is not a second producer.
             let mut producers = Vec::new();
@@ -264,7 +281,7 @@ fn project_casts_final_output_to_declared_slot_type() {
     let fields = [Field::new("k", DataType::Int64, false)];
     let source =
         sql_source_with_declared_fields("SELECT CAST(k AS INT) AS out FROM fixture", &fields);
-    let programs = programs(&source, &fields);
+    let programs = programs(source, &fields);
     let mut producers = Vec::new();
     for program in programs.values() {
         for node in program.graph().nodes() {
@@ -311,7 +328,7 @@ fn identity_fixture() -> (Arc<LocalProgram>, ProgramNodeId, Chunk) {
     use arrow::array::StringArray;
     let fields = [Field::new("k", DataType::Utf8, true)];
     let source = sql_source_with_declared_fields("SELECT k AS alias FROM fixture", &fields);
-    let programs = programs(&source, &fields);
+    let programs = programs(source, &fields);
     let mut producers = Vec::new();
     for program in programs.values() {
         for node in program.graph().nodes() {

@@ -262,6 +262,14 @@ impl TableWriterOperatorFactory {
         node: &tests::WriterFixture,
         state: &RuntimeState,
     ) -> ExecutionResult<Self> {
+        Self::for_test_fixture_with_projection_layout(node, state).map(|(factory, _)| factory)
+    }
+
+    #[cfg(test)]
+    fn for_test_fixture_with_projection_layout(
+        node: &tests::WriterFixture,
+        state: &RuntimeState,
+    ) -> ExecutionResult<(Self, novarocks_local_program::StaticLayout)> {
         let (program, projection, _) = tests::compiled_projection(
             node.projection.ty.clone(),
             node.expected_schema.clone(),
@@ -278,12 +286,13 @@ impl TableWriterOperatorFactory {
             None,
             &node.binding,
         )?;
+        let novarocks_local_program::ProgramNodeKind::TableWriter { projection, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            unreachable!()
+        };
+        let projection_layout = projection.layout.clone();
         if node.partial_count != 0 {
-            let novarocks_local_program::ProgramNodeKind::TableWriter { projection, .. } =
-                program.graph().nodes()[program.graph().root().index()].kind()
-            else {
-                unreachable!()
-            };
             Arc::get_mut(&mut factory.plan)
                 .expect("unpublished fixture plan")
                 .local_partial_source = Some(tests::prepare_count_source(
@@ -293,7 +302,7 @@ impl TableWriterOperatorFactory {
                 state,
             ));
         }
-        Ok(factory)
+        Ok((factory, projection_layout))
     }
 }
 
@@ -1110,6 +1119,9 @@ impl TableWriterOperator {
 
     #[cfg(test)]
     fn replace_partial_aggregate_for_test(&mut self, partial: Box<dyn Operator>) {
+        // A replacement is the actual child under test. Do not let prepare
+        // silently overwrite it with the deferred compiled COUNT fixture.
+        self.local_partial_source = None;
         let mut child = ChildStep::new(partial, self.readiness_observable.clone());
         if let Some(control) = &self.runtime_error {
             child
@@ -1766,7 +1778,11 @@ pub(crate) mod tests {
         with_step(state, |ctx| {
             let step = operator;
             if operation == PipelineOperation::Finishing {
-                step.finish(ctx).unwrap();
+                // StepOperator EOS is a no-payload control signal. Any
+                // finalization output/failure is observed by admitted drive.
+                if let Err(error) = step.finish(ctx) {
+                    return error;
+                }
             }
             for _ in 0..64 {
                 match step.drive(ctx) {
@@ -1877,6 +1893,7 @@ pub(crate) mod tests {
     }
 
     struct ProjectedInputObserver {
+        value_slot: SlotId,
         values: Arc<std::sync::Mutex<Vec<i64>>>,
         finishing: bool,
         cancelled: bool,
@@ -1901,7 +1918,7 @@ pub(crate) mod tests {
         ) -> ExecutionResult<StepResult> {
             let chunk = chunk.into_uncovered_chunk()?;
             let values = chunk
-                .column_by_slot_id(SlotId::new(1))?
+                .column_by_slot_id(self.value_slot)?
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {
@@ -3323,12 +3340,16 @@ pub(crate) mod tests {
         )
         .expect("projecting writer node");
         let state = test_runtime_state();
-        let mut operator = writer_factory(&node, &state).create_operator(1, 0);
+        let (factory, projection_layout) =
+            TableWriterOperatorFactory::for_test_fixture_with_projection_layout(&node, &state)
+                .unwrap();
+        let mut operator = factory.create_operator(1, 0);
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         operator
             .kernel_for_test_mut()
             .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
                 ProjectedInputObserver {
+                    value_slot: projection_layout.slots()[0],
                     values: Arc::clone(&observed),
                     finishing: false,
                     cancelled: false,
@@ -3632,6 +3653,8 @@ pub(crate) mod tests {
             );
         }
         accept_native_input(&mut operator, &state, raw).expect("the same second raw page resumes");
+        // EOS only marks input complete; the subsequent admitted drive
+        // drains both accepted partial output and finalization output.
         operator
             .finish_for_test(&state)
             .expect("signal EOS once with accepted work outstanding");
@@ -4471,6 +4494,29 @@ pub(crate) mod tests {
             }
         }
         assert!(memory.current() > 0, "queued Arrow input must be charged");
+        // Find the actor's actual installed queue owner after PipelineDriver
+        // has rebound the operator trackers. Compiled schemas and prepared
+        // creators remain live until driver retirement and are not queue data.
+        fn collect_writer_queues(root: &Arc<MemTracker>, queues: &mut Vec<Arc<MemTracker>>) {
+            if root.label() == "ConnectorWriterQueue" {
+                queues.push(root.clone());
+            }
+            for child in root.children() {
+                collect_writer_queues(&child, queues);
+            }
+        }
+        let mut queues = Vec::new();
+        collect_writer_queues(&memory, &mut queues);
+        assert_eq!(
+            queues.len(),
+            1,
+            "one actual actor queue belongs to this driver"
+        );
+        let queued_input = queues.pop().unwrap();
+        assert!(
+            queued_input.current() > 0,
+            "actual queue owns the in-flight Arrow input"
+        );
 
         let fragment = Arc::new(FragmentContext::new(
             None,
@@ -4495,6 +4541,10 @@ pub(crate) mod tests {
         assert!(!abort_started.load(Ordering::Acquire));
         assert!(task.has_pending_finish());
         assert!(memory.current() > 0, "in-flight append retains its input");
+        assert!(
+            queued_input.current() > 0,
+            "the queue keeps its input until append exits"
+        );
         append_gate.notify_one();
         assert!(poll_until(
             || abort_started.load(Ordering::Acquire),
@@ -4509,9 +4559,13 @@ pub(crate) mod tests {
             "fragment completion must wait for the writer's actual abort exit"
         );
         assert_eq!(
-            memory.current(),
+            queued_input.current(),
             0,
             "cancel must release queued Arrow input"
+        );
+        assert!(
+            memory.current() > 0,
+            "live driver retains its compiled schema/creator owners while abort is pending"
         );
 
         abort_gate.notify_one();
@@ -4606,8 +4660,14 @@ pub(crate) mod tests {
         let execution = Arc::new(TestWriteExecution::new(stats.clone()).with_fragments(0, 0));
         let memory = MemTracker::new_root("native writer child handoff");
         let state = test_runtime_state_with_mem(Some(memory.clone()));
-        let mut operator = writer_factory(&writer_fixture(execution), &state).create_operator(1, 0);
-        let child = Probe::new(false);
+        let (factory, projection_layout) =
+            TableWriterOperatorFactory::for_test_fixture_with_projection_layout(
+                &writer_fixture(execution),
+                &state,
+            )
+            .unwrap();
+        let mut operator = factory.create_operator(1, 0);
+        let child = Probe::with_slot(false, projection_layout.slots()[0]);
         child.finish_ready.store(false, Ordering::Release);
         operator
             .kernel_for_test_mut()
