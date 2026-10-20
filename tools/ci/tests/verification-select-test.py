@@ -141,6 +141,22 @@ class Selection(unittest.TestCase):
         self.assertEqual(chosen['heavy_ignored'],[])
         self.assertEqual(chosen['gaps'],[])
 
+    def test_deployable_fe_example_is_exact_document_review_without_masking_other_inputs(self):
+        repository = Path(__file__).resolve().parents[3]
+        rules = json.loads((repository / 'tools/ci/verification/impact-rules.json').read_text())
+        self.rules = rules
+        chosen = self.choose(['novarocks-fe.toml.example'])
+        self.assertFalse(chosen['broad'])
+        self.assertEqual(chosen['gaps'], [])
+        self.assertEqual(chosen['packages'], [])
+        self.assertEqual(self.names(chosen, 'sql_suites'), set())
+        unknown = self.choose(['unregistered-deployment.toml.example'])
+        self.assertTrue(unknown['broad'])
+        self.assertEqual(unknown['gaps'][0]['path'], 'unregistered-deployment.toml.example')
+        global_build = self.choose(['Cargo.toml'])
+        self.assertTrue(global_build['broad'])
+        self.assertEqual(global_build['gaps'], [])
+
     def test_declared_runtime_input_selects_its_rust_consumer(self):
         self.metadata['packages'][0]['metadata']['novarocks']['test']['runtime-inputs']=['tests/sql/correctness/**/*.sql']
         chosen=self.choose(['tests/sql/correctness/optimizer/sql/new_case.sql'])
