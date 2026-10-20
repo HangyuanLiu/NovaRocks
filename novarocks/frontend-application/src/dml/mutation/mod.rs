@@ -64,9 +64,15 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
             .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?
         {
             MutationStageOutcome::NoOp => Ok(CoordinatedWriteReport::NoOp),
-            MutationStageOutcome::AbortRequired { reason, handle } => {
-                Ok(CoordinatedWriteReport::AbortRequired { reason, handle })
-            }
+            MutationStageOutcome::AbortRequired {
+                reason,
+                engine_error_code,
+                handle,
+            } => Ok(CoordinatedWriteReport::AbortRequired {
+                reason,
+                engine_error_code,
+                handle,
+            }),
             MutationStageOutcome::CommitRequired(handle) => {
                 Ok(CoordinatedWriteReport::CommitRequired(handle))
             }

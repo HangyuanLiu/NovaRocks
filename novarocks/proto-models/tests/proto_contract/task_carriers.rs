@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use novarocks_proto_models::{common, novarocks, plan};
+use novarocks_proto_models::{common, novarocks};
 
 fn roundtrip_message<M>(value: &M) -> M
 where
@@ -254,24 +254,7 @@ fn file_scan_range_survives_proto_roundtrip() {
 #[test]
 fn create_task_carriers_separate_frozen_plan_from_task_assignment() {
     let fragment = novarocks::FrozenFragment {
-        package: Default::default(),
-        plan_version: vec![1; 16].into(),
-        plan_contract_revision: 1,
-        fragment_contract_version: 1,
-        pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
-            min: 1,
-            max: 8,
-            requires_power_of_two: false,
-        }),
-        plan: Some(plan::PlanFragment {
-            sink: Some(plan::DataSink {
-                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                    dest_node_id: 20,
-                    ..Default::default()
-                })),
-            }),
-            ..Default::default()
-        }),
+        package: b"opaque package".to_vec().into(),
     };
     let metadata = novarocks::CreationMetadata {
         query_context: None,
@@ -304,10 +287,7 @@ fn create_task_carriers_separate_frozen_plan_from_task_assignment() {
         .expect("decode creation metadata");
     assert_eq!(fragment, decoded_fragment);
     assert_eq!(metadata, decoded_metadata);
-    assert_eq!(
-        encoded_field_numbers(&decoded_fragment),
-        vec![1, 2, 3, 4, 5]
-    );
+    assert_eq!(encoded_field_numbers(&decoded_fragment), vec![7]);
     assert_eq!(encoded_field_numbers(&decoded_metadata), vec![2, 5]);
     let descriptor = decoded_metadata.descriptor.expect("task descriptor");
     let edge = &descriptor.topology.expect("task topology").outbound[0];

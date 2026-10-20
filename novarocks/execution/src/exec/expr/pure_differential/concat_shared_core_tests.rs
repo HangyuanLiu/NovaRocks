@@ -172,16 +172,13 @@ fn c12_p2_concat_fixed_boundaries_constants_and_empty_match_v1() {
     c.finish();
 }
 #[test]
-fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_in_both_modes() {
+fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_for_compiled() {
     use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
     use novarocks_physical_plan::{
         ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
     };
-    use novarocks_sql::compiler::SqlPhysicalEmissionMode;
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+
+    {
         for name in NAMES {
             let fields = ["sep", "a", "b", "c"].map(|n| Field::new(n, DataType::Utf8, true));
             let sql = if name == "concat" {
@@ -189,7 +186,7 @@ fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_in_both_m
             } else {
                 "SELECT concat_ws(sep,a,b,c) FROM t"
             };
-            let owner = sql_source_with_declared_fields(sql, &fields, mode);
+            let owner = sql_source_with_declared_fields(sql, &fields);
             let mut count = 0;
             for f in owner.plan().fragments().values() {
                 for (id, node) in f.expressions().iter() {
@@ -230,7 +227,7 @@ fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_in_both_m
                     }
                     assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
                     println!(
-                        "C12-P2 retained {mode:?}/{name} definition={id:?} children={args:?} request={request:?}"
+                        "C12-P2 retained compiled/{name} definition={id:?} children={args:?} request={request:?}"
                     );
                     count += 1;
                 }

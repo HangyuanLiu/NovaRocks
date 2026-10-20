@@ -23,7 +23,7 @@ use super::lowered_draft::{
 use super::physical_fragment_effects::{
     PhysicalFragmentEffectsError, aggregate_source, writer_source,
 };
-use crate::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_functions::{FunctionBindingError, PureCallLifecycle};
 use novarocks_physical_plan::{
     ExprKind, FragmentDefinitionSource, PhysicalCallDefinition, PhysicalCallSite,
@@ -94,9 +94,6 @@ pub(crate) fn admit_all_call_definitions_observed(
     owner: &SqlAuthoredPhysicalPlan,
     control: &dyn PureCompileControl,
 ) -> Result<(), SqlSourceSupportError> {
-    if owner.emission_mode() == SqlPhysicalEmissionMode::OriginalNativeV1 {
-        return Ok(());
-    }
     check_source_definitions(owner, control)
 }
 

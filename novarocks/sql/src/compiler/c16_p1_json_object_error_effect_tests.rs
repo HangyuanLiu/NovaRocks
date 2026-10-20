@@ -22,15 +22,11 @@ use arrow::datatypes::DataType;
 use novarocks_functions::PureKernelAbi;
 use novarocks_type_contract::FunctionIntrinsicRowError;
 
-fn compile(sql: &str, mode: SqlPhysicalEmissionMode) -> SqlOptimizedOutput {
-    compile_with_id_type(sql, mode, DataType::Int64)
+fn compile(sql: &str) -> SqlOptimizedOutput {
+    compile_with_id_type(sql, DataType::Int64)
 }
 
-fn compile_with_id_type(
-    sql: &str,
-    mode: SqlPhysicalEmissionMode,
-    id_type: DataType,
-) -> SqlOptimizedOutput {
+fn compile_with_id_type(sql: &str, id_type: DataType) -> SqlOptimizedOutput {
     let source = crate::planner::table::test_sql_scan_source(
         crate::planner::table::SqlScanKind::ConnectorRead,
     );
@@ -94,7 +90,6 @@ fn compile_with_id_type(
         noop_constant_evaluator(),
         None,
         crate::constant::test_constant_policy(),
-        mode,
         control.clone(),
     ))
     .unwrap()
@@ -106,7 +101,7 @@ fn compile_with_id_type(
         .unwrap()
 }
 
-fn whole_data_project(node: &OptimizedOperatorNode, mode: SqlPhysicalEmissionMode) -> bool {
+fn whole_data_project(node: &OptimizedOperatorNode) -> bool {
     let Operator::PhysicalProject(project) = &node.op else {
         return false;
     };
@@ -125,30 +120,26 @@ fn whole_data_project(node: &OptimizedOperatorNode, mode: SqlPhysicalEmissionMod
         );
         assert_eq!(
             binding.admitted_execution_abi,
-            match mode {
-                SqlPhysicalEmissionMode::OriginalNativeV1 => None,
-                SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration =>
-                    Some(PureKernelAbi::ScalarInvocationV1),
-            }
+            Some(PureKernelAbi::ScalarInvocationV1)
         );
         assert!(crate::optimizer::scalar_expr::can_fail(arena, item.expr));
         assert_eq!(arena.data_type(item.expr), &DataType::Utf8);
         true
     })
 }
-fn subtree_has_whole_data(node: &OptimizedOperatorNode, mode: SqlPhysicalEmissionMode) -> bool {
-    whole_data_project(node, mode)
+fn subtree_has_whole_data(node: &OptimizedOperatorNode) -> bool {
+    whole_data_project(node)
         || node
             .children
             .iter()
-            .any(|child| subtree_has_whole_data(child, mode))
+            .any(|child| subtree_has_whole_data(child))
 }
-fn count_preserved_filter(node: &OptimizedOperatorNode, mode: SqlPhysicalEmissionMode) -> usize {
+fn count_preserved_filter(node: &OptimizedOperatorNode) -> usize {
     let own = match &node.op {
         Operator::PhysicalFilter(_) => usize::from(
             node.children
                 .iter()
-                .any(|child| subtree_has_whole_data(child, mode)),
+                .any(|child| subtree_has_whole_data(child)),
         ),
         Operator::PhysicalScan(scan) => {
             assert!(
@@ -162,16 +153,13 @@ fn count_preserved_filter(node: &OptimizedOperatorNode, mode: SqlPhysicalEmissio
     own + node
         .children
         .iter()
-        .map(|child| count_preserved_filter(child, mode))
+        .map(|child| count_preserved_filter(child))
         .sum::<usize>()
 }
 
 #[test]
-fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_in_both_modes() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_for_compiled() {
+    {
         for filtered in [false, true] {
             let suffix = if filtered {
                 "WHERE id = 2 ORDER BY id"
@@ -181,14 +169,14 @@ fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_in_b
             let sql = format!(
                 "SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]), n) AS unused_error FROM t) s {suffix}"
             );
-            let output = compile(&sql, mode);
+            let output = compile(&sql);
             assert!(
-                subtree_has_whole_data(&output.optimized_tree, mode),
+                subtree_has_whole_data(&output.optimized_tree),
                 "PruneProjectColumns must retain the unreferenced whole-call Data use"
             );
             if filtered {
                 assert!(
-                    count_preserved_filter(&output.optimized_tree, mode) > 0,
+                    count_preserved_filter(&output.optimized_tree) > 0,
                     "PushFilterThroughProject must retain the outer filter above Data"
                 );
             }
@@ -197,8 +185,8 @@ fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_in_b
 }
 
 #[test]
-fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_in_both_modes() {
-    fn check(node: &OptimizedOperatorNode, mode: SqlPhysicalEmissionMode) -> usize {
+fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_for_compiled() {
+    fn check(node: &OptimizedOperatorNode) -> usize {
         let mut count = 0;
         if let Operator::PhysicalProject(project) = &node.op {
             let arena = node.execution_props.scalar_arena.as_ref().unwrap();
@@ -209,7 +197,7 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_in
                 if binding.function_id.as_str() != "builtin.scalar/json_object/v1" {
                     continue;
                 }
-                assert!(whole_data_project(node, mode));
+                assert!(whole_data_project(node));
                 let ScalarNode::FunctionCall {
                     binding,
                     args: access,
@@ -265,13 +253,10 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_in
             + node
                 .children
                 .iter()
-                .map(|child| check(child, mode))
+                .map(|child| check(child))
                 .sum::<usize>()
     }
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         for filtered in [false, true] {
             let suffix = if filtered {
                 "WHERE id = 2 ORDER BY id"
@@ -281,10 +266,10 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_in
             let sql = format!(
                 "SELECT id FROM (SELECT id, json_object([[id, n]][IF(id = 2, NULL, 1)], n) AS unused_error FROM t) s {suffix}"
             );
-            let output = compile_with_id_type(&sql, mode, DataType::Int32);
-            assert_eq!(check(&output.optimized_tree, mode), 1);
+            let output = compile_with_id_type(&sql, DataType::Int32);
+            assert_eq!(check(&output.optimized_tree), 1);
             if filtered {
-                assert!(count_preserved_filter(&output.optimized_tree, mode) > 0);
+                assert!(count_preserved_filter(&output.optimized_tree) > 0);
             }
         }
     }

@@ -76,6 +76,20 @@ pub(crate) enum ExpressionLoweringError {
     UnsupportedCall(PhysicalCallSite),
     Invalid(&'static str),
 }
+impl ExpressionLoweringError {
+    pub(crate) fn is_unsupported(&self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedExpression(_)
+                | Self::UnsupportedCall(_)
+                | Self::Binding(FunctionBindingError::UnavailableImplementation(_))
+                | Self::Specialization(FunctionSpecializationFailure::MissingPureImplementation(_))
+                | Self::Specialization(FunctionSpecializationFailure::Binding(
+                    FunctionBindingError::UnavailableImplementation(_)
+                ))
+        )
+    }
+}
 impl fmt::Display for ExpressionLoweringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

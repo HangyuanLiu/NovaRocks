@@ -21,7 +21,7 @@
 //! - Preserves output schema ordering and nullability contracts from plan lowering.
 //!
 //! Key exported interfaces:
-//! - Types: `ProjectProcessorFactory`.
+//! - Types: `ProjectFixtureFactory`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -655,18 +655,21 @@ pub(crate) fn materialize_project_output_owned<'a>(
 }
 
 #[derive(Clone)]
-enum ProjectOutputDeclaration {
+#[cfg(test)]
+enum FixtureProjectOutputDeclaration {
     Frozen(novarocks_local_program::StaticLayout),
     #[cfg(test)]
     Fixture(ChunkSchemaRef),
 }
 #[derive(Clone)]
-enum ProjectPurposeDeclarations {
+#[cfg(test)]
+enum FixtureProjectPurposeDeclarations {
     Frozen(novarocks_local_program::ProjectExpressionSlots),
     #[cfg(test)]
     Fixture(Arc<[ChunkSlotSchema]>),
 }
-impl ProjectPurposeDeclarations {
+#[cfg(test)]
+impl FixtureProjectPurposeDeclarations {
     fn len(&self) -> usize {
         match self {
             Self::Frozen(slots) => slots.len(),
@@ -676,17 +679,21 @@ impl ProjectPurposeDeclarations {
     }
 }
 
-pub struct ProjectProcessorFactory {
+#[cfg(test)]
+/// F3 component oracle over explicit expression/array/layout facts.
+/// This test-only fixture owns no construction tree and is not a product operator.
+pub(crate) struct ProjectFixtureFactory {
     name: String,
     arena: Arc<ExprArena>,
     exprs: Vec<ExprId>,
     expr_slot_ids: Vec<SlotId>,
-    purposes: Option<ProjectPurposeDeclarations>,
+    purposes: Option<FixtureProjectPurposeDeclarations>,
     output_indices: Option<Vec<usize>>,
-    output: ProjectOutputDeclaration,
+    output: FixtureProjectOutputDeclaration,
     validate_final_result_input: bool,
 }
-impl ProjectProcessorFactory {
+#[cfg(test)]
+impl ProjectFixtureFactory {
     #[expect(
         clippy::too_many_arguments,
         reason = "Complete frozen Project declarations"
@@ -707,9 +714,9 @@ impl ProjectProcessorFactory {
             arena,
             exprs,
             expr_slot_ids,
-            purposes.map(ProjectPurposeDeclarations::Frozen),
+            purposes.map(FixtureProjectPurposeDeclarations::Frozen),
             output_indices,
-            ProjectOutputDeclaration::Frozen(output),
+            FixtureProjectOutputDeclaration::Frozen(output),
         )
     }
     /// Component fixtures provide an explicit complete source schema. They
@@ -735,9 +742,9 @@ impl ProjectProcessorFactory {
             arena,
             exprs,
             expr_slot_ids,
-            purposes.map(|slots| ProjectPurposeDeclarations::Fixture(slots.into())),
+            purposes.map(|slots| FixtureProjectPurposeDeclarations::Fixture(slots.into())),
             output_indices,
-            ProjectOutputDeclaration::Fixture(output),
+            FixtureProjectOutputDeclaration::Fixture(output),
         )
     }
     #[expect(
@@ -750,9 +757,9 @@ impl ProjectProcessorFactory {
         arena: Arc<ExprArena>,
         exprs: Vec<ExprId>,
         expr_slot_ids: Vec<SlotId>,
-        purposes: Option<ProjectPurposeDeclarations>,
+        purposes: Option<FixtureProjectPurposeDeclarations>,
         output_indices: Option<Vec<usize>>,
-        output: ProjectOutputDeclaration,
+        output: FixtureProjectOutputDeclaration,
     ) -> Self {
         let mut name = if node_id >= 0 {
             format!("PROJECT (id={node_id})")
@@ -778,9 +785,10 @@ impl ProjectProcessorFactory {
         self
     }
 }
-impl ProjectProcessorFactory {
-    fn create_operator(&self) -> ProjectProcessorOperator {
-        ProjectProcessorOperator {
+#[cfg(test)]
+impl ProjectFixtureFactory {
+    fn create_operator(&self) -> ProjectFixtureOperator {
+        ProjectFixtureOperator {
             name: self.name.clone(),
             arena: self.arena.clone(),
             exprs: self.exprs.clone(),
@@ -803,7 +811,8 @@ impl ProjectProcessorFactory {
     }
 }
 
-impl OperatorFactory for ProjectProcessorFactory {
+#[cfg(test)]
+impl OperatorFactory for ProjectFixtureFactory {
     fn name(&self) -> &str {
         &self.name
     }
@@ -812,15 +821,16 @@ impl OperatorFactory for ProjectProcessorFactory {
     }
 }
 
-struct ProjectProcessorOperator {
+#[cfg(test)]
+struct ProjectFixtureOperator {
     name: String,
     arena: Arc<ExprArena>,
     exprs: Vec<ExprId>,
     expr_slot_ids: Vec<SlotId>,
     expr_slot_schemas: HashMap<SlotId, ChunkSlotSchema>,
     output_indices: Option<Vec<usize>>,
-    declared_output: Option<ProjectOutputDeclaration>,
-    purpose_sources: Option<ProjectPurposeDeclarations>,
+    declared_output: Option<FixtureProjectOutputDeclaration>,
+    purpose_sources: Option<FixtureProjectPurposeDeclarations>,
     output_chunk_schema: Option<ChunkSchemaRef>,
     // Containers/data are dropped before their finite map creation hold.
     purpose_storage: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
@@ -834,7 +844,8 @@ struct ProjectProcessorOperator {
     finished: bool,
 }
 
-impl Operator for ProjectProcessorOperator {
+#[cfg(test)]
+impl Operator for ProjectFixtureOperator {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -862,11 +873,11 @@ impl Operator for ProjectProcessorOperator {
                 .as_ref()
                 .ok_or(ConstructionFailure::MissingOwner)?;
             let output = match declaration {
-                ProjectOutputDeclaration::Frozen(layout) => {
+                FixtureProjectOutputDeclaration::Frozen(layout) => {
                     factory.create_compiled_chunk_schema(layout)?
                 }
                 #[cfg(test)]
-                ProjectOutputDeclaration::Fixture(source) => {
+                FixtureProjectOutputDeclaration::Fixture(source) => {
                     let owner = factory.begin_typed_construction(source)?;
                     if !source.is_typed() {
                         return Err(ConstructionFailure::InvalidSource(
@@ -908,7 +919,7 @@ impl Operator for ProjectProcessorOperator {
                 }
                 purposes = HashMap::with_capacity(source.len());
                 match source {
-                    ProjectPurposeDeclarations::Frozen(slots) => {
+                    FixtureProjectPurposeDeclarations::Frozen(slots) => {
                         for slot in slots.iter() {
                             let storage = owner
                                 .storage_lifetime()
@@ -929,7 +940,7 @@ impl Operator for ProjectProcessorOperator {
                         }
                     }
                     #[cfg(test)]
-                    ProjectPurposeDeclarations::Fixture(slots) => {
+                    FixtureProjectPurposeDeclarations::Fixture(slots) => {
                         for slot in slots.iter() {
                             if !slot.is_typed() {
                                 return Err(ConstructionFailure::InvalidSource(
@@ -998,7 +1009,8 @@ impl Operator for ProjectProcessorOperator {
     }
 }
 
-impl ProcessorOperator for ProjectProcessorOperator {
+#[cfg(test)]
+impl ProcessorOperator for ProjectFixtureOperator {
     fn accepts_encoded_column(&self, slot_id: SlotId, data_type: &DataType) -> bool {
         let supported_carrier = if self.validate_final_result_input {
             is_final_result_string_dictionary(data_type)
@@ -1063,7 +1075,8 @@ impl ProcessorOperator for ProjectProcessorOperator {
     }
 }
 
-impl ProjectProcessorOperator {
+#[cfg(test)]
+impl ProjectFixtureOperator {
     fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
         if let Some(failure) = &self.prepare_failure {
             return Err(failure.clone());
@@ -1541,7 +1554,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::ProjectProcessorOperator;
+    use super::ProjectFixtureOperator;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::LiteralValue;
     use crate::exec::expr::function::FunctionKind;
@@ -1578,7 +1591,7 @@ mod tests {
             Ok(())
         }
     }
-    fn install_fixture_creator(op: &mut ProjectProcessorOperator) {
+    fn install_fixture_creator(op: &mut ProjectFixtureOperator) {
         use crate::exec::pipeline::operator::Operator;
         use crate::exec::pipeline::operator::input_construction::*;
         let factory = ObservedInputConstructionFactory::try_new(
@@ -1595,13 +1608,13 @@ mod tests {
             Arc::new(LockedArrowInputConstructionModel),
         )
         .unwrap();
-        op.declared_output = Some(super::ProjectOutputDeclaration::Fixture(
+        op.declared_output = Some(super::FixtureProjectOutputDeclaration::Fixture(
             op.output_chunk_schema
                 .take()
                 .expect("explicit fixture output declaration"),
         ));
         if !op.expr_slot_schemas.is_empty() {
-            op.purpose_sources = Some(super::ProjectPurposeDeclarations::Fixture(
+            op.purpose_sources = Some(super::FixtureProjectPurposeDeclarations::Fixture(
                 op.expr_slot_schemas
                     .values()
                     .cloned()
@@ -1673,7 +1686,7 @@ mod tests {
         .unwrap()
     }
     fn run_declared_physical_fixture(
-        op: &mut ProjectProcessorOperator,
+        op: &mut ProjectFixtureOperator,
         input: Chunk,
     ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         use novarocks_type_contract::FunctionValueType;
@@ -1757,7 +1770,7 @@ mod tests {
         .unwrap()
     }
     fn configure_typed_identity(
-        op: &mut ProjectProcessorOperator,
+        op: &mut ProjectFixtureOperator,
         declaration: &novarocks_type_contract::FunctionValueType,
     ) {
         let source = match op.arena.node(op.exprs[0]) {
@@ -1880,7 +1893,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            let mut op = ProjectProcessorOperator {
+            let mut op = ProjectFixtureOperator {
                 name: "PROJECT".into(),
                 arena: Arc::new(arena),
                 exprs: vec![write, read],
@@ -1990,7 +2003,7 @@ mod tests {
             .unwrap();
         let mut arena = ExprArena::default();
         let expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), declaration.clone());
-        let mut op = ProjectProcessorOperator {
+        let mut op = ProjectFixtureOperator {
             name: "PROJECT".into(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -2072,7 +2085,7 @@ mod tests {
             },
             DataType::Utf8,
         );
-        let op = ProjectProcessorOperator {
+        let op = ProjectFixtureOperator {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower],
@@ -2152,7 +2165,7 @@ mod tests {
             let output = Arc::new(
                 ChunkSchema::try_new_typed(fields, ValueTypeStorageLifetime::pure()).unwrap(),
             );
-            let factory = super::ProjectProcessorFactory::from_fixture_schema(
+            let factory = super::ProjectFixtureFactory::from_fixture_schema(
                 1,
                 false,
                 arena.clone(),
@@ -2185,7 +2198,7 @@ mod tests {
             },
             DataType::Utf8,
         );
-        let mut op = ProjectProcessorOperator {
+        let mut op = ProjectFixtureOperator {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower],
@@ -2271,7 +2284,7 @@ mod tests {
             ])
             .expect("output schema"),
         );
-        let mut op = ProjectProcessorOperator {
+        let mut op = ProjectFixtureOperator {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower, coalesce],
@@ -2342,7 +2355,7 @@ mod tests {
             ])
             .expect("output schema"),
         );
-        let mut op = ProjectProcessorOperator {
+        let mut op = ProjectFixtureOperator {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![lower, read_overwritten],
@@ -2402,7 +2415,7 @@ mod tests {
         let expr_write_slot17 =
             arena.push_typed(ExprNode::SlotId(SlotId::new(18)), DataType::Int32);
         let expr_read_slot17 = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), DataType::Int32);
-        let mut op = ProjectProcessorOperator {
+        let mut op = ProjectFixtureOperator {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![expr_write_slot17, expr_read_slot17],
@@ -2500,7 +2513,7 @@ mod tests {
             ValueTypeStorageLifetime::pure(),
         )
         .unwrap();
-        let mut op = ProjectProcessorOperator {
+        let mut op = ProjectFixtureOperator {
             name: "PROJECT".into(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -2563,7 +2576,7 @@ mod tests {
             )])
             .expect("schema"),
         );
-        let mut op = ProjectProcessorOperator {
+        let mut op = ProjectFixtureOperator {
             name: "PROJECT".to_string(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -2612,21 +2625,18 @@ mod tests {
         assert_eq!(values.value(1), 2);
     }
 
-    fn final_identity_operator(
-        data_type: DataType,
-        domain: LogicalType,
-    ) -> ProjectProcessorOperator {
+    fn final_identity_operator(data_type: DataType, domain: LogicalType) -> ProjectFixtureOperator {
         final_identity_operator_with_field(field_with_logical_type(
             Field::new("result", data_type, true),
             domain,
         ))
     }
 
-    fn final_identity_operator_with_field(field: Field) -> ProjectProcessorOperator {
+    fn final_identity_operator_with_field(field: Field) -> ProjectFixtureOperator {
         let slot = SlotId::new(1);
         let mut arena = ExprArena::default();
         let expr = arena.push_typed(ExprNode::SlotId(slot), field.data_type().clone());
-        ProjectProcessorOperator {
+        ProjectFixtureOperator {
             name: "FINAL RESULT".into(),
             arena: Arc::new(arena),
             exprs: vec![expr],
@@ -3226,7 +3236,7 @@ mod tests {
         let mut declared_operator = final_identity_operator(DataType::Binary, LogicalType::Bitmap);
         configure_typed_identity(&mut declared_operator, &declaration);
         let schema = declared_operator.output_chunk_schema.take().unwrap();
-        let factory = super::ProjectProcessorFactory::from_fixture_schema(
+        let factory = super::ProjectFixtureFactory::from_fixture_schema(
             37,
             true,
             Arc::new(arena),
@@ -3434,7 +3444,7 @@ mod owned_project_tests {
             Ok(())
         }
     }
-    fn frozen_project_fixture() -> (ProjectProcessorFactory, Chunk) {
+    fn frozen_project_fixture() -> (ProjectFixtureFactory, Chunk) {
         use novarocks_local_program::{
             ProjectExpressionSlot, ProjectExpressionSlots, StaticLayout,
         };
@@ -3472,7 +3482,7 @@ mod owned_project_tests {
         .unwrap();
         let mut arena = ExprArena::default();
         let expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(7)), ty);
-        let factory = ProjectProcessorFactory::new(
+        let factory = ProjectFixtureFactory::new(
             41,
             false,
             Arc::new(arena),
@@ -3503,7 +3513,7 @@ mod owned_project_tests {
         .unwrap();
         (factory, input)
     }
-    fn frozen_hour_project_fixture() -> (ProjectProcessorFactory, Chunk, Vec<Option<i32>>) {
+    fn frozen_hour_project_fixture() -> (ProjectFixtureFactory, Chunk, Vec<Option<i32>>) {
         use crate::exec::expr::function::{FUNCTION_REGISTRY, FunctionKind};
         use novarocks_local_program::{
             ProjectExpressionSlot, ProjectExpressionSlots, StaticExprKind, StaticFunctionKind,
@@ -3600,7 +3610,7 @@ mod owned_project_tests {
             }
         ));
         let arena = ExprArena::from_immutable(&frozen).unwrap();
-        let factory = ProjectProcessorFactory::new(
+        let factory = ProjectFixtureFactory::new(
             41,
             false,
             Arc::new(arena),
@@ -4273,7 +4283,7 @@ mod owned_project_tests {
             )
             .is_err()
         );
-        let op = ProjectProcessorOperator {
+        let op = ProjectFixtureOperator {
             name: "TEST_PROJECT".into(),
             arena: Arc::new(wrong_arena),
             exprs: vec![wrong_source],

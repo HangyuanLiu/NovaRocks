@@ -17,12 +17,12 @@
 
 //! Task preparation for one compiled LocalProgram (local-compiler output).
 //!
-//! The same handle, resources, result session, runtime state and failure
-//! points as [`prepare_fragment`](super::prepare_fragment) are reused; only
-//! the program source differs. Nothing here reads a legacy fragment program,
+//! Task preparation owns its handle, resources, result session, runtime state
+//! and failure points. Nothing here reads a legacy fragment program,
 //! thaws an expression arena or takes expression semantics from the query
 //! options: those come from the compiled program alone.
 
+use crate::runtime::fragment::io::ResultPresentation;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -506,4 +506,4 @@ fn prepare_compiled_fragment_in(
 
 #[cfg(test)]
 #[path = "compiled_prepare_tests.rs"]
-mod tests;
+pub(in crate::runtime::fragment) mod tests;

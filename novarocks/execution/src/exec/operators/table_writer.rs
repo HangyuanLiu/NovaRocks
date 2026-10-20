@@ -65,9 +65,10 @@ use crate::exec::node::table_write_relation::{
 use crate::exec::node::table_write_relation::{
     TableWriteAggregateBoundary, TableWriteAggregateGuard,
 };
+#[cfg(test)]
+use crate::exec::node::table_writer::WriterFixture;
 use crate::exec::node::table_writer::{
-    TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
-    TableWriterRuntimeBinding,
+    TableWriterInputProjection, TableWriterPhysicalContextTemplate, TableWriterRuntimeBinding,
 };
 use crate::exec::operators::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
@@ -86,6 +87,7 @@ use crate::runtime::runtime_state::RuntimeState;
 const MAX_WRITER_MULTIPLEX_ROW_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
+#[cfg(test)]
 struct LocalPreparedWriterPartial {
     calls: novarocks_local_program::PreparedWriterAggregateCalls,
     input_layout: novarocks_local_program::StaticLayout,
@@ -108,6 +110,7 @@ struct TableWriterPlan {
     /// `AGGREGATE_PARTIAL` rows. A plan-tree writer binds it from the
     /// process function set; a compiled writer from its prepared calls.
     partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
+    #[cfg(test)]
     local_partial_source: Option<LocalPreparedWriterPartial>,
     #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
@@ -168,6 +171,7 @@ impl TableWriterOperatorFactory {
         clippy::too_many_arguments,
         reason = "A local writer joins frozen facts and exact Task capabilities"
     )]
+    #[cfg(test)]
     pub(crate) fn try_new_local(
         node_id: i32,
         target: WriteTargetOrdinal,
@@ -264,6 +268,7 @@ impl TableWriterOperatorFactory {
                     writer_multiplex_schema,
                 ),
                 partial_aggregate_factory,
+                #[cfg(test)]
                 local_partial_source: None,
                 #[cfg(novarocks_dev_controls)]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
@@ -273,8 +278,9 @@ impl TableWriterOperatorFactory {
 
     /// Construct a composite writer with the exact process function set used
     /// to bind every ordinary partial aggregate in its typed tail.
-    pub fn try_new(
-        node: &TableWriterNode,
+    #[cfg(test)]
+    fn for_test_fixture(
+        node: &WriterFixture,
         function_set: Arc<SealedExecutionFunctionSet>,
     ) -> Result<Self, String> {
         let name = if node.node_id >= 0 {
@@ -304,6 +310,7 @@ impl TableWriterOperatorFactory {
                     node.writer_multiplex_schema().clone(),
                 ),
                 partial_aggregate_factory,
+                #[cfg(test)]
                 local_partial_source: None,
                 #[cfg(novarocks_dev_controls)]
                 aggregate_guard: Arc::clone(node.aggregate_guard()),
@@ -314,6 +321,7 @@ impl TableWriterOperatorFactory {
 
 /// Explicit construction-plan expansion adapter; local preparation supplies
 /// the actual owner and requires complete frozen selection facts.
+#[cfg(test)]
 fn build_partial_aggregate_factory(
     node_id: i32,
     calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
@@ -330,6 +338,7 @@ fn build_partial_aggregate_factory(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn build_partial_aggregate_factory_core(
     node_id: i32,
     calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
@@ -559,6 +568,7 @@ impl TableWriterOperatorFactory {
             relation: plan.writer_multiplex_schema.clone(),
             construction: None,
             partial_aggregate,
+            #[cfg(test)]
             local_partial_source: plan.local_partial_source.clone(),
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::clone(&plan.aggregate_guard),
@@ -640,6 +650,7 @@ struct TableWriterOperator {
     relation: WriterRelationPreparation,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     partial_aggregate: Option<Box<dyn Operator>>,
+    #[cfg(test)]
     local_partial_source: Option<LocalPreparedWriterPartial>,
     #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
@@ -745,7 +756,10 @@ impl Operator for TableWriterOperator {
             .expect("table writer result tracker lock") = Some(result_tracker);
         self.pending_output_tracker =
             Some(MemTracker::new_child("WriterMultiplexOutput", &tracker));
-        if self.partial_aggregate.is_some() || self.local_partial_source.is_some() {
+        let has_partials = self.partial_aggregate.is_some();
+        #[cfg(test)]
+        let has_partials = has_partials || self.local_partial_source.is_some();
+        if has_partials {
             let aggregate_tracker = MemTracker::new_child("WriterPartialAggregate", &tracker);
             if let Some(partial) = self.partial_aggregate.as_mut() {
                 partial.set_mem_tracker(aggregate_tracker.clone());
@@ -768,6 +782,7 @@ impl Operator for TableWriterOperator {
             self.state = TableWriterState::Failed;
             return Err(error);
         }
+        #[cfg(test)]
         if let Some(recipe) = self.local_partial_source.as_ref() {
             let deferred = (|| -> ExecutionResult<Box<dyn Operator>> {
                 let factory = self
@@ -1703,12 +1718,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::ExecNode;
     use crate::exec::node::table_write_aggregate::{
         WriterPartialAggregateCall, WriterPartialAggregatePlan,
     };
     use crate::exec::node::table_write_relation::WriterMultiplexRelationSchema;
-    use crate::exec::node::values::ValuesNode;
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
@@ -2135,8 +2148,9 @@ pub(crate) mod tests {
             ] {
                 let stats = Arc::new(WriteExecutionStats::default());
                 let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-                let (node, functions) = writer_node_with_count_partials(execution, 1);
-                let factory = TableWriterOperatorFactory::try_new(&node, functions).unwrap();
+                let (node, functions) = writer_fixture_with_count_partials(execution, 1);
+                let factory =
+                    TableWriterOperatorFactory::for_test_fixture(&node, functions).unwrap();
                 let mut operator = factory.create_operator(1, 0);
                 let original: ExecutionFailure = cause.clone().into();
                 operator.replace_partial_aggregate_for_test(Box::new(TypedFailurePartial {
@@ -2490,31 +2504,33 @@ pub(crate) mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
-    fn values_input() -> Box<ExecNode> {
-        Box::new(ExecNode {
-            kind: crate::exec::node::ExecNodeKind::Values(ValuesNode {
-                chunk: Chunk::default(),
-                node_id: 1,
-            }),
-        })
+    pub(crate) fn writer_fixture(execution: Arc<dyn ConnectorWriteExecution>) -> WriterFixture {
+        WriterFixture::try_new(
+            2,
+            writer_handle(),
+            target(0),
+            execution,
+            writer_input_schema(),
+            identity_projection(),
+            TableWriterPhysicalContextTemplate::new([1; 16], 4, [2; 16], 0),
+            request_context(),
+            Arc::new(TestFragmentEncoder),
+        )
+        .expect("writer fixture")
     }
 
-    pub(crate) fn writer_node(execution: Arc<dyn ConnectorWriteExecution>) -> TableWriterNode {
-        writer_node_over(values_input(), execution)
-    }
-
-    fn writer_factory(node: &TableWriterNode) -> TableWriterOperatorFactory {
-        TableWriterOperatorFactory::try_new(
+    fn writer_factory(node: &WriterFixture) -> TableWriterOperatorFactory {
+        TableWriterOperatorFactory::for_test_fixture(
             node,
             crate::runtime::execution_runtime::test_execution_function_set(),
         )
         .expect("table writer factory")
     }
 
-    pub(crate) fn writer_node_with_count_partials(
+    pub(crate) fn writer_fixture_with_count_partials(
         execution: Arc<dyn ConnectorWriteExecution>,
         count: usize,
-    ) -> (TableWriterNode, Arc<SealedExecutionFunctionSet>) {
+    ) -> (WriterFixture, Arc<SealedExecutionFunctionSet>) {
         let function_set = crate::runtime::execution_runtime::test_execution_function_set();
         let resolved = function_set
             .catalog()
@@ -2549,8 +2565,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
         };
-        let node = TableWriterNode::try_new_with_relation(
-            values_input(),
+        let node = WriterFixture::try_new_with_relation(
             2,
             writer_handle(),
             target(0),
@@ -2567,27 +2582,6 @@ pub(crate) mod tests {
         (node, function_set)
     }
 
-    /// A writer node over a caller-supplied input, for tests that care about the
-    /// pipeline shape the input implies rather than the writer's own behavior.
-    pub(crate) fn writer_node_over(
-        input: Box<ExecNode>,
-        execution: Arc<dyn ConnectorWriteExecution>,
-    ) -> TableWriterNode {
-        TableWriterNode::try_new(
-            input,
-            2,
-            writer_handle(),
-            target(0),
-            execution,
-            writer_input_schema(),
-            identity_projection(),
-            TableWriterPhysicalContextTemplate::new([1; 16], 4, [2; 16], 0),
-            request_context(),
-            Arc::new(TestFragmentEncoder),
-        )
-        .expect("table writer node")
-    }
-
     fn drain(operator: &mut Box<dyn Operator>, state: &RuntimeState) -> Vec<Chunk> {
         let processor = operator.as_processor_mut().expect("processor");
         let mut out = Vec::new();
@@ -2601,7 +2595,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn table_writer_node_rejects_a_foreign_catalog_generation() {
+    fn table_writer_binding_rejects_a_foreign_catalog_generation() {
         struct ForeignExecution(CatalogHandle);
         #[async_trait::async_trait]
         impl ConnectorWriteExecution for ForeignExecution {
@@ -2620,8 +2614,7 @@ pub(crate) mod tests {
             ConnectorInstanceId::parse("test_connector").expect("instance id"),
             CatalogVersion::from_bytes([8; 32]),
         );
-        let error = TableWriterNode::try_new(
-            values_input(),
+        let error = WriterFixture::try_new(
             2,
             writer_handle(),
             target(0),
@@ -2644,7 +2637,7 @@ pub(crate) mod tests {
     fn prepared_writer_does_not_open_provider_until_activation() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
 
@@ -2669,7 +2662,7 @@ pub(crate) mod tests {
     fn prepared_writer_abort_does_not_wait_for_an_unstarted_actor() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
 
@@ -2688,7 +2681,7 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let factory = writer_factory(&writer_node(execution.clone()));
+        let factory = writer_factory(&writer_fixture(execution.clone()));
 
         let dop = 4;
         let mut operators: Vec<Box<dyn Operator>> =
@@ -2730,8 +2723,7 @@ pub(crate) mod tests {
         let projection =
             TableWriterInputProjection::try_new(arena, vec![input], Arc::clone(&expected_schema))
                 .expect("target projection");
-        let node = TableWriterNode::try_new(
-            values_input(),
+        let node = WriterFixture::try_new(
             2,
             writer_handle(),
             target(0),
@@ -2775,11 +2767,11 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let (node, function_set) = writer_node_with_count_partials(execution, 1);
+        let (node, function_set) = writer_fixture_with_count_partials(execution, 1);
         let node = node.with_aggregate_guard(Arc::new(RejectAggregateBoundary(
             TableWriteAggregateBoundary::PartialUpdate,
         )));
-        let mut operator = TableWriterOperatorFactory::try_new(&node, function_set)
+        let mut operator = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
             .expect("writer factory")
             .create(1, 0);
         let state = test_runtime_state();
@@ -2802,11 +2794,11 @@ pub(crate) mod tests {
     fn partial_aggregate_guard_rejects_finalize_without_success_output() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
-        let (node, function_set) = writer_node_with_count_partials(execution, 1);
+        let (node, function_set) = writer_fixture_with_count_partials(execution, 1);
         let node = node.with_aggregate_guard(Arc::new(RejectAggregateBoundary(
             TableWriteAggregateBoundary::PartialFinalize,
         )));
-        let mut operator = TableWriterOperatorFactory::try_new(&node, function_set)
+        let mut operator = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
             .expect("writer factory")
             .create(1, 0);
         let state = test_runtime_state();
@@ -2832,7 +2824,7 @@ pub(crate) mod tests {
             let execution = Arc::new(
                 TestWriteExecution::new(Arc::clone(&stats)).with_fragments(fragment_count, 4),
             );
-            let factory = writer_factory(&writer_node(execution));
+            let factory = writer_factory(&writer_fixture(execution));
             let mut operator = factory.create(1, 0);
             let state = test_runtime_state();
             bind(&mut operator, &state);
@@ -2881,9 +2873,9 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let (node, function_set) = writer_node_with_count_partials(execution, 1_024);
-        let factory =
-            TableWriterOperatorFactory::try_new(&node, function_set).expect("composite factory");
+        let (node, function_set) = writer_fixture_with_count_partials(execution, 1_024);
+        let factory = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
+            .expect("composite factory");
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
@@ -2959,9 +2951,9 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let (node, function_set) = writer_node_with_count_partials(execution, 1);
-        let factory =
-            TableWriterOperatorFactory::try_new(&node, function_set).expect("composite factory");
+        let (node, function_set) = writer_fixture_with_count_partials(execution, 1);
+        let factory = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
+            .expect("composite factory");
         let slot_id = SlotId::new(
             node.writer_multiplex_schema()
                 .contract()
@@ -3063,8 +3055,7 @@ pub(crate) mod tests {
             WriterMultiplexSchema::try_new(vec![channel.clone()]).expect("multiplex contract"),
         )
         .expect("multiplex relation");
-        let node = TableWriterNode::try_new_with_relation(
-            values_input(),
+        let node = WriterFixture::try_new_with_relation(
             2,
             writer_handle(),
             target(0),
@@ -3152,8 +3143,7 @@ pub(crate) mod tests {
             WriterMultiplexSchema::try_new(channels.clone()).expect("multiplex contract"),
         )
         .expect("multiplex relation");
-        let node = TableWriterNode::try_new_with_relation(
-            values_input(),
+        let node = WriterFixture::try_new_with_relation(
             2,
             writer_handle(),
             target(0),
@@ -3257,7 +3247,7 @@ pub(crate) mod tests {
     fn table_writer_reports_zero_rows_when_it_wrote_nothing() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
@@ -3280,7 +3270,7 @@ pub(crate) mod tests {
             TestWriteExecution::new(Arc::clone(&stats))
                 .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES),
         );
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
@@ -3297,7 +3287,7 @@ pub(crate) mod tests {
             TestWriteExecution::new(Arc::clone(&stats))
                 .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1),
         );
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
@@ -3324,7 +3314,7 @@ pub(crate) mod tests {
     fn cancelling_one_driver_aborts_only_its_own_writer() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut first = factory.create(2, 0);
         let mut second = factory.create(2, 1);
         let state = test_runtime_state();
@@ -3379,7 +3369,7 @@ pub(crate) mod tests {
         }
 
         let execution = Arc::new(FailingExecution(catalog_handle()));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
@@ -3439,7 +3429,7 @@ pub(crate) mod tests {
             catalog_handle: catalog_handle(),
             aborted: Arc::clone(&aborted),
         });
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create_operator(1, 0);
         let state = test_runtime_state();
         install_construction(&mut operator, &state);
@@ -3470,7 +3460,7 @@ pub(crate) mod tests {
     fn driver_resumes_after_async_writer_finish_to_deliver_its_output() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let runtime_state = Arc::new(test_runtime_state());
         let mut writer = factory.create(1, 0);
         bind(&mut writer, runtime_state.as_ref());
@@ -3581,7 +3571,7 @@ pub(crate) mod tests {
             gate: Arc::clone(&gate),
             rows: Arc::clone(&rows),
         });
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut operator = factory.create_operator(1, 0);
         let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
             "slow-writer-metrics",
@@ -3702,7 +3692,7 @@ pub(crate) mod tests {
         });
         let memory = MemTracker::new_root("table-writer-cancel-test");
         let runtime_state = Arc::new(test_runtime_state_with_mem(Some(Arc::clone(&memory))));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         let mut writer = factory.create(1, 0);
         bind(&mut writer, runtime_state.as_ref());
         let mut driver = PipelineDriver::new(
@@ -3794,7 +3784,7 @@ pub(crate) mod tests {
     fn terminal_writer_keeps_pending_finish_until_actor_handle_exits() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(stats));
-        let mut writer = writer_factory(&writer_node(execution)).create_operator(1, 0);
+        let mut writer = writer_factory(&writer_fixture(execution)).create_operator(1, 0);
         let runtime_state = test_runtime_state_with_mem(None);
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let actor_gate = Arc::clone(&gate);
@@ -3824,7 +3814,7 @@ pub(crate) mod tests {
     fn a_table_writer_is_never_the_pipeline_sink() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(stats));
-        let factory = writer_factory(&writer_node(execution));
+        let factory = writer_factory(&writer_fixture(execution));
         assert!(!factory.is_sink());
         assert!(!factory.is_source());
     }

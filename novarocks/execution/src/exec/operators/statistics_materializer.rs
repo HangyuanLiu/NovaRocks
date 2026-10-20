@@ -60,13 +60,15 @@ const BYTE_QUANTUM: usize = RootProfileV1::EMIT_BYTES_PER_TURN;
 const WORK_QUANTUM: usize = RootProfileV1::CELLS_PER_TURN;
 
 enum StatisticsLiteralSource {
-    Legacy(Arc<ExprArena>),
+    #[cfg(test)]
+    Fixture(Arc<ExprArena>),
     Compiled(Arc<novarocks_local_program::LocalProgram>),
 }
 impl StatisticsLiteralSource {
     fn blob(&self, expr: crate::exec::expr::ExprId) -> Option<&str> {
         match self {
-            Self::Legacy(arena) => match arena.node(expr) {
+            #[cfg(test)]
+            Self::Fixture(arena) => match arena.node(expr) {
                 Some(ExprNode::Literal(LiteralValue::Utf8(value))) => Some(value),
                 Some(ExprNode::Constant(value)) => Self::constant_blob(value),
                 _ => None,
@@ -96,19 +98,13 @@ impl StatisticsLiteralSource {
         }
         value.try_utf8().ok().flatten()
     }
-    #[cfg(test)]
-    fn original_arena(&self) -> &ExprArena {
-        match self {
-            Self::Legacy(arena) => arena,
-            Self::Compiled(_) => panic!("legacy fixture requires its original arena"),
-        }
-    }
 }
 /// Compiled execution retains its original immutable declaration until the
 /// actual BE preparation owner creates a runtime schema. The explicit legacy
 /// adapter keeps its already-authored source schema only during expansion.
 enum StatisticsSchemaPreparation {
-    Legacy {
+    #[cfg(test)]
+    Fixture {
         schema: ChunkSchemaRef,
         fixed_capacity: usize,
     },
@@ -117,19 +113,22 @@ enum StatisticsSchemaPreparation {
 impl StatisticsSchemaPreparation {
     fn arrow_schema(&self) -> arrow::datatypes::SchemaRef {
         match self {
-            Self::Legacy { schema, .. } => schema.arrow_schema_ref(),
+            #[cfg(test)]
+            Self::Fixture { schema, .. } => schema.arrow_schema_ref(),
             Self::Compiled(layout) => layout.schema().clone(),
         }
     }
     fn slots(&self) -> &[SlotId] {
         match self {
-            Self::Legacy { schema, .. } => schema.slot_ids(),
+            #[cfg(test)]
+            Self::Fixture { schema, .. } => schema.slot_ids(),
             Self::Compiled(layout) => layout.slots(),
         }
     }
-    fn legacy_schema(&self) -> Option<&ChunkSchemaRef> {
+    fn fixture_schema(&self) -> Option<&ChunkSchemaRef> {
         match self {
-            Self::Legacy { schema, .. } => Some(schema),
+            #[cfg(test)]
+            Self::Fixture { schema, .. } => Some(schema),
             Self::Compiled(_) => None,
         }
     }
@@ -149,7 +148,8 @@ impl StatisticsMaterializerFactory {
         clippy::too_many_arguments,
         reason = "Frozen source roles and bounds are independently validated"
     )]
-    pub(crate) fn try_new(
+    #[cfg(test)]
+    fn from_test_facts(
         arena: Arc<ExprArena>,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
@@ -161,12 +161,12 @@ impl StatisticsMaterializerFactory {
         max_bytes: usize,
     ) -> Result<Self, String> {
         Self::try_new_from_source(
-            StatisticsLiteralSource::Legacy(arena),
+            StatisticsLiteralSource::Fixture(arena),
             value_slot,
             literal_slots,
             mappings,
             input_slots,
-            StatisticsSchemaPreparation::Legacy {
+            StatisticsSchemaPreparation::Fixture {
                 fixed_capacity: 0,
                 schema,
             },
@@ -337,7 +337,8 @@ impl StatisticsMaterializerFactory {
                     .ok_or("statistics body is absent from the frozen input port")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if let StatisticsSchemaPreparation::Legacy {
+        #[cfg(test)]
+        if let StatisticsSchemaPreparation::Fixture {
             schema,
             fixed_capacity,
         } = &mut schema
@@ -397,9 +398,10 @@ impl OperatorFactory for StatisticsMaterializerFactory {
     fn create(&self, _: i32, _: i32) -> Box<dyn Operator> {
         Box::new(StatisticsMaterializer {
             definition: self.0.clone(),
-            output: self.0.schema.legacy_schema().cloned(),
+            output: self.0.schema.fixture_schema().cloned(),
             fixed_capacity: match &self.0.schema {
-                StatisticsSchemaPreparation::Legacy { fixed_capacity, .. } => *fixed_capacity,
+                #[cfg(test)]
+                StatisticsSchemaPreparation::Fixture { fixed_capacity, .. } => *fixed_capacity,
                 StatisticsSchemaPreparation::Compiled(_) => 0,
             },
             construction: None,
@@ -962,7 +964,7 @@ mod tests {
                 UnpivotConstant::Utf8Map(Vec::new()),
             ],
         };
-        StatisticsMaterializerFactory::try_new(
+        StatisticsMaterializerFactory::from_test_facts(
             Arc::new(arena),
             SlotId::new(3),
             vec![SlotId::new(1), SlotId::new(2), SlotId::new(4)],
@@ -976,9 +978,10 @@ mod tests {
     }
     fn operator(factory: StatisticsMaterializerFactory) -> StatisticsMaterializer {
         StatisticsMaterializer {
-            output: factory.0.schema.legacy_schema().cloned(),
+            output: factory.0.schema.fixture_schema().cloned(),
             fixed_capacity: match &factory.0.schema {
-                StatisticsSchemaPreparation::Legacy { fixed_capacity, .. } => *fixed_capacity,
+                #[cfg(test)]
+                StatisticsSchemaPreparation::Fixture { fixed_capacity, .. } => *fixed_capacity,
                 StatisticsSchemaPreparation::Compiled(_) => 0,
             },
             definition: factory.0,
@@ -1235,8 +1238,7 @@ mod tests {
     }
 
     /// Real published PhysicalPlan facts go through local-compiler and the
-    /// compiled pipeline. The separate legacy_graph below remains an explicit
-    /// expansion fixture and is never evidence for compiled prepare ownership.
+    /// compiled pipeline, including the exact protected-result sink boundary.
     fn compiled_graph(
         protected: bool,
         state: &RuntimeState,
@@ -1264,10 +1266,6 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(
-            protected,
-            "this fixture publishes the actual statistics root purpose"
-        );
         let pure = PureFixtureControl;
         // Explicit tiny FE fixture admission. It is neither a BE grant nor a
         // production candidate/default receiving profile.
@@ -1416,10 +1414,14 @@ mod tests {
             target,
             constants,
             1,
-            FragmentSink::RootResult(Box::new(RootOutputContract::new(
-                RootProfileId::V1,
-                FrozenRootOutput::InternalFacts(InternalResultDomain::StatisticsArtifactV1),
-            ))),
+            if protected {
+                FragmentSink::RootResult(Box::new(RootOutputContract::new(
+                    RootProfileId::V1,
+                    FrozenRootOutput::InternalFacts(InternalResultDomain::StatisticsArtifactV1),
+                )))
+            } else {
+                FragmentSink::Result
+            },
             Some(&["input_fields", "blob_type", "body", "properties"]),
         );
         let program = compile_family_fixture(package, 1);
@@ -1438,130 +1440,11 @@ mod tests {
         .unwrap()
     }
 
-    fn legacy_graph(
-        protected: bool,
-        state: &RuntimeState,
-    ) -> crate::exec::pipeline::builder::PipelineGraph {
-        use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-        use crate::exec::node::{unpivot::UnpivotNode, values::ValuesNode};
-        use crate::exec::pipeline::{
-            binding::{ExchangeBindings, ScanBindings},
-            dependency::DependencyManager,
-        };
-        use novarocks_local_program::StaticSinkProgram;
-        let definition = factory(vec![1], "theta".into(), 4096, 1).unwrap().0;
-        let (legacy_source, _) = input(&[b"actual decoded aggregate"]);
-        let chunk = crate::exec::chunk::typed_fixture::chunk(
-            legacy_source.record_batch().clone(),
-            &[SlotId::new(99)],
-            &[novarocks_type_contract::FunctionValueType::new(
-                DataType::Binary,
-                false,
-            )],
-        );
-        // This is the fixed StatisticsArtifactV1 output declaration, not the
-        // incoming aggregate's Binary source schema or an Arrow annotation.
-        let item = Arc::new(arrow::datatypes::Field::new("", DataType::Int32, false));
-        let entries = Arc::new(arrow::datatypes::Field::new(
-            "",
-            DataType::Struct(
-                vec![
-                    Arc::new(arrow::datatypes::Field::new("", DataType::Utf8, false)),
-                    Arc::new(arrow::datatypes::Field::new("", DataType::Utf8, false)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let types = [
-            novarocks_type_contract::FunctionValueType::new(DataType::List(item), false),
-            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-            novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
-            novarocks_type_contract::FunctionValueType::new(DataType::Map(entries, false), false),
-        ];
-        let slots = [
-            SlotId::new(1),
-            SlotId::new(2),
-            SlotId::new(3),
-            SlotId::new(4),
-        ];
-        let fields = ["input_fields", "blob_type", "body", "properties"]
-            .into_iter()
-            .zip(&types)
-            .map(|(name, ty)| {
-                arrow::datatypes::Field::new(name, ty.data_type().clone(), ty.nullable())
-            })
-            .collect::<Vec<_>>();
-        let layout = crate::exec::chunk::typed_fixture::layout(
-            Arc::new(arrow::datatypes::Schema::new(fields)),
-            &slots,
-            &types,
-        );
-        let tracker = crate::runtime::mem_tracker::MemTracker::new_root(
-            "statistics fixture output declaration",
-        );
-        let factory = actual_factory(&tracker, &state.error_state());
-        let output = factory.create_compiled_chunk_schema(&layout).unwrap();
-        assert!(output.is_typed());
-        let mut arena = definition.source.original_arena().clone();
-        for mapping in &definition.mappings {
-            for constant in &mapping.constants {
-                if let UnpivotConstant::Scalar { expr_id, nullable } = constant {
-                    assert!(!*nullable, "the original theta literal is required");
-                    arena.set_value_type(*expr_id, types[1].clone()).unwrap();
-                }
-            }
-        }
-        let plan = ExecPlan {
-            arena,
-            root: ExecNode {
-                kind: ExecNodeKind::Unpivot(UnpivotNode {
-                    input: Box::new(ExecNode {
-                        kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
-                    }),
-                    node_id: 2,
-                    passthrough_columns: Vec::new(),
-                    value_output_slot_id: SlotId::new(3),
-                    literal_output_slot_ids: vec![SlotId::new(1), SlotId::new(2), SlotId::new(4)],
-                    value_mappings: definition.mappings.clone(),
-                    output_chunk_schema: output,
-                    max_output_rows: 4096,
-                    max_output_bytes: 32 << 20,
-                }),
-            },
-        };
-        let profile = crate::exec::chunk::typed_fixture::profile(
-            &plan,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            Some(std::num::NonZeroUsize::new(1).unwrap()),
-        );
-        let sink = if protected {
-            StaticSinkProgram::RootResult(Arc::new(RootOutputContract::new(
-                RootProfileId::V1,
-                FrozenRootOutput::InternalFacts(InternalResultDomain::StatisticsArtifactV1),
-            )))
-        } else {
-            StaticSinkProgram::Noop
-        };
-        let (program, bindings) = crate::exec::chunk::typed_fixture::lower(
-            plan,
-            profile,
-            if protected {
-                vec![crate::exec::node::ExternalSinkRequirement::Result]
-            } else {
-                Vec::new()
-            },
-            sink,
-        );
-        let graph = crate::exec::pipeline::builder::build_native_pipeline_graph_for_local_program_with_runtime_settings(&program, &bindings, false, DependencyManager::new(), None, ExchangeBindings::default(), ScanBindings::default(), 1, Some(1), None, crate::runtime::execution_runtime::test_execution_function_set(), state.error_state(), 1, 1024, 1024).unwrap();
-        graph
-    }
-
     #[test]
-    fn real_local_program_builder_selects_the_protected_source_only_for_statistics_root() {
+    fn real_compiled_builder_selects_the_protected_source_only_for_statistics_root() {
         for protected in [true, false] {
             let state = RuntimeState::default();
-            let graph = legacy_graph(protected, &state);
+            let graph = compiled_graph(protected, &state);
             assert_eq!(graph.pipelines.len(), 1);
             let factories = &graph.pipelines[0].factories;
             assert_eq!(factories.len(), 2);

@@ -28,34 +28,22 @@
 //! pairing the plan was published with, so a miss here is a defect rather than
 //! a case to handle.
 
+// Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use novarocks_functions::EngineFunctionCatalog;
 use novarocks_physical_plan::PlanVersionId;
 use novarocks_physical_plan::{
     Distribution, EdgeKind, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
-    ProviderColumnReference, ProviderReadOccurrenceId, Relation, WriteTargetOrdinal,
+    ProviderReadOccurrenceId, WriteTargetOrdinal,
 };
-use novarocks_plan_codec::{
-    PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, PhysicalV1WriteFact,
-    SealedWriteTargets, encode_physical_plan_typed_pure_with_fragment_preparation,
-    physical_v1_scan_runtime_filters, physical_v1_scan_source_seal_digest,
-};
-use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::connector_read::{
-    ConnectorReadEncoder, ConnectorTableScanSource, encode_connector_expression,
-};
-use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
-use crate::native::fragment_encoder::submission::{
-    freeze_completed_fragments, freeze_completed_packages,
-};
+use crate::native::fragment_encoder::submission::freeze_completed_packages;
 use crate::query_execution::artifact::native_submission::{
     NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
 };
-use crate::query_execution::assembly::CteMulticastConsumer;
 use crate::query_execution::attempt_plan_facts::{
     AttemptEdgeFacts, AttemptPartitionKind, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
 };
@@ -65,9 +53,7 @@ use crate::query_execution::fragment_scheduling::{
     SchedulingStreamKind,
 };
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-use crate::query_execution::package_freeze::{
-    CompiledPackageCarrier, StaticPlanCarrier, extract_checked_packages,
-};
+use crate::query_execution::package_freeze::{CompiledPackageCarrier, extract_checked_packages};
 use crate::query_execution::package_writes::{WriteRecipeSession, author_frozen_writes};
 use crate::query_execution::post_compile::mint_native_encoding_provenance;
 use crate::query_execution::preparation::attempt_access::{
@@ -136,70 +122,29 @@ impl EncodedCompletedPlan {
     }
 }
 
-/// Put one completed plan on the wire, and place everything its scans were
-/// frozen with where the attempt that runs them will look.
-///
-/// A freeze leaves three things and each has its own consumer: facts that put
-/// the plan on the wire, a capability that performs the read, and what opening
-/// that read's splits takes. They separate exactly here, after having been
-/// accounted for together, and the capability moves rather than copies because
-/// a capability cannot be copied.
-/// What one plan's write targets were sealed and admitted with.
-///
-/// The handle is what the wire carries; the field names are what the provider
-/// matches its own schema by. Both belong to the same admission, so they are
-/// taken together rather than as two independent caller choices. The session
-/// that sealed them is what a compiled package's frozen writer recipes are
-/// authored from: each target's plan and the handle encoder the plan's own
-/// handles came from.
+/// The exact session that authors the package's frozen writer recipes.
 pub(crate) struct WriteTargetFacts<'a> {
-    pub(crate) sealed: &'a SealedWriteTargets,
-    pub(crate) field_names: BTreeMap<WriteTargetOrdinal, BTreeMap<[u8; 32], Box<str>>>,
     pub(crate) session: &'a dyn WriteRecipeSession,
 }
 
-/// Put one completed plan on the wire in the process's static carrier.
-///
-/// The static carrier is the process's one composition choice. The plan tree
-/// is frozen from the v1 encoding; a compiled package is frozen from the
-/// physical plan alone, with the constant policy the statement was compiled
-/// with. A plan the chosen carrier cannot express is refused, never encoded
-/// into the other carrier.
+/// Freeze one completed plan into compiled packages under the host's explicit
+/// admission and encode limits and the statement's own constant policy.
 // Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
 pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
-    functions: &EngineFunctionCatalog,
-    carrier: &StaticPlanCarrier,
+    carrier: &CompiledPackageCarrier,
     statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: Option<&WriteTargetFacts<'_>>,
-    root_allow_throw_exception: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
-    if let Some(mode) = paired.candidate().sql_emission_mode()
-        && mode != carrier.sql_emission_mode()
-    {
-        return Err(novarocks_plan_codec::PhysicalEncodeError::Invalid(
-            "completed SQL emission mode differs from the process static plan carrier".to_string(),
-        ));
-    }
-    let result = match carrier {
-        StaticPlanCarrier::PlanTree => encode_completed_plan_tree(
-            paired,
-            functions,
-            write_targets,
-            root_allow_throw_exception,
-            statement_constant_policy,
-            control,
-        ),
-        StaticPlanCarrier::CompiledPackage(carrier) => encode_completed_packages(
-            paired,
-            carrier,
-            statement_constant_policy,
-            write_targets,
-            control,
-        ),
-    };
+    let result = encode_completed_packages(
+        paired,
+        carrier,
+        statement_constant_policy,
+        write_targets,
+        control,
+    );
     if matches!(
         &result,
         Err(novarocks_plan_codec::PhysicalEncodeError::Control(_))
@@ -208,85 +153,6 @@ pub(crate) fn encode_completed_plan(
     }
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
     result
-}
-
-/// Freeze one completed plan as native plan trees.
-fn encode_completed_plan_tree(
-    paired: CompletedPlanWithAccess<FrozenProviderRead>,
-    functions: &EngineFunctionCatalog,
-    write_targets: Option<&WriteTargetFacts<'_>>,
-    root_allow_throw_exception: bool,
-    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
-    (|| -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
-        let semantic_candidate = paired.candidate().clone();
-        let (candidate, reads) = paired.into_parts();
-        let plan = candidate.plan();
-        let (encodings, capabilities) = split_frozen_reads(reads);
-        let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
-        // The FE author carries complete owner-local type tables. Its original
-        // compile control observes construction; it acquires no memory grant.
-        // Both native carriers borrow the same original SQL occurrence
-        // author. Selected signatures never manufacture context or effects.
-        let semantics = semantic_candidate
-            .author_native_writer_preparation(statement_constant_policy, control)
-            .map_err(|error| match error {
-                novarocks_sql::compiler::PackageSemanticsError::Control(error) => {
-                    novarocks_plan_codec::PhysicalEncodeError::Control(error)
-                }
-                error => novarocks_plan_codec::PhysicalEncodeError::Invalid(error.to_string()),
-            })?;
-        let calls = |id| {
-            semantics
-                .get(&id)
-                .map(|source| (source.fragment(), source.calls()))
-        };
-        let fragment_source = Some(novarocks_plan_codec::NativeFragmentPreparationSource {
-            writer_calls: &calls,
-            parameters: plan.parameters(),
-        });
-        let encoded = encode_physical_plan_typed_pure_with_fragment_preparation(
-            plan,
-            functions,
-            &facts,
-            root_allow_throw_exception,
-            control,
-            fragment_source,
-        )?;
-        let access = attempt_access_for_completed_plan(plan, capabilities)?;
-        let scans = completed_plan_scan_facts(plan, &encodings)?;
-        let provenance = mint_native_encoding_provenance();
-        let topology = completed_plan_topology(plan)?;
-        let submission = completed_plan_submission_facts(plan, &encoded, &topology, control)?;
-        // A static plan is a property of the plan, not of an attempt: every
-        // fragment is frozen here, once, and every attempt -- a recovery
-        // included -- creates its tasks from these bytes.
-        let native = NativeFragmentAttachment::for_completed_plan(
-            freeze_completed_fragments(encoded.fragments, &submission, topology.anchor)?,
-            topology.anchor,
-            provenance,
-        )?;
-        let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
-        let plan_facts = AttemptPlanFacts::from_completed(
-            scheduling,
-            completed_plan_edge_facts(plan)?,
-            scans,
-            submission,
-            AttemptRuntimeFilterFacts::from_completed(plan)?,
-            // A plan that writes states which targets its root delivers, because
-            // that is what the commit is taken over. A read plan writes none, and
-            // says none rather than an empty list.
-            Some(completed_plan_write_targets(plan)).filter(|targets| !targets.is_empty()),
-        );
-        Ok(EncodedCompletedPlan {
-            semantic_candidate,
-            native,
-            topology,
-            plan_facts,
-            access,
-        })
-    })()
 }
 
 /// What each frozen read leaves the encoding and what it leaves the attempt,
@@ -371,7 +237,7 @@ fn encode_completed_packages(
         provenance,
     )?;
     // Scan scheduling and the attempt's scan facts are read from the plan and
-    // the freezes, exactly as for the plan tree; no wire encoding is consulted.
+    // the freezes; no wire encoding is consulted.
     let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
     let plan_facts = AttemptPlanFacts::from_completed(
         scheduling,
@@ -407,12 +273,16 @@ fn refuse_uncompiled_plan_shapes(
     // lower yet is refused by the backend's compiler, by name.
     for fragment in plan.fragments().values() {
         if let Some(reason) = compiled_sink_refusal(fragment.sink()) {
-            return Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason));
+            return Err(
+                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason.into()),
+            );
         }
     }
     for edge in plan.edges().values() {
         if let Some(reason) = compiled_edge_refusal(edge.kind) {
-            return Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason));
+            return Err(
+                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason.into()),
+            );
         }
     }
     Ok(())
@@ -464,64 +334,6 @@ pub(crate) struct CompletedPlanTopology {
     pub(crate) anchor: u32,
 }
 
-/// Derive what submission encoding reads from one completed plan and its one
-/// native encoding. Router identities come from those encoded edges; their
-/// partition and slot contracts remain in the native fragment template.
-pub(crate) fn completed_plan_submission_facts(
-    plan: &PhysicalPlan,
-    encoded: &plan::DistributedPlan,
-    topology: &CompletedPlanTopology,
-    control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<SubmissionPlanFacts, novarocks_plan_codec::PhysicalEncodeError> {
-    let (fragments, stream_edge_sources) =
-        completed_plan_submission_fragments(plan, plan.result_port())?;
-    let mut cte_consumers = BTreeMap::<u32, Vec<CteMulticastConsumer>>::new();
-    for (_, consumer) in novarocks_plan_codec::physical_typed_cte_consumer_views(encoded, control)?
-    {
-        cte_consumers
-            .entry(consumer.cte_id)
-            .or_default()
-            .push(CteMulticastConsumer {
-                fragment_id: consumer.target_fragment_id,
-                exchange_node_id: consumer.target_exchange_node_id,
-            });
-    }
-
-    let router_edges =
-        encoded
-            .edges
-            .iter()
-            .filter_map(|edge| {
-                let Some(plan::fragment_edge_kind::Kind::ChangeStreamRouter(router)) =
-                    edge.edge_kind.as_ref().and_then(|kind| kind.kind.as_ref())
-                else {
-                    return None;
-                };
-                Some((edge, router))
-            })
-            .map(|(edge, router)| {
-                Ok(crate::query_execution::assembly::RouterSubmissionEdge {
-                    source_fragment_id: edge.source_fragment_id,
-                    target_fragment_id: edge.target_fragment_id,
-                    target_exchange_node_id: edge.target_exchange_node_id,
-                    router_group_id: router.router_group_id,
-                    route_id: router.route_id.as_slice().try_into().map_err(|_| {
-                        "completed router edge has a non-32-byte route ID".to_string()
-                    })?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-    Ok(SubmissionPlanFacts::for_completed_plan(
-        plan.version(),
-        plan.required().plan_contract_revision,
-        topology.order.clone(),
-        fragments,
-        stream_edge_sources,
-        cte_consumers,
-        router_edges,
-    ))
-}
-
 /// The per-fragment submission facts of one completed plan and the fragments
 /// that feed a stream edge, both read from the plan alone.
 fn completed_plan_submission_fragments(
@@ -559,13 +371,6 @@ fn completed_plan_submission_fragments(
             u32::from(fragment.id().get()),
             role,
             completed_fragment_output_columns(public_result, fragment.id()),
-            // A multicast sink is a CTE producer, and the plan names that CTE
-            // by the fragment that produces it -- the same name its edges
-            // carry, so a consumer and its producer agree without a second
-            // identity.
-            matches!(fragment.sink(), FragmentSink::Multicast { .. })
-                .then(|| u32::from(fragment.id().get())),
-            fragment.dop_domain(),
         ));
     }
     Ok((fragments, stream_edge_sources))
@@ -584,13 +389,9 @@ fn compiled_plan_submission_facts(
     let (fragments, stream_edge_sources) =
         completed_plan_submission_fragments(plan, candidate.original_public_result_port())?;
     Ok(SubmissionPlanFacts::for_completed_plan(
-        plan.version(),
-        plan.required().plan_contract_revision,
         topology.order.clone(),
         fragments,
         stream_edge_sources,
-        BTreeMap::new(),
-        Vec::new(),
     ))
 }
 
@@ -771,7 +572,34 @@ fn completed_plan_scan_facts(
     plan: &PhysicalPlan,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
 ) -> Result<Vec<AttemptScanFacts>, String> {
-    let runtime_filters = physical_v1_scan_runtime_filters(plan)?;
+    // The physical plan owns the one global binding numbering. This FE
+    // projection reads only scan consumers and imposes no carrier restrictions
+    // on other endpoints (including ordered JoinBuildKey producers).
+    let mut runtime_filters =
+        BTreeMap::<(FragmentId, NodeId), Vec<(u32, novarocks_physical_plan::ValueId)>>::new();
+    for binding in
+        novarocks_physical_plan::runtime_filter_bindings(plan).map_err(|error| error.to_string())?
+    {
+        let novarocks_physical_plan::RuntimeFilterBindingRole::Consumer(index) = binding.role
+        else {
+            continue;
+        };
+        let consumer = &plan.runtime_filters()[&binding.filter].consumers[index];
+        if consumer.apply_point != novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource {
+            continue;
+        }
+        let [value] = consumer.endpoint.values.as_ref() else {
+            return Err(format!(
+                "scan runtime filter endpoint at fragment {} node {} requires exactly one value",
+                binding.fragment.get(),
+                binding.node.get()
+            ));
+        };
+        runtime_filters
+            .entry((binding.fragment, binding.node))
+            .or_default()
+            .push((binding.binding_id, *value));
+    }
     let mut scans = Vec::new();
     for fragment in plan.fragments().values() {
         for node in fragment.nodes().values() {
@@ -856,27 +684,6 @@ fn wire_node_id(node: NodeId) -> Result<i32, String> {
         .map_err(|_| format!("scan node {} exceeds the wire node identity", node.get()))
 }
 
-/// One plan's wire-private facts, addressed the way the encoder asks for
-/// them.
-///
-/// A scan's facts are addressed by the node that performs it; a writer's by
-/// the target it writes, because one target may be written from more than one
-/// node and every one of them writes the same handle.
-pub(crate) struct FrontendPhysicalV1Facts {
-    by_node: BTreeMap<(FragmentId, NodeId), PhysicalV1ScanFact>,
-    by_target: BTreeMap<WriteTargetOrdinal, PhysicalV1WriteFact>,
-}
-
-impl PhysicalV1PrivateFacts for FrontendPhysicalV1Facts {
-    fn scan_fact(&self, fragment: FragmentId, node: NodeId) -> Option<&PhysicalV1ScanFact> {
-        self.by_node.get(&(fragment, node))
-    }
-
-    fn write_fact(&self, target: WriteTargetOrdinal) -> Option<&PhysicalV1WriteFact> {
-        self.by_target.get(&target)
-    }
-}
-
 /// The write targets one completed plan writes, in ordinal order.
 fn completed_plan_write_targets(plan: &PhysicalPlan) -> Vec<WriteTargetOrdinal> {
     let mut targets = plan
@@ -891,247 +698,6 @@ fn completed_plan_write_targets(plan: &PhysicalPlan) -> Vec<WriteTargetOrdinal> 
     targets.sort_unstable_by_key(|ordinal| ordinal.get());
     targets.dedup();
     targets
-}
-
-/// Build the private facts for every scan of one completed plan.
-fn physical_v1_private_facts(
-    plan: &PhysicalPlan,
-    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
-    write_targets: Option<&WriteTargetFacts<'_>>,
-) -> Result<FrontendPhysicalV1Facts, String> {
-    // The encoder derives the runtime-filter binding identities itself and
-    // checks what it is handed against them. Asking it rather than repeating
-    // the numbering is what keeps the two from drifting apart.
-    let runtime_filters = physical_v1_scan_runtime_filters(plan)?;
-    let mut by_node = BTreeMap::new();
-    for fragment in plan.fragments().values() {
-        for node in fragment.nodes().values() {
-            let NodeKind::Scan {
-                occurrence,
-                relation,
-                read_budget,
-                provider_outputs,
-                ..
-            } = &node.kind
-            else {
-                continue;
-            };
-            let encoding = encodings.get(occurrence).ok_or_else(|| {
-                format!(
-                    "completed plan scans provider read occurrence {} with no frozen read",
-                    occurrence.get()
-                )
-            })?;
-            let dynamic_filters = runtime_filters
-                .get(&(fragment.id(), node.id))
-                .map_or(&[][..], Vec::as_slice);
-            let source = scan_source(
-                encoding,
-                read_budget.max_batch_rows,
-                read_budget.max_batch_bytes,
-                dynamic_filters,
-                provider_outputs,
-            )?;
-            let seal = physical_v1_scan_source_seal_digest(
-                *occurrence,
-                relation.read(),
-                selection_digest(relation),
-                source.as_proto(),
-            )?;
-            by_node.insert(
-                (fragment.id(), node.id),
-                PhysicalV1ScanFact {
-                    occurrence: *occurrence,
-                    read: relation.read().clone(),
-                    selection_digest: selection_digest(relation),
-                    source_seal_digest: seal,
-                    database: encoding.identity.namespace.as_str().into(),
-                    // A scan addresses its relation by frozen reference, so it
-                    // has no alias to carry: an alias is a name a statement
-                    // used, and no reader resolves anything by it.
-                    alias: None,
-                    table_name: encoding.identity.table.as_str().into(),
-                    table_source: plan::ScanSource {
-                        kind: Some(plan::scan_source::Kind::TypedConnectorRead(
-                            source.as_proto().clone(),
-                        )),
-                    },
-                    table_columns: frozen_table_columns(encoding),
-                    columns: scan_columns(encoding, provider_outputs)?,
-                },
-            );
-        }
-    }
-    // Every target the plan writes must be one this session sealed: a target
-    // the session did not seal is a writer handle nobody accounted for.
-    //
-    // The converse does not hold. One session seals every target its statement
-    // writes and then drives a query per target -- a copy-on-write UPDATE
-    // seals the delete and the insert together -- so a sealed target this
-    // plan does not write belongs to one of that statement's other queries.
-    let written = completed_plan_write_targets(plan);
-    let mut by_target = BTreeMap::new();
-    for target in &written {
-        let facts = write_targets.ok_or_else(|| {
-            format!(
-                "completed plan writes target {} with no sealed writer handle",
-                target.get()
-            )
-        })?;
-        let handle = facts.sealed.handle_for_target(*target).ok_or_else(|| {
-            format!(
-                "completed plan writes target {} with no sealed writer handle",
-                target.get()
-            )
-        })?;
-        let field_names = facts.field_names.get(target).cloned().ok_or_else(|| {
-            format!(
-                "completed plan writes target {} with no accepted field bindings",
-                target.get()
-            )
-        })?;
-        by_target.insert(
-            *target,
-            PhysicalV1WriteFact {
-                handle,
-                field_names,
-            },
-        );
-    }
-    Ok(FrontendPhysicalV1Facts { by_node, by_target })
-}
-
-const fn selection_digest(relation: &Relation) -> [u8; 32] {
-    match relation {
-        Relation::Data(relation) => relation.selection_digest,
-        Relation::Metadata(relation) => relation.selection_digest,
-    }
-}
-
-/// The provider-owned half of one scan, as the wire carries it.
-fn scan_source(
-    encoding: &FrozenReadEncoding,
-    max_batch_rows: u64,
-    max_batch_bytes: u64,
-    dynamic_filters: &[(u32, novarocks_physical_plan::ValueId)],
-    provider_outputs: &[(ProviderColumnReference, novarocks_physical_plan::ValueId)],
-) -> Result<ConnectorTableScanSource, String> {
-    let encoder = encoding.encoder.as_ref();
-    let assignments = encoding
-        .assignments
-        .iter()
-        .enumerate()
-        .map(|(index, assignment)| {
-            encoder.encode_assignment(
-                assignment,
-                FieldPath::root("connector_table_scan_source")
-                    .field("assignments")
-                    .index(index),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let raw = dto::ConnectorTableScanSource {
-        table: Some(
-            encoder
-                .encode_relation(&encoding.relation)
-                .map_err(|error| error.to_string())?,
-        ),
-        assignments,
-        enforced_predicate: Some(
-            encoder
-                .encode_tuple_domain(
-                    &encoding.enforced_predicate,
-                    FieldPath::root("connector_table_scan_source").field("enforced_predicate"),
-                )
-                .map_err(|error| error.to_string())?,
-        ),
-        unenforced_predicate: Some(
-            encoder
-                .encode_tuple_domain(
-                    &encoding.unenforced_predicate,
-                    FieldPath::root("connector_table_scan_source").field("unenforced_predicate"),
-                )
-                .map_err(|error| error.to_string())?,
-        ),
-        remaining_expression: encoding
-            .remaining_expression
-            .as_ref()
-            .map(encode_connector_expression),
-        dynamic_filters: dynamic_filters
-            .iter()
-            .map(|(filter_id, value)| {
-                let ordinal = provider_outputs
-                    .iter()
-                    .position(|(_, output)| output == value)
-                    .ok_or_else(|| {
-                        format!(
-                            "runtime filter {filter_id} constrains a value this scan does not produce"
-                        )
-                    })?;
-                Ok(dto::DynamicFilterBinding {
-                    filter_id: *filter_id,
-                    variable: encoding.assignments[ordinal].variable().to_owned(),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-        max_batch_rows,
-        max_batch_bytes,
-        work_source: match encoding.work_source {
-            ConnectorReadWorkSource::RuntimeSplits => dto::ScanWorkSource::RuntimeSplits as i32,
-            ConnectorReadWorkSource::WholeRelation => dto::ScanWorkSource::WholeRelation as i32,
-        },
-    };
-    ConnectorTableScanSource::parse(raw, FieldPath::root("connector_table_scan_source"))
-        .map_err(|error| error.to_string())
-}
-
-/// Borrow each frozen provider column's complete declaration until the
-/// fragment encoder binds it into that fragment's actual type namespace.
-fn frozen_table_columns(encoding: &FrozenReadEncoding) -> Box<[PhysicalV1ScanColumn]> {
-    encoding
-        .columns
-        .iter()
-        .map(|(reference, column)| PhysicalV1ScanColumn {
-            column: reference.clone(),
-            name: column.name().into(),
-            ty: column.engine_type().clone(),
-            connector_type: column.connector_type(),
-            // Iceberg lineage fields are ordinary explicitly projected read fields.
-            internal: false,
-        })
-        .collect()
-}
-
-/// Each column the scan produces, in the order the plan produces them.
-fn scan_columns(
-    encoding: &FrozenReadEncoding,
-    provider_outputs: &[(ProviderColumnReference, novarocks_physical_plan::ValueId)],
-) -> Result<Box<[PhysicalV1ScanColumn]>, String> {
-    provider_outputs
-        .iter()
-        .map(|(reference, _)| {
-            let (_, column) = encoding
-                .columns
-                .iter()
-                .find(|(frozen, _)| frozen == reference)
-                .ok_or_else(|| {
-                    "completed plan scan produces a provider column its freeze did not project"
-                        .to_string()
-                })?;
-            Ok(PhysicalV1ScanColumn {
-                column: reference.clone(),
-                name: column.name().into(),
-                // Preserve the complete source-authored engine declaration;
-                // provider attributes remain with the separate frozen source.
-                ty: column.engine_type().clone(),
-                connector_type: column.connector_type(),
-                // A scan produces relation columns; `internal` marks a writer
-                // relation value, which a read never carries.
-                internal: false,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1155,132 +721,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn native_writer_loan_rejects_foreign_fragment_even_with_the_exact_same_site() {
-        use novarocks_sql::compiler::{
-            SqlPhysicalEmissionMode, author_native_writer_preparation, writer_state_source_for_test,
-        };
-
-        // Reuse the real writer-statistics planner, branch router and checked
-        // request journal. Neither the calls nor their sites are test-built.
-        let mut catalog = novarocks_functions::EngineFunctionCatalogBuilder::new();
-        catalog
-            .register(
-                novarocks_connector_iceberg_functions::iceberg_theta_registration()
-                    .unwrap()
-                    .definition()
-                    .clone(),
-            )
-            .unwrap();
-        let functions = Arc::new(catalog.seal_bound().unwrap());
-        let owner = writer_state_source_for_test(
-            novarocks_connector_iceberg_functions::ICEBERG_THETA_AGGREGATE_NAME,
-            &[1, 1],
-            &[false, false],
-            functions.clone(),
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        );
-        let control = SqlCompileControl::unbounded();
-        let sources = author_native_writer_preparation(
-            &owner,
-            crate::application::test_constant_policy(),
-            &control,
-        )
-        .expect("the actual checked Writer source authors its receipts");
-        assert!(sources.len() >= 2, "real distributed writer fragments");
-        let (&target, target_source) = sources
-            .iter()
-            .find(|(_, source)| !source.calls().is_empty())
-            .expect("an actual Writer site");
-        let (&foreign, foreign_source) = sources
-            .iter()
-            .find(|(id, source)| **id != target && !source.calls().is_empty())
-            .expect("a second actual Writer fragment");
-        assert_eq!(foreign_source.fragment(), foreign);
-        let site = *target_source.calls().keys().next().unwrap();
-        assert_eq!(target_source.fragment(), target);
-        assert_eq!(target_source.calls()[&site].site, site);
-
-        // These are the exact private wire projections of the same original
-        // provider handles and target names, not new semantic declarations.
-        let mut facts = FrontendPhysicalV1Facts {
-            by_node: BTreeMap::new(),
-            by_target: BTreeMap::new(),
-        };
-        for fragment in owner.plan().fragments().values() {
-            for node in fragment.nodes().values() {
-                if let NodeKind::TableWriter { target } = &node.kind {
-                    facts.by_target.insert(
-                        target.write_target_ordinal,
-                        PhysicalV1WriteFact {
-                            handle: novarocks_proto_models::connector_write::ConnectorWriterHandle {
-                                provider_payload: Some(
-                                    novarocks_proto_codec::connector_common::encode_connector_payload_message(
-                                        &target.handle,
-                                    ),
-                                ),
-                            },
-                            field_names: target
-                                .target_fields
-                                .iter()
-                                .map(|field| (field.token.to_bytes(), field.provider_name.clone()))
-                                .collect(),
-                        },
-                    );
-                }
-            }
-        }
-        let lawful = |id| {
-            sources
-                .get(&id)
-                .map(|source| (source.fragment(), source.calls()))
-        };
-        encode_physical_plan_typed_pure_with_fragment_preparation(
-            owner.plan(),
-            &functions,
-            &facts,
-            false,
-            &control,
-            Some(novarocks_plan_codec::NativeFragmentPreparationSource {
-                writer_calls: &lawful,
-                parameters: owner.plan().parameters(),
-            }),
-        )
-        .expect("each actual source remains in its own fragment");
-
-        let foreign_loan = |id| {
-            sources.get(&id).map(|source| {
-                let namespace = if id == target {
-                    foreign
-                } else {
-                    source.fragment()
-                };
-                (namespace, source.calls())
-            })
-        };
-        // In particular, no missing or different call site explains rejection:
-        // the foreign loan still contains the exact original Writer receipt.
-        let (namespace, calls) = foreign_loan(target).unwrap();
-        assert_eq!(namespace, foreign);
-        assert_eq!(calls[&site], target_source.calls()[&site]);
-        let refused = encode_physical_plan_typed_pure_with_fragment_preparation(
-            owner.plan(),
-            &functions,
-            &facts,
-            false,
-            &control,
-            Some(novarocks_plan_codec::NativeFragmentPreparationSource {
-                writer_calls: &foreign_loan,
-                parameters: owner.plan().parameters(),
-            }),
-        );
-        assert!(matches!(
-            refused,
-            Err(novarocks_plan_codec::PhysicalEncodeError::Invalid(message))
-                if message == "writer preparation borrows a different fragment owner"
-        ));
-    }
 
     struct NoFacts;
 
@@ -1315,12 +755,9 @@ mod tests {
         let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
         let encoded = encode_completed_plan(
             completed,
-            &novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                .expect("builtin engine function catalog"),
-            &StaticPlanCarrier::PlanTree,
+            &compiled_carrier(),
             crate::application::test_constant_policy(),
             None,
-            false,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("a completed plan encodes");
@@ -1377,7 +814,7 @@ mod tests {
         let completed = runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql,novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration), &scope),
+                    .complete(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"));
         let control = SqlCompileControl::unbounded();
@@ -1488,19 +925,16 @@ mod tests {
     }
 
     /// The compiled package carrier under test sizing.
-    fn compiled_carrier() -> StaticPlanCarrier {
-        StaticPlanCarrier::CompiledPackage(CompiledPackageCarrier::new(
+    fn compiled_carrier() -> CompiledPackageCarrier {
+        CompiledPackageCarrier::new(
             test_package_admission(),
             novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
-        ))
+        )
     }
 
     /// Complete one table-free statement with the production Frontend
     /// constant evaluator.
-    fn completed_for(
-        sql: &str,
-        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-    ) -> CompletedPlanWithAccess<FrozenProviderRead> {
+    fn completed_for(sql: &str) -> CompletedPlanWithAccess<FrozenProviderRead> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1509,28 +943,25 @@ mod tests {
         runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql, emission_mode), &scope),
+                    .complete(request_for(sql), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"))
     }
 
     fn encode_with(
         sql: &str,
-        carrier: &StaticPlanCarrier,
+        carrier: &CompiledPackageCarrier,
     ) -> (
         Arc<PhysicalPlan>,
         Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError>,
     ) {
-        let completed = completed_for(sql, carrier.sql_emission_mode());
+        let completed = completed_for(sql);
         let plan = Arc::clone(completed.candidate().plan());
         let encoded = encode_completed_plan(
             completed,
-            &novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                .expect("builtin engine function catalog"),
             carrier,
             crate::application::test_constant_policy(),
             None,
-            false,
             &SqlCompileControl::unbounded(),
         );
         (plan, encoded)
@@ -1642,325 +1073,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_tree_original_percentile_empty_keeps_complete_request_without_candidate_gate() {
-        use novarocks_proto_models::{expr, plan};
-        use novarocks_type_contract::{
-            CompileCheckpoints, CompilePhase, ValueKind, ValueLogicalType,
-        };
-        use prost::Message;
-        fn visit<'a>(
-            value: &'a expr::Expr,
-            calls: &mut Vec<(&'a expr::Expr, &'a expr::FunctionCall)>,
-        ) {
-            if let Some(expr::expr::Kind::FunctionCall(call)) = &value.kind {
-                calls.push((value, call));
-                for arg in &call.args {
-                    visit(arg, calls);
-                }
-            }
-        }
-        fn node<'a>(
-            value: &'a plan::DistributedNode,
-            calls: &mut Vec<(&'a expr::Expr, &'a expr::FunctionCall)>,
-        ) {
-            if let Some(plan::distributed_node::Payload::Physical(value)) = &value.payload {
-                if let Some(plan::plan_node::Kind::Project(project)) = &value.kind {
-                    for item in &project.items {
-                        if let Some(value) = &item.expr {
-                            visit(value, calls);
-                        }
-                    }
-                }
-            }
-            for child in &value.children {
-                node(child, calls);
-            }
-        }
-        let sql =
-            "SELECT HEX(CAST(percentile_empty() AS VARBINARY)) AS raw, percentile_empty() AS p";
-        let (source, encoded) = encode_with(sql, &StaticPlanCarrier::PlanTree);
-        let encoded = encoded.expect("existing default percentile_empty must not acquire a Candidate pure implementation gate");
-        let control = SqlCompileControl::unbounded();
-        let mut originals = 0;
-        let mut conversions = 0;
-        for id in encoded.native.fragment_ids() {
-            let frozen = novarocks_proto_models::novarocks::FrozenFragment::decode(
-                encoded.native.get(id).unwrap().content().bytes().clone(),
-            )
-            .unwrap();
-            let fragment = frozen.plan.expect("modern native tree");
-            assert!(frozen.package.is_empty());
-            let requests = fragment
-                .original_call_requests
-                .as_ref()
-                .expect("mandatory true original request namespace");
-            let table = fragment
-                .execution_types
-                .as_ref()
-                .expect("complete execution namespace");
-            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-            let types = novarocks_plan_codec::execution_type_table::decode_execution_type_table_observed(
-                table,
-                novarocks_plan_codec::execution_type_table::ExecutionTypeTableLimits::for_validated_root_count(table.value_bindings.len()).unwrap(),
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                &mut |_| Ok::<_, novarocks_plan_codec::host_projection_v2::AdmissionRefusal<std::convert::Infallible>>(()),
-                &mut work,
-            ).unwrap();
-            let mut calls = Vec::new();
-            node(fragment.root.as_ref().unwrap(), &mut calls);
-            for output in &fragment.output_exprs {
-                visit(output, &mut calls);
-            }
-            for (expression, call) in calls {
-                let binding = call
-                    .frozen_binding
-                    .as_ref()
-                    .expect("actual original selection");
-                assert_eq!(binding.id, expression.original_definition_id.unwrap());
-                let request = requests
-                    .entries
-                    .iter()
-                    .find(|request| request.request_id == call.original_request_id)
-                    .expect("actual definition's source request");
-                assert_eq!(request.definition.as_ref().unwrap().kind, Some(novarocks_proto_models::call_request::call_request_definition::Kind::ExpressionDefinitionId(binding.id)));
-                if call.function_name == "percentile_empty" {
-                    originals += 1;
-                    assert!(
-                        binding.arguments.is_empty()
-                            && request.arguments.is_empty()
-                            && call.args.is_empty()
-                    );
-                    assert_eq!(request.logical_argument_count, Some(0));
-                    let Some(novarocks_proto_models::physical_package_v2::function_binding_definition::Result::ScalarValueTypeId(value_id)) = &binding.result else { panic!("actual scalar result") };
-                    let result = types.get_observed(*value_id, &mut work).unwrap().unwrap();
-                    assert!(matches!(
-                        result.value_type().kind(),
-                        ValueKind::Nominal(ValueLogicalType::Percentile)
-                    ));
-                    let original = source.fragments()
-                        [&novarocks_physical_plan::FragmentId::new(id)]
-                        .call_requests()
-                        .entries()
-                        .get(
-                            &novarocks_physical_plan::PhysicalCallDefinition::Expression(
-                                novarocks_physical_plan::ExprId::new(binding.id),
-                            ),
-                        )
-                        .expect("same completed plan's sole original source");
-                    assert_eq!(
-                        request.expected_result_value_type_id.is_some(),
-                        original.expected_result_type.is_some(),
-                        "optional target presence comes from the original request, not the selected result"
-                    );
-                    if let (Some(target_id), Some(original)) = (
-                        request.expected_result_value_type_id,
-                        original.expected_result_type.as_ref(),
-                    ) {
-                        let target = types.get_observed(target_id, &mut work).unwrap().unwrap();
-                        assert!(
-                            target
-                                .exactly_equals_checked_observed(original, || work.step())
-                                .unwrap()
-                        );
-                    }
-                }
-                if call.function_name == "value_domain_conversion" {
-                    conversions += 1;
-                }
-            }
-            work.finish().unwrap();
-        }
-        assert!(
-            originals > 0,
-            "do not replace the original public producer with another function or folded fixture"
-        );
-        assert!(
-            conversions > 0,
-            "the genuine opaque-to-binary occurrence remains on the public path"
-        );
-    }
-
-    #[test]
-    fn plan_tree_freezes_nominal_conversion_with_original_target_and_control() {
-        use novarocks_proto_models::{expr, physical_package_v2 as binding, plan};
-        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
-        use prost::Message;
-
-        fn expressions<'a>(node: &'a plan::DistributedNode, out: &mut Vec<&'a expr::Expr>) {
-            if let Some(plan::distributed_node::Payload::Physical(physical)) = &node.payload {
-                match &physical.kind {
-                    Some(plan::plan_node::Kind::Project(project)) => {
-                        out.extend(project.items.iter().map(|item| item.expr.as_ref().unwrap()));
-                    }
-                    Some(plan::plan_node::Kind::Values(values)) => {
-                        out.extend(values.rows.iter().flat_map(|row| &row.values));
-                    }
-                    _ => {}
-                }
-            }
-            for child in &node.children {
-                expressions(child, out);
-            }
-        }
-        fn calls<'a>(
-            expression: &'a expr::Expr,
-            out: &mut Vec<(&'a expr::Expr, &'a expr::FunctionCall)>,
-        ) {
-            if let Some(expr::expr::Kind::FunctionCall(call)) = &expression.kind {
-                out.push((expression, call));
-                for argument in &call.args {
-                    calls(argument, out);
-                }
-            }
-        }
-
-        let sql = "SELECT PARSE_JSON('{\"k\":1}') AS j, [PARSE_JSON('{\"k\":1}'), NULL] AS json_items, CAST([PARSE_JSON('{\"k\":1}'), NULL] AS ARRAY<VARCHAR>) AS text_items";
-        let (_, encoded) = encode_with(sql, &StaticPlanCarrier::PlanTree);
-        let encoded = encoded.expect("original nominal query encodes");
-        let control = SqlCompileControl::unbounded();
-        let mut conversions = 0;
-        for id in encoded.native.fragment_ids() {
-            let artifact = encoded.native.get(id).unwrap();
-            let frozen = novarocks_proto_models::novarocks::FrozenFragment::decode(
-                artifact.content().bytes().clone(),
-            )
-            .unwrap();
-            let fragment = frozen.plan.unwrap();
-            assert!(fragment.execution_types.is_some());
-            assert!(fragment.original_call_requests.is_some());
-            let table = fragment.execution_types.as_ref().unwrap();
-            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-            // Inspection is an explicit pure role; it authorizes no BE allocation.
-            let decoded = novarocks_plan_codec::execution_type_table::decode_execution_type_table_observed(
-                table,
-                novarocks_plan_codec::execution_type_table::ExecutionTypeTableLimits::for_validated_root_count(table.value_bindings.len()).unwrap(),
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                &mut |_| Ok::<_, novarocks_plan_codec::host_projection_v2::AdmissionRefusal<std::convert::Infallible>>(()),
-                &mut work,
-            ).unwrap();
-            let mut roots = Vec::new();
-            expressions(fragment.root.as_ref().unwrap(), &mut roots);
-            roots.extend(fragment.output_exprs.iter());
-            let mut scalar_calls = Vec::new();
-            for root in roots {
-                calls(root, &mut scalar_calls);
-            }
-            for (expression, call) in scalar_calls {
-                let selected = call
-                    .frozen_binding
-                    .as_ref()
-                    .expect("every named scalar keeps its exact selection");
-                let definition = expression
-                    .original_definition_id
-                    .expect("original expression definition");
-                assert_eq!(selected.id, definition);
-                let request = fragment
-                    .original_call_requests
-                    .as_ref()
-                    .unwrap()
-                    .entries
-                    .iter()
-                    .find(|request| request.request_id == call.original_request_id)
-                    .unwrap();
-                assert_eq!(request.definition.as_ref().unwrap().kind,
-                    Some(novarocks_proto_models::call_request::call_request_definition::Kind::ExpressionDefinitionId(definition)));
-                if call.function_name == "value_domain_conversion" {
-                    let Some(binding::function_binding_definition::Result::ScalarValueTypeId(
-                        target,
-                    )) = &selected.result
-                    else {
-                        panic!("scalar result")
-                    };
-                    let Some(binding::function_argument_type::Kind::ValueTypeId(source)) =
-                        &selected.arguments[0].kind
-                    else {
-                        panic!("value argument")
-                    };
-                    let expected = request
-                        .expected_result_value_type_id
-                        .expect("the original conversion request keeps its complete target");
-                    // Execution type IDs name actual source occurrences, not
-                    // semantic interning. Request and selected result objects
-                    // have distinct addresses while retaining the same FVT.
-                    let expected = decoded.get_observed(expected, &mut work).unwrap().unwrap();
-                    let selected_target =
-                        decoded.get_observed(*target, &mut work).unwrap().unwrap();
-                    assert!(
-                        expected
-                            .exactly_equals_checked_observed(selected_target, || work.step())
-                            .unwrap(),
-                        "original target and frozen selection differ in full semantic type, layout or child/root NULL"
-                    );
-                    assert_ne!(
-                        source, target,
-                        "nominal conversion has distinct complete declarations"
-                    );
-                    let source = decoded.get_observed(*source, &mut work).unwrap().unwrap();
-                    let target = decoded.get_observed(*target, &mut work).unwrap().unwrap();
-                    assert_eq!(
-                        source.data_type(),
-                        target.data_type(),
-                        "the conversion preserves its installed physical carrier"
-                    );
-                    assert_ne!(
-                        source.value_type(),
-                        target.value_type(),
-                        "JSON and Text remain distinct full semantic declarations"
-                    );
-                    conversions += 1;
-                }
-            }
-            work.finish().unwrap();
-        }
-        assert!(
-            conversions > 0,
-            "the genuine query retains its nominal converter"
-        );
-    }
-
-    /// One plan frozen into either carrier states the same Frontend facts,
-    /// and each carrier is refused by the other carrier's decoder: a backend
-    /// interprets only the carrier its own composition chose.
-    #[test]
-    fn each_carrier_states_the_same_facts_and_is_refused_by_the_other_decoder() {
-        use novarocks_task_codec::creation::{decode_static_fragment, decode_static_package};
-        use prost::Message;
-
-        let path = || novarocks_proto_codec::FieldPath::root("frozen_fragment");
-        for sql in [
-            "SELECT 1",
-            "SELECT a FROM (SELECT 1 AS a UNION ALL SELECT 2) t ORDER BY a",
-        ] {
-            let (_, tree) = encode_with(sql, &StaticPlanCarrier::PlanTree);
-            let tree = tree.expect("plan tree encodes");
-            let (_, packaged) = encode_with(sql, &compiled_carrier());
-            let packaged = packaged.expect("compiled package encodes");
-            assert_eq!(
-                tree.native.fragment_ids().collect::<Vec<_>>(),
-                packaged.native.fragment_ids().collect::<Vec<_>>()
-            );
-            assert_eq!(tree.topology, packaged.topology);
-            for id in tree.native.fragment_ids() {
-                let tree = tree.native.get(id).expect("plan tree artifact");
-                let package = packaged.native.get(id).expect("package artifact");
-                assert_eq!(
-                    tree.facts(),
-                    package.facts(),
-                    "{sql}: fragment {id} facts agree across carriers"
-                );
-                let frozen = novarocks_proto_models::novarocks::FrozenFragment::decode(
-                    tree.content().bytes().clone(),
-                )
-                .expect("a plan-tree carrier is one FrozenFragment");
-                assert!(frozen.package.is_empty() && frozen.plan.is_some());
-                decode_static_fragment(tree.content(), path()).expect("the plan tree decodes");
-                assert!(decode_static_package(tree.content(), path()).is_err());
-                assert!(decode_static_fragment(package.content(), path()).is_err());
-            }
-        }
-    }
-
     /// What the compiled carrier cannot express yet is refused by name before
     /// any package is authored, and is never encoded as a plan tree instead.
     /// A scan is expressed, from the read its freeze kept, and a writer from
@@ -2011,13 +1123,12 @@ mod tests {
                 if reason.contains("no frozen read")
         ));
         // A real FE plan has none of these shapes.
-        let (plan, _) = encode_with("SELECT 1", &StaticPlanCarrier::PlanTree);
+        let (plan, _) = encode_with("SELECT 1", &compiled_carrier());
         refuse_uncompiled_plan_shapes(&plan).expect("SELECT 1 has a compiled shape");
     }
 
     /// A real FE plan whose CTE feeds two consumers multicasts it. The
-    /// compiled carrier refuses that plan by name and freezes nothing; the
-    /// plan-tree carrier still expresses it.
+    /// compiled carrier refuses that plan by name and freezes nothing.
     #[test]
     fn a_multicast_plan_is_refused_by_the_compiled_carrier_and_freezes_nothing() {
         let sql = "WITH t AS (SELECT 1 AS a) SELECT a FROM t UNION ALL SELECT a FROM t";
@@ -2039,8 +1150,6 @@ mod tests {
             freezes,
             "a refused plan freezes nothing"
         );
-        let (_, tree) = encode_with(sql, &StaticPlanCarrier::PlanTree);
-        tree.expect("the plan tree expresses CTE multicast");
     }
 
     /// Decode the FE's own v2 bytes and compile every fragment with the
@@ -2170,8 +1279,6 @@ mod tests {
             "SELECT a, b FROM (VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), \
              (7, 7), (8, 8), (9, 9), (10, 10), (11, 11), (12, 12)) AS t(a, b)",
         ] {
-            let (_, encoded) = encode_with(sql, &compiled_carrier());
-            encoded.unwrap_or_else(|error| panic!("{sql}: the compiled carrier encodes: {error}"));
             assert_eq!(compiled_programs(sql).len(), 2, "{sql}");
         }
     }
@@ -2179,9 +1286,9 @@ mod tests {
     // A VALUES cell keeps its analyzed type until final lowering assigns its
     // column's, so a NULL cell is a NULL of its column's type. Lowered in its
     // own type first and then replaced, it left a definition no operator
-    // read, which final validation refused before either carrier encoded.
+    // read, which final validation refused before package encoding.
     #[test]
-    fn values_with_null_cells_complete_and_encode_under_both_carriers() {
+    fn values_with_null_cells_complete_and_encode_as_compiled_packages() {
         for sql in [
             "SELECT a, b FROM (VALUES (1, NULL), (2, 3)) t(a, b) ORDER BY a",
             "SELECT a, b, c FROM (VALUES (1, 10, 'x'), (2, NULL, 'y'), (3, 20, NULL), \
@@ -2189,10 +1296,8 @@ mod tests {
             "SELECT a, b, c, d FROM (VALUES (1, NULL, 'x', 1.5), (2, 3, NULL, NULL), \
              (NULL, 4, 'y', 2.5)) AS t(a, b, c, d)",
         ] {
-            let (plan, encoded) = encode_with(sql, &StaticPlanCarrier::PlanTree);
-            encoded.unwrap_or_else(|error| panic!("{sql}: the plan-tree carrier encodes: {error}"));
-            let (_, encoded) = encode_with(sql, &compiled_carrier());
-            encoded.unwrap_or_else(|error| panic!("{sql}: the compiled carrier encodes: {error}"));
+            let (plan, encoded) = encode_with(sql, &compiled_carrier());
+            encoded.unwrap_or_else(|error| panic!("{sql}: the compiled package encodes: {error}"));
             assert_eq!(
                 compiled_programs(sql).len(),
                 plan.fragments().len(),
@@ -2204,17 +1309,24 @@ mod tests {
     #[test]
     fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CompletedTailControl {
             encode_checkpoints: AtomicUsize,
+            checkpoints: Mutex<Vec<(CompilePhase, u32)>>,
             /// The Encode checkpoint that refuses; `None` only observes.
             tail_at: Option<usize>,
             tail_error: CompileControlError,
             earlier_error: Option<CompileControlError>,
         }
         impl PureCompileControl for CompletedTailControl {
-            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                self.checkpoints.lock().unwrap().push((phase, units));
                 // The last Encode checkpoint is the FE exit, after the actual
                 // native fragment freezes and attempt-fact projection.
                 if phase == CompilePhase::Encode
@@ -2234,7 +1346,6 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
         for error in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
@@ -2251,22 +1362,39 @@ mod tests {
             // refusal lands on its true tail rather than a counted guess.
             let observed = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                checkpoints: Mutex::new(Vec::new()),
                 tail_at: None,
                 tail_error: error,
                 earlier_error: None,
             };
             encode_completed_plan(
                 completed,
-                &functions,
-                &StaticPlanCarrier::PlanTree,
+                &compiled_carrier(),
                 crate::application::test_constant_policy(),
                 None,
-                false,
                 &observed,
             )
             .expect("the observed encoding succeeds");
             let encode_checkpoints = observed.encode_checkpoints.load(Ordering::SeqCst);
             assert!(encode_checkpoints >= 4, "FE and codec entry/exit at least");
+            let observed_checkpoints = observed.checkpoints.into_inner().unwrap();
+            assert_eq!(
+                observed_checkpoints.first(),
+                Some(&(CompilePhase::Encode, 0))
+            );
+            let first_validate = observed_checkpoints
+                .iter()
+                .position(|(phase, _)| *phase == CompilePhase::Validate)
+                .expect("the actual package author validates its semantic facts");
+            // Package read authoring has its own completed Encode scope before
+            // semantic validation. Keep that legitimate prefix, rather than
+            // assuming validation immediately follows the outer FE entry.
+            let before_validate = &observed_checkpoints[..first_validate];
+            assert!(
+                before_validate
+                    .iter()
+                    .all(|(phase, _)| *phase == CompilePhase::Encode)
+            );
             let completed = runtime
                 .block_on(
                     FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
@@ -2275,6 +1403,7 @@ mod tests {
             let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
             let control = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                checkpoints: Mutex::new(Vec::new()),
                 tail_at: Some(encode_checkpoints - 1),
                 tail_error: error,
                 earlier_error: None,
@@ -2282,11 +1411,9 @@ mod tests {
             assert!(matches!(
                 encode_completed_plan(
                     completed,
-                    &functions,
-                    &StaticPlanCarrier::PlanTree,
+                    &compiled_carrier(),
                     crate::application::test_constant_policy(),
                     None,
-                    false,
                     &control,
                 ),
                 Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
@@ -2310,26 +1437,34 @@ mod tests {
                 crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
             let first_failure = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                checkpoints: Mutex::new(Vec::new()),
                 tail_at: Some(encode_checkpoints - 1),
-                tail_error: CompileControlError::ResourceExhausted,
+                tail_error: if error == CompileControlError::ResourceExhausted {
+                    CompileControlError::Cancelled
+                } else {
+                    CompileControlError::ResourceExhausted
+                },
                 earlier_error: Some(error),
             };
             assert!(matches!(
                 encode_completed_plan(
                     completed,
-                    &functions,
-                    &StaticPlanCarrier::PlanTree,
+                    &compiled_carrier(),
                     crate::application::test_constant_policy(),
                     None,
-                    false,
                     &first_failure,
                 ),
                 Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
             ));
             assert_eq!(
                 first_failure.encode_checkpoints.load(Ordering::SeqCst),
-                1,
-                "the first Validate refusal preserves the original Encode entry without a footer",
+                before_validate.len(),
+                "the first Validate refusal preserves completed author scopes without an outer Encode footer",
+            );
+            assert_eq!(
+                first_failure.checkpoints.lock().unwrap().as_slice(),
+                &observed_checkpoints[..=first_validate],
+                "the first Validate refusal stops at its exact checkpoint with no subsequent checkpoint",
             );
             assert_eq!(
                 crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
@@ -2355,12 +1490,9 @@ mod tests {
         let version = completed.candidate().plan().version();
         let encoded = encode_completed_plan(
             completed,
-            &novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                .expect("builtin engine function catalog"),
-            &StaticPlanCarrier::PlanTree,
+            &compiled_carrier(),
             crate::application::test_constant_policy(),
             None,
-            false,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("a completed plan encodes");
@@ -2440,8 +1572,8 @@ mod tests {
         };
         use novarocks_physical_plan::{
             ExactInputVersion, FragmentBuilder, MetadataRelation, MetadataRelationKind,
-            PhysicalProperties, PlanBuilder, RelationField, RowMultiplicity, ValueOrigin,
-            ValueType,
+            PhysicalProperties, PlanBuilder, ProviderColumnReference, Relation, RelationField,
+            RowMultiplicity, ValueOrigin, ValueType,
         };
 
         let binding = ConnectorReadBinding::new(
@@ -2556,7 +1688,7 @@ mod tests {
             .unwrap();
         let (_root, scope) = query_scope();
         let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(
-            request_for("SELECT hll_hash('x') AS h,to_bitmap(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_binary(to_bitmap(1)) AS raw", novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1), &scope,
+            request_for("SELECT hll_hash('x') AS h,to_bitmap(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_binary(to_bitmap(1)) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();
@@ -2585,30 +1717,21 @@ mod tests {
     }
 
     fn request() -> SqlFinalPlanCompileRequest {
-        request_with(
-            "SELECT 1",
-            noop_constant_evaluator(),
-            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-        )
+        request_with("SELECT 1", noop_constant_evaluator())
     }
 
     /// A request folding constants with the production Frontend evaluator,
     /// so the frozen packages are the ones production would freeze.
-    fn request_for(
-        sql: &str,
-        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
-    ) -> SqlFinalPlanCompileRequest {
+    fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
         request_with(
             sql,
             crate::query_execution::constant_eval::constant_evaluator(),
-            emission_mode,
         )
     }
 
     fn request_with(
         sql: &str,
         constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
-        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
@@ -2624,7 +1747,6 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             constant_evaluator,
             crate::application::test_constant_policy(),
-            emission_mode,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

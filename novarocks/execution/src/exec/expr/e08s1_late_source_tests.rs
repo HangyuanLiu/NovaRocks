@@ -18,48 +18,21 @@
 //! Actual source journal/all-definition capability consumer; no replacement graph.
 use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use arrow::datatypes::DataType;
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
 
-use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_sql::compiler::{
     SqlCompileControl, SqlCompileError, check_pure_call_definitions_observed,
 };
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[test]
-fn e08s1_late_original_actual_source_missing_aggregate_is_typed_named_unavailable() {
-    let source = sql_source(
-        "SELECT dict_merge(CAST(k AS VARCHAR), 1) FROM fixture",
-        DataType::Int32,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
-    let error =
-        check_pure_call_definitions_observed(&source, &SqlCompileControl::unbounded()).unwrap_err();
-    let SqlCompileError::Analyze(error) = error else {
-        panic!("typed support failure: {error}")
-    };
-    assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-    assert!(error.message().contains("builtin.aggregate/dict_merge/"));
-    // A completed physical source has no new AST span. Do not forge one.
-    assert!(error.control_error().is_none());
-    assert_eq!(
-        source.emission_mode(),
-        SqlPhysicalEmissionMode::OriginalNativeV1
-    );
-}
+
 #[test]
 fn e08s1_late_actual_source_same_journal_supported_canonical_calls_and_over_are_accepted() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+    {
         let source = sql_source(
             "SELECT reverse(CAST(k AS VARCHAR)), count(k) OVER () FROM fixture",
             DataType::Int32,
-            mode,
         );
         check_pure_call_definitions_observed(&source, &SqlCompileControl::unbounded()).unwrap();
-        assert_eq!(source.emission_mode(), mode);
     }
 }
 struct Refuse {
@@ -81,7 +54,6 @@ fn e08s1_late_actual_source_three_compile_causes_stop_before_first_definition() 
     let source = sql_source(
         "SELECT reverse(CAST(k AS VARCHAR)) FROM fixture",
         DataType::Int32,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
     );
     for cause in [
         CompileControlError::Cancelled,

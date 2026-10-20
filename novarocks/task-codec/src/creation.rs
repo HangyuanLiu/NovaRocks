@@ -27,23 +27,20 @@
 //! bounds and local structure decide whether a request may enter the protocol
 //! at all. It does not decode the static fragment. Only the backend that wins
 //! a task's creation interprets that plan, through
-//! [`decode_static_fragment`]; a request that names an identity which already
+//! [`decode_static_package`]; a request that names an identity which already
 //! exists is answered from that task's lifecycle, and its static bytes are
 //! never read.
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
 use std::any::Any;
 use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
 
-use novarocks_execution_contract::FragmentContractVersion;
-use novarocks_execution_contract::FragmentSinkKind;
 use novarocks_execution_contract::task_execution::creation::{CreationContent, FrozenBytes};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::identity::QueryContextRef;
 use novarocks_execution_contract::task_execution::operation::OperationEnvelope;
 use novarocks_proto_codec::{FieldPath, ProtocolError};
-use novarocks_proto_models::{novarocks, plan};
+use novarocks_proto_models::novarocks;
 use prost::Message;
 use prost::encoding::{encoded_len_varint, key_len};
 
@@ -193,134 +190,6 @@ pub fn decode_task_assignment(
     })
 }
 
-/// One fragment's static plan, decoded by the backend that won a task's
-/// creation.
-#[derive(Debug)]
-pub struct DecodedStaticFragment {
-    frozen: novarocks::FrozenFragment,
-    sink_kind: FragmentSinkKind,
-}
-
-impl DecodedStaticFragment {
-    /// The plan fragment, for the backend's own plan decoder.
-    pub fn plan(&self) -> &plan::PlanFragment {
-        self.frozen
-            .plan
-            .as_ref()
-            .expect("a decoded static fragment always has a plan")
-    }
-
-    pub fn into_plan(self) -> plan::PlanFragment {
-        self.frozen
-            .plan
-            .expect("a decoded static fragment always has a plan")
-    }
-
-    /// What this fragment's validated sink does.
-    pub const fn sink_kind(&self) -> FragmentSinkKind {
-        self.sink_kind
-    }
-
-    pub fn plan_version(&self) -> &[u8] {
-        &self.frozen.plan_version
-    }
-
-    pub const fn plan_contract_revision(&self) -> u32 {
-        self.frozen.plan_contract_revision
-    }
-
-    /// Proves one task's parallelism lies inside this fragment's frozen
-    /// parallelism domain.
-    pub fn verify_task_dop(
-        &self,
-        pipeline_dop: NonZeroUsize,
-        path: FieldPath,
-    ) -> Result<(), ProtocolError> {
-        let domain = self
-            .frozen
-            .pipeline_dop_domain
-            .as_ref()
-            .expect("a decoded static fragment always has a DOP domain");
-        let dop = u32::try_from(pipeline_dop.get())
-            .map_err(|_| out_of_range(path.clone(), "task parallelism exceeds the wire width"))?;
-        if dop < domain.min
-            || dop > domain.max
-            || (domain.requires_power_of_two && !dop.is_power_of_two())
-        {
-            return Err(inconsistent(
-                path,
-                "task parallelism is outside the frozen fragment DOP domain",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Decodes and validates one fragment's static plan carrier.
-///
-/// The header is proved here: plan version, plan and fragment contract
-/// revisions, a nonempty parallelism domain, and a plan with a known sink.
-/// The plan tree itself is interpreted by the backend's plan decoder.
-pub fn decode_static_fragment(
-    bytes: &FrozenBytes,
-    path: FieldPath,
-) -> Result<DecodedStaticFragment, ProtocolError> {
-    let frozen = novarocks::FrozenFragment::decode(bytes.to_bytes())
-        .map_err(|error| invalid(path.clone(), format!("invalid frozen fragment: {error}")))?;
-    // One carrier per fragment: a compiled package is never read by the
-    // plan-tree interpreter, and is never silently ignored by it either.
-    if !frozen.package.is_empty() {
-        return Err(invalid(
-            path.clone().field("package"),
-            "a compiled fragment package is not a plan-tree carrier",
-        ));
-    }
-    if frozen.plan_version.len() != 16 || frozen.plan_version.iter().all(|byte| *byte == 0) {
-        return Err(invalid(
-            path.clone().field("plan_version"),
-            "plan version must contain 16 nonzero identity bytes",
-        ));
-    }
-    if frozen.plan_contract_revision == 0 {
-        return Err(invalid(
-            path.clone().field("plan_contract_revision"),
-            "plan contract revision must be nonzero",
-        ));
-    }
-    if frozen.fragment_contract_version != u32::from(FragmentContractVersion::CURRENT.get()) {
-        return Err(invalid(
-            path.clone().field("fragment_contract_version"),
-            "fragment contract version is unsupported",
-        ));
-    }
-    let dop = frozen.pipeline_dop_domain.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("pipeline_dop_domain"),
-            "frozen fragment requires a pipeline DOP domain",
-        )
-    })?;
-    if dop.min == 0 || dop.max < dop.min {
-        return Err(invalid(
-            path.clone().field("pipeline_dop_domain"),
-            "pipeline DOP domain must be nonempty and nonzero",
-        ));
-    }
-    let plan = frozen.plan.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("plan"),
-            "frozen fragment requires a plan fragment",
-        )
-    })?;
-    let sink = plan.sink.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("plan").field("sink"),
-            "plan fragment requires a sink",
-        )
-    })?;
-    let sink_kind = decode_sink_kind(sink, path.field("plan").field("sink"))?;
-    Ok(DecodedStaticFragment { frozen, sink_kind })
-}
-
 /// One fragment's compiled-package carrier, decoded by the backend that won a
 /// task's creation.
 ///
@@ -343,9 +212,8 @@ impl DecodedStaticPackage {
 
 /// Decodes one fragment's compiled-package carrier.
 ///
-/// The package owns its plan version, contract revision and parallelism
-/// domain, so a carrier that also states any plan-tree fact is refused rather
-/// than reconciled: each fact keeps exactly one owner.
+/// The package owns its plan version, contract revision and parallelism domain.
+/// This outer carrier owns only the exact immutable package bytes.
 pub fn decode_static_package(
     bytes: &FrozenBytes,
     path: FieldPath,
@@ -358,38 +226,8 @@ pub fn decode_static_package(
             "a compiled carrier requires its fragment package",
         ));
     }
-    if !frozen.plan_version.is_empty()
-        || frozen.plan_contract_revision != 0
-        || frozen.fragment_contract_version != 0
-        || frozen.pipeline_dop_domain.is_some()
-        || frozen.plan.is_some()
-    {
-        return Err(invalid(
-            path,
-            "a compiled carrier cannot restate plan-tree facts its package owns",
-        ));
-    }
     Ok(DecodedStaticPackage {
         package: frozen.package,
-    })
-}
-
-fn decode_sink_kind(
-    sink: &plan::DataSink,
-    path: FieldPath,
-) -> Result<FragmentSinkKind, ProtocolError> {
-    let kind = sink
-        .kind
-        .as_ref()
-        .ok_or_else(|| missing(path, "data sink requires a kind"))?;
-    Ok(match kind {
-        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::RootResult(_) => {
-            FragmentSinkKind::Result
-        }
-        plan::data_sink::Kind::Noop(_) => FragmentSinkKind::Noop,
-        plan::data_sink::Kind::DataStream(_) => FragmentSinkKind::DataStream,
-        plan::data_sink::Kind::MultiCastDataStream(_) => FragmentSinkKind::MultiCastDataStream,
-        plan::data_sink::Kind::ChangeStreamRouter(_) => FragmentSinkKind::SplitDataStream,
     })
 }
 
@@ -452,6 +290,7 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use prost::bytes::Bytes;
+    use std::num::NonZeroUsize;
 
     fn descriptor() -> TaskDescriptor {
         let execution =
@@ -483,70 +322,32 @@ mod tests {
         FrozenBytes::freeze(Bytes::from(fragment.encode_to_vec()))
     }
 
-    // Exactly one carrier per fragment: the package interpreter reads only a
-    // package, and the plan-tree interpreter refuses one instead of ignoring it.
     #[test]
-    fn a_compiled_package_carrier_has_exactly_one_owner_for_every_fact() {
+    fn a_compiled_package_carrier_retains_exact_bytes_and_refuses_missing_or_malformed_input() {
         let package = Bytes::from_static(b"opaque fragment package");
-        let carrier = novarocks::FrozenFragment {
-            package: package.clone(),
-            ..Default::default()
-        };
-        let decoded = decode_static_package(&frozen(carrier.clone()), FieldPath::root("f"))
-            .expect("package carrier");
-        assert_eq!(decoded.package(), &package);
-        assert_eq!(decoded.into_package(), package);
-
-        let refused = decode_static_fragment(&frozen(carrier.clone()), FieldPath::root("f"))
-            .expect_err("a plan-tree interpreter refuses a package");
-        assert!(
-            refused.to_string().contains("not a plan-tree carrier"),
-            "{refused}"
-        );
-
-        let empty = decode_static_package(
-            &frozen(novarocks::FrozenFragment::default()),
+        let decoded = decode_static_package(
+            &frozen(novarocks::FrozenFragment {
+                package: package.clone(),
+            }),
             FieldPath::root("f"),
         )
-        .expect_err("a compiled carrier needs its package");
+        .expect("package carrier");
+        assert_eq!(decoded.package(), &package);
+        assert_eq!(decoded.into_package(), package);
         assert!(
-            empty.to_string().contains("requires its fragment package"),
-            "{empty}"
+            decode_static_package(
+                &frozen(novarocks::FrozenFragment::default()),
+                FieldPath::root("f")
+            )
+            .is_err()
         );
-
-        for restated in [
-            novarocks::FrozenFragment {
-                plan_version: vec![7; 16],
-                ..carrier.clone()
-            },
-            novarocks::FrozenFragment {
-                plan_contract_revision: 1,
-                ..carrier.clone()
-            },
-            novarocks::FrozenFragment {
-                fragment_contract_version: 1,
-                ..carrier.clone()
-            },
-            novarocks::FrozenFragment {
-                pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: false,
-                }),
-                ..carrier.clone()
-            },
-            novarocks::FrozenFragment {
-                plan: Some(plan::PlanFragment::default()),
-                ..carrier.clone()
-            },
-        ] {
-            let error = decode_static_package(&frozen(restated), FieldPath::root("f"))
-                .expect_err("a restated plan-tree fact");
-            assert!(
-                error.to_string().contains("cannot restate plan-tree facts"),
-                "{error}"
-            );
-        }
+        assert!(
+            decode_static_package(
+                &FrozenBytes::freeze(Bytes::from_static(&[0x3a, 0x80])),
+                FieldPath::root("f")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -658,68 +459,5 @@ mod tests {
                 "fragment {fragment} metadata {metadata}"
             );
         }
-    }
-
-    #[test]
-    fn a_static_fragment_header_is_proved_before_its_plan_is_used() {
-        let frozen = novarocks::FrozenFragment {
-            package: Default::default(),
-            plan_version: vec![1; 16],
-            plan_contract_revision: 1,
-            fragment_contract_version: u32::from(FragmentContractVersion::CURRENT.get()),
-            pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
-                min: 1,
-                max: 4,
-                requires_power_of_two: true,
-            }),
-            plan: Some(plan::PlanFragment {
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
-            }),
-        };
-        let bytes = FrozenBytes::freeze(frozen.encode_to_vec().into());
-        let decoded = decode_static_fragment(&bytes, FieldPath::root("f")).expect("legal");
-        assert_eq!(decoded.sink_kind(), FragmentSinkKind::Result);
-        assert!(
-            decoded
-                .verify_task_dop(NonZeroUsize::new(2).expect("nonzero"), FieldPath::root("d"))
-                .is_ok()
-        );
-        assert!(
-            decoded
-                .verify_task_dop(NonZeroUsize::new(3).expect("nonzero"), FieldPath::root("d"))
-                .is_err(),
-            "a power-of-two domain refuses three"
-        );
-
-        let mut no_sink = frozen.clone();
-        no_sink.plan.as_mut().expect("plan").sink = None;
-        assert!(
-            decode_static_fragment(
-                &FrozenBytes::freeze(no_sink.encode_to_vec().into()),
-                FieldPath::root("f")
-            )
-            .is_err()
-        );
-
-        let mut zero_version = frozen;
-        zero_version.plan_version = vec![0; 16];
-        assert!(
-            decode_static_fragment(
-                &FrozenBytes::freeze(zero_version.encode_to_vec().into()),
-                FieldPath::root("f")
-            )
-            .is_err()
-        );
-        assert!(
-            decode_static_fragment(
-                &FrozenBytes::freeze(Bytes::from_static(&[0x0a, 0x80])),
-                FieldPath::root("f")
-            )
-            .is_err(),
-            "malformed bytes are refused by the one protobuf interpreter"
-        );
     }
 }

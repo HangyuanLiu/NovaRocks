@@ -11,7 +11,6 @@ pub mod resources;
 pub mod runtime_state;
 pub mod scan;
 pub mod sink;
-pub mod submission;
 
 pub use error::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
@@ -21,11 +20,10 @@ pub use fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 pub use handle::{
     CompiledFragmentSubmission, CompiledWriterBindings, DormantFragmentHandle,
     FragmentPrepareContext, RunningFragmentHandle, compiled_sink_kind, prepare_compiled_fragment,
-    prepare_compiled_fragment_with_metadata_host, prepare_fragment,
+    prepare_compiled_fragment_with_metadata_host,
 };
 pub use instance::*;
 pub use resources::ExchangeReceiverRetirement;
-pub use submission::FragmentSubmission;
 
 pub use execution_failure::{
     ExecutionFailure, ExecutionFailureCause, ExecutionFailureContext, ExecutionResult,

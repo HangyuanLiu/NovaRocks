@@ -321,6 +321,20 @@ suite = "tpc-ds"
 case = "q94"
 error_code = "CommitUnknown"
 reason = "synthetic commit unknown"
+
+[[failure]]
+tier = "full"
+suite = "typed-refusals"
+case = "sql-refusal"
+error_code = "sql.analyze.unavailable_implementation"
+reason = "synthetic SQL refusal"
+
+[[failure]]
+tier = "full"
+suite = "typed-refusals"
+case = "engine-refusal"
+error_code = "Unsupported"
+reason = "synthetic engine refusal"
 EOF
 
 cat >"$run_dir/sql/tpc-ds.log" <<'EOF'
@@ -337,6 +351,192 @@ CI_TIER="full"
 KNOWN_FAILURES_FILE="$baseline"
 CI_KNOWN_FAILURE_ROWS=""
 CI_FAILURE_TAIL=""
+
+cat >"$run_dir/sql/typed-refusals.log" <<'EOF'
+[novarocks-sql-test] suite=typed-refusals mode=verify
+  [typed-refusals] expected-error (steps=1)
+    PASS (expected error: engine_error_code=QueryTimeout)
+    PASS (expected error: sql_error_code=sql.analyze.unknown_code)
+  [typed-refusals] sql-refusal (steps=1)
+    sql_error_code=sql.analyze.unavailable_implementation target execute failed: ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] unavailable
+    sql_error_code=sql.analyze.unavailable_implementation target execute failed: repeated summary
+  [typed-refusals] engine-refusal (steps=1)
+    engine_error_code=Unsupported target execute failed: ERROR 1105 (HY000): [Unsupported] unsupported
+  [typed-refusals] timing-pass (steps=1)
+    sql_error_code=sql.analyze.unknown_code ignored because this case passed
+case timings (all):
+  [typed-refusals] expected-error PASS 0.01s
+  [typed-refusals] sql-refusal FAIL 0.01s
+  [typed-refusals] engine-refusal FAIL 0.01s
+  [typed-refusals] timing-pass PASS 0.01s
+FAIL: total=4 pass=2 fail=2
+EOF
+
+ci_classify_sql_log "typed-refusals" "$run_dir/sql/typed-refusals.log" true
+if [ "$(printf '%s\n' "$CI_KNOWN_FAILURE_ROWS" | rg -c 'KNOWN_FAIL')" != "2" ]; then
+  echo "both error-code tags must match exactly once for failed cases only" >&2
+  exit 1
+fi
+grep -F 'sql.analyze.unavailable_implementation' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+grep -F 'Unsupported' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+
+for unknown_code in sql.analyze.unavailable_implementation.extra UnknownEngineCode; do
+  unknown_tag="sql_error_code"
+  if [ "$unknown_code" = UnknownEngineCode ]; then unknown_tag="engine_error_code"; fi
+  cat >"$tmpdir/unknown-code.log" <<EOF
+  [typed-refusals] sql-refusal (steps=1)
+    $unknown_tag=$unknown_code target execute failed
+case timings (all):
+  [typed-refusals] sql-refusal FAIL 0.01s
+EOF
+  CI_KNOWN_FAILURE_ROWS=""
+  if ci_classify_sql_log "typed-refusals" "$tmpdir/unknown-code.log" true; then
+    echo "an unknown code must remain a hard failure: $unknown_code" >&2
+    exit 1
+  fi
+  grep -F 'NEW_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+  grep -F "$unknown_code" <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+done
+
+cat >"$tmpdir/expected-errors.log" <<'EOF'
+  [typed-refusals] expected-error (steps=1)
+    PASS (expected error: engine_error_code=UnknownEngineCode)
+    PASS (expected error: sql_error_code=sql.analyze.unknown_code)
+EOF
+CI_KNOWN_FAILURE_ROWS=""
+ci_classify_sql_log "typed-refusals" "$tmpdir/expected-errors.log"
+if [ -n "$CI_KNOWN_FAILURE_ROWS" ]; then
+  echo "expected-error PASS lines without timing rows must remain unclassified" >&2
+  exit 1
+fi
+
+cat >"$tmpdir/unclassified-failure.log" <<'EOF'
+  [typed-refusals] sql-refusal (steps=1)
+    sql_error_code=sql.analyze.unavailable_implementation target execute failed
+  [typed-refusals] missing-code (steps=1)
+    target execute failed: no error code
+case timings (all):
+  [typed-refusals] sql-refusal FAIL 0.01s
+  [typed-refusals] missing-code FAIL 0.01s
+EOF
+CI_KNOWN_FAILURE_ROWS=""
+if ci_classify_sql_log "typed-refusals" "$tmpdir/unclassified-failure.log" true; then
+  echo "a registered SQL refusal must not hide an unclassified failed case" >&2
+  exit 1
+fi
+
+# Real runner failure markers must not be hidden by an earlier registered
+# refusal in the same failed case. Preserve that refusal as a separate fact.
+for secondary_failure in \
+  '    ❌ target execute failed: materialized view does not exist' \
+  '    ❌ failed to cleanup target case database: database is busy' \
+  '    ❌ sql_error_code=sql.analyze.unavailable_implementation expected error containing timeout, got: unavailable' \
+  '[typed-refusals] ❌ suite init failed: unavailable fixture'; do
+  cat >"$tmpdir/secondary-failure.log" <<EOF_LOG
+  [typed-refusals] sql-refusal (steps=2)
+    ❌ sql_error_code=sql.analyze.unavailable_implementation target execute failed: unavailable
+$secondary_failure
+case timings (all):
+  [typed-refusals] sql-refusal FAIL 0.01s
+EOF_LOG
+  CI_KNOWN_FAILURE_ROWS=""
+  if ci_classify_sql_log "typed-refusals" "$tmpdir/secondary-failure.log" true; then
+    echo "a registered refusal must not hide another runner failure: $secondary_failure" >&2
+    exit 1
+  fi
+  grep -F 'KNOWN_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+done
+
+# Suite cleanup errors have their own summary section, without a failure emoji
+# or error-code annotation on each entry.
+cat >"$tmpdir/suite-cleanup-failure.log" <<'EOF_LOG'
+  [typed-refusals] sql-refusal (steps=1)
+    ❌ sql_error_code=sql.analyze.unavailable_implementation target execute failed: unavailable
+case timings (all):
+  [typed-refusals] sql-refusal FAIL 0.01s
+cleanup errors:
+  [typed-refusals] target suite hook failed: /fixture/cleanup.sql: database is busy
+EOF_LOG
+CI_KNOWN_FAILURE_ROWS=""
+if ci_classify_sql_log "typed-refusals" "$tmpdir/suite-cleanup-failure.log" true; then
+  echo "a registered refusal must not hide the suite cleanup error section" >&2
+  exit 1
+fi
+grep -F 'KNOWN_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+
+# A typed label describes the actual error, but the runner's failed assertion
+# is still NEW_FAIL when the negative oracle or VERIFY contract did not match.
+for failed_assertion in \
+  'expected error containing "query timed out after 1000 ms", got: unavailable' \
+  'VERIFY FAILED: expected rows differ'; do
+  cat >"$tmpdir/coded-assertion-failure.log" <<EOF_LOG
+  [typed-refusals] sql-refusal (steps=1)
+    ❌ sql_error_code=sql.analyze.unavailable_implementation $failed_assertion
+case timings (all):
+  [typed-refusals] sql-refusal FAIL 0.01s
+EOF_LOG
+  CI_KNOWN_FAILURE_ROWS=""
+  if ci_classify_sql_log "typed-refusals" "$tmpdir/coded-assertion-failure.log" true; then
+    echo "a failed runner assertion must not inherit a registered refusal" >&2
+    exit 1
+  fi
+  grep -F 'NEW_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+  grep -F 'sql.analyze.unavailable_implementation' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+  if grep -F 'KNOWN_FAIL' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null; then
+    echo "a failed runner assertion was classified as a known refusal" >&2
+    exit 1
+  fi
+done
+
+cat >"$tmpdir/diagnostic-code.log" <<'EOF_LOG'
+  [typed-refusals] sql-refusal (steps=1)
+    ❌ VERIFY FAILED: expected PASS sql_error_code=sql.analyze.unavailable_implementation
+case timings (all):
+  [typed-refusals] sql-refusal FAIL 0.01s
+EOF_LOG
+CI_KNOWN_FAILURE_ROWS=""
+if ci_classify_sql_log "typed-refusals" "$tmpdir/diagnostic-code.log" true; then
+  echo "a diagnostic containing a registered code and PASS must remain a failure" >&2
+  exit 1
+fi
+if [ -n "$CI_KNOWN_FAILURE_ROWS" ]; then
+  echo "error codes in diagnostic text must not create refusal classification rows" >&2
+  exit 1
+fi
+
+cat >"$tmpdir/direct-refusal.log" <<'EOF_LOG'
+  [typed-refusals] expected-error (steps=1)
+    ✅ PASS (expected error matched): error contains timeout engine_error_code=UnknownEngineCode sql_error_code=sql.analyze.unknown_code
+  [typed-refusals] sql-refusal (steps=1)
+    result text quotes ❌ without a runner failure marker
+    ❌ sql_error_code=sql.analyze.unavailable_implementation target execute failed: message quotes PASS and engine_error_code=UnknownEngineCode
+case timings (all):
+  [typed-refusals] expected-error PASS 0.01s
+  [typed-refusals] sql-refusal FAIL 0.01s
+EOF_LOG
+CI_KNOWN_FAILURE_ROWS=""
+ci_classify_sql_log "typed-refusals" "$tmpdir/direct-refusal.log" true
+if [ "$(printf '%s\n' "$CI_KNOWN_FAILURE_ROWS" | rg -c 'KNOWN_FAIL')" != "1" ]; then
+  echo "a direct registered refusal must classify once using only its leading label" >&2
+  exit 1
+fi
+if grep -F 'UnknownEngineCode' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null; then
+  echo "expected-error PASS or diagnostic codes leaked into refusal classification" >&2
+  exit 1
+fi
+
+cat >"$tmpdir/sql-refusal-xpass.log" <<'EOF'
+case timings (all):
+  [typed-refusals] sql-refusal PASS 0.01s
+EOF
+CI_KNOWN_FAILURE_ROWS=""
+if ci_classify_unexpected_passes "typed-refusals" "$tmpdir/sql-refusal-xpass.log"; then
+  echo "a registered SQL refusal that passes must remain an unexpected pass" >&2
+  exit 1
+fi
+grep -F 'UNEXPECTED_PASS' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+grep -F 'sql.analyze.unavailable_implementation' <<<"$CI_KNOWN_FAILURE_ROWS" >/dev/null
+CI_KNOWN_FAILURE_ROWS=""
 
 if ci_classify_unexpected_passes "tpc-ds" "$run_dir/sql/tpc-ds.log"; then
   echo "expected mixed pass/fail known-failure log to report an unexpected pass" >&2

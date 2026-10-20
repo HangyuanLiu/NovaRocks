@@ -50,7 +50,7 @@ fn original_nine_frames_keep_fresh_values_and_always_bitmap_through_alias_last_f
             let runtime = runtime(&binding);
             let program = program_typed(name, &ty, &binding);
             let input = batch(&program, false, 4096);
-            let mut frame = RuntimeScalarFrameForTest::try_new(
+            let mut frame = RuntimeScalarFrameForTest::try_new_with_allocation_host(
                 program.clone(),
                 site(&program),
                 runtime.clone(),

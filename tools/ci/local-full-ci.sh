@@ -879,6 +879,7 @@ ci_classify_sql_log() {
   local row_suite
   local row_case
   local remaining
+  local error_tag
   local error_code
   local status_line
   local status
@@ -888,10 +889,16 @@ ci_classify_sql_log() {
   local hard_failure=0
   local seen_keys=""
   local seen_key
+  local direct_target_failure
+  local code_prefix='^[[:space:]]*(❌[[:space:]]+)?((engine_error_code|sql_error_code)=[A-Za-z0-9_.]+[[:space:]]+)+'
+  local target_failure_prefix="${code_prefix}target execute failed(:|$)"
+  local expected_pass_prefix='^[[:space:]]*(✅[[:space:]]+PASS \(expected error matched\):|PASS \(expected error:)'
+  local cleanup_heading='^[[:space:]]*cleanup errors:[[:space:]]*$'
+  local failure_marker='^[[:space:]]*(\[[^]]+\][[:space:]]+)?❌[[:space:]]+'
 
   [ -f "$log_path" ] || return 1
 
-  # Expected-error PASS lines can include engine_error_code=..., so prefer
+  # Expected-error PASS lines can include either error-code tag, so prefer
   # case timing FAIL rows when the runner emitted them.
   failed_case_keys="$(ci_sql_failed_case_keys "$log_path")"
   failed_case_count="$(ci_case_key_count "$failed_case_keys")"
@@ -904,16 +911,32 @@ ci_classify_sql_log() {
       current_case="${BASH_REMATCH[2]}"
     fi
 
-    case "$line" in
-      *PASS*engine_error_code=*)
-        continue
-        ;;
-    esac
+    if [[ "$line" =~ $expected_pass_prefix ]]; then
+      continue
+    fi
+    if [[ "$line" =~ $cleanup_heading ]]; then
+      hard_failure=1
+      continue
+    fi
 
-    remaining="$line"
-    while [[ "$remaining" =~ engine_error_code=([A-Za-z0-9_]+) ]]; do
-      error_code="${BASH_REMATCH[1]}"
-      remaining="${remaining#*engine_error_code=$error_code}"
+    # Only the runner's leading labels describe this failure. Diagnostic text
+    # can quote unrelated codes or PASS output and is not classification input.
+    if [[ "$line" =~ $code_prefix ]]; then
+      remaining="${BASH_REMATCH[0]}"
+    else
+      if [[ "$line" =~ $failure_marker ]]; then
+        hard_failure=1
+      fi
+      continue
+    fi
+    direct_target_failure=false
+    if [[ "$line" =~ $target_failure_prefix ]]; then
+      direct_target_failure=true
+    fi
+    while [[ "$remaining" =~ (engine_error_code|sql_error_code)=([A-Za-z0-9_.]+) ]]; do
+      error_tag="${BASH_REMATCH[1]}"
+      error_code="${BASH_REMATCH[2]}"
+      remaining="${remaining#*"$error_tag=$error_code"}"
       row_suite="${current_suite:-$suite}"
       row_case="${current_case:-unknown}"
 
@@ -921,7 +944,12 @@ ci_classify_sql_log() {
         continue
       fi
 
-      seen_key="|${row_suite}|${row_case}|${error_code}|"
+      # Expected-error mismatches, VERIFY failures and cleanup failures cannot
+      # inherit a registered refusal just because they carry the same code.
+      if [ "$direct_target_failure" != true ]; then
+        hard_failure=1
+      fi
+      seen_key="|${row_suite}|${row_case}|${error_code}|${direct_target_failure}|"
       case "$seen_keys" in
         *"$seen_key"*)
           continue
@@ -935,10 +963,15 @@ ci_classify_sql_log() {
         classified_failed_case_count=$((classified_failed_case_count + 1))
       fi
 
-      status_line="$(ci_known_failure_status "$KNOWN_FAILURES_FILE" "$CI_TIER" "$row_suite" "$row_case" "$error_code")"
-      IFS='|' read -r status reason expires <<EOF
+      if [ "$direct_target_failure" = true ]; then
+        status_line="$(ci_known_failure_status "$KNOWN_FAILURES_FILE" "$CI_TIER" "$row_suite" "$row_case" "$error_code")"
+        IFS='|' read -r status reason expires <<EOF
 $status_line
 EOF
+      else
+        status="NEW_FAIL"
+        reason="runner failure is not a direct target execution refusal"
+      fi
       ci_record_sql_classification "$row_suite" "$row_case" "$status" "$error_code" "$reason"
       classification_count=$((classification_count + 1))
       if [ "$status" != "KNOWN_FAIL" ]; then

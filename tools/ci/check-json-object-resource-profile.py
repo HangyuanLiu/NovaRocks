@@ -53,7 +53,6 @@ CONTEXTS = (
     ("functions-test", "novarocks-functions", "normal,build,dev", ()),
     ("execution-test", "novarocks-execution", "normal,build,dev", ()),
     ("server-default", "novarocks-server", "normal,build", ()),
-    ("server-candidate", "novarocks-server", "normal,build", ("physical-wire-v2-candidate",)),
 )
 
 class ProfileError(ValueError):

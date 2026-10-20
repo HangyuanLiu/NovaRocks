@@ -17,14 +17,10 @@
 
 //! NIDL contract round-trip tests: hand-written internal <-> proto conversions
 //! + encode/decode/assert_eq, locking each wire contract. Permanent (unlike the
-//!   NIDL-0 spike). One submodule per proto file; expr/plan added in later PRs.
+//!   NIDL-0 spike). Shared values, task carriers and service contracts remain.
 
 #[path = "proto_contract/common.rs"]
 mod common;
-#[path = "proto_contract/expr.rs"]
-mod expr;
-#[path = "proto_contract/plan.rs"]
-mod plan;
 #[path = "proto_contract/release_fixtures.rs"]
 mod release_fixtures;
 #[path = "proto_contract/service.rs"]

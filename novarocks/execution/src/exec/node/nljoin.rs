@@ -16,7 +16,6 @@
 // under the License.
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
-use crate::exec::node::ExecNode;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NestedLoopJoinType {
@@ -28,30 +27,4 @@ pub enum NestedLoopJoinType {
     LeftSemi,
     LeftAnti,
     NullAwareLeftAnti,
-}
-
-#[derive(Clone, Debug)]
-pub struct NestedLoopJoinNode {
-    pub left: Box<ExecNode>,
-    pub right: Box<ExecNode>,
-    pub node_id: i32,
-    pub join_type: NestedLoopJoinType,
-    pub join_conjunct: Option<ExprId>,
-    pub left_chunk_schema: ChunkSchemaRef,
-    pub right_chunk_schema: ChunkSchemaRef,
-    pub join_scope_chunk_schema: ChunkSchemaRef,
-}
-
-impl NestedLoopJoinNode {
-    pub fn left_schema(&self) -> arrow::datatypes::SchemaRef {
-        self.left_chunk_schema.arrow_schema_ref()
-    }
-
-    pub fn right_schema(&self) -> arrow::datatypes::SchemaRef {
-        self.right_chunk_schema.arrow_schema_ref()
-    }
-
-    pub fn join_scope_schema(&self) -> arrow::datatypes::SchemaRef {
-        self.join_scope_chunk_schema.arrow_schema_ref()
-    }
 }

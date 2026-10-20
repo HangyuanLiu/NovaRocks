@@ -62,7 +62,7 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
             match self
                 .engine
                 .run_delete(self.prepared.handle.as_ref())
-                .map_err(DmlError::executor)?
+                .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?
             {
                 DeleteWriteReport::NoOp => CoordinatedWriteReport::NoOp,
                 DeleteWriteReport::CommitRequired(handle) => {
@@ -191,5 +191,76 @@ impl DmlService {
         StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::DataMutation)
             .run(spec)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod execution_error_tests {
+    use super::*;
+    use crate::dml::error::DmlExecutionError;
+    use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+    use crate::query_execution::dml::delete::{DeleteOperation, DeletePrepared};
+    use novarocks_types::EngineErrorCode;
+
+    struct Prepared;
+    impl DeletePrepared for Prepared {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct RefusingEngine {
+        code: Option<EngineErrorCode>,
+    }
+    impl DeleteEngine for RefusingEngine {
+        fn prepare_delete(&self, _: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
+            panic!("already prepared");
+        }
+
+        fn run_delete(
+            &self,
+            _: &dyn DeletePrepared,
+        ) -> Result<DeleteWriteReport, DmlExecutionError> {
+            Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::Failed,
+                "unsupported diagnostic",
+            )
+            .with_engine_error_code(self.code)
+            .into())
+        }
+
+        fn finalize_delete(&self, _: &dyn DeletePrepared) -> Result<(), String> {
+            panic!("refused write cannot finalize");
+        }
+    }
+
+    #[test]
+    fn delete_execution_port_preserves_typed_runtime_identity() {
+        for code in [None, Some(EngineErrorCode::UnsupportedCompiledShape)] {
+            let engine = RefusingEngine { code };
+            let prepared = PreparedDelete {
+                operation: DeleteOperation {
+                    publication_id: LakePublicationId::new_v7(),
+                    catalog: "ice".into(),
+                    namespace: "db".into(),
+                    table: "orders".into(),
+                    target_ref: "main".into(),
+                    attempt_id: "fixture".into(),
+                    base_snapshot_id: None,
+                },
+                handle: Arc::new(Prepared),
+                sql_source: "DELETE FROM orders WHERE id = 1".into(),
+            };
+            let executor = DeleteWriteExecutor {
+                engine: &engine,
+                prepared: &prepared,
+            };
+            let error = executor
+                .run_coordinated_write(&write_transaction_spec(&prepared))
+                .err()
+                .expect("write must fail");
+            assert_eq!(error.engine_error_code(), code);
+            assert_eq!(error.to_string(), "Executor: unsupported diagnostic");
+        }
     }
 }

@@ -25,7 +25,7 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{ProgramRootInput, StaticExprKind, root_input_layout};
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, PureCompileControl,
 };
@@ -52,7 +52,6 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
     let source = sql_source(
         "SELECT CAST(k AS DECIMAL(4,0)) FROM fixture.source",
         DataType::Int64,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
     let mut count = 0;
     for fragment in source.plan().fragments().values() {

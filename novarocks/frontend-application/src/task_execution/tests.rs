@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::native::fragment_encoder::frozen::tests as frozen_tests;
-use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticFragmentHeader};
+use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticSinkTarget};
 use crate::query_execution::artifact::{FragmentId, NativePlacementAssignment};
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -43,8 +43,8 @@ use novarocks_execution::task_execution::{
     TaskDomainReceipt, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState,
     TaskStatus, TaskStatusVersion, TerminationDetail, UpdateTaskReceipt,
 };
-use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
-use novarocks_proto_models::{novarocks as wire, plan as native_plan};
+use novarocks_physical_plan::PipelineDopDomain;
+use novarocks_proto_models::novarocks as wire;
 use novarocks_query_application::coordination::{
     DispatchBudget, DispatchLane, MonotonicInstant, RenewSchedule, StageState,
 };
@@ -153,94 +153,58 @@ impl ConfidentialContent for FakeSecret {
     }
 }
 
-/// One real frozen static plan for a fragment of the test schedules.
-///
-/// `padding` pads the root node so a test controls how large the frozen plan
-/// is; everything else is the smallest plan a frozen fragment may carry.
+/// A checked Result or single-Stream package. Multi-edge control tests keep
+/// their neutral topology separate and use a real Result package here; they
+/// do not claim admission of a multicast or router executable package.
 fn frozen_fragment(
     fragment_id: FragmentId,
-    sink: native_plan::data_sink::Kind,
+    targets: &[StaticSinkTarget],
     padding: usize,
 ) -> Arc<FragmentArtifact> {
-    FragmentArtifact::freeze(
-        native_plan::PlanFragment {
-            fragment_id,
-            root: Some(native_plan::DistributedNode {
-                node_id: i32::try_from(fragment_id).expect("a small fragment id") * 100,
-                tuple_ids: vec![1; padding],
-                ..Default::default()
-            }),
-            sink: Some(native_plan::DataSink { kind: Some(sink) }),
-            ..Default::default()
+    let target = match targets {
+        [target] => Some((
+            target.target_fragment_id(),
+            target.target_exchange_node_id(),
+        )),
+        _ => None,
+    };
+    frozen_tests::frozen_package(
+        fragment_id,
+        i32::try_from(fragment_id).expect("small fragment") * 100,
+        [9; 16],
+        PipelineDopDomain {
+            min: 1,
+            max: 4,
+            requires_power_of_two: false,
         },
-        StaticFragmentHeader {
-            plan_version: PlanVersionId::try_new([9; 16]).expect("a nonzero plan version"),
-            plan_contract_revision: 1,
-            dop_domain: PipelineDopDomain {
-                min: 1,
-                max: 4,
-                requires_power_of_two: false,
-            },
-        },
+        target,
+        padding,
     )
-    .expect("a test fragment freezes")
 }
 
-/// The sink a fragment of `edges` declares: one branch per outbound edge, in
-/// edge order, or the result for a fragment that feeds nothing.
+/// The task graph's own neutral targets, in its declared branch order.
 fn edge_sink(
     fragment_id: FragmentId,
     edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
-) -> native_plan::data_sink::Kind {
-    let mut branches = edges
+) -> Vec<StaticSinkTarget> {
+    edges
         .iter()
         .filter(|edge| edge.source_fragment_id == fragment_id)
-        .map(|edge| native_plan::DataStreamSink {
-            target_fragment_id: edge.target_fragment_id,
-            dest_node_id: edge.target_exchange_node_id,
-            ..Default::default()
+        .map(|edge| {
+            StaticSinkTarget::for_test(edge.target_fragment_id, edge.target_exchange_node_id)
         })
-        .collect::<Vec<_>>();
-    match branches.len() {
-        0 => native_plan::data_sink::Kind::Result(true),
-        1 => native_plan::data_sink::Kind::DataStream(branches.remove(0)),
-        _ => native_plan::data_sink::Kind::MultiCastDataStream(
-            native_plan::MultiCastDataStreamSink { sinks: branches },
-        ),
-    }
+        .collect()
 }
 
-/// A multicast leaf sink whose branches are `targets`, in that order.
-fn multicast_sink(targets: [(FragmentId, i32); 2]) -> native_plan::data_sink::Kind {
-    native_plan::data_sink::Kind::MultiCastDataStream(native_plan::MultiCastDataStreamSink {
-        sinks: targets
-            .into_iter()
-            .map(
-                |(target_fragment_id, dest_node_id)| native_plan::DataStreamSink {
-                    target_fragment_id,
-                    dest_node_id,
-                    ..Default::default()
-                },
-            )
-            .collect(),
-    })
+fn multicast_sink(targets: [(FragmentId, i32); 2]) -> Vec<StaticSinkTarget> {
+    targets
+        .into_iter()
+        .map(|(fragment, node)| StaticSinkTarget::for_test(fragment, node))
+        .collect()
 }
 
-/// A change-stream router leaf sink whose routes are `targets`, in that order.
-fn router_sink(targets: [(FragmentId, i32); 2]) -> native_plan::data_sink::Kind {
-    native_plan::data_sink::Kind::ChangeStreamRouter(native_plan::ChangeStreamRouterSink {
-        routes: targets
-            .into_iter()
-            .map(|(target_fragment_id, target_exchange_node_id)| {
-                native_plan::ChangeStreamBranchRoute {
-                    target_fragment_id,
-                    target_exchange_node_id,
-                    ..Default::default()
-                }
-            })
-            .collect(),
-        ..Default::default()
-    })
+fn router_sink(targets: [(FragmentId, i32); 2]) -> Vec<StaticSinkTarget> {
+    multicast_sink(targets)
 }
 
 /// Creation facts for every placement of one schedule, handed out the way
@@ -251,7 +215,7 @@ struct FakePlans<'a> {
     schedule: &'a SchedulingPlan,
     edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     padding: usize,
-    leaf_sink: Option<native_plan::data_sink::Kind>,
+    leaf_sink: Option<Vec<StaticSinkTarget>>,
     frozen: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
 }
 
@@ -272,13 +236,20 @@ impl<'a> FakePlans<'a> {
 
     /// The same source, with the leaf fragment declaring `sink` instead of
     /// the one its edges imply.
-    fn with_leaf_sink(mut self, sink: native_plan::data_sink::Kind) -> Self {
+    fn with_leaf_sink(mut self, sink: Vec<StaticSinkTarget>) -> Self {
         self.leaf_sink = Some(sink);
         self
     }
 }
 
 impl FragmentPlanSource for FakePlans<'_> {
+    fn control_topology_targets(&self, fragment_id: FragmentId) -> Option<Vec<StaticSinkTarget>> {
+        Some(match (&self.leaf_sink, fragment_id) {
+            (Some(targets), LEAF_FRAGMENT) => targets.clone(),
+            _ => edge_sink(fragment_id, self.edges),
+        })
+    }
+
     fn take_plan(
         &mut self,
         fragment_id: FragmentId,
@@ -302,7 +273,7 @@ impl FragmentPlanSource for FakePlans<'_> {
         let fragment = Arc::clone(
             self.frozen
                 .entry(fragment_id)
-                .or_insert_with(|| frozen_fragment(fragment_id, sink, padding)),
+                .or_insert_with(|| frozen_fragment(fragment_id, &sink, padding)),
         );
         Ok(FragmentPlanFacts {
             fragment,

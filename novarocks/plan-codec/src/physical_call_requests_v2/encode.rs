@@ -677,7 +677,6 @@ fn emit_core(
                 w.step()?;
             }
             entries.push(wire::OriginalCallRequest {
-                request_id: None, // The package definition key is its explicit owner identity.
                 definition: Some(wire::CallRequestDefinition { kind: Some(kind) }),
                 arguments,
                 logical_argument_count: Some(

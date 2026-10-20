@@ -1027,11 +1027,6 @@ fn unsupported_window_shapes_are_refused_by_feature() {
         } if node == WINDOW => feature,
         other => panic!("expected a window refusal, got {other}"),
     };
-    // AVG has no installed pure aggregate, so no window kernel either.
-    assert_eq!(
-        feature(refused(Call::uninstalled_aggregate("avg", &[x]))),
-        "aggregate OVER without an installed pure window kernel"
-    );
     let mut distinct = Call::aggregate("count", &[x]);
     distinct.distinct = true;
     assert_eq!(feature(refused(distinct)), "DISTINCT window call");
@@ -1046,6 +1041,75 @@ fn unsupported_window_shapes_are_refused_by_feature() {
         ))),
         "GROUPS window frame"
     );
+}
+
+#[test]
+fn window_unknown_identity_is_not_a_capability_refusal() {
+    let error = try_compile(&Shape {
+        partitioned: true,
+        ordered: true,
+        calls: vec![Call::uninstalled_aggregate("avg", &[Arg::Column(X)])],
+    })
+    .unwrap_err();
+    assert!(!error.is_unsupported());
+    assert!(matches!(
+        &error,
+        FragmentCompileError::Owner { error, .. }
+            if matches!(error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+                Some(crate::expressions::ExpressionLoweringError::Specialization(
+                    novarocks_functions::FunctionSpecializationFailure::Binding(
+                        novarocks_functions::FunctionBindingError::UnknownFunction))))
+    ));
+}
+
+/// Lookup-level coverage: a pure seal cannot contain a metadata-only entry.
+#[test]
+fn window_metadata_without_pure_owner_remains_a_capability_refusal() {
+    let catalog = catalog();
+    let source = package(
+        &Shape {
+            partitioned: true,
+            ordered: true,
+            calls: vec![Call::window("row_number", &[])],
+        },
+        &catalog,
+    );
+    let NodeKind::Window(spec) = &source.fragment().nodes()[&WINDOW].kind else {
+        panic!("expected the fixture window")
+    };
+    let ExprKind::WindowCall { function, .. } = &source
+        .fragment()
+        .expressions()
+        .get(spec.expressions[0].expression)
+        .unwrap()
+        .kind
+    else {
+        panic!("expected the fixture window call")
+    };
+    let original = catalog
+        .metadata()
+        .definition("row_number", FunctionKind::Window)
+        .unwrap();
+    let metadata_only = novarocks_functions::FunctionDefinition::try_new_bound(
+        original.canonical_name(),
+        original.visibility(),
+        original.binding_declaration().unwrap().clone(),
+        Arc::new(original.binding_resolver().unwrap().clone()),
+    )
+    .unwrap();
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder.register(metadata_only).unwrap();
+    let metadata = builder.seal_bound().unwrap();
+    let error = crate::window::window_function_abi(function, &metadata, &Control).unwrap_err();
+    assert!(error.is_unsupported());
+    assert!(matches!(
+        &error,
+        FragmentCompileError::Owner { error, .. }
+            if matches!(error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+                Some(crate::expressions::ExpressionLoweringError::Specialization(
+                    novarocks_functions::FunctionSpecializationFailure::MissingPureImplementation(actual)))
+                    if actual == &function.overload)
+    ));
 }
 
 #[test]

@@ -65,6 +65,11 @@ const UNSUPPORTED_EXPRESSION: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const UNAVAILABLE_IMPLEMENTATION: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.unavailable_implementation"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const UNSUPPORTED_QUERY_SHAPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.unsupported_query_shape"),
     phase: ErrorPhase::Analyze,
@@ -87,6 +92,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     INVALID_ARGUMENT,
     INVALID_QUERY_SHAPE,
     UNSUPPORTED_EXPRESSION,
+    UNAVAILABLE_IMPLEMENTATION,
     UNSUPPORTED_QUERY_SHAPE,
     INTERNAL,
 ];
@@ -102,7 +108,7 @@ pub enum AnalyzeErrorKind {
     InvalidArgument,
     InvalidQueryShape,
     UnsupportedExpression,
-    /// Candidate-carrier implementation admission; the public code remains unsupported_expression.
+    /// A bound overload has no installed pure implementation.
     UnavailableImplementation,
     UnsupportedQueryShape,
     Internal,
@@ -119,7 +125,8 @@ impl AnalyzeErrorKind {
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
-            Self::UnsupportedExpression | Self::UnavailableImplementation => UNSUPPORTED_EXPRESSION,
+            Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
+            Self::UnavailableImplementation => UNAVAILABLE_IMPLEMENTATION,
             Self::UnsupportedQueryShape => UNSUPPORTED_QUERY_SHAPE,
             Self::Internal => INTERNAL,
         }
@@ -306,6 +313,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_pure_implementation_keeps_its_own_code_through_argument_context() {
+        let overload =
+            novarocks_functions::FunctionOverloadId::try_new("fixture/missing/pure-v1").unwrap();
+        let error = AnalyzeError::function_binding(
+            novarocks_functions::FunctionBindingError::UnavailableImplementation(overload),
+        );
+        let error = error
+            .at_type_mismatch(Span::new(7, 8))
+            .at_invalid_argument(Span::new(7, 8));
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
+        assert_eq!(
+            error.code().as_str(),
+            "sql.analyze.unavailable_implementation"
+        );
+        let user = error.to_user_error(None);
+        assert_eq!(
+            user.code().as_str(),
+            "sql.analyze.unavailable_implementation"
+        );
+        assert_eq!(
+            AnalyzeErrorKind::UnsupportedExpression
+                .descriptor()
+                .code
+                .as_str(),
+            "sql.analyze.unsupported_expression"
+        );
+    }
+
+    #[test]
     fn descriptors_are_the_frozen_analyze_contract() {
         let codes = ERROR_CODE_DESCRIPTORS
             .iter()
@@ -322,6 +358,7 @@ mod tests {
                 "sql.analyze.invalid_argument",
                 "sql.analyze.invalid_query_shape",
                 "sql.analyze.unsupported_expression",
+                "sql.analyze.unavailable_implementation",
                 "sql.analyze.unsupported_query_shape",
                 "sql.analyze.internal",
             ]

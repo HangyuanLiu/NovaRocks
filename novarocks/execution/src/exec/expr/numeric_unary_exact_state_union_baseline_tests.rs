@@ -15,18 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact mode counterpart to frozen OriginalNativeV1 source-route before probes.
+//! Compiled SQL state-union source routes retain their original producer facts.
 use novarocks_physical_plan::{AggregatePhase, NodeKind};
-use novarocks_sql::compiler::{SqlCompileControl, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlCompileControl;
 fn check(sum: Option<(i64, i64, i64)>, intermediate: bool) {
     let control = SqlCompileControl::unbounded();
-    let owner = novarocks_sql::compiler::ordinary_union_source_for_test(
-        sum,
-        intermediate,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        &control,
-    )
-    .unwrap();
+    let owner =
+        novarocks_sql::compiler::ordinary_union_source_for_test(sum, intermediate, &control)
+            .unwrap();
     let mut partial = 0;
     let mut middle = 0;
     let mut final_calls = 0;

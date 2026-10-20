@@ -45,13 +45,12 @@ pub mod physical_connector_payload_v2;
 pub mod physical_constant_v2;
 pub mod physical_control_v2;
 pub mod physical_cuts_v2;
-mod physical_encode;
-mod physical_expr;
 pub mod physical_expression_v2;
 pub(crate) mod physical_fragment_envelope_v2;
 pub mod physical_node_v2;
 pub mod physical_package_metadata_v2;
 pub mod physical_package_v2;
+pub use physical_package_v2::PhysicalEncodeError;
 pub mod physical_properties_v2;
 pub mod physical_provider_binding_v2;
 pub mod physical_provider_read_v2;
@@ -68,10 +67,8 @@ pub mod physical_simple_nodes_v2;
 pub mod physical_table_function_node_v2;
 pub mod physical_table_write_nodes_v2;
 pub mod physical_topn_node_v2;
-mod physical_type;
 pub mod physical_type_v2;
 pub mod physical_unpivot_v2;
-mod physical_v1;
 pub mod physical_value_origin_v2;
 pub mod physical_value_v2;
 pub mod physical_writer_grouped_unpivot_v2;
@@ -79,26 +76,14 @@ pub mod physical_writer_recipe_v2;
 pub mod physical_writer_schema_v2;
 pub mod resource_preflight_v2;
 mod resource_source_model;
+mod runtime_filter_facts;
+#[cfg(test)]
+mod runtime_filter_test_support;
+mod sealed_write_targets;
+pub use runtime_filter_facts::runtime_filter_comparator_digest;
 pub mod value_type_table;
-mod write_targets;
 
-pub use physical_encode::{
-    NativeFragmentPreparationSource, NoPhysicalV1PrivateFacts, PhysicalEncodeError,
-    PhysicalTypedCteConsumerView, PhysicalV1CteConsumer, PhysicalV1PrivateFacts,
-    PhysicalV1RuntimeFilterBinding, PhysicalV1RuntimeFilterBindingRole, PhysicalV1ScanColumn,
-    PhysicalV1ScanFact, PhysicalV1WriteFact, ScanRuntimeFilterBindings,
-    encode_physical_plan_typed_pure, encode_physical_plan_typed_pure_with_fragment_preparation,
-    encode_physical_plan_typed_with_host, physical_typed_cte_consumer_view,
-    physical_typed_cte_consumer_views, physical_v1_runtime_filter_bindings,
-    physical_v1_runtime_filter_comparator_digest, physical_v1_scan_runtime_filters,
-    physical_v1_scan_source_seal_digest,
-};
-pub use physical_v1::{
-    NATIVE_V1_MAX_TREE_DEPTH, PhysicalV1PreflightError, WireLayout, WireLayoutError, WireSlotId,
-    preflight_physical_plan_v1,
-};
-
-pub use write_targets::SealedWriteTargets;
+pub use sealed_write_targets::SealedWriteTargets;
 
 // Refuse flags that would make capability reporting disagree with compiled seams.
 #[cfg(any(

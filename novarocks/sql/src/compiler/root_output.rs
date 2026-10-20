@@ -324,7 +324,6 @@ mod tests {
                 crate::functions::test_function_catalog_snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();

@@ -133,31 +133,10 @@ pub struct BackendServerConfig {
     /// one factory per provider kind before query lifecycle admission.
     pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
     /// The one static plan interpreter Server composed for this process.
-    pub static_plan_interpreter: BackendStaticPlanInterpreter,
+    pub static_plan_interpreter: CompiledStaticPlan,
     /// This process's memory readings for the `/metrics` endpoint, supplied
     /// by the process that owns the allocator and the probes.
     pub process_memory: crate::backend_metrics::ProcessMemoryObservation,
-}
-
-/// The one static plan interpreter a backend process composes.
-///
-/// Server selects it once, at composition. A task's carrier never selects it,
-/// and no process composes both: the plan-tree decoder refuses a package
-/// carrier and the compiled-package interpreter refuses a plan tree.
-pub enum BackendStaticPlanInterpreter {
-    /// The production plan-tree decoder. No package carrier is gated.
-    PlanTree,
-    /// The compiled-package interpreter and its ingress package gate.
-    CompiledPackage(CompiledStaticPlan),
-}
-
-impl BackendStaticPlanInterpreter {
-    const fn label(&self) -> &'static str {
-        match self {
-            Self::PlanTree => "plan_tree",
-            Self::CompiledPackage(_) => "compiled_package",
-        }
-    }
 }
 
 /// The compiled-package interpreter and the ingress gate, built over the
@@ -452,7 +431,7 @@ fn compose_backend_application_services(
     scan_stream_host: novarocks_worker::ScanStreamHost,
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
-    static_plan_interpreter: BackendStaticPlanInterpreter,
+    static_plan_interpreter: CompiledStaticPlan,
     #[cfg(novarocks_dev_controls)] test_session: Option<
         &crate::backend_test_session::BackendTestSession,
     >,
@@ -569,17 +548,15 @@ fn compose_backend_application_services(
         completion_capacity,
     );
     tracing::info!(
-        static_plan_interpreter = static_plan_interpreter.label(),
+        static_plan_interpreter = "compiled_package",
         "composed the backend static plan interpreter"
     );
-    let (compiled_package_compiler, static_package_admission) = match static_plan_interpreter {
-        BackendStaticPlanInterpreter::PlanTree => (None, None),
-        BackendStaticPlanInterpreter::CompiledPackage(CompiledStaticPlan {
-            compiler,
-            admission,
-        }) => (Some(compiler), Some(admission)),
-    };
+    let CompiledStaticPlan {
+        compiler,
+        admission,
+    } = static_plan_interpreter;
     let execution_host = crate::backend_task_execution::NativeTaskExecutionHost::new(
+        compiler,
         queries,
         Arc::clone(&context_host) as Arc<dyn crate::backend_task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
@@ -609,10 +586,7 @@ fn compose_backend_application_services(
         Some(session) => execution_host.with_test_controls(session.native.clone()),
         None => execution_host,
     };
-    let execution_host = Arc::new(match compiled_package_compiler {
-        None => execution_host,
-        Some(compiler) => execution_host.with_compiled_package_compiler(compiler),
-    });
+    let execution_host = Arc::new(execution_host);
     let task_creation_gate: Arc<dyn novarocks_worker::TaskCreationGate> =
         Arc::new(novarocks_worker::NoopTaskCreationGate);
     #[cfg(novarocks_dev_controls)]
@@ -634,17 +608,11 @@ fn compose_backend_application_services(
         ),
         task_creation_gate,
     );
-    let task_execution_ingress = match static_package_admission {
-        None => RegistryTaskExecutionIngress::new(
-            Arc::clone(&task_execution_registry),
-            native_compatibility_id,
-        ),
-        Some(admission) => RegistryTaskExecutionIngress::with_static_package_admission(
-            Arc::clone(&task_execution_registry),
-            native_compatibility_id,
-            admission,
-        ),
-    };
+    let task_execution_ingress = RegistryTaskExecutionIngress::new(
+        Arc::clone(&task_execution_registry),
+        native_compatibility_id,
+        admission,
+    );
     #[cfg(novarocks_dev_controls)]
     if let Some(session) = test_session {
         task_execution_ingress
@@ -1309,9 +1277,9 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendServerConfig, BackendStaticPlanInterpreter,
-        CompiledStaticPlan, QueryContextRef, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
-        combine_primary_and_shutdown, compose_backend_application_services,
+        BackendExecutionRuntimeInput, BackendServerConfig, CompiledStaticPlan, QueryContextRef,
+        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
+        compose_backend_application_services,
     };
     use crate::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress;
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
@@ -1511,7 +1479,7 @@ mod tests {
                 novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
             catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
-            static_plan_interpreter: BackendStaticPlanInterpreter::PlanTree,
+            static_plan_interpreter: super::test_compiled_static_plan(),
             process_memory: novarocks_native_adapter::backend_test_support::test_process_memory(),
         }
     }
@@ -1607,7 +1575,7 @@ mod tests {
             ),
             CatalogManagerConfig::default(),
             &[],
-            BackendStaticPlanInterpreter::PlanTree,
+            super::test_compiled_static_plan(),
             #[cfg(novarocks_dev_controls)]
             None,
         )
@@ -2095,7 +2063,7 @@ mod tests {
             ),
             CatalogManagerConfig::default(),
             &[],
-            BackendStaticPlanInterpreter::CompiledPackage(plan),
+            plan,
             #[cfg(novarocks_dev_controls)]
             None,
         )
@@ -2166,4 +2134,23 @@ mod tests {
             "a refused create leaves no task behind"
         );
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_compiled_static_plan() -> CompiledStaticPlan {
+    let limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
+    let model = Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl).unwrap());
+    CompiledStaticPlan {
+        compiler: Arc::new(crate::backend_task_execution::execution_host::tests::compiled_package_host::interpreter()),
+        admission: Arc::new(StaticPackageAdmission::new(model, limits.wire)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_static_package_admission() -> Arc<StaticPackageAdmission> {
+    let limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
+    Arc::new(StaticPackageAdmission::new(
+        Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl).unwrap()),
+        limits.wire,
+    ))
 }

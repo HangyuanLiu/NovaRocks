@@ -138,7 +138,6 @@ fn authored(
         functions,
         false,
         crate::constant::test_constant_policy(),
-        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         control,
     )?
     .finish_observed(control)

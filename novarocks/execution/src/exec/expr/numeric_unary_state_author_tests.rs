@@ -17,12 +17,11 @@
 
 //! Actual original request-author probes; new expectations are initially UNRUN.
 use novarocks_sql::compiler::{
-    SqlCompileControl, SqlPhysicalEmissionMode, ordinary_state_observe_for_test,
-    ordinary_union_source_for_test,
+    SqlCompileControl, ordinary_state_observe_for_test, ordinary_union_source_for_test,
 };
-fn check(sum: Option<(i64, i64, i64)>, intermediate: bool, mode: SqlPhysicalEmissionMode) {
+fn check(sum: Option<(i64, i64, i64)>, intermediate: bool) {
     let control = SqlCompileControl::unbounded();
-    let owner = ordinary_union_source_for_test(sum, intermediate, mode, &control).unwrap();
+    let owner = ordinary_union_source_for_test(sum, intermediate, &control).unwrap();
     let actual = ordinary_state_observe_for_test(&owner, &control).unwrap();
     assert_eq!(
         (actual.partials, actual.intermediates, actual.finals),
@@ -41,43 +40,16 @@ fn check(sum: Option<(i64, i64, i64)>, intermediate: bool, mode: SqlPhysicalEmis
         2 + usize::from(intermediate)
     );
 }
-#[test]
-fn numeric_unary_original_state_author_count_union() {
-    check(None, false, SqlPhysicalEmissionMode::OriginalNativeV1);
-}
-#[test]
-fn numeric_unary_original_state_author_count_intermediate() {
-    check(None, true, SqlPhysicalEmissionMode::OriginalNativeV1);
-}
-#[test]
-fn numeric_unary_original_state_author_sum_distinct_cv() {
-    check(
-        Some((1, 2, 3)),
-        true,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
-}
+
 #[test]
 fn numeric_unary_exact_state_author_count_union() {
-    check(
-        None,
-        false,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    check(None, false);
 }
 #[test]
 fn numeric_unary_exact_state_author_count_intermediate() {
-    check(
-        None,
-        true,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    check(None, true);
 }
 #[test]
 fn numeric_unary_exact_state_author_sum_distinct_cv() {
-    check(
-        Some((1, 2, 3)),
-        true,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    check(Some((1, 2, 3)), true);
 }

@@ -729,25 +729,16 @@ pub(crate) fn place_runtime_filters(
     place_runtime_filters_with_policy(root, settings, AggregateTopNPlacementPolicy::GlobalGroups);
 }
 
-/// The emission author explicitly permits the computed-type direct Partial
-/// route; both modes retain the original Global placement and ID space.
-pub(crate) fn place_runtime_filters_for_emission(
+/// Place filters for the sole compiled execution path, including direct UTF-8 Partial groups.
+pub(crate) fn place_runtime_filters_for_compiled(
     root: &mut PhysicalPlanNode,
     settings: &SessionOptimizerSettings,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
 ) {
-    match emission_mode {
-        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1 => {
-            place_runtime_filters(root, settings);
-        }
-        crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
-            place_runtime_filters_with_policy(
-                root,
-                settings,
-                AggregateTopNPlacementPolicy::GlobalAndDirectPartialUtf8,
-            );
-        }
-    }
+    place_runtime_filters_with_policy(
+        root,
+        settings,
+        AggregateTopNPlacementPolicy::GlobalAndDirectPartialUtf8,
+    );
 }
 
 fn place_runtime_filters_with_policy(

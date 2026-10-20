@@ -128,6 +128,7 @@ fn decode_failure_category(
         Ok(novarocks::TaskFailureCategory::Exchange) => Ok(TaskFailureCategory::Exchange),
         Ok(novarocks::TaskFailureCategory::Protocol) => Ok(TaskFailureCategory::Protocol),
         Ok(novarocks::TaskFailureCategory::Internal) => Ok(TaskFailureCategory::Internal),
+        Ok(novarocks::TaskFailureCategory::Unsupported) => Ok(TaskFailureCategory::Unsupported),
         Ok(novarocks::TaskFailureCategory::Unspecified) | Err(_) => Err(invalid_enum(
             path,
             "failure category must be a known non-default value",
@@ -142,6 +143,7 @@ fn encode_failure_category(value: TaskFailureCategory) -> i32 {
         TaskFailureCategory::Exchange => novarocks::TaskFailureCategory::Exchange,
         TaskFailureCategory::Protocol => novarocks::TaskFailureCategory::Protocol,
         TaskFailureCategory::Internal => novarocks::TaskFailureCategory::Internal,
+        TaskFailureCategory::Unsupported => novarocks::TaskFailureCategory::Unsupported,
     };
     encoded as i32
 }

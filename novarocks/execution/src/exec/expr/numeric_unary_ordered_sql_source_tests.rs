@@ -22,7 +22,6 @@ use novarocks_physical_plan::{
     FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
     StaticFunctionArgument,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
 
 // This fixture reads installed records from the same actual builtin metadata
 // owners as Server's seal_candidate_pure_catalog. It never fabricates an ABI,
@@ -73,15 +72,14 @@ pub(super) fn installed_builtin_owner_catalogue() -> novarocks_functions::PureEn
     }
     builder.seal_pure(installed).unwrap()
 }
-fn check(sql: &str, group_concat: bool, mode: SqlPhysicalEmissionMode) {
-    let exact = mode == SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration;
+fn check(sql: &str, group_concat: bool) {
     let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
     let semantics = if group_concat {
         semantics.with_group_concat_max_len(4096)
     } else {
         semantics
     };
-    let source = sql_source_with_semantics(sql, DataType::Int8, mode, semantics);
+    let source = sql_source_with_semantics(sql, DataType::Int8, semantics);
     let mut count = 0usize;
     for fragment in source.plan().fragments().values() {
         for node in fragment.nodes().values() {
@@ -143,40 +141,24 @@ fn check(sql: &str, group_concat: bool, mode: SqlPhysicalEmissionMode) {
         count >= 1,
         "actual SQL must retain an actual ordered aggregate call"
     );
-    if exact {
+    {
         let actual = programs_with_catalogue(&source, &installed_builtin_owner_catalogue());
         assert_eq!(actual.len(), source.plan().fragments().len());
     }
 }
-#[test]
-fn numeric_unary_original_ordered_sql_array_agg() {
-    check(
-        "SELECT ARRAY_AGG(k ORDER BY -k) AS observed FROM fixture",
-        false,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
-}
+
 #[test]
 fn numeric_unary_exact_ordered_sql_array_agg() {
     check(
         "SELECT ARRAY_AGG(k ORDER BY -k) AS observed FROM fixture",
         false,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
 }
-#[test]
-fn numeric_unary_original_ordered_sql_group_concat() {
-    check(
-        "SELECT GROUP_CONCAT(CAST(k AS VARCHAR) ORDER BY -k) AS observed FROM fixture",
-        true,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
-}
+
 #[test]
 fn numeric_unary_exact_ordered_sql_group_concat() {
     check(
         "SELECT GROUP_CONCAT(CAST(k AS VARCHAR) ORDER BY -k) AS observed FROM fixture",
         true,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
 }

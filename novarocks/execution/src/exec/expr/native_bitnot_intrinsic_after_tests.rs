@@ -29,7 +29,7 @@ use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailu
 use novarocks_local_program::{
     ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_types::SlotId;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -80,8 +80,6 @@ fn original(input: ArrayRef) -> ArrayRef {
         .eval(root, &Chunk::new_with_chunk_schema(data, schema))
         .unwrap()
 }
-const EXACT: SqlPhysicalEmissionMode =
-    SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration;
 // Loan the already installed catalogue author; the old unary fixture's
 // deliberately IF/COALESCE-only wrapper is unchanged.
 fn programs(
@@ -139,7 +137,6 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
         let source = sql_source(
             "SELECT ~k AS original_inverted FROM fixture.source",
             input.data_type().clone(),
-            EXACT,
         );
         let public = source
             .checked_original_result_declaration_observed(&Control)
@@ -201,7 +198,6 @@ fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() 
     let source = sql_source(
         "SELECT ~CAST(k AS LARGEINT) AS original_inverted FROM fixture.source",
         DataType::Int64,
-        EXACT,
     );
     let plans = programs(&source);
     let (program, root) = producer_root(&plans);
@@ -233,7 +229,6 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
     let source = sql_source(
         "SELECT ~i AS original_inverted FROM (VALUES (CAST(1 AS BIGINT)),(CAST(NULL AS BIGINT)),(CAST(-2 AS BIGINT))) AS source(i)",
         DataType::Int64,
-        EXACT,
     );
     let plans = programs(&source);
     let (program, root) = producer_root(&plans);
@@ -254,7 +249,7 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
     assert!(source.plan().result_port().unwrap().fields[0].ty.nullable());
 }
 fn constant_outputs(sql: &str) -> Vec<ArrayRef> {
-    let source = sql_source(sql, DataType::Int64, EXACT);
+    let source = sql_source(sql, DataType::Int64);
     let plans = programs(&source);
     let mut actual = Vec::new();
     for program in plans.values() {
@@ -324,8 +319,8 @@ fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sou
 }
 #[test]
 fn native_bitnot_intrinsic_exact_physical_null_is_refused_before_folding() {
-    let refused = std::panic::catch_unwind(|| sql_source("SELECT ~NULL", DataType::Int64, EXACT))
-        .unwrap_err();
+    let refused =
+        std::panic::catch_unwind(|| sql_source("SELECT ~NULL", DataType::Int64)).unwrap_err();
     let message = refused
         .downcast_ref::<String>()
         .map(String::as_str)
@@ -384,7 +379,7 @@ fn causes() -> [KernelFailure; 7] {
 #[test]
 fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_keeps_cause_and_never_replays()
  {
-    let source = sql_source("SELECT ~k FROM fixture.source", DataType::Int64, EXACT);
+    let source = sql_source("SELECT ~k FROM fixture.source", DataType::Int64);
     let plans = programs(&source);
     let (program, root) = producer_root(&plans);
     let data = batch(
@@ -443,8 +438,8 @@ fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_convers
         ValueLogicalType::LargeInt,
     )
     .unwrap();
-    for mode in [SqlPhysicalEmissionMode::OriginalNativeV1, EXACT] {
-        let source = sql_source(sql, DataType::Int64, mode);
+    {
+        let source = sql_source(sql, DataType::Int64);
         assert_eq!(
             source.plan().result_port().unwrap().fields[0].ty,
             expected_type

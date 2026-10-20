@@ -40,7 +40,7 @@
 
 mod compiled_package;
 mod context_host;
-mod execution_host;
+pub(crate) mod execution_host;
 mod preparation_memory_control;
 mod project_materialization;
 #[cfg(novarocks_dev_controls)]

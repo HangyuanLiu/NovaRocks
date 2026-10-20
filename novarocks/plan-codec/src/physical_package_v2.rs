@@ -32,6 +32,10 @@ mod binding_sources;
 mod decode;
 mod definition_sources;
 mod encode;
+mod encode_error;
+pub use encode_error::PhysicalEncodeError;
+
+mod frozen_limits;
 mod nodes;
 mod provider_sources;
 #[cfg(any(test, novarocks_dev_controls))]
@@ -49,6 +53,7 @@ pub use definition_sources::{
     DefinitionSourceLimits, FragmentDefinitionSource, visit_fragment_definitions_observed,
 };
 pub use encode::{PackageEncodeError, PackageEncodeLimits, encode_fragment_package};
+pub use frozen_limits::{FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION};
 pub use provider_sources::{ProviderSourceError, ProviderSourceLimits};
 pub use type_views::{TypeViewError, TypeViewLimits};
 

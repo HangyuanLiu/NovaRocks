@@ -52,7 +52,10 @@ const MAX_UNPIVOT_CONSTANTS: usize = 16_384;
 const MAX_UNPIVOT_NESTED_ELEMENTS: usize = 4_096;
 const MAX_UNPIVOT_CONSTANT_BYTES: usize = 16 * 1024 * 1024;
 
-pub struct UnpivotProcessorFactory {
+#[cfg(test)]
+/// F3 component oracle over explicit expression/array/layout facts.
+/// This test-only fixture owns no construction tree and is not a product operator.
+pub(crate) struct UnpivotFixtureFactory {
     name: String,
     arena: Arc<ExprArena>,
     passthrough_columns: Vec<UnpivotPassthroughColumn>,
@@ -65,7 +68,8 @@ pub struct UnpivotProcessorFactory {
     max_output_bytes: usize,
 }
 
-impl UnpivotProcessorFactory {
+#[cfg(test)]
+impl UnpivotFixtureFactory {
     #[expect(
         clippy::too_many_arguments,
         reason = "The typed unpivot operator keeps independently validated column roles explicit."
@@ -145,13 +149,14 @@ impl UnpivotProcessorFactory {
     }
 }
 
-impl OperatorFactory for UnpivotProcessorFactory {
+#[cfg(test)]
+impl OperatorFactory for UnpivotFixtureFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(UnpivotProcessorOperator {
+        Box::new(UnpivotFixtureOperator {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             passthrough_columns: self.passthrough_columns.clone(),
@@ -173,7 +178,8 @@ impl OperatorFactory for UnpivotProcessorFactory {
     }
 }
 
-struct UnpivotProcessorOperator {
+#[cfg(test)]
+struct UnpivotFixtureOperator {
     name: String,
     arena: Arc<ExprArena>,
     passthrough_columns: Vec<UnpivotPassthroughColumn>,
@@ -193,7 +199,8 @@ struct UnpivotProcessorOperator {
     mem_tracker: Option<Arc<MemTracker>>,
 }
 
-impl Operator for UnpivotProcessorOperator {
+#[cfg(test)]
+impl Operator for UnpivotFixtureOperator {
     fn creates_typed_storage(&self) -> bool {
         self.output_layout.is_some()
             || self
@@ -250,7 +257,8 @@ impl Operator for UnpivotProcessorOperator {
     }
 }
 
-impl ProcessorOperator for UnpivotProcessorOperator {
+#[cfg(test)]
+impl ProcessorOperator for UnpivotFixtureOperator {
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.input.is_none()
     }
@@ -632,7 +640,8 @@ pub(crate) struct Segment {
     pub(crate) len: usize,
 }
 
-impl UnpivotProcessorOperator {
+#[cfg(test)]
+impl UnpivotFixtureOperator {
     fn build_output(&self, input: &Chunk, start: usize, len: usize) -> Result<Chunk, String> {
         let output_chunk_schema = self
             .output_chunk_schema
@@ -694,7 +703,8 @@ impl UnpivotProcessorOperator {
     }
 }
 
-impl UnpivotProcessorOperator {
+#[cfg(test)]
+impl UnpivotFixtureOperator {
     fn build_output_typed(
         &self,
         input: &Chunk,
@@ -1458,7 +1468,7 @@ mod tests {
         .unwrap()
     }
 
-    fn factory(max_rows: usize, max_bytes: usize) -> UnpivotProcessorFactory {
+    fn factory(max_rows: usize, max_bytes: usize) -> UnpivotFixtureFactory {
         let mut arena = ExprArena::default();
         let first = arena.push_typed(
             ExprNode::Literal(LiteralValue::Utf8("first".to_string())),
@@ -1468,7 +1478,7 @@ mod tests {
             ExprNode::Literal(LiteralValue::Utf8("second".to_string())),
             DataType::Utf8,
         );
-        UnpivotProcessorFactory::new(
+        UnpivotFixtureFactory::new(
             9,
             Arc::new(arena),
             vec![UnpivotPassthroughColumn {
@@ -1581,7 +1591,7 @@ mod tests {
 
     #[test]
     fn direct_construction_rejects_noncanonical_map_constants() {
-        let error = UnpivotProcessorFactory::new(
+        let error = UnpivotFixtureFactory::new(
             1,
             Arc::new(ExprArena::default()),
             Vec::new(),
@@ -1610,7 +1620,7 @@ mod tests {
     fn direct_construction_preserves_scalar_constant_nullability() {
         let mut arena = ExprArena::default();
         let null = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Utf8);
-        let error = UnpivotProcessorFactory::new(
+        let error = UnpivotFixtureFactory::new(
             1,
             Arc::new(arena),
             Vec::new(),
@@ -1712,7 +1722,7 @@ mod tests {
                 }],
             })
             .collect::<Vec<_>>();
-        let factory = UnpivotProcessorFactory::new(
+        let factory = UnpivotFixtureFactory::new(
             10,
             Arc::new(arena),
             vec![],
@@ -1758,7 +1768,7 @@ mod tests {
         let state = RuntimeState::default();
         let mut arena = ExprArena::default();
         let label = arena.push_typed(label, DataType::Int8);
-        let factory = UnpivotProcessorFactory::new(
+        let factory = UnpivotFixtureFactory::new(
             11,
             Arc::new(arena),
             vec![UnpivotPassthroughColumn {
@@ -1852,7 +1862,7 @@ mod tests {
         let state = RuntimeState::default();
         let output_schema = schema(vec![(11, "value", DataType::Binary, false)]);
         let make_factory = |max_rows, max_bytes| {
-            UnpivotProcessorFactory::new(
+            UnpivotFixtureFactory::new(
                 12,
                 Arc::new(ExprArena::default()),
                 vec![],
@@ -2003,7 +2013,7 @@ mod tests {
         ] {
             let mut arena = ExprArena::default();
             let id = arena.push_typed(ExprNode::Constant(source), DataType::Utf8);
-            let error = UnpivotProcessorFactory::new(
+            let error = UnpivotFixtureFactory::new(
                 1,
                 Arc::new(arena),
                 vec![],
@@ -2067,7 +2077,7 @@ mod tests {
                 );
                 let mut arena = ExprArena::default();
                 let id = arena.push_typed(ExprNode::Constant(source), ty.clone());
-                let result = UnpivotProcessorFactory::new(
+                let result = UnpivotFixtureFactory::new(
                     1,
                     Arc::new(arena),
                     vec![],
@@ -2159,7 +2169,7 @@ mod tests {
         )
         .unwrap()
     }
-    fn typed_scalar_unpivot() -> UnpivotProcessorFactory {
+    fn typed_scalar_unpivot() -> UnpivotFixtureFactory {
         use novarocks_type_contract::FunctionValueType;
         let label_type = FunctionValueType::new(DataType::Int8, false);
         let label = cv_constant(
@@ -2187,7 +2197,7 @@ mod tests {
             &PureDeclarationControl,
         )
         .unwrap();
-        UnpivotProcessorFactory::new_from_static_layout(
+        UnpivotFixtureFactory::new_from_static_layout(
             9,
             Arc::new(arena),
             vec![UnpivotPassthroughColumn {
@@ -2344,7 +2354,7 @@ mod tests {
             &PureDeclarationControl,
         )
         .unwrap();
-        let factory = UnpivotProcessorFactory::new_from_static_layout(
+        let factory = UnpivotFixtureFactory::new_from_static_layout(
             9,
             Arc::new(ExprArena::default()),
             vec![],

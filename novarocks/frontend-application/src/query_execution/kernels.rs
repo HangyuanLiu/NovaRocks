@@ -27,7 +27,7 @@ use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
-use crate::query_execution::package_freeze::StaticPlanCarrier;
+use crate::query_execution::package_freeze::CompiledPackageCarrier;
 use crate::query_execution::service::QueryExecutionService;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogApplicationPort;
@@ -49,7 +49,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 pub struct QueryPreparationKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -113,7 +113,7 @@ impl QueryPreparationKernel {
         backend_topology: BackendTopologyService,
         exchange_port: u16,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             functions,
@@ -139,7 +139,7 @@ impl QueryPreparationKernel {
     }
 
     /// The static carrier this kernel freezes completed plans into.
-    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+    pub(crate) const fn static_plan_carrier(&self) -> &CompiledPackageCarrier {
         &self.static_plan_carrier
     }
 
@@ -190,7 +190,7 @@ impl QueryPreparationKernel {
 pub struct DmlExecutionKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -209,7 +209,7 @@ pub struct DmlExecutionKernel {
 pub struct DmlPlanningServices {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
 }
 
@@ -218,7 +218,7 @@ impl DmlPlanningServices {
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             functions,
@@ -298,7 +298,7 @@ impl DmlExecutionKernel {
     }
 
     /// The static carrier this kernel freezes completed plans into.
-    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+    pub(crate) const fn static_plan_carrier(&self) -> &CompiledPackageCarrier {
         &self.static_plan_carrier
     }
 
@@ -469,7 +469,7 @@ impl ViewExecutionKernel {
 pub struct MaintenanceExecutionKernel {
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
-    static_plan_carrier: StaticPlanCarrier,
+    static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -493,7 +493,7 @@ impl MaintenanceExecutionKernel {
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        static_plan_carrier: StaticPlanCarrier,
+        static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
         Self {
             constant_policy,
@@ -515,7 +515,7 @@ impl MaintenanceExecutionKernel {
     }
 
     /// The static carrier this kernel freezes completed plans into.
-    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+    pub(crate) const fn static_plan_carrier(&self) -> &CompiledPackageCarrier {
         &self.static_plan_carrier
     }
 

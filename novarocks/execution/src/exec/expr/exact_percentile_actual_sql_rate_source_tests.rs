@@ -22,13 +22,13 @@ use novarocks_physical_plan::{
     FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
     StaticFunctionArgument,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::FunctionValueType;
-fn check(mode: SqlPhysicalEmissionMode) {
+fn check() {
     for name in ["percentile_cont", "percentile_disc", "percentile_disc_lc"] {
         for rate in ["0", "1", "0.25", "0.5", "0.75", "CAST(0.5 AS DOUBLE)"] {
             let sql = format!("SELECT {name}(k,{rate}) AS observed FROM fixture");
-            let source = sql_source(&sql, DataType::Int32, mode);
+            let source = sql_source(&sql, DataType::Int32);
             let mut count = 0;
             for fragment in source.plan().fragments().values() {
                 for node in fragment.nodes().values() {
@@ -62,7 +62,7 @@ fn check(mode: SqlPhysicalEmissionMode) {
                         // Record the actual authored type, rather than guessing
                         // it from ConstantValue or retagging a numeric literal.
                         eprintln!(
-                            "original SQL rate source sql={sql:?} mode={mode:?} phase={:?} rate={actual_rate:?} state={:?} output={:?}",
+                            "original SQL rate source sql={sql:?} mode=compiled phase={:?} rate={actual_rate:?} state={:?} output={:?}",
                             call.binding.phase,
                             call.binding.intermediate_type,
                             call.binding.function.result_type
@@ -92,11 +92,8 @@ fn check(mode: SqlPhysicalEmissionMode) {
         }
     }
 }
-#[test]
-fn exact_percentile_original_sql_rate_source() {
-    check(SqlPhysicalEmissionMode::OriginalNativeV1);
-}
+
 #[test]
 fn exact_percentile_candidate_sql_rate_source() {
-    check(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration);
+    check();
 }

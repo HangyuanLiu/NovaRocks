@@ -18,37 +18,12 @@
 //! Actual original source publication before all-definition capability admission.
 use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use arrow::datatypes::DataType;
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
 
-#[test]
-fn e08s1_late_original_full_source_keeps_missing_aggregate_without_new_lookup() {
-    let source = sql_source(
-        "SELECT dict_merge(CAST(k AS VARCHAR), 1) FROM fixture",
-        DataType::Int32,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
-    let mut found = false;
-    for fragment in source.plan().fragments().values() {
-        for node in fragment.nodes().values() {
-            if let novarocks_physical_plan::NodeKind::Aggregate { calls, .. } = &node.kind {
-                found |= calls.iter().any(|call| {
-                    call.binding.function.function_id.as_str() == "builtin.aggregate/dict_merge/v1"
-                });
-            }
-        }
-    }
-    assert!(found, "original source retains its actual aggregate author");
-}
 #[test]
 fn e08s1_late_original_full_source_has_scalar_and_aggregate_over_definitions() {
     let source = sql_source(
         "SELECT reverse(CAST(k AS VARCHAR)), count(k) OVER () FROM fixture",
         DataType::Int32,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
     );
     assert!(!source.plan().fragments().is_empty());
-    assert_eq!(
-        source.emission_mode(),
-        SqlPhysicalEmissionMode::OriginalNativeV1
-    );
 }

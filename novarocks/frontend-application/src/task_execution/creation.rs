@@ -609,8 +609,8 @@ pub(crate) mod tests {
         ExchangeEdgeId, OperationEnvelope, OperationKind, QueryContextRef, TaskIdentity,
         TaskOperationId,
     };
-    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
-    use novarocks_proto_models::{novarocks as proto, plan};
+    use novarocks_physical_plan::PipelineDopDomain;
+    use novarocks_proto_models::novarocks as proto;
     use novarocks_task_codec::operation::encode_create_task;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
@@ -619,7 +619,7 @@ pub(crate) mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticFragmentHeader};
+    use crate::native::fragment_encoder::frozen::FragmentArtifact;
 
     thread_local! {
         static METADATA_FREEZES: Cell<usize> = const { Cell::new(0) };
@@ -665,30 +665,18 @@ pub(crate) mod tests {
     }
 
     fn producer_artifact() -> Arc<FragmentArtifact> {
-        FragmentArtifact::freeze(
-            plan::PlanFragment {
-                fragment_id: 1,
-                root: Some(plan::DistributedNode::default()),
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                        dest_node_id: 20,
-                        target_fragment_id: 2,
-                        ..Default::default()
-                    })),
-                }),
-                ..Default::default()
+        crate::native::fragment_encoder::frozen::tests::frozen_package(
+            1,
+            0,
+            [5; 16],
+            PipelineDopDomain {
+                min: 1,
+                max: 4,
+                requires_power_of_two: false,
             },
-            StaticFragmentHeader {
-                plan_version: PlanVersionId::try_new([5; 16]).expect("nonzero version"),
-                plan_contract_revision: 1,
-                dop_domain: PipelineDopDomain {
-                    min: 1,
-                    max: 4,
-                    requires_power_of_two: false,
-                },
-            },
+            Some((2, 20)),
+            0,
         )
-        .expect("a frozen producer fragment")
     }
 
     /// Two producers of stage 1 feed three consumers of stage 2 on one edge.

@@ -45,7 +45,6 @@ fn exact(sql: &str) -> SqlAuthoredPhysicalPlan {
         builtin_sql_function_catalog().snapshot(),
         &DECLINE,
         policy(),
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -340,13 +339,9 @@ fn sql_call_dependency_loan_real_table_unnest_retains_relation_and_channels() {
 #[test]
 fn sql_call_dependency_loan_original_aggregate_all_phases_keep_source_and_state_channels() {
     let control = SqlCompileControl::unbounded();
-    let owner = novarocks_sql::compiler::ordinary_union_source_for_test(
-        Some((7, 11, 13)),
-        true,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        &control,
-    )
-    .unwrap();
+    let owner =
+        novarocks_sql::compiler::ordinary_union_source_for_test(Some((7, 11, 13)), true, &control)
+            .unwrap();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut updates = 0;
     let mut merges = 0;

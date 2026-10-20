@@ -17,7 +17,7 @@
 
 //! Role-neutral native submission assembly helpers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -228,46 +228,13 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
     )
 }
 
-// Index each plain `Stream` producer fragment to its single outgoing stream
-// edge. This is an infallible projection of the sealed edge set: the planner
-/// The exact routing fields submission needs from an encoded completed plan.
-/// Partition expressions and slot layouts stay in the
-/// native template and are never reconstructed during placement.
-#[derive(Clone)]
-pub(crate) struct RouterSubmissionEdge {
-    pub(crate) source_fragment_id: FragmentId,
-    pub(crate) target_fragment_id: FragmentId,
-    pub(crate) target_exchange_node_id: i32,
-    pub(crate) router_group_id: i32,
-    pub(crate) route_id: [u8; 32],
-}
-
-// This is an infallible projection of the sealed edge set: the planner seal
-// (`validate_source_edge_shape`) already owns plain/router mix rejection and the
-// per-(source, group) branch_id / branch_kind / target-exchange uniqueness that
-// this used to re-check, so grouping here only collects the sealed branches. Re-
-// adding a shape check here would duplicate a planner-owned decision (guarded by
-// `planner_topology_contract`).
-pub fn group_router_edges_by_source(
-    edges: &[RouterSubmissionEdge],
-) -> BTreeMap<(FragmentId, i32), Vec<&RouterSubmissionEdge>> {
-    let mut grouped: BTreeMap<(FragmentId, i32), Vec<&RouterSubmissionEdge>> = BTreeMap::new();
-    for edge in edges {
-        grouped
-            .entry((edge.source_fragment_id, edge.router_group_id))
-            .or_default()
-            .push(edge);
-    }
-    grouped
-}
+/// Validate the submitted fragment owns a supported static sink.
 pub fn ensure_native_fragment_sink_supported(
     fragment_id: FragmentId,
     is_root: bool,
     has_stream_edge: bool,
-    has_router_edges: bool,
-    has_cte_id: bool,
 ) -> Result<(), String> {
-    if is_root || has_stream_edge || has_router_edges || has_cte_id {
+    if is_root || has_stream_edge {
         return Ok(());
     }
 
@@ -326,174 +293,6 @@ pub(crate) fn validate_scheduling_placements(plan: &SchedulingPlan) -> Result<()
     Ok(())
 }
 
-/// Applies only placement to an already-encoded provider-neutral connector
-/// source. The traversal deliberately has no provider branch and never
-pub fn patch_native_change_stream_router_sink(
-    fragment: &mut novarocks_proto_models::plan::PlanFragment,
-    fragment_id: FragmentId,
-    router_group_id: i32,
-    branch_edges: &[&RouterSubmissionEdge],
-) -> Result<(), String> {
-    let mut patched_fragment = fragment.clone();
-    patch_native_change_stream_router_sink_in_place(
-        &mut patched_fragment,
-        fragment_id,
-        router_group_id,
-        branch_edges,
-    )?;
-    *fragment = patched_fragment;
-    Ok(())
-}
-
-fn patch_native_change_stream_router_sink_in_place(
-    fragment: &mut novarocks_proto_models::plan::PlanFragment,
-    fragment_id: FragmentId,
-    router_group_id: i32,
-    branch_edges: &[&RouterSubmissionEdge],
-) -> Result<(), String> {
-    if branch_edges.is_empty() {
-        return Err("native Iceberg change-stream router sink has no branch edges".to_string());
-    }
-    let router = match fragment.sink.as_mut().and_then(|sink| sink.kind.as_mut()) {
-        Some(novarocks_proto_models::plan::data_sink::Kind::ChangeStreamRouter(router)) => router,
-        _ => {
-            return Err(format!(
-                "fragment {fragment_id} is router source for group {router_group_id} but native \
-                 fragment payload is missing CHANGE_STREAM_ROUTER_SINK"
-            ));
-        }
-    };
-
-    if router.group_id != router_group_id {
-        return Err(format!(
-            "native Iceberg change-stream router source={fragment_id} expected group={router_group_id} \
-             but encoded group={}",
-            router.group_id
-        ));
-    }
-
-    let mut edge_route_ids = BTreeSet::new();
-    for edge in branch_edges {
-        if edge.router_group_id != router_group_id {
-            return Err(format!(
-                "native Iceberg change-stream router source={} expected group={} but edge uses group={}",
-                fragment_id, router_group_id, edge.router_group_id
-            ));
-        }
-        if !edge_route_ids.insert(edge.route_id) {
-            return Err(format!(
-                "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
-                 has duplicate opaque route id"
-            ));
-        }
-    }
-
-    let mut encoded_route_ids = BTreeSet::new();
-    for route in &router.routes {
-        let route_id: [u8; 32] = route.route_id.as_slice().try_into().map_err(|_| {
-            format!("native row-mutation router source={fragment_id} group={router_group_id} has non-32-byte route id")
-        })?;
-        if !encoded_route_ids.insert(route_id) {
-            return Err(format!(
-                "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
-                 has duplicate encoded opaque route id"
-            ));
-        }
-    }
-
-    if encoded_route_ids != edge_route_ids {
-        return Err(format!(
-            "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
-             route id set mismatch: encoded={encoded_route_ids:?}, branch_edges={edge_route_ids:?}"
-        ));
-    }
-
-    for edge in branch_edges {
-        if edge.router_group_id != router_group_id {
-            return Err(format!(
-                "native Iceberg change-stream router source={} expected group={} but edge uses group={}",
-                fragment_id, router_group_id, edge.router_group_id
-            ));
-        }
-
-        let route = router
-            .routes
-            .iter_mut()
-            .find(|route| route.route_id.as_slice() == edge.route_id)
-            .ok_or_else(|| {
-                format!(
-                    "native row-mutation router source={} group={} has no matching route",
-                    fragment_id, router_group_id
-                )
-            })?;
-        route.target_fragment_id = edge.target_fragment_id;
-        route.target_exchange_node_id = edge.target_exchange_node_id;
-
-        if route.output_partition.is_none() {
-            return Err(format!(
-                "native row-mutation router source={} group={} missing output_partition from native encoder",
-                fragment_id, router_group_id
-            ));
-        }
-    }
-
-    debug!(
-        "patched native Iceberg change-stream router sink: fragment={} group={} branches={}",
-        fragment_id,
-        router_group_id,
-        branch_edges.len()
-    );
-    Ok(())
-}
-
-/// Route identities borrowed from the completed native plan's CTE edges.
-/// Partition expressions and producer slots remain inside that exact fragment.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct CteMulticastConsumer {
-    pub(crate) fragment_id: FragmentId,
-    pub(crate) exchange_node_id: i32,
-}
-
-pub(crate) fn validate_native_cte_multicast_sink(
-    fragment: &novarocks_proto_models::plan::PlanFragment,
-    fragment_id: FragmentId,
-    cte_id: u32,
-    consumers: &[CteMulticastConsumer],
-) -> Result<(), String> {
-    if fragment.fragment_id != fragment_id || fragment.cte_id != Some(cte_id) {
-        return Err("CTE fragment identity differs from its completed plan".into());
-    }
-    if fragment.execution_types.is_none() {
-        return Err("CTE fragment has no execution type owner".into());
-    }
-    let Some(novarocks_proto_models::plan::data_sink::Kind::MultiCastDataStream(multicast)) =
-        fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-    else {
-        return Err("CTE fragment has no encoded multicast sink".into());
-    };
-    if consumers.is_empty() || consumers.len() != multicast.sinks.len() {
-        return Err(format!(
-            "CTE fragment {cte_id} has inconsistent consumer count"
-        ));
-    }
-    let mut remaining = consumers.iter().copied().collect::<BTreeSet<_>>();
-    if remaining.len() != consumers.len() {
-        return Err("CTE fragment has duplicate completed consumer routes".into());
-    }
-    for sink in &multicast.sinks {
-        let consumer = CteMulticastConsumer {
-            fragment_id: sink.target_fragment_id,
-            exchange_node_id: sink.dest_node_id,
-        };
-        if sink.output_partition.is_none() || !remaining.remove(&consumer) {
-            return Err("CTE encoded sink differs from its completed consumer route".into());
-        }
-    }
-    // No partition, slot, or type is regenerated here. The codec validated the
-    // exact edge mapping while borrowing this fragment's own execution table.
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -503,13 +302,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     #[cfg(test)]
     use arrow::record_batch::RecordBatch;
-    use novarocks_spi::connector::ConnectorWriteRouteId;
 
     use super::*;
     use crate::query_execution::schedule::FragmentInstancePlacement;
     use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_proto_models::plan as native_plan;
     use novarocks_types::SlotId;
     use novarocks_types::UniqueId;
 
@@ -524,54 +321,11 @@ mod tests {
         }
     }
 
-    fn router_edge(target_fragment_id: FragmentId) -> RouterSubmissionEdge {
-        RouterSubmissionEdge {
-            source_fragment_id: 1,
-            target_fragment_id,
-            target_exchange_node_id: 77,
-            router_group_id: 7,
-            route_id: ConnectorWriteRouteId::from_bytes([7; 32]).to_bytes(),
-        }
-    }
-
-    fn router_fragment() -> native_plan::PlanFragment {
-        native_plan::PlanFragment {
-            fragment_id: 1,
-            sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::ChangeStreamRouter(
-                    native_plan::ChangeStreamRouterSink {
-                        group_id: 7,
-                        effect_output_ordinal: 0,
-                        routes: vec![native_plan::ChangeStreamBranchRoute {
-                            target_fragment_id: 0,
-                            target_exchange_node_id: -1,
-                            output_partition_ordinals: Vec::new(),
-                            output_partition: Some(native_plan::DataPartition {
-                                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                                exprs: Vec::new(),
-                            }),
-                            route_id: vec![7; 32],
-                            write_target_ordinal: 0,
-                            accepted_effects: vec![native_plan::RowMutationEffect::Delete as i32],
-                            input_ordinals: vec![0],
-                        }],
-                    },
-                )),
-            }),
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn validates_native_sink_and_output_roles() {
-        ensure_native_fragment_sink_supported(7, false, true, false, false)
-            .expect("stream sink is supported");
-        ensure_native_fragment_sink_supported(8, false, false, true, false)
-            .expect("router sink is supported");
-        ensure_native_fragment_sink_supported(9, false, false, false, true)
-            .expect("CTE multicast sink is supported");
+        ensure_native_fragment_sink_supported(7, false, true).expect("stream sink is supported");
         assert!(
-            ensure_native_fragment_sink_supported(10, false, false, false, false)
+            ensure_native_fragment_sink_supported(10, false, false)
                 .expect_err("unowned dynamic sink must be rejected")
                 .contains("unowned fragment sink")
         );
@@ -664,65 +418,6 @@ mod tests {
             .expect_err("decimal precision drift must fail")
             .contains("complete value type differs")
         );
-    }
-
-    #[test]
-    fn cte_freeze_keeps_the_encoded_owner_and_rejects_missing_routes() {
-        let fragment = native_plan::PlanFragment {
-            fragment_id: 1,
-            cte_id: Some(1),
-            execution_types: Some(Default::default()),
-            sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::MultiCastDataStream(
-                    native_plan::MultiCastDataStreamSink {
-                        sinks: vec![native_plan::DataStreamSink {
-                            dest_node_id: 77,
-                            target_fragment_id: 2,
-                            output_partition: Some(native_plan::DataPartition {
-                                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                                exprs: vec![],
-                            }),
-                            output_columns: vec![10, 10],
-                            limit: None,
-                        }],
-                    },
-                )),
-            }),
-            ..Default::default()
-        };
-        let consumer = CteMulticastConsumer {
-            fragment_id: 2,
-            exchange_node_id: 77,
-        };
-        let before = fragment.clone();
-        validate_native_cte_multicast_sink(&fragment, 1, 1, &[consumer]).unwrap();
-        assert_eq!(fragment, before);
-        assert!(
-            validate_native_cte_multicast_sink(
-                &fragment,
-                1,
-                1,
-                &[CteMulticastConsumer {
-                    fragment_id: 3,
-                    ..consumer
-                }]
-            )
-            .is_err()
-        );
-        let mut missing_owner = fragment;
-        missing_owner.execution_types = None;
-        assert!(validate_native_cte_multicast_sink(&missing_owner, 1, 1, &[consumer]).is_err());
-    }
-
-    #[test]
-    fn rejects_router_validation_drift_without_mutating_the_fragment() {
-        let mut fragment = router_fragment();
-        let before = fragment.clone();
-        let edge = router_edge(2);
-        let error = patch_native_change_stream_router_sink(&mut fragment, 1, 8, &[&edge])
-            .expect_err("router group drift must fail before patching");
-        assert!(error.contains("expected group=8"), "{error}");
-        assert_eq!(fragment, before, "router patch must be atomic");
     }
 
     #[test]

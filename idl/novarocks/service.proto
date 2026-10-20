@@ -29,7 +29,6 @@ import "common.proto";
 import "catalog.proto";
 import "connector_read.proto";
 import "filter.proto";
-import "plan.proto";
 import "result.proto";
 
 // FE<->BE control + data-plane RPC surface. One service, all cluster-internal
@@ -767,30 +766,14 @@ message TaskExchangeTopology {
 // content once per fragment and plan version and sends the same bytes to every
 // task of the fragment; a task's endpoint and instance facts never belong here.
 message FrozenFragment {
-  bytes plan_version = 1;  // exactly 16 nonzero bytes
-  uint32 plan_contract_revision = 2;  // nonzero
-  uint32 fragment_contract_version = 3;  // nonzero
-  PipelineDopDomain pipeline_dop_domain = 4;
-  novarocks.plan.PlanFragment plan = 5;
-  // An always-empty provider requirement placeholder was retired without a
-  // producer or a consumer. Component admission that needs requirements must
-  // introduce a new field; this number and name are never reused.
-  reserved 6;
-  reserved "required_providers";
-  // The exact bytes of one physical_package_v2.FragmentPackage. A carrier is
-  // either the plan tree (fields 1-5) or this package, never both: the package
-  // owns its plan version, contract revision and DOP domain. It is kept as
-  // opaque bytes so the receiver's generated resource preflight runs before
-  // any message is materialized. Only a compiled-package interpreter accepts
-  // it; the plan-tree interpreter refuses it.
+  reserved 1, 2, 3, 4, 5, 6;
+  reserved "plan_version", "plan_contract_revision", "fragment_contract_version",
+      "pipeline_dop_domain", "plan", "required_providers";
+  // Opaque package bytes keep generated resource preflight before DTO decode.
   bytes package = 7;
 }
 
-message PipelineDopDomain {
-  uint32 min = 1;  // nonzero
-  uint32 max = 2;  // >= min
-  bool requires_power_of_two = 3;
-}
+
 
 // The task-local half of one creation. Each fact has exactly one owner: the
 // descriptor owns identity, kernel key, parallelism, split plan nodes and
@@ -1358,6 +1341,7 @@ enum TaskFailureCategory {
   TASK_FAILURE_CATEGORY_EXCHANGE = 3;
   TASK_FAILURE_CATEGORY_PROTOCOL = 4;
   TASK_FAILURE_CATEGORY_INTERNAL = 5;
+  TASK_FAILURE_CATEGORY_UNSUPPORTED = 6;
 }
 
 enum TaskFailurePhase {

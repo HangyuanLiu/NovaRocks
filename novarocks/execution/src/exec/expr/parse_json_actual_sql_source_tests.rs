@@ -18,15 +18,14 @@
 //! The corpus outer Json -> Struct conversion already fails in Original and is a separate gate.
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition, StaticFunctionArgument};
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::{FunctionArgumentType, FunctionValueType, ValueLogicalType};
 const SQL: &str = "SELECT parse_json('[1,2,3]') AS parsed";
-fn check(mode: SqlPhysicalEmissionMode) {
+fn check() {
     let source =
         super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields(
             SQL,
             &[],
-            mode,
         );
     let mut count = 0;
     for fragment in source.plan().fragments().values() {
@@ -62,7 +61,7 @@ fn check(mode: SqlPhysicalEmissionMode) {
             assert_eq!(function.result_type, result);
             assert_eq!(node.ty, result);
             eprintln!(
-                "PARSE_JSON actual kept call mode={mode:?} fragment={:?} definition={id:?} selected={function:?} request={request:?} children={args:?}",
+                "PARSE_JSON actual kept call mode=compiled fragment={:?} definition={id:?} selected={function:?} request={request:?} children={args:?}",
                 fragment.id()
             );
             count += 1;
@@ -73,11 +72,8 @@ fn check(mode: SqlPhysicalEmissionMode) {
         "same original corpus call subtree survives no-op fold"
     );
 }
-#[test]
-fn parse_json_actual_original_sql_kept_call_source() {
-    check(SqlPhysicalEmissionMode::OriginalNativeV1)
-}
+
 #[test]
 fn parse_json_actual_candidate_sql_kept_call_source() {
-    check(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
+    check()
 }

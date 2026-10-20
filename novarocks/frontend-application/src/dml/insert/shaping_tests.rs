@@ -601,8 +601,8 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
     fn analyze(query: ast::Query) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
         use novarocks_sql::compiler::{
             SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent,
-            SqlCompiler, SqlPhysicalEmissionMode, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
-            SqlSessionContext, SqlStatementInput,
+            SqlCompiler, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput,
         };
         let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
         let snapshot = SqlPlannerTableSnapshot::new(&catalog);
@@ -622,7 +622,6 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
             crate::query_execution::constant_eval::constant_evaluator(),
             None,
             crate::application::test_constant_policy(),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         ))?
         .into_pending()

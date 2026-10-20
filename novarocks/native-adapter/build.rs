@@ -22,12 +22,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 const IDL_DIR: &str = "../../idl/novarocks";
-const NATIVE_PROTO_FILES: [&str; 6] = [
+const NATIVE_PROTO_FILES: [&str; 5] = [
     "common.proto",
     "connector_read.proto",
-    "expr.proto",
+    "execution_shared.proto",
     "filter.proto",
-    "plan.proto",
     "service.proto",
 ];
 
@@ -46,7 +45,6 @@ fn main() {
         .build_server(true)
         .codec_path("crate::native_codec::NativeProstCodec")
         .extern_path(".novarocks.common", "::novarocks_proto_models::common")
-        .extern_path(".novarocks.expr", "::novarocks_proto_models::expr")
         .extern_path(".novarocks.filter", "::novarocks_proto_models::filter")
         .extern_path(".novarocks.plan", "::novarocks_proto_models::plan")
         .extern_path(".novarocks", "::novarocks_proto_models::novarocks")

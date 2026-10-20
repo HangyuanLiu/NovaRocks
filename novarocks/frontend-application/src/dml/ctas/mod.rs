@@ -414,6 +414,13 @@ fn unknown_failure(
 }
 
 fn ctas_failure(source_text: &str, failure: CtasFailure) -> DmlError {
+    if let Some(reason) = failure.compiled_shape_refusal() {
+        let error =
+            novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
+                reason,
+            );
+        return DmlError::executor(error.to_user_message()).with_engine_error_code(error.code());
+    }
     if let Some(error) = failure.compile_control_error() {
         return DmlError::compile_control(error);
     }
@@ -520,6 +527,33 @@ fn internal_failure(message: impl Into<String>) -> CtasFailure {
 #[cfg(test)]
 mod tests {
     use crate::query_execution::dml::ctas::PreparedStandardCtasCatalogAction;
+
+    #[test]
+    fn compiled_ctas_refusal_preserves_capability_identity_before_publication_wrapping() {
+        use crate::query_execution::dml::ctas::CtasUserError;
+        let failure = CtasFailure {
+            kind: CtasFailureKind::Unsupported,
+            message: "[UnsupportedCompiledShape] change-stream router".into(),
+            user_error: Some(CtasUserError::UnsupportedCompiledShape(
+                "change-stream router".into(),
+            )),
+        };
+        let error = ctas_failure("CREATE TABLE AS SELECT ...", failure);
+        assert_eq!(
+            error.engine_error_code(),
+            Some(EngineErrorCode::UnsupportedCompiledShape)
+        );
+        assert_eq!(
+            format!("[{}] {error}", error.engine_error_code().unwrap().as_str()),
+            "[UnsupportedCompiledShape] Executor: change-stream router"
+        );
+        let failure = internal_failure("unsupported text does not imply capability");
+        assert_eq!(
+            ctas_failure("", failure).engine_error_code(),
+            Some(EngineErrorCode::CommitKnownUncommitted)
+        );
+    }
+
     use std::any::Any;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

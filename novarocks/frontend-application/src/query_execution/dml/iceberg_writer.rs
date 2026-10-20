@@ -386,19 +386,18 @@ impl PreparedIcebergWrite {
     ///
     /// The plan is encoded when it is prepared, so submitting it takes
     /// nothing the caller has to assemble first.
-    pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
+    pub(crate) fn run_coordinated_write(
+        &self,
+    ) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
         {
             let mut assembly = self
                 .native_assembly
                 .lock()
                 .expect("prepared Iceberg write native assembly lock poisoned");
             if assembly.is_none() {
-                *assembly = Some(
-                    self.prepare_native_assembly_for_execution(
-                        self.semantic_binding.execution.as_ref(),
-                    )
-                    .map_err(|error| error.to_string())?,
-                );
+                *assembly = Some(self.prepare_native_assembly_for_execution(
+                    self.semantic_binding.execution.as_ref(),
+                )?);
             }
         }
         let assembly = self
@@ -424,7 +423,7 @@ impl PreparedIcebergWrite {
                     .with_attempt_reservation(attempt_reservation),
             )
             .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
-            .map_err(|error| error.to_string())?;
+            .map_err(crate::dml::error::DmlExecutionError::from)?;
         Ok(outcome.into_execution_result())
     }
 

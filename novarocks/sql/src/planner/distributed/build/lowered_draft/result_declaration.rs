@@ -64,9 +64,6 @@ impl<'a> CheckedSqlResultDeclaration<'a> {
     pub const fn original_port(&self) -> &'a ResultPort {
         self.original
     }
-    pub(super) const fn from_original_port(original: &'a ResultPort) -> Self {
-        Self { original }
-    }
 
     pub fn fields(&self) -> &[ResultField] {
         &self.original.fields

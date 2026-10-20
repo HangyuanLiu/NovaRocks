@@ -45,7 +45,7 @@ use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthorit
 use novarocks_physical_plan::{
     ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
 };
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 use novarocks_type_contract::ValueLogicalType;
 use novarocks_types::{
     QueryId,
@@ -144,7 +144,6 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
     };
     let source = sql_source_with_columns(
         &sql,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         &[
             ("a", ty.clone()),
             ("b", ty.clone()),

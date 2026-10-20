@@ -21,13 +21,13 @@ use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
 use arrow::datatypes::DataType;
 use novarocks_local_program::ProgramStateTemplate;
-use novarocks_sql::compiler::SqlPhysicalEmissionMode;
+
 const SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/sql/correctness/project/sql/project_append_trailing_char_if_absent_semantics.sql"
 ));
-fn check(mode: SqlPhysicalEmissionMode) {
-    let source = sql_source(SQL, DataType::Int64, mode);
+fn check() {
+    let source = sql_source(SQL, DataType::Int64);
     let functions = installed_builtin_owner_catalogue();
     let lowered = programs_with_catalogue(&source, &functions);
     let mut observed = 0;
@@ -52,7 +52,7 @@ fn check(mode: SqlPhysicalEmissionMode) {
             assert_eq!(result.data_type().clone(), DataType::Utf8);
             assert!(result.nullable());
             eprintln!(
-                "append_trailing actual compiled retained call mode={mode:?} fragment={fragment:?} site={site:?} contract={contract:?} implementation={:?}",
+                "append_trailing actual compiled retained call mode=compiled fragment={fragment:?} site={site:?} contract={contract:?} implementation={:?}",
                 call.implementation()
             );
             observed += 1;
@@ -63,11 +63,8 @@ fn check(mode: SqlPhysicalEmissionMode) {
         "same original source must prepare the actual installed scalar owner"
     );
 }
-#[test]
-fn append_trailing_compiled_original_kept_call_source() {
-    check(SqlPhysicalEmissionMode::OriginalNativeV1)
-}
+
 #[test]
 fn append_trailing_compiled_candidate_kept_call_source() {
-    check(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
+    check()
 }

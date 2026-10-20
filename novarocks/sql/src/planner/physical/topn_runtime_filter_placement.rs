@@ -474,7 +474,7 @@ mod tests {
     };
     use crate::planner::physical::runtime_filter::AggregateTopNRuntimeFilterBuildIntent;
     use crate::planner::physical::runtime_filter_placement::{
-        RUNTIME_FILTER_RULE, place_runtime_filters, place_runtime_filters_for_emission,
+        RUNTIME_FILTER_RULE, place_runtime_filters, place_runtime_filters_for_compiled,
     };
     use crate::planner::physical::{
         AggMode, AggregateOutputLayout, HashSource, PhysicalHashAggregateNode,
@@ -489,16 +489,14 @@ mod tests {
 
     #[test]
     fn candidate_places_direct_partial_utf8_with_complete_key_and_order() {
-        use crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration;
         for nullable in [false, true] {
             for asc in [false, true] {
                 for nulls_first in [false, true] {
                     let mut plan =
                         eligible_direct_partial_plan(DataType::Utf8, nullable, asc, nulls_first);
-                    place_runtime_filters_for_emission(
+                    place_runtime_filters_for_compiled(
                         &mut plan,
                         &SessionOptimizerSettings::default(),
-                        ExactComputedWithOriginalDeclaration,
                     );
                     let builds = aggregate_topn_builds(&plan);
                     let probes = source_probes(&plan);
@@ -532,33 +530,21 @@ mod tests {
     }
 
     #[test]
-    fn emission_policy_preserves_global_placement_and_legacy_local_refusal() {
-        use crate::compiler::SqlPhysicalEmissionMode::{
-            ExactComputedWithOriginalDeclaration, OriginalNativeV1,
-        };
-        for mode in [OriginalNativeV1, ExactComputedWithOriginalDeclaration] {
+    fn compiled_policy_preserves_global_and_direct_partial_placement() {
+        {
             let mut global = eligible_topn_plan(DataType::Int32, true, false);
-            place_runtime_filters_for_emission(
-                &mut global,
-                &SessionOptimizerSettings::default(),
-                mode,
-            );
+            place_runtime_filters_for_compiled(&mut global, &SessionOptimizerSettings::default());
             assert_eq!(aggregate_topn_builds(&global).len(), 1);
             assert_eq!(source_probes(&global).len(), 1);
         }
         let mut local = eligible_direct_partial_plan(DataType::Utf8, true, true, false);
-        place_runtime_filters_for_emission(
-            &mut local,
-            &SessionOptimizerSettings::default(),
-            OriginalNativeV1,
-        );
-        assert!(aggregate_topn_builds(&local).is_empty());
-        assert!(source_probes(&local).is_empty());
+        place_runtime_filters_for_compiled(&mut local, &SessionOptimizerSettings::default());
+        assert_eq!(aggregate_topn_builds(&local).len(), 1);
+        assert_eq!(source_probes(&local).len(), 1);
     }
 
     #[test]
     fn candidate_skips_ineligible_optional_partial_requests_atomically() {
-        use crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration;
         type Mutation = Box<dyn Fn(&mut PhysicalPlanNode)>;
         let cases: Vec<(&str, Mutation)> = vec![
             ("unsplit", Box::new(|p| topn_mut(p).is_split = false)),
@@ -638,20 +624,12 @@ mod tests {
         for (label, mutate) in cases {
             let mut plan = eligible_direct_partial_plan(DataType::Utf8, true, true, true);
             mutate(&mut plan);
-            place_runtime_filters_for_emission(
-                &mut plan,
-                &SessionOptimizerSettings::default(),
-                ExactComputedWithOriginalDeclaration,
-            );
+            place_runtime_filters_for_compiled(&mut plan, &SessionOptimizerSettings::default());
             assert!(aggregate_topn_builds(&plan).is_empty(), "{label}");
             assert!(source_probes(&plan).is_empty(), "{label}");
         }
         let mut integer = eligible_direct_partial_plan(DataType::Int64, true, true, true);
-        place_runtime_filters_for_emission(
-            &mut integer,
-            &SessionOptimizerSettings::default(),
-            ExactComputedWithOriginalDeclaration,
-        );
+        place_runtime_filters_for_compiled(&mut integer, &SessionOptimizerSettings::default());
         assert!(aggregate_topn_builds(&integer).is_empty());
         assert!(source_probes(&integer).is_empty());
     }

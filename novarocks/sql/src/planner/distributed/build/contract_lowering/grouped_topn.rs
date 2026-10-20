@@ -34,10 +34,7 @@ impl ContractLoweringVisitor<'_> {
         child: &LoweredNode,
         phase: ContractTopNPhase,
     ) -> Result<bool, ContractLoweringError> {
-        if self.emission_mode
-            != crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration
-            || !matches!(phase, ContractTopNPhase::Partial { .. })
-        {
+        if !matches!(phase, ContractTopNPhase::Partial { .. }) {
             return Ok(false);
         }
         self.work.flush()?;

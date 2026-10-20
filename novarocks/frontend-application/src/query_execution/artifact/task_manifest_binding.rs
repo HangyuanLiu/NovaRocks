@@ -1414,150 +1414,144 @@ mod tests {
         execution: QueryExecutionId,
         purpose: FullBindPurpose,
     ) -> super::super::RequestBoundNativeTemplate {
-        use arrow::array::{Array, Int64Array};
-        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
-            ConstantPoolId, ConstantPools, ConstantReference, Distribution, ExprKind,
-            FragmentBuilder, FragmentSink, NodeKind, OutputPort, PhysicalNode, PhysicalProperties,
-            PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField, ResultPort,
-            ResultValueDomain, RowMultiplicity, ValueOrigin, ValueType,
+            MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
+            ScanReadBudget, ValueType,
         };
         use novarocks_query_application::preparation::{
-            CompletedPhysicalPlanCandidate, CompletedPlanWithAccess, FinalPlanRuntimeAccess,
+            FinalPlanCompletionDriver, ReadAccessSink, SqlCompletionFactSource,
         };
         use novarocks_result_contract::FrozenRootOutput;
+        use novarocks_sql::compiler::{
+            DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
+            SqlCompileIntent, SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch,
+            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+            builtin_sql_function_catalog,
+        };
+        use novarocks_workload_control::{
+            ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        };
+
+        struct NoFacts;
+        #[async_trait::async_trait]
+        impl SqlCompletionFactSource for NoFacts {
+            type Access = crate::query_execution::provider_read_facts::FrozenProviderRead;
+
+            async fn resolve(
+                &self,
+                _: &SqlNeedBatch,
+                _: &ReadAccessSink<Self::Access>,
+            ) -> Result<SqlFactBatch, String> {
+                panic!("the literal SQL fixture must not request provider facts")
+            }
+        }
 
         let version = PlanVersionId::try_new([83; 16]).expect("finite component plan version");
-        let fragment_id = novarocks_physical_plan::FragmentId::new(1);
-        let mut fragment = FragmentBuilder::new(fragment_id);
-        let node = fragment.reserve_node_id().expect("one node");
-        let ty = ValueType::new(DataType::Int64, false);
-        let pool_id = ConstantPoolId::new(0);
-        let pool = novarocks_physical_plan::ConstantPool::try_new(
-            std::sync::Arc::new(Field::new("payload", DataType::Int64, false)),
-            ty.clone(),
-            Int64Array::from(vec![7]).to_data(),
+        let request = SqlFinalPlanCompileRequest::new(
+            version,
+            SqlStatementInput::sql("SELECT 7 AS payload"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: Some("iceberg".to_string()),
+                current_database: "db".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            crate::query_execution::constant_eval::constant_evaluator(),
             crate::application::test_constant_policy(),
-            novarocks_type_contract::CompilePhase::Encode,
-            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            SqlCompileControl::unbounded(),
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
         )
-        .expect("one checked original Int64 constant");
-        let mut constants = ConstantPools::empty();
-        constants.insert(pool_id, pool).expect("one constant pool");
-        let literal = fragment
-            .add_expression(
-                node,
-                ty.clone(),
-                ExprKind::Constant(ConstantReference {
-                    pool: pool_id,
-                    ordinal: 0,
-                }),
-            )
-            .expect("one exact checked Int64 constant reference");
-        let value = fragment
-            .add_value(
-                ty.clone(),
-                ValueOrigin::NodeOutput {
-                    node,
-                    output_ordinal: 0,
-                },
-            )
-            .expect("one original node output");
-        let port = OutputPort {
-            node,
-            columns: Box::from([value]),
-        };
-        fragment
-            .insert_node_unchecked(PhysicalNode {
-                id: node,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: PhysicalProperties {
-                    distribution: Distribution::Singleton,
-                    row_multiplicity: RowMultiplicity::SingleCopy,
-                    ordering: Box::default(),
-                },
-                output: port.clone(),
-                kind: NodeKind::Values {
-                    rows: Box::from([Box::from([literal])]),
-                },
-            })
-            .expect("one complete Values node");
-        let fragment = fragment
-            .finish_definition(
-                node,
-                FragmentSink::Result,
-                PipelineDopDomain {
-                    min: 1,
-                    max: 1,
-                    requires_power_of_two: false,
-                },
-            )
-            .expect("one singleton result fragment");
-        let mut plan = PlanBuilder::new(version).with_constant_pools(constants);
-        plan.add_fragment(fragment).expect("one fragment");
-        plan.set_result_port(ResultPort {
-            scalar_schema: None,
-            fragment: fragment_id,
-            output: port,
-            fields: Box::from([ResultField {
-                domain: ResultValueDomain::Plain,
-                name: "payload".into(),
-                alias: None,
-                value,
-                ty,
-            }]),
-        })
-        .expect("one original result occurrence");
-        let plan = plan
-            .finish_observed(&novarocks_sql::compiler::SqlCompileControl::unbounded())
-            .expect("production caller-observed whole-plan validation");
+        .expect("workload control");
+        workload.mark_ready().expect("workload control ready");
+        let root = workload
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("query root");
+        let scope = root.owner.scope();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("completion runtime");
+        // SQL completion keeps the real immutable call-source journal even
+        // when constant folding leaves only a literal Values expression.
+        let paired = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request, &scope))
+            .expect("the exact original Int64 payload completes from SQL");
+        let plan = paired.candidate().plan();
+        assert_eq!(plan.version(), version);
+        assert_eq!(plan.fragments().len(), 2, "distributed producer and gather");
+        let result = paired
+            .candidate()
+            .original_public_result_port()
+            .expect("the original SQL public result declaration");
+        let root_fragment = u32::from(result.fragment.get());
+        assert!(plan.fragments().contains_key(&result.fragment));
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));
+        // ResultField retains the expression label separately from the SQL
+        // alias. Public rendering owns the column name seen by the client.
+        let render = novarocks_sql::compiler::client_render_schema_from_port(Some(result), 0)
+            .expect("render schema from the original SQL public result declaration");
+        assert_eq!(render.columns().len(), 1);
+        assert_eq!(render.columns()[0].name, "payload");
+        assert_eq!(render.columns()[0].source_ordinal, 0);
         let output = match purpose {
-            FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(
-                novarocks_sql::compiler::client_render_schema(&plan, 0)
-                    .expect("render schema from the original completed plan"),
-            ),
+            FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(render),
             FullBindPurpose::CountOnly => FrozenRootOutput::CountOnly,
         };
-        let candidate = CompletedPhysicalPlanCandidate::for_program(
-            plan,
-            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("production completed program validation")
-        .freeze_root_output(output)
-        .expect("freeze the original root purpose");
-        let paired =
-            CompletedPlanWithAccess::try_pair(
-                candidate,
-                FinalPlanRuntimeAccess::<
-                    crate::query_execution::provider_read_facts::FrozenProviderRead,
-                >::new(),
-            )
-            .unwrap_or_else(|(error, _access)| {
-                panic!("literal plan has no read capability: {error}")
-            });
-        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog()
-            .expect("original builtin engine function catalog");
+        let paired = paired
+            .freeze_root_output(output)
+            .unwrap_or_else(|(error, _access)| panic!("freeze the original root purpose: {error}"));
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             paired,
-            &functions,
-            &crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+            &crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            ),
             crate::application::test_constant_policy(),
             None,
-            false,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("production physical-to-native encoding");
-        assert_eq!(encoded.native.fragment_ids().count(), 1);
+        assert_eq!(encoded.native.fragment_ids().count(), 2);
         assert_eq!(encoded.access.iter().count(), 0);
         assert!(encoded.plan_facts.scans().is_empty());
-        assert!(encoded.plan_facts.edges().is_empty());
+        assert_eq!(encoded.plan_facts.edges().len(), 1);
+        assert_eq!(encoded.plan_facts.scheduling().anchor, root_fragment);
         let template = encoded.into_attempt_template(version);
         let scheduling = template
             .attempt_scheduling_facts()
             .expect("original scheduling facts");
-        assert_eq!(scheduling.fragments.len(), 1);
-        assert!(scheduling.fragments[0].scans.is_empty());
+        assert_eq!(scheduling.fragments.len(), 2);
+        assert_eq!(scheduling.edges.len(), 1);
+        assert!(
+            scheduling
+                .fragments
+                .iter()
+                .all(|fragment| fragment.scans.is_empty())
+        );
 
         // Finite component-only request-bound fixture. All static Native facts
         // and template affinity above came from the real encoder; no provider,
@@ -1587,21 +1581,112 @@ mod tests {
     fn full_bind_schedule(
         execution: QueryExecutionId,
         backend: BackendProcessId,
+        template: &super::super::RequestBoundNativeTemplate,
     ) -> super::ScheduleFacts {
-        let (root, context) = task(execution, 1, 1, backend);
+        let prepared = super::PreparedManifestFacts::from_template(&template.template)
+            .expect("the actual frozen Native graph supplies every manifest fact");
+        let scheduling = template
+            .template
+            .attempt_scheduling_facts()
+            .expect("the same actual attempt scheduling facts");
+        assert_eq!(prepared.fragments.len(), 2);
+        assert_eq!(prepared.edges.len(), 1);
+        assert_eq!(scheduling.fragments.len(), 2);
+        assert_eq!(scheduling.edges.len(), 1);
+        assert_eq!(
+            scheduling.execution_anchor_fragment_id,
+            prepared.execution_anchor
+        );
+        assert!(
+            scheduling
+                .fragments
+                .iter()
+                .all(|fragment| fragment.scans.is_empty())
+        );
+        assert_eq!(
+            scheduling
+                .fragments
+                .iter()
+                .map(|fragment| fragment.fragment_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            prepared.fragments,
+        );
+        // This existing component seam projects one task per real fragment at
+        // the fixture's original DOP=1 and exact selected backend. It does not
+        // construct QA's move-only AttemptSchedule or alter the compiled graph.
+        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        let mut identities = std::collections::BTreeMap::new();
+        let fragments = prepared
+            .fragments
+            .iter()
+            .enumerate()
+            .map(|(index, &fragment_id)| {
+                let ordinal = u32::try_from(index + 1).expect("finite fixture task ordinal");
+                let stage_id = StageId::new(ordinal).expect("one nonzero stage per real fragment");
+                let identity = TaskIdentity::new(
+                    execution,
+                    stage_id,
+                    TaskId::new(ordinal).expect("one nonzero task per real fragment"),
+                    backend,
+                );
+                identities.insert(fragment_id, identity);
+                super::ProjectedFragment {
+                    fragment_id,
+                    stage_id,
+                    tasks: vec![ProjectedTask {
+                        identity,
+                        context,
+                        instance_index: 0,
+                        scan_work: Vec::new(),
+                    }],
+                }
+            })
+            .collect();
+        let root = identities[&prepared.execution_anchor];
+        let edges = prepared
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(index, (&(source, target, exchange), &partition))| {
+                assert_eq!(partition, super::BoundManifestPartitionKind::Unpartitioned);
+                let original = scheduling
+                    .edges
+                    .iter()
+                    .find(|edge| {
+                        (
+                            edge.source_fragment_id,
+                            edge.target_fragment_id,
+                            edge.target_exchange_node_id,
+                        ) == (source, target, exchange)
+                    })
+                    .expect("the actual scheduling edge and frozen edge agree");
+                assert_eq!(
+                    original.stream_kind,
+                    novarocks_query_application::api::SchedulingStreamKind::Gather
+                );
+                assert!(!original.hash_partitioned);
+                assert_eq!(
+                    identities[&target], root,
+                    "the real gather terminates at the public root"
+                );
+                super::ProjectedEdge {
+                    edge_id: ExchangeEdgeId::new(
+                        u32::try_from(index + 1).expect("finite fixture edge ordinal"),
+                    )
+                    .expect("one nonzero edge per real edge"),
+                    source_fragment_id: source,
+                    target_fragment_id: target,
+                    target_exchange_node_id: exchange,
+                    producers: vec![(identities[&source], 0)],
+                    destinations: vec![identities[&target]],
+                    sender_count: NonZeroU32::new(1).expect("one actual producer task"),
+                }
+            })
+            .collect();
         super::ScheduleFacts {
             execution,
-            fragments: vec![super::ProjectedFragment {
-                fragment_id: 1,
-                stage_id: StageId::new(1).expect("one nonzero stage"),
-                tasks: vec![ProjectedTask {
-                    identity: root,
-                    context,
-                    instance_index: 0,
-                    scan_work: Vec::new(),
-                }],
-            }],
-            edges: Vec::new(),
+            fragments,
+            edges,
             contexts: vec![context],
             root,
         }
@@ -1620,12 +1705,10 @@ mod tests {
             let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
                 .expect("legacy descriptors are representable before selected-root use")
                 .into_parts();
+            let template = full_bind_native_template(execution, purpose);
+            let schedule = full_bind_schedule(execution, process, &template);
             let error = super::TaskManifestBinding::bind_facts(
-                full_bind_native_template(execution, purpose),
-                execution,
-                full_bind_schedule(execution, process),
-                revision,
-                backends,
+                template, execution, schedule, revision, backends,
             )
             .expect_err("the production bind call must refuse the exact unsupported root");
             assert_eq!(
@@ -1642,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn full_manifest_bind_accepts_supported_root_and_retains_legacy_candidate() {
+    fn full_manifest_bind_accepts_supported_root_and_retains_unsupported_non_root_candidate() {
         for purpose in [FullBindPurpose::ClientRows, FullBindPurpose::CountOnly] {
             let execution = execution();
             let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
@@ -1654,22 +1737,60 @@ mod tests {
             let frozen = FrozenAttemptTopology::capture(snapshot).expect("original snapshot");
             assert!(frozen.eligible_backends().contains(&legacy_process));
             let (revision, backends) = frozen.into_parts();
-            let schedule = full_bind_schedule(execution, process);
+            let template = full_bind_native_template(execution, purpose);
+            let schedule = full_bind_schedule(execution, process, &template);
             let root = schedule.root;
+            let expected_edge = &schedule.edges[0];
+            let expected_key = (
+                expected_edge.source_fragment_id,
+                expected_edge.target_fragment_id,
+                expected_edge.target_exchange_node_id,
+            );
+            let producer = expected_edge.producers[0].0;
+            assert_ne!(producer, root);
             let manifest = super::TaskManifestBinding::bind_facts(
-                full_bind_native_template(execution, purpose),
-                execution,
-                schedule,
-                revision,
-                backends,
+                template, execution, schedule, revision, backends,
             )
             .expect("production full binding reaches a valid manifest");
             assert_eq!(manifest.execution(), execution);
             assert_eq!(manifest.root(), root);
             assert_eq!(manifest.topology_revision(), 84);
-            assert_eq!(manifest.tasks().len(), 1);
+            assert_eq!(manifest.tasks().len(), 2);
             assert_eq!(manifest.contexts().len(), 1);
-            assert!(manifest.edges().is_empty());
+            assert_eq!(manifest.edges().len(), 1);
+            assert_eq!(
+                manifest
+                    .tasks()
+                    .iter()
+                    .map(|task| task.identity())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [producer, root].into_iter().collect()
+            );
+            assert!(
+                manifest
+                    .tasks()
+                    .iter()
+                    .all(|task| task.identity().backend_process_id() == process
+                        && task.context() == manifest.contexts()[0].context())
+            );
+            let edge = &manifest.edges()[0];
+            assert_eq!(
+                (
+                    edge.source_fragment_id(),
+                    edge.target_fragment_id(),
+                    edge.target_exchange_node_id()
+                ),
+                expected_key
+            );
+            assert_eq!(
+                edge.partition_kind(),
+                super::BoundManifestPartitionKind::Unpartitioned
+            );
+            assert_eq!(edge.producers().len(), 1);
+            assert_eq!(edge.producers()[0].task(), producer);
+            assert_eq!(edge.producers()[0].sender_ordinal(), 0);
+            assert_eq!(edge.destinations(), &[root]);
+            assert_eq!(edge.sender_count().get(), 1);
             assert_eq!(manifest.contexts()[0].backend().process_id(), process);
             assert!(
                 manifest.contexts()[0]
@@ -1691,19 +1812,21 @@ mod tests {
         let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
-        let mut schedule = full_bind_schedule(execution, process);
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let mut schedule = full_bind_schedule(execution, process, &template);
         let foreign = QueryExecutionId::new(
             execution.query_id(),
             AttemptId::new(2).expect("another nonzero attempt"),
         )
         .expect("foreign attempt");
-        schedule.root = task(foreign, 1, 1, process).0;
+        schedule.root = TaskIdentity::new(
+            foreign,
+            schedule.root.stage_id(),
+            schedule.root.task_id(),
+            process,
+        );
         let error = super::TaskManifestBinding::bind_facts(
-            full_bind_native_template(execution, FullBindPurpose::ClientRows),
-            execution,
-            schedule,
-            revision,
-            backends,
+            template, execution, schedule, revision, backends,
         )
         .expect_err("same supported backend cannot replace the complete scheduled task identity");
         assert!(

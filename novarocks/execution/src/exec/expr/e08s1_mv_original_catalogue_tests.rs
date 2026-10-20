@@ -576,15 +576,11 @@ fn sink(binding: novarocks_sql::binding::SqlTableBindingId) -> DmlWritePlanInput
 }
 /// Both public entrypoints use the same explicit relation/refresh facts.
 /// This fixture does not finalize providers, writers or Native Tasks.
-pub(super) fn run(
-    mode: SqlPhysicalEmissionMode,
-    incremental: bool,
-) -> (Result<(), SqlCompileError>, Arc<Observations>) {
-    run_with_denied_loan(mode, incremental, false)
+pub(super) fn run(incremental: bool) -> (Result<(), SqlCompileError>, Arc<Observations>) {
+    run_with_denied_loan(incremental, false)
 }
 /// The test-owned catalogue can explicitly deny pure loans without changing bindings.
 pub(super) fn run_with_denied_loan(
-    mode: SqlPhysicalEmissionMode,
     incremental: bool,
     deny_loans: bool,
 ) -> (Result<(), SqlCompileError>, Arc<Observations>) {
@@ -612,7 +608,6 @@ pub(super) fn run_with_denied_loan(
     };
     let result = if incremental {
         analyze_join_incremental_refresh_change_stream(SqlMvJoinIncrementalRefreshAnalyzeContext {
-            emission_mode: mode,
             canonical_query: Box::new(query.clone()),
             rewrite_snapshot: snapshot,
             join_mode: SqlMvJoinIncrementalRefreshMode::AppendOnly,
@@ -642,7 +637,6 @@ pub(super) fn run_with_denied_loan(
         .map(|_| ())
     } else {
         analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
-            emission_mode: mode,
             canonical_query: Box::new(query.clone()),
             rewrite_snapshot: snapshot,
             expected_root_hash_column: "__row_id__".into(),
@@ -662,26 +656,26 @@ pub(super) fn run_with_denied_loan(
     (result, observations)
 }
 #[test]
-fn e08s1_mv_original_first_refresh_generated_bindings_keep_original_catalogue() {
-    let (result, observations) = run(SqlPhysicalEmissionMode::OriginalNativeV1, false);
+fn e08s1_mv_original_first_refresh_generated_bindings_retain_scoped_catalogue() {
+    let (result, observations) = run(false);
     result.unwrap();
-    assert_eq!(observations.scopes.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.scopes.load(Ordering::SeqCst), 1);
     let bindings = observations.bindings.lock().unwrap();
     assert!(
         bindings
             .iter()
-            .any(|(name, scoped)| name == "join_row_key" && !scoped)
+            .any(|(name, scoped)| name == "join_row_key" && *scoped)
     );
 }
 #[test]
-fn e08s1_mv_original_incremental_refresh_generated_bindings_keep_original_catalogue() {
-    let (result, observations) = run(SqlPhysicalEmissionMode::OriginalNativeV1, true);
+fn e08s1_mv_original_incremental_refresh_generated_bindings_retain_scoped_catalogue() {
+    let (result, observations) = run(true);
     result.unwrap();
-    assert_eq!(observations.scopes.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.scopes.load(Ordering::SeqCst), 1);
     let bindings = observations.bindings.lock().unwrap();
     assert!(
         bindings
             .iter()
-            .any(|(name, scoped)| name == "join_row_key" && !scoped)
+            .any(|(name, scoped)| name == "join_row_key" && *scoped)
     );
 }

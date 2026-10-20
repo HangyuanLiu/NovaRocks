@@ -132,15 +132,11 @@ fn height(count: usize) -> usize {
 #[derive(Clone, Copy)]
 enum HeaderProfile {
     Receiving(BindingProjectionLimits),
-    // Same role as the original default call-request reader. This is checked
-    // source geometry, not a made-up unlimited receiving profile or grant.
-    InputDerived,
 }
 impl HeaderProfile {
     fn receiving(self) -> Option<BindingProjectionLimits> {
         match self {
             Self::Receiving(limits) => Some(limits),
-            Self::InputDerived => None,
         }
     }
     fn gate(
@@ -151,7 +147,6 @@ impl HeaderProfile {
     ) -> Result<(), BindingCodecError> {
         match self {
             Self::Receiving(limits) => policy.gate(facts, limits, admit),
-            Self::InputDerived => admit(facts).map_err(Into::into),
         }
     }
 }
@@ -545,39 +540,6 @@ pub fn prepare_function_binding_headers_in<'loan, 'control: 'loan>(
         limits,
         Policy(true),
         admit,
-        work,
-    )
-}
-
-/// Preflight one actual default scalar occurrence in the execution namespace.
-/// The original header arithmetic/work/source walker is shared. No index is
-/// created for this already-addressed occurrence and no installed owner proof
-/// is implied. The caller supplies its one real coexisting source invoice.
-pub fn preflight_execution_binding_header_input_derived_in(
-    definition: &wire::FunctionBindingDefinition,
-    types: &crate::execution_type_table::DecodedExecutionTypeTable,
-    original_source_bytes: usize,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<BindingProjectionFacts, BindingCodecError> {
-    let mut last_work = 0usize;
-    let mut observe = |facts: &BindingProjectionFacts| {
-        // All source/request/work arithmetic has already run in the sole
-        // model. Preserve its monotone completed snapshots; this grants no
-        // construction capacity and is not a receiving-profile author.
-        if facts.cumulative_work_upper_bound < last_work {
-            return Err(CompileControlError::ResourceExhausted);
-        }
-        last_work = facts.cumulative_work_upper_bound;
-        Ok(())
-    };
-    preflight_namespace(
-        std::slice::from_ref(definition),
-        types.len(),
-        size_of::<crate::execution_type_table::DecodedExecutionTypeTable>(),
-        original_source_bytes,
-        HeaderProfile::InputDerived,
-        Policy(true),
-        &mut observe,
         work,
     )
 }

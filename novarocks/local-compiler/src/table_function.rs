@@ -43,8 +43,9 @@ use crate::{
 };
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, FunctionBindingSelection, FunctionResultType, PureCallPreparation,
-    PureCallSpecialization, PureEngineFunctionCatalog, PureKernelAbi, ScopedExpressionEffects,
+    CallEffectInput, EngineFunctionCatalog, FunctionBindingSelection, FunctionResultType,
+    PureCallPreparation, PureCallSpecialization, PureEngineFunctionCatalog, PureKernelAbi,
+    ScopedExpressionEffects,
 };
 use novarocks_local_program::{
     DiagnosticSourceNodeId, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance,
@@ -54,7 +55,7 @@ use novarocks_local_program::{
     TableFunctionOutputSlot,
 };
 use novarocks_physical_plan::{
-    ExprId, ExpressionRootRole, ExpressionRootSite, Fragment, FragmentPackage,
+    BoundTableFunction, ExprId, ExpressionRootRole, ExpressionRootSite, Fragment, FragmentPackage,
     FunctionArgumentType, NodeId, NodeKind, PhysicalCallDefinition, PhysicalCallSite, PhysicalNode,
     TableFunctionOutput, ValueId,
 };
@@ -112,27 +113,36 @@ pub(crate) fn admit_table_function(
         }
     }
     work.flush()?;
-    let declaration = functions.metadata().pure_overload_declaration_observed(
-        &function.function_id,
-        FunctionKind::Table,
-        &function.overload,
-        work.control(),
-    );
+    let abi = table_function_abi(function, functions.metadata(), work.control());
     work.flush()?;
-    let abi = match declaration {
-        Ok(declaration) => Some(declaration.implementation().abi),
-        Err(novarocks_functions::FunctionSpecializationFailure::Control(cause)) => {
-            return Err(cause.into());
-        }
-        Err(_) => None,
-    };
-    if abi != Some(PureKernelAbi::TableV1) {
+    if abi? != PureKernelAbi::TableV1 {
         return Err(FragmentCompileError::Unsupported {
             node: Some(node.id),
             feature: "table function without an installed pure TableV1 kernel",
         });
     }
     Ok(())
+}
+
+/// Preserve the exact metadata lookup cause before capability classification.
+/// The production caller supplies metadata from its sealed pure catalog.
+pub(super) fn table_function_abi(
+    function: &BoundTableFunction,
+    functions: &EngineFunctionCatalog,
+    control: &dyn PureCompileControl,
+) -> Result<PureKernelAbi, FragmentCompileError> {
+    match functions.pure_overload_declaration_observed(
+        &function.function_id,
+        FunctionKind::Table,
+        &function.overload,
+        control,
+    ) {
+        Ok(declaration) => Ok(declaration.implementation().abi),
+        Err(novarocks_functions::FunctionSpecializationFailure::Control(cause)) => {
+            Err(cause.into())
+        }
+        Err(error) => Err(ExpressionLoweringError::Specialization(error).into()),
+    }
 }
 
 /// Additional resource upper bound of one TableFunction beyond its own node

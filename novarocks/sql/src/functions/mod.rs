@@ -660,6 +660,22 @@ impl FunctionBindingResolver for TestExactAggregateBindingResolver {
     }
 }
 
+/// ANALYZE planning fixtures need a genuinely installed Binary-state/Binary-output
+/// aggregate. Reuse the existing typed Theta CPU owner and its complete effects,
+/// overloads and state contract; a metadata-only synthetic blob is not executable.
+/// This helper is test-only and adds no registration to the product catalogue.
+#[cfg(test)]
+pub(crate) fn test_installed_blob_aggregate_catalog() -> EngineFunctionCatalog {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(
+            novarocks_connector_iceberg_functions::iceberg_theta_pure_definition()
+                .expect("installed test aggregate owner"),
+        )
+        .expect("register installed test aggregate");
+    builder.seal_bound().expect("test aggregate catalogue")
+}
+
 /// Build a test-only catalog whose custom aggregate has the same exact,
 /// identity-bearing contract required from production contributors.
 #[cfg(test)]

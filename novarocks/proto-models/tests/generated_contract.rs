@@ -2,8 +2,7 @@ use prost::Message;
 use prost_reflect::DescriptorPool;
 
 use novarocks_proto_models::{
-    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, connector_common, expr, novarocks,
-    plan,
+    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, connector_common, novarocks, plan,
 };
 
 #[test]
@@ -13,15 +12,14 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
     let _ = common::UniqueId::default();
     let _ = catalog::CatalogSet::default();
     let _ = connector_common::ConnectorEncodedPayload::default();
-    let _ = expr::Expr::default();
-    let _ = plan::PlanFragment::default();
+    let _ = plan::ExecutionTypeTable::default();
     let _ = novarocks::CreateTaskRequest::default();
 
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
     assert!(
         pool.get_message_by_name("novarocks.plan.PlanFragment")
-            .is_some()
+            .is_none()
     );
     assert!(
         pool.get_service_by_name("novarocks.NovaRocksGrpc")
@@ -52,128 +50,9 @@ fn connector_common_envelope_has_an_exact_purpose_and_catalog_generation() {
 }
 
 #[test]
-fn window_aggregate_exact_binding_and_function_order_are_append_only_fields() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let window = pool
-        .get_message_by_name("novarocks.plan.WindowExpr")
-        .expect("WindowExpr descriptor");
-    let function_order = window
-        .get_field_by_name("function_order_by")
-        .expect("aggregate function ORDER BY field");
-    assert_eq!(function_order.number(), 11);
-    assert!(function_order.is_list());
-    assert_eq!(
-        function_order
-            .kind()
-            .as_message()
-            .expect("SortItem message")
-            .full_name(),
-        "novarocks.expr.SortItem"
-    );
-
-    let binding = window
-        .get_field_by_name("aggregate_binding")
-        .expect("exact aggregate binding field");
-    assert_eq!(binding.number(), 12);
-    assert!(!binding.is_list());
-    assert_eq!(
-        binding
-            .kind()
-            .as_message()
-            .expect("ResolvedAggregateSignature message")
-            .full_name(),
-        "novarocks.plan.ResolvedAggregateSignature"
-    );
-
-    let signature = pool
-        .get_message_by_name("novarocks.plan.ResolvedAggregateSignature")
-        .expect("ResolvedAggregateSignature descriptor");
-    for (name, number) in [
-        ("overload_identity", 1),
-        ("argument_types", 2),
-        ("intermediate_type", 3),
-        ("output_type", 4),
-        ("state_format_identity", 5),
-    ] {
-        assert_eq!(
-            signature
-                .get_field_by_name(name)
-                .unwrap_or_else(|| panic!("ResolvedAggregateSignature.{name}"))
-                .number(),
-            number
-        );
-    }
-}
-
-#[test]
 fn write_relation_contracts_are_versioned_append_only_fields() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let writer = pool
-        .get_message_by_name("novarocks.plan.TableWriterNode")
-        .expect("TableWriterNode descriptor");
-    assert_eq!(
-        writer
-            .get_field_by_name("writer_multiplex_schema")
-            .expect("writer relation schema")
-            .number(),
-        8
-    );
-    let finish = pool
-        .get_message_by_name("novarocks.plan.TableFinishNode")
-        .expect("TableFinishNode descriptor");
-    assert_eq!(
-        finish
-            .get_field_by_name("writer_multiplex_schema")
-            .expect("finish input relation schema")
-            .number(),
-        2
-    );
-    assert_eq!(
-        finish
-            .get_field_by_name("root_result_schema")
-            .expect("finish output relation schema")
-            .number(),
-        3
-    );
-    for message_name in ["WriterMultiplexSchema", "RootWriteResultSchema"] {
-        let full_name = format!("novarocks.plan.{message_name}");
-        let schema = pool
-            .get_message_by_name(&full_name)
-            .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        assert_eq!(
-            schema
-                .get_field_by_name("contract_version")
-                .expect("contract version")
-                .number(),
-            1
-        );
-        let columns = schema.get_field_by_name("columns").expect("columns");
-        assert_eq!(columns.number(), 2);
-        assert!(columns.is_list());
-        assert_eq!(
-            columns
-                .kind()
-                .as_message()
-                .expect("ArrowPhysicalColumn message")
-                .full_name(),
-            "novarocks.arrow_type.ArrowPhysicalColumn"
-        );
-        assert!(schema.get_field_by_name("schema_metadata").is_none());
-        assert!(schema.reserved_ranges().any(|range| range.contains(&3)));
-        assert!(
-            schema
-                .reserved_names()
-                .any(|name| name == "schema_metadata")
-        );
-        let logical = schema
-            .get_field_by_name("logical_types")
-            .expect("complete logical namespace");
-        assert_eq!(logical.number(), 4);
-        assert!(logical.is_list());
-    }
-
     let column = pool
         .get_message_by_name("novarocks.arrow_type.ArrowPhysicalColumn")
         .expect("ArrowPhysicalColumn descriptor");
@@ -223,14 +102,11 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
         assert!(field.reserved_ranges().any(|range| range.contains(&number)));
         assert!(field.reserved_names().any(|reserved| reserved == name));
     }
-    for (message, number, name) in [
-        (
-            "novarocks.arrow_type.ArrowPhysicalSchema",
-            2,
-            "schema_metadata",
-        ),
-        ("novarocks.plan.ColumnDef", 5, "logical_type"),
-    ] {
+    for (message, number, name) in [(
+        "novarocks.arrow_type.ArrowPhysicalSchema",
+        2,
+        "schema_metadata",
+    )] {
         let descriptor = pool.get_message_by_name(message).unwrap();
         assert!(descriptor.get_field_by_name(name).is_none());
         assert!(
@@ -392,72 +268,6 @@ fn native_compatibility_identity_fields_are_exact_and_append_only() {
 }
 
 #[test]
-fn retired_starrocks_native_scan_fields_remain_reserved() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-
-    let scan_source = pool
-        .get_message_by_name("novarocks.plan.ScanSource")
-        .expect("ScanSource descriptor");
-    assert!(
-        scan_source
-            .reserved_ranges()
-            .any(|range| range.contains(&7)),
-        "ScanSource field 7 must remain reserved"
-    );
-    assert!(
-        scan_source
-            .reserved_names()
-            .any(|name| name == "starrocks_table"),
-        "ScanSource starrocks_table name must remain reserved"
-    );
-
-    let scan_range = pool
-        .get_message_by_name("novarocks.ScanRange")
-        .expect("ScanRange descriptor");
-    assert!(
-        scan_range.reserved_ranges().any(|range| range.contains(&2)),
-        "ScanRange field 2 must remain reserved"
-    );
-    assert!(
-        scan_range
-            .reserved_names()
-            .any(|name| name == "starrocks_tablet"),
-        "ScanRange starrocks_tablet name must remain reserved"
-    );
-}
-
-#[test]
-fn retired_mv_native_scan_fields_remain_reserved_and_fail_closed() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let scan_source = pool
-        .get_message_by_name("novarocks.plan.ScanSource")
-        .expect("ScanSource descriptor");
-
-    for field_number in [5, 6] {
-        assert!(
-            scan_source
-                .reserved_ranges()
-                .any(|range| range.contains(&field_number)),
-            "ScanSource field {field_number} must remain reserved"
-        );
-    }
-    for field_name in ["iceberg_mv_target_state", "iceberg_mv_target_locator"] {
-        assert!(
-            scan_source.reserved_names().any(|name| name == field_name),
-            "ScanSource {field_name} name must remain reserved"
-        );
-    }
-
-    for encoded in [&[0x2a, 0x00][..], &[0x32, 0x00][..]] {
-        let source = plan::ScanSource::decode(encoded)
-            .expect("retired source field remains decodable as an unknown field");
-        assert!(source.kind.is_none());
-    }
-}
-
-#[test]
 fn retired_query_option_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
@@ -482,17 +292,6 @@ fn retired_query_option_fields_remain_reserved() {
             "QueryOptions {field_name} name must remain reserved"
         );
     }
-}
-
-#[test]
-fn retired_starrocks_native_scan_wire_fields_fail_closed() {
-    let source = plan::ScanSource::decode(&[0x3a, 0x00][..])
-        .expect("retired source field remains decodable as an unknown field");
-    assert!(source.kind.is_none());
-
-    let range = novarocks::ScanRange::decode(&[0x12, 0x00][..])
-        .expect("retired range field remains decodable as an unknown field");
-    assert!(range.kind.is_none());
 }
 
 #[test]
@@ -915,28 +714,6 @@ fn the_retired_participant_role_vocabulary_stays_off_the_wire() {
 }
 
 #[test]
-fn write_dataflow_nodes_are_appended_after_the_existing_distributed_payloads() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let node = pool
-        .get_message_by_name("novarocks.plan.DistributedNode")
-        .expect("DistributedNode descriptor");
-    // The two overlay-only write nodes are appended; the pre-existing payload
-    // arms keep their numbers so an older plan still parses the same way.
-    for (field_name, field_number) in [
-        ("physical", 10),
-        ("exchange", 11),
-        ("table_writer", 12),
-        ("table_finish", 13),
-    ] {
-        let field = node
-            .get_field_by_name(field_name)
-            .unwrap_or_else(|| panic!("DistributedNode.{field_name} descriptor"));
-        assert_eq!(field.number(), field_number);
-    }
-}
-
-#[test]
 fn the_connector_write_carriers_use_provider_owned_payloads() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
@@ -998,55 +775,6 @@ fn the_connector_write_carriers_use_provider_owned_payloads() {
     }
 }
 
-/// Sink tags and names stay reserved so a later field cannot silently occupy
-/// a number an older encoder still fills.
-#[test]
-fn data_sink_reserved_fields_are_not_reused() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-
-    for (message_name, field_number, field_name) in [
-        ("novarocks.plan.DataSink", 7, "connector_write"),
-        ("novarocks.plan.DataSink", 8, "statistics"),
-    ] {
-        let message = pool
-            .get_message_by_name(message_name)
-            .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        assert!(
-            message
-                .reserved_ranges()
-                .any(|range| range.contains(&field_number)),
-            "{message_name} field {field_number} must remain reserved"
-        );
-        assert!(
-            message.reserved_names().any(|name| name == field_name),
-            "{message_name} {field_name} must remain reserved"
-        );
-        assert!(
-            message.fields().all(|field| field.number() != field_number),
-            "{message_name} must not reuse tag {field_number}"
-        );
-        assert!(
-            message.fields().all(|field| field.name() != field_name),
-            "{message_name} must not reuse name {field_name}"
-        );
-    }
-}
-
-#[test]
-fn data_sink_reserved_wire_tags_have_no_sink_kind() {
-    // DataSink field 7, wire type 2: the retired `connector_write` sink arm.
-    let sink = plan::DataSink::decode(&[0x3a, 0x00][..])
-        .expect("retired sink field remains decodable as an unknown field");
-    assert!(sink.kind.is_none());
-
-    // DataSink field 8 is reserved for statistics. Unknown tags do not select
-    // a sink kind, so these bytes cannot introduce another output channel.
-    let sink = plan::DataSink::decode(&[0x42, 0x00][..])
-        .expect("retired statistics sink remains decodable as an unknown field");
-    assert!(sink.kind.is_none());
-}
-
 /// A create carries exactly two independently retained protobuf byte sections.
 /// Neither the old typed outer fields nor their wire tags may return: a second
 /// query context or descriptor there would be another creation authority.
@@ -1103,27 +831,11 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
         ("pipeline_dop_domain", 4),
         ("plan", 5),
     ] {
-        assert_eq!(frozen.get_field_by_name(name).expect(name).number(), tag);
+        assert!(frozen.get_field_by_name(name).is_none());
+        assert!(frozen.reserved_ranges().any(|range| range.contains(&tag)));
+        assert!(frozen.reserved_names().any(|reserved| reserved == name));
     }
-    for (name, type_name) in [
-        ("pipeline_dop_domain", "novarocks.PipelineDopDomain"),
-        ("plan", "novarocks.plan.PlanFragment"),
-    ] {
-        assert_eq!(
-            frozen
-                .get_field_by_name(name)
-                .expect(name)
-                .kind()
-                .as_message()
-                .expect("nested message")
-                .full_name(),
-            type_name
-        );
-    }
-    assert!(matches!(
-        frozen.get_field_by_name("plan_version").unwrap().kind(),
-        prost_reflect::Kind::Bytes
-    ));
+    assert_eq!(frozen.fields().count(), 1);
     // The compiled-package carrier is opaque bytes, never a nested message:
     // decoding it must wait for the receiver's generated resource preflight.
     let package = frozen.get_field_by_name("package").expect("package");
@@ -1144,13 +856,10 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
             .is_none()
     );
 
-    let dop = pool
-        .get_message_by_name("novarocks.PipelineDopDomain")
-        .expect("PipelineDopDomain descriptor");
-    for (name, tag) in [("min", 1), ("max", 2), ("requires_power_of_two", 3)] {
-        assert_eq!(dop.get_field_by_name(name).expect(name).number(), tag);
-    }
-
+    assert!(
+        pool.get_message_by_name("novarocks.PipelineDopDomain")
+            .is_none()
+    );
     let metadata = pool
         .get_message_by_name("novarocks.CreationMetadata")
         .expect("CreationMetadata descriptor");
@@ -1246,19 +955,6 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
 fn dynamic_sink_destinations_cannot_return_to_the_static_plan() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    for (message_name, tag) in [
-        ("novarocks.plan.MultiCastDataStreamSink", 2),
-        ("novarocks.plan.ChangeStreamBranchRoute", 8),
-    ] {
-        let message = pool
-            .get_message_by_name(message_name)
-            .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        assert!(message.get_field_by_name("destinations").is_none());
-        assert!(message.fields().all(|field| field.number() != tag));
-        assert!(message.reserved_ranges().any(|range| range.contains(&tag)));
-        assert!(message.reserved_names().any(|name| name == "destinations"));
-    }
-
     // Destinations stay out of the static plan because the task assignment
     // binds each static sink position to a topology edge instead.
     let assignment = pool

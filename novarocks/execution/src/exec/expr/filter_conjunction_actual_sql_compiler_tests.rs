@@ -32,9 +32,7 @@ use novarocks_local_program::{
     ProgramNodeKind, ProgramUseRef, StaticExprKind,
 };
 use novarocks_physical_plan::*;
-use novarocks_sql::compiler::{
-    SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode, author_fragment_package_semantics,
-};
+use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
 };
@@ -415,8 +413,8 @@ pub(super) fn validate_package(
 }
 
 const HAVING: &str = "SELECT k FROM fixture.ndv_null_contract GROUP BY k\nHAVING ndv(v) = 0 AND approx_count_distinct(v) = 0 ORDER BY k;";
-fn permanent(mode: SqlPhysicalEmissionMode) {
-    let source = ndv_sql_source(HAVING, mode);
+fn permanent() {
+    let source = ndv_sql_source(HAVING);
     let mut filter_fragment = None;
     for (&id, fragment) in source.plan().fragments() {
         for node in fragment.nodes().values() {
@@ -444,13 +442,10 @@ fn permanent(mode: SqlPhysicalEmissionMode) {
             .count(),
         1
     );
-    eprintln!("actual full Filter lowered from original node {original_node:?} in mode {mode:?}");
+    eprintln!("actual full Filter lowered from original node {original_node:?} in mode compiled");
 }
-#[test]
-fn filter_conjunction_original_sql_compiler_complete() {
-    permanent(SqlPhysicalEmissionMode::OriginalNativeV1);
-}
+
 #[test]
 fn filter_conjunction_candidate_sql_compiler_complete() {
-    permanent(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration);
+    permanent();
 }

@@ -35,11 +35,6 @@ pub mod connector_write {
     include!(concat!(env!("OUT_DIR"), "/novarocks.connector_write.rs"));
 }
 
-#[allow(clippy::module_inception)]
-pub mod expr {
-    include!(concat!(env!("OUT_DIR"), "/novarocks.expr.rs"));
-}
-
 pub mod filter {
     include!(concat!(env!("OUT_DIR"), "/novarocks.filter.rs"));
 }
@@ -54,7 +49,7 @@ pub mod call_request {
     include!(concat!(env!("OUT_DIR"), "/novarocks.call_request.rs"));
 }
 
-/// Shared logical value definitions for both static plan carriers.
+/// Shared logical value definitions for compiled packages and runtime filters.
 pub mod value_type {
     include!(concat!(env!("OUT_DIR"), "/novarocks.value_type.rs"));
 }
@@ -96,6 +91,7 @@ pub mod physical_package_v2 {
     ));
 }
 
+/// Shared execution type namespaces and runtime-filter contracts.
 #[allow(clippy::large_enum_variant)]
 pub mod plan {
     // Expansion aliases; physical Arrow descriptors have one generated owner.

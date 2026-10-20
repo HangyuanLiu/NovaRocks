@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextConvergenceState,
     QueryContextConvergenceVersion,
@@ -58,6 +57,7 @@ use novarocks_execution_contract::task_execution::status::{
     TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
+use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
 use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
@@ -2884,6 +2884,7 @@ fn poll_root_result_after_with_limit(
             RegistryTaskExecutionIngress::new(
                 Arc::clone(registry),
                 NativeCompatibilityId::new([0x71; 32]),
+                crate::backend_application::test_static_package_admission(),
             )
             .as_ref(),
             novarocks_proto_models::novarocks::FetchTaskResultRequest {
@@ -3871,6 +3872,7 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
     let ingress = RegistryTaskExecutionIngress::new(
         Arc::clone(&fixture.registry),
         NativeCompatibilityId::new([0x71; 32]),
+        crate::backend_application::test_static_package_admission(),
     );
     assert!(matches!(
         runtime
@@ -3912,6 +3914,7 @@ fn canceled_queued_terminal_relookup_retains_its_ingress_slot() {
     let ingress = RegistryTaskExecutionIngress::new(
         Arc::clone(&fixture.registry),
         NativeCompatibilityId::new([0x71; 32]),
+        crate::backend_application::test_static_package_admission(),
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)

@@ -33,8 +33,7 @@ use novarocks_type_contract::{
 
 use super::{
     expression_occurrences::{
-        AuthoredPhysicalOccurrences, ExpressionOccurrenceError, NativeWriterOccurrences,
-        WriterOccurrenceContexts,
+        AuthoredPhysicalOccurrences, ExpressionOccurrenceError, WriterOccurrenceContexts,
     },
     physical_relational_effects::{
         PhysicalRelationalEffectsError, relational_writer_context_observed,
@@ -141,15 +140,6 @@ pub(crate) fn prepare_physical_writer_occurrence_observed(
         functions,
         work,
     )
-}
-
-pub(crate) fn prepare_native_writer_occurrence_observed(
-    input: WriterOccurrenceCallInput<'_, '_>,
-    occurrences: &NativeWriterOccurrences<'_>,
-    functions: &dyn SqlFunctionCatalog,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<FreshPhysicalWriterOccurrence, PhysicalWriterOccurrenceError> {
-    prepare_writer_occurrence_in(input, &occurrences.contexts(), functions, work)
 }
 
 fn prepare_writer_occurrence_in(

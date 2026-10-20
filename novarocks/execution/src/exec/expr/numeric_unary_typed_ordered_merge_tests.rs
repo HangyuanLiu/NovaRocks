@@ -22,12 +22,11 @@ use novarocks_physical_plan::{
     StaticFunctionArgument,
 };
 use novarocks_sql::compiler::{
-    SqlCompileControl, SqlPhysicalEmissionMode, ordered_array_state_source_for_test,
-    ordinary_state_observe_for_test,
+    SqlCompileControl, ordered_array_state_source_for_test, ordinary_state_observe_for_test,
 };
-fn check(intermediate: bool, mode: SqlPhysicalEmissionMode) {
+fn check(intermediate: bool) {
     let control = SqlCompileControl::unbounded();
-    let source = ordered_array_state_source_for_test(intermediate, mode, &control).unwrap();
+    let source = ordered_array_state_source_for_test(intermediate, &control).unwrap();
     let actual = ordinary_state_observe_for_test(&source, &control).unwrap();
     assert_eq!(
         (actual.partials, actual.intermediates, actual.finals),
@@ -93,25 +92,13 @@ fn check(intermediate: bool, mode: SqlPhysicalEmissionMode) {
         }
     }
 }
-#[test]
-fn numeric_unary_original_typed_ordered_merge_partial_final() {
-    check(false, SqlPhysicalEmissionMode::OriginalNativeV1);
-}
+
 #[test]
 fn numeric_unary_exact_typed_ordered_merge_partial_final() {
-    check(
-        false,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    check(false);
 }
-#[test]
-fn numeric_unary_original_typed_ordered_merge_intermediate() {
-    check(true, SqlPhysicalEmissionMode::OriginalNativeV1);
-}
+
 #[test]
 fn numeric_unary_exact_typed_ordered_merge_intermediate() {
-    check(
-        true,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    check(true);
 }

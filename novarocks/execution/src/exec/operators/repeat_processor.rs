@@ -21,7 +21,7 @@
 //! - Maintains repeat-id aware output layout required by downstream aggregation.
 //!
 //! Key exported interfaces:
-//! - Types: `RepeatProcessorFactory`.
+//! - Types: `RepeatFixtureFactory`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -227,7 +227,10 @@ where
 }
 
 /// Factory for repeat processors that expand rows for grouping-set style execution.
-pub struct RepeatProcessorFactory {
+#[cfg(test)]
+/// F3 component oracle over explicit expression/array/layout facts.
+/// This test-only fixture owns no construction tree and is not a product operator.
+pub(crate) struct RepeatFixtureFactory {
     name: String,
     null_slot_ids: Vec<Vec<SlotId>>,
     grouping_slot_ids: Vec<SlotId>,
@@ -238,7 +241,8 @@ pub struct RepeatProcessorFactory {
     declared_input: Option<ChunkSchemaRef>,
 }
 
-impl RepeatProcessorFactory {
+#[cfg(test)]
+impl RepeatFixtureFactory {
     pub fn new(
         node_id: i32,
         null_slot_ids: Vec<Vec<SlotId>>,
@@ -310,13 +314,14 @@ impl RepeatProcessorFactory {
     }
 }
 
-impl OperatorFactory for RepeatProcessorFactory {
+#[cfg(test)]
+impl OperatorFactory for RepeatFixtureFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(RepeatProcessorOperator {
+        Box::new(RepeatFixtureOperator {
             name: self.name.clone(),
             null_slot_ids: self.null_slot_ids.clone(),
             grouping_slot_ids: self.grouping_slot_ids.clone(),
@@ -338,7 +343,8 @@ impl OperatorFactory for RepeatProcessorFactory {
     }
 }
 
-struct RepeatProcessorOperator {
+#[cfg(test)]
+struct RepeatFixtureOperator {
     name: String,
     null_slot_ids: Vec<Vec<SlotId>>,
     grouping_slot_ids: Vec<SlotId>,
@@ -358,7 +364,8 @@ struct RepeatProcessorOperator {
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
-impl Operator for RepeatProcessorOperator {
+#[cfg(test)]
+impl Operator for RepeatFixtureOperator {
     fn creates_typed_storage(&self) -> bool {
         self.input_layout.is_some() || self.declared_input.is_some()
     }
@@ -447,7 +454,8 @@ impl Operator for RepeatProcessorOperator {
     }
 }
 
-impl ProcessorOperator for RepeatProcessorOperator {
+#[cfg(test)]
+impl ProcessorOperator for RepeatFixtureOperator {
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.input.is_none()
     }
@@ -661,7 +669,8 @@ impl ProcessorOperator for RepeatProcessorOperator {
     }
 }
 
-impl RepeatProcessorOperator {
+#[cfg(test)]
+impl RepeatFixtureOperator {
     fn validate_config(&self) -> Result<(), String> {
         if self.repeat_times == 0 {
             return Err("repeat operator requires repeat_times > 0".to_string());
@@ -729,7 +738,7 @@ mod tests {
             Chunk::new_with_chunk_schema(batch, chunk_schema)
         };
 
-        let mut op = RepeatProcessorOperator {
+        let mut op = RepeatFixtureOperator {
             name: "Repeat".to_string(),
             null_slot_ids: vec![vec![SlotId::new(2)], vec![SlotId::new(1)]],
             grouping_slot_ids: vec![SlotId::new(10)],
@@ -889,7 +898,7 @@ mod typed_owner_tests {
         input: novarocks_local_program::StaticLayout,
         output: novarocks_local_program::StaticLayout,
     ) -> Box<dyn Operator> {
-        RepeatProcessorFactory::new_from_static_layouts(
+        RepeatFixtureFactory::new_from_static_layouts(
             71,
             vec![vec![SlotId::new(1)], vec![]],
             vec![SlotId::new(10)],

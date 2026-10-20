@@ -33,7 +33,7 @@ use novarocks_local_program::{
     ProgramNodeId, ProgramNodeKind,
 };
 use novarocks_physical_plan::{FragmentId, NodeKind};
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{
     sync::{Arc, Mutex},
@@ -56,8 +56,8 @@ struct Fixture {
     program: Arc<LocalProgram>,
     node: ProgramNodeId,
 }
-fn fixture(sql: &str, mode: SqlPhysicalEmissionMode) -> Fixture {
-    let source = ndv_sql_source(sql, mode);
+fn fixture(sql: &str) -> Fixture {
+    let source = ndv_sql_source(sql);
     let functions = installed_builtin_owner_catalogue();
     let mut results = compiler_results(&source, &functions);
     let mut found = None;
@@ -187,12 +187,9 @@ fn group(f: &Fixture) -> CompiledFilterConjunctionInstance {
     CompiledFilterConjunctionInstance::try_new(Arc::clone(&f.program), f.node, &Control).unwrap()
 }
 #[test]
-fn filter_conjunction_actual_native_sql_frame_two_modes_and_sparse_empty() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        let f = fixture(NATIVE, mode);
+fn filter_conjunction_actual_native_sql_frame_compiled_and_sparse_empty() {
+    {
+        let f = fixture(NATIVE);
         let input = batch(&f, &[0, 1, 0], &[]);
         let mut instance = group(&f);
         assert_eq!(
@@ -233,7 +230,6 @@ fn filter_conjunction_actual_native_sql_frame_two_modes_and_sparse_empty() {
 fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latches() {
     let f = fixture(
         "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS DATE) IS NOT NULL AND ndv(v)=0",
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
     let input = batch(
         &f,
@@ -275,7 +271,6 @@ fn filter_conjunction_actual_pure_decider_masks_and_required_site_batchrow_latch
 fn filter_conjunction_actual_nested_not_is_null_keeps_value_demand() {
     let f = fixture(
         "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING NOT (CAST(MAX(CAST(v AS DOUBLE)) AS DATE) IS NULL) AND ndv(v)=0",
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
     let input = batch(&f, &[0, 1, 0], &[None, Some(f64::NAN), Some(20200101.)]);
     assert_eq!(
@@ -291,7 +286,6 @@ fn filter_conjunction_actual_nested_not_is_null_keeps_value_demand() {
 fn filter_conjunction_actual_rand_domains_and_cross_batch_state() {
     let f = fixture(
         "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING ndv(v)=0 AND rand(13)<0.5",
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
     let mut narrow = group(&f);
     let mut guarded = group(&f);
@@ -330,7 +324,6 @@ fn filter_conjunction_actual_rand_domains_and_cross_batch_state() {
 fn filter_conjunction_actual_pending_error_commits_before_rand_boundary() {
     let f = fixture(
         "SELECT k FROM fixture.ndv_null_contract GROUP BY k HAVING CAST(MAX(CAST(v AS DOUBLE)) AS DATE) IS NOT NULL AND rand(13)<0.5",
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     );
     let input = batch(&f, &[0], &[Some(f64::NAN)]);
     let mut instance = group(&f);
@@ -385,10 +378,7 @@ fn causes() -> [KernelFailure; 7] {
 }
 #[test]
 fn filter_conjunction_actual_every_runtime_callback_seven_causes_prefix_no_tail_latch() {
-    let f = fixture(
-        NATIVE,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let f = fixture(NATIVE);
     let input = batch(&f, &[0, 1, 0], &[]);
     let success = Stop {
         at: usize::MAX,
@@ -429,10 +419,7 @@ fn filter_conjunction_actual_every_runtime_callback_seven_causes_prefix_no_tail_
 }
 #[test]
 fn filter_conjunction_actual_row_quantum_and_empty_schema_validation() {
-    let f = fixture(
-        NATIVE,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let f = fixture(NATIVE);
     let input = batch(&f, &vec![0; 321], &[]);
     let control = Stop {
         at: usize::MAX,
@@ -482,10 +469,7 @@ impl PureCompileControl for CompileStop {
 }
 #[test]
 fn filter_conjunction_actual_local_compile_three_causes_sampled_prefix() {
-    let source = ndv_sql_source(
-        NATIVE,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    let source = ndv_sql_source(NATIVE);
     let functions = installed_builtin_owner_catalogue();
     let (fragment, _) = source
         .plan()

@@ -129,21 +129,17 @@ fn c12_p1_trim_fixed_white_nonwhite_long_constants_and_empty_match_v1() {
     c.finish();
 }
 #[test]
-fn c12_p1_trim_real_sql_column_calls_keep_ordered_requests_in_both_modes() {
+fn c12_p1_trim_real_sql_column_calls_keep_ordered_requests_for_compiled() {
     use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_single_field;
     use novarocks_physical_plan::{
         ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
     };
-    use novarocks_sql::compiler::SqlPhysicalEmissionMode;
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
+
+    {
         for name in NAMES {
             let owner = sql_source_with_single_field(
                 &format!("SELECT {name}(k) FROM t"),
                 Field::new("k", DataType::Utf8, true),
-                mode,
             );
             let mut count = 0;
             for f in owner.plan().fragments().values() {
@@ -181,7 +177,7 @@ fn c12_p1_trim_real_sql_column_calls_keep_ordered_requests_in_both_modes() {
                     );
                     assert_eq!(node.ty, FunctionValueType::new(DataType::Utf8, true));
                     println!(
-                        "C12-P1 retained {mode:?}/{name} definition={id:?} child={child:?} request={request:?}"
+                        "C12-P1 retained compiled/{name} definition={id:?} child={child:?} request={request:?}"
                     );
                     count += 1;
                 }

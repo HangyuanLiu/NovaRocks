@@ -392,13 +392,12 @@ fn compile_dml_change_stream_write(
     // The recipes are sealed before the plan is compiled because the plan's
     // writer nodes carry them: a plan and the session that sealed it must not be
     // separable.
-    let sealed_write_targets = write_session
+    let _sealed_write_targets = write_session
         .seal_write_targets()
         .map_err(|error| format!("seal row-mutation write targets: {error}"))?;
     let routed_targets = change_stream_routed_targets(write_session)?;
     let mut routes = Vec::with_capacity(routed_targets.len());
     let mut statistics_targets = Vec::with_capacity(routed_targets.len());
-    let mut field_names = std::collections::BTreeMap::new();
     for (write_target, route) in routed_targets {
         let target_binding = admit_session_connector_write_target(
             table_bindings.as_ref(),
@@ -424,10 +423,7 @@ fn compile_dml_change_stream_write(
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )
         .map_err(|error| format!("build row-mutation route sink: {error}"))?;
-        field_names.insert(
-            write_target.ordinal(),
-            sink.accepted_field_names().into_iter().collect(),
-        );
+
         routes.push(DmlChangeStreamRoute {
             route_id: route.route_id(),
             // The branch's identity is its sealed ordinal, never its position
@@ -466,7 +462,6 @@ fn compile_dml_change_stream_write(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         state.constant_policy(),
-        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -495,7 +490,6 @@ fn compile_dml_change_stream_write(
             shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
         },
         decimal_overflow_policy,
-        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -543,12 +537,7 @@ fn compile_dml_change_stream_write(
     let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
     let finalized = completion.finish(
         novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                version,
-                dop_domain,
-                reads,
-                state.static_plan_carrier().sql_emission_mode(),
-            ),
+            novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
             targets,
         ),
         &completion_control,
@@ -573,17 +562,13 @@ fn compile_dml_change_stream_write(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        state.function_catalog().as_ref(),
         state.static_plan_carrier(),
         state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
-                sealed: &sealed_write_targets,
-                field_names,
                 session: write_session.as_ref(),
             },
         ),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     Ok(
@@ -716,12 +701,25 @@ pub(crate) enum MutationStagedWrite {
     NoOp,
     AbortRequired {
         reason: String,
+        engine_error_code: Option<novarocks_types::EngineErrorCode>,
         execution: Arc<dyn MutationExecution>,
     },
     CommitRequired {
         execution: Arc<dyn MutationExecution>,
         completion: MutationCommitCompletion,
     },
+}
+
+fn mutation_stage_abort_required(
+    error: crate::dml::error::DmlExecutionError,
+    execution: Arc<dyn MutationExecution>,
+) -> MutationStagedWrite {
+    let (reason, engine_error_code) = error.into_abort_parts();
+    MutationStagedWrite::AbortRequired {
+        reason,
+        engine_error_code,
+        execution,
+    }
 }
 
 /// Frontend-local mutation input lowered from SQLP-5's typed AST.  Expression
@@ -1435,10 +1433,7 @@ pub(crate) fn stage_prepared_update_mutation(
                     return Err(error);
                 }
                 Err(error) => {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason: error.to_string(),
-                        execution: execution_handle,
-                    });
+                    return Ok(mutation_stage_abort_required(error, execution_handle));
                 }
             };
             // A statement whose every branch closed without staging an artifact
@@ -1447,6 +1442,7 @@ pub(crate) fn stage_prepared_update_mutation(
             if !staged.staged_any_artifact {
                 if let Err(reason) = execution_handle.release_empty_write_session() {
                     return Ok(MutationStagedWrite::AbortRequired {
+                        engine_error_code: None,
                         reason,
                         execution: execution_handle,
                     });
@@ -1514,18 +1510,16 @@ pub(crate) fn stage_prepared_update_mutation(
             });
             let result = match execution_handle.run_stage() {
                 Ok(result) => result,
-                Err(reason) => {
+                Err(error) => {
                     if execution_handle.needs_abort_on_stage_error() {
-                        return Ok(MutationStagedWrite::AbortRequired {
-                            reason,
-                            execution: execution_handle,
-                        });
+                        return Ok(mutation_stage_abort_required(error, execution_handle));
                     }
-                    return Err(reason.into());
+                    return Err(error);
                 }
             };
             let Some(completion) = result.write_session else {
                 return Ok(MutationStagedWrite::AbortRequired {
+                    engine_error_code: None,
                     reason: "MOR UPDATE staged without a write-session completion".to_string(),
                     execution: execution_handle,
                 });
@@ -1538,6 +1532,7 @@ pub(crate) fn stage_prepared_update_mutation(
             if completion.is_empty() {
                 if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
                     return Ok(MutationStagedWrite::AbortRequired {
+                        engine_error_code: None,
                         reason,
                         execution: execution_handle,
                     });
@@ -1848,7 +1843,7 @@ fn run_change_stream_write_session_stage(
     _write_session: &Arc<ConnectorWriteSession>,
     planned: crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
     _statement: &str,
-) -> Result<QueryExecutionResult, String> {
+) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
     let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
         assembly,
         // The sealed routes are read only by the build observer; the plan the
@@ -1881,7 +1876,7 @@ impl MorUpdateChangeStreamExecutor {
             .map_err(|error| format!("release empty MOR UPDATE write session: {error}"))
     }
 
-    fn run_stage(&self) -> Result<QueryExecutionResult, String> {
+    fn run_stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
         let planned = self
             .planned
             .lock()
@@ -1900,7 +1895,7 @@ impl MorUpdateChangeStreamExecutor {
 
 impl MutationExecution for MorUpdateChangeStreamExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        self.run_stage()
+        self.run_stage().map_err(|error| error.to_string())
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -1938,7 +1933,7 @@ impl MorMergeChangeStreamExecutor {
             .map_err(|error| format!("release empty MOR MERGE write session: {error}"))
     }
 
-    fn run_stage(&self) -> Result<QueryExecutionResult, String> {
+    fn run_stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
         let planned = self
             .planned
             .lock()
@@ -1957,7 +1952,7 @@ impl MorMergeChangeStreamExecutor {
 
 impl MutationExecution for MorMergeChangeStreamExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        self.run_stage()
+        self.run_stage().map_err(|error| error.to_string())
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -3465,7 +3460,6 @@ fn execute_exact_cow_match_query(
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         state.constant_policy(),
-        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -3484,7 +3478,6 @@ fn execute_exact_cow_match_query(
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
         optimize_request,
         execution.optimizer_settings(),
-        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -3545,11 +3538,9 @@ fn execute_exact_cow_match_query(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        state.function_catalog().as_ref(),
         state.static_plan_carrier(),
         state.constant_policy(),
         None,
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
     )?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
@@ -3590,7 +3581,7 @@ fn execute_exact_cow_match_query(
         .query_execution()
         .execute(request)
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_cow_match)
-        .map_err(|error| error.to_string())?)
+        .map_err(crate::dml::error::DmlExecutionError::from)?)
 }
 
 #[cfg(test)]
@@ -4042,18 +4033,16 @@ pub(crate) fn stage_prepared_merge_mutation(
         });
         let result = match execution_handle.run_stage() {
             Ok(result) => result,
-            Err(reason) => {
+            Err(error) => {
                 if execution_handle.needs_abort_on_stage_error() {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason,
-                        execution: execution_handle,
-                    });
+                    return Ok(mutation_stage_abort_required(error, execution_handle));
                 }
-                return Err(reason.into());
+                return Err(error);
             }
         };
         let Some(completion) = result.write_session else {
             return Ok(MutationStagedWrite::AbortRequired {
+                engine_error_code: None,
                 reason: "MOR MERGE staged without a write-session completion".to_string(),
                 execution: execution_handle,
             });
@@ -4064,6 +4053,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         if completion.is_empty() {
             if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
                 return Ok(MutationStagedWrite::AbortRequired {
+                    engine_error_code: None,
                     reason,
                     execution: execution_handle,
                 });
@@ -4142,15 +4132,13 @@ pub(crate) fn stage_prepared_merge_mutation(
             return Err(error);
         }
         Err(error) => {
-            return Ok(MutationStagedWrite::AbortRequired {
-                reason: error.to_string(),
-                execution: execution_handle,
-            });
+            return Ok(mutation_stage_abort_required(error, execution_handle));
         }
     };
     if !staged.staged_any_artifact {
         if let Err(reason) = execution_handle.release_empty_write_session() {
             return Ok(MutationStagedWrite::AbortRequired {
+                engine_error_code: None,
                 reason,
                 execution: execution_handle,
             });
@@ -5045,7 +5033,10 @@ mod tests {
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 crate::application::test_constant_policy(),
-                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+                crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                    novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                    novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                ),
             ),
             None,
             Arc::clone(&connector_control),
@@ -5894,13 +5885,19 @@ mod tests {
 
         for expected in outcomes {
             let staged = MutationStagedWrite::AbortRequired {
+                engine_error_code: None,
                 reason: "synthetic post-begin staging failure".to_string(),
                 execution: Arc::new(AbortOutcomeExecution {
                     outcome: expected.clone(),
                     context: connector_context_for_test(),
                 }),
             };
-            let MutationStagedWrite::AbortRequired { reason, execution } = staged else {
+            let MutationStagedWrite::AbortRequired {
+                reason,
+                execution,
+                engine_error_code: None,
+            } = staged
+            else {
                 panic!("expected AbortRequired");
             };
             assert_eq!(reason, "synthetic post-begin staging failure");
@@ -6722,7 +6719,10 @@ mod tests {
                             crate::catalog_application::query_catalog::new_query_catalog_service(),
                         ),
                         crate::application::test_constant_policy(),
-                        crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+                        crate::query_execution::package_freeze::CompiledPackageCarrier::new(
+                            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                            novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                        ),
                     ),
                     None,
                     registry,
@@ -7640,6 +7640,38 @@ mod tests {
     /// connector was never asked to commit" an assertable fact rather than an
     /// inference.
     #[test]
+    fn a_compiled_refusal_retains_the_post_begin_session_abort_obligation() {
+        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
+        let execution = mor_update_executor(Arc::clone(&fixture.session));
+        let staged = mutation_stage_abort_required(
+            crate::dml::error::DmlExecutionError::UnsupportedCompiledShape(
+                "FULL OUTER hash join".into(),
+            ),
+            execution,
+        );
+        let MutationStagedWrite::AbortRequired {
+            reason,
+            engine_error_code,
+            execution,
+        } = staged
+        else {
+            panic!("post-begin failure must retain abort ownership");
+        };
+        assert_eq!(
+            engine_error_code,
+            Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
+        );
+        assert_eq!(reason, "FULL OUTER hash join");
+        assert_eq!(fixture.calls.lock().unwrap().abort, 0);
+        assert!(matches!(
+            execution.abort_terminal().unwrap(),
+            novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted { .. }
+        ));
+        assert_eq!(fixture.calls.lock().unwrap().abort, 1);
+        assert_eq!(fixture.calls.lock().unwrap().finish, 0);
+    }
+
+    #[test]
     fn a_mor_write_whose_data_plane_never_closed_never_reaches_the_provider() {
         let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
         let execution = mor_update_executor(Arc::clone(&fixture.session));
@@ -7647,7 +7679,7 @@ mod tests {
         let reason = execution
             .run_stage()
             .expect_err("a stage with no dispatched plan fails");
-        assert!(reason.contains("already consumed"), "{reason}");
+        assert!(reason.to_string().contains("already consumed"), "{reason}");
         assert!(execution.needs_abort_on_stage_error());
         assert_eq!(fixture.session.finish_invocations(), 0);
 

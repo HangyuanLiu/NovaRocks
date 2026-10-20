@@ -26,11 +26,7 @@ use crate::optimizer::{
 use arrow::datatypes::DataType;
 use novarocks_type_contract::ValueLogicalType;
 
-fn compile(
-    score_type: DataType,
-    predicate: &str,
-    mode: SqlPhysicalEmissionMode,
-) -> SqlOptimizedOutput {
+fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
     let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
     catalog.create_database("db").unwrap();
     let mut evidence = Vec::new();
@@ -99,7 +95,6 @@ fn compile(
         noop_constant_evaluator(),
         None,
         crate::constant::test_constant_policy(),
-        mode,
         control.clone(),
     ))
     .unwrap()
@@ -308,11 +303,8 @@ fn retains_score_join_equality(tree: &OptimizedOperatorNode) -> bool {
 }
 #[test]
 fn real_int32_sql_keeps_original_or_and_both_exact_widened_range_envelopes() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        let output = compile(DataType::Int32, ORIGINAL, mode);
+    {
+        let output = compile(DataType::Int32, ORIGINAL);
         let tree = &output.optimized_tree;
         assert!(
             retains_original_interval_union(tree),
@@ -334,11 +326,7 @@ fn real_int32_sql_keeps_original_or_and_both_exact_widened_range_envelopes() {
 }
 #[test]
 fn real_int64_sql_direct_domain_control_keeps_original_or_and_both_envelopes() {
-    let output = compile(
-        DataType::Int64,
-        ORIGINAL,
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-    );
+    let output = compile(DataType::Int64, ORIGINAL);
     assert!(retains_original_interval_union(&output.optimized_tree));
     assert!(retains_score_join_equality(&output.optimized_tree));
     assert_eq!(
@@ -352,11 +340,7 @@ fn real_sql_does_not_derive_range_envelopes_through_unproven_cast_domains() {
         let predicate = format!(
             "(l.score=r.score AND CAST(l.score AS {target}) BETWEEN 10 AND 20) OR (l.score=r.score AND CAST(l.score AS {target}) BETWEEN 30 AND 40)"
         );
-        let output = compile(
-            DataType::Int64,
-            &predicate,
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-        );
+        let output = compile(DataType::Int64, &predicate);
         assert!(
             retains_residual_or(&output.optimized_tree),
             "original OR remains for {target}"

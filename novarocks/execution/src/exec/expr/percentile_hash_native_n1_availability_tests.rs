@@ -25,7 +25,7 @@ use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
 use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SqlCompileControl, SqlCompileError, SqlCompileIntent,
-    SqlFinalPlanCompileRequest, SqlPhysicalEmissionMode, SqlPlanningEnvironment, SqlStatementInput,
+    SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlStatementInput,
     builtin_sql_function_catalog,
 };
 #[test]
@@ -117,7 +117,6 @@ fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuse
             builtin_sql_function_catalog().snapshot(),
             &EVALUATOR,
             super::pure_differential::constant_policy(),
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

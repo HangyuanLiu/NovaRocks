@@ -17,10 +17,7 @@
 //! Same original current-root binding is checked even when LogicalOnly has no fold walk.
 use super::e08s1_logical_environment_original_tests::logical;
 use super::sql_scalar_presence_original_tests::{SERIAL, fold_count, reset};
-use novarocks_sql::{
-    analyze_error::AnalyzeErrorKind,
-    compiler::{SqlCompileError, SqlPhysicalEmissionMode},
-};
+use novarocks_sql::{analyze_error::AnalyzeErrorKind, compiler::SqlCompileError};
 #[test]
 fn e08s1_logical_environment_exact_absent_source_is_named_with_original_span() {
     let _serial = SERIAL.lock().unwrap();
@@ -35,12 +32,7 @@ fn e08s1_logical_environment_exact_absent_source_is_named_with_original_span() {
         ),
     ] {
         reset();
-        let error = logical(
-            sql,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            None,
-        )
-        .unwrap_err();
+        let error = logical(sql, None).unwrap_err();
         let SqlCompileError::Analyze(error) = error else {
             panic!("original AST binding refusal: {error:?}")
         };
@@ -58,12 +50,7 @@ fn e08s1_logical_environment_exact_authored_raw_limit_keeps_original_logical_suc
     let _serial = SERIAL.lock().unwrap();
     for raw in [-1, 4096] {
         reset();
-        logical(
-            "SELECT GROUP_CONCAT(REVERSE('abc'))",
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            Some(raw),
-        )
-        .unwrap();
+        logical("SELECT GROUP_CONCAT(REVERSE('abc'))", Some(raw)).unwrap();
         assert_eq!(fold_count(), 0);
     }
 }

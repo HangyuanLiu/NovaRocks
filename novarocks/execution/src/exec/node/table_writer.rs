@@ -40,7 +40,6 @@ use crate::exec::chunk::ChunkSchema;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
-use crate::exec::node::ExecNode;
 use crate::exec::node::table_write_aggregate::WriterPartialAggregatePlan;
 use crate::exec::node::table_write_relation::ConnectorCommitFragmentEncoder;
 #[cfg(novarocks_dev_controls)]
@@ -425,23 +424,17 @@ impl std::fmt::Debug for TableWriterInputProjection {
     }
 }
 
-/// A normal unary processor that writes its input and reports what it wrote.
-#[derive(Clone)]
-pub struct TableWriterNode {
-    pub input: Box<ExecNode>,
+/// Neutral operator-test facts paired with an actual Task runtime binding.
+/// It owns no input node and cannot be submitted as an execution plan.
+#[cfg(test)]
+pub(crate) struct WriterFixture {
     pub node_id: i32,
-    handle: ConnectorWriterHandle,
+    binding: TableWriterRuntimeBinding,
     target: WriteTargetOrdinal,
-    execution: Arc<dyn ConnectorWriteExecution>,
     expected_schema: SchemaRef,
     projection: TableWriterInputProjection,
-    physical_template: TableWriterPhysicalContextTemplate,
-    request_context: ConnectorRequestContext,
-    fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     writer_multiplex_schema: crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
     partial_aggregate_plan: WriterPartialAggregatePlan,
-    #[cfg(novarocks_dev_controls)]
-    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 /// Provider and attempt capabilities moved out of the transient decoder node.
@@ -501,13 +494,13 @@ impl TableWriterRuntimeBinding {
     }
 }
 
-impl TableWriterNode {
+#[cfg(test)]
+impl WriterFixture {
     #[expect(
         clippy::too_many_arguments,
         reason = "A table writer joins independently-owned plan, provider, attempt, and codec facts."
     )]
     pub fn try_new(
-        input: Box<ExecNode>,
         node_id: i32,
         handle: ConnectorWriterHandle,
         target: WriteTargetOrdinal,
@@ -519,7 +512,6 @@ impl TableWriterNode {
         fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     ) -> Result<Self, ExecPlanBuildError> {
         Self::try_new_with_relation(
-            input,
             node_id,
             handle,
             target,
@@ -539,7 +531,6 @@ impl TableWriterNode {
         reason = "A table writer joins independently-owned plan, provider, attempt, codec, and relation facts."
     )]
     pub fn try_new_with_relation(
-        input: Box<ExecNode>,
         node_id: i32,
         handle: ConnectorWriterHandle,
         target: WriteTargetOrdinal,
@@ -552,12 +543,13 @@ impl TableWriterNode {
         writer_multiplex_schema: crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
         partial_aggregate_plan: WriterPartialAggregatePlan,
     ) -> Result<Self, ExecPlanBuildError> {
-        if execution.catalog_handle() != handle.binding().catalog_handle() {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Node,
-                "table writer catalog handle does not match its query-leased write execution",
-            ));
-        }
+        let binding = TableWriterRuntimeBinding::try_new(
+            handle,
+            execution,
+            physical_template,
+            request_context,
+            fragment_encoder,
+        )?;
         if projection.schema().as_ref() != expected_schema.as_ref() {
             return Err(ExecPlanBuildError::new(
                 ExecPlanInvariant::Schema,
@@ -565,32 +557,25 @@ impl TableWriterNode {
             ));
         }
         Ok(Self {
-            input,
+            binding,
             node_id,
-            handle,
             target,
-            execution,
             expected_schema,
             projection,
-            physical_template,
-            request_context,
-            fragment_encoder,
             writer_multiplex_schema,
             partial_aggregate_plan,
-            #[cfg(novarocks_dev_controls)]
-            aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
     #[cfg(novarocks_dev_controls)]
     pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
-        self.aggregate_guard = guard;
+        self.binding.aggregate_guard = guard;
         self
     }
 
     pub const fn handle(&self) -> &ConnectorWriterHandle {
-        &self.handle
+        &self.binding.handle
     }
 
     pub const fn target(&self) -> WriteTargetOrdinal {
@@ -598,7 +583,7 @@ impl TableWriterNode {
     }
 
     pub const fn execution(&self) -> &Arc<dyn ConnectorWriteExecution> {
-        &self.execution
+        &self.binding.execution
     }
 
     pub const fn expected_schema(&self) -> &SchemaRef {
@@ -609,21 +594,16 @@ impl TableWriterNode {
         &self.projection
     }
 
-    /// Decoder-only patch point for the node-owned expression arena.
-    pub fn projection_arena_mut(&mut self) -> &mut ExprArena {
-        self.projection.arena_mut()
-    }
-
     pub const fn physical_template(&self) -> TableWriterPhysicalContextTemplate {
-        self.physical_template
+        self.binding.physical_template
     }
 
     pub const fn request_context(&self) -> &ConnectorRequestContext {
-        &self.request_context
+        &self.binding.request_context
     }
 
     pub const fn fragment_encoder(&self) -> &Arc<dyn ConnectorCommitFragmentEncoder> {
-        &self.fragment_encoder
+        &self.binding.fragment_encoder
     }
 
     pub const fn writer_multiplex_schema(
@@ -636,55 +616,22 @@ impl TableWriterNode {
         &self.partial_aggregate_plan
     }
 
-    pub(crate) fn into_static_parts_with_binding(
-        self,
-    ) -> (
-        TableWriterRuntimeBinding,
-        (
-            Box<ExecNode>,
-            WriteTargetOrdinal,
-            SchemaRef,
-            TableWriterInputProjection,
-            crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
-            WriterPartialAggregatePlan,
-        ),
-    ) {
-        (
-            TableWriterRuntimeBinding {
-                handle: self.handle,
-                execution: self.execution,
-                physical_template: self.physical_template,
-                request_context: self.request_context,
-                fragment_encoder: self.fragment_encoder,
-                #[cfg(novarocks_dev_controls)]
-                aggregate_guard: self.aggregate_guard,
-            },
-            (
-                self.input,
-                self.target,
-                self.expected_schema,
-                self.projection,
-                self.writer_multiplex_schema,
-                self.partial_aggregate_plan,
-            ),
-        )
-    }
-
     #[cfg(novarocks_dev_controls)]
     pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
-        &self.aggregate_guard
+        &self.binding.aggregate_guard
     }
 }
 
-impl std::fmt::Debug for TableWriterNode {
+#[cfg(test)]
+impl std::fmt::Debug for WriterFixture {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("TableWriterNode")
+            .debug_struct("WriterFixture")
             .field("node_id", &self.node_id)
             .field("target", &self.target)
-            .field("handle", &self.handle)
+            .field("handle", &self.binding.handle)
             .field("expected_schema", &self.expected_schema)
-            .field("physical_template", &self.physical_template)
+            .field("physical_template", &self.binding.physical_template)
             .finish_non_exhaustive()
     }
 }

@@ -24,7 +24,6 @@ use novarocks_physical_plan::{
 fn source() -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     super::hll_hash_actual_sql_source_tests::hll_sql_source(
         "select bitmap_union_int(c2) from fixture.t1",
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &[("c1", DataType::Int32), ("c2", DataType::Int32)],
     )
 }

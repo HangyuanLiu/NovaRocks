@@ -22,12 +22,12 @@ use novarocks_physical_plan::{
     StaticFunctionArgument,
 };
 use novarocks_sql::compiler::{
-    SqlCompileControl, SqlPhysicalEmissionMode, ordinary_extrema_constant_state_source_for_test,
+    SqlCompileControl, ordinary_extrema_constant_state_source_for_test,
     ordinary_state_observe_for_test,
 };
-fn check(maximum: bool, mode: SqlPhysicalEmissionMode) {
+fn check(maximum: bool) {
     let control = SqlCompileControl::unbounded();
-    let owner = ordinary_extrema_constant_state_source_for_test(maximum, mode, &control).unwrap();
+    let owner = ordinary_extrema_constant_state_source_for_test(maximum, &control).unwrap();
     let observed = ordinary_state_observe_for_test(&owner, &control).unwrap();
     assert_eq!(
         (observed.partials, observed.intermediates, observed.finals),
@@ -92,26 +92,13 @@ fn check(maximum: bool, mode: SqlPhysicalEmissionMode) {
     }
     assert_eq!(nullable_producers, 1);
 }
-#[test]
-fn numeric_unary_original_state_min_own_constant_with_nullable_producer() {
-    check(false, SqlPhysicalEmissionMode::OriginalNativeV1);
-}
+
 #[test]
 fn numeric_unary_exact_state_min_own_constant_with_nullable_producer() {
-    check(
-        false,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    check(false);
 }
 
 #[test]
-fn numeric_unary_original_state_max_own_constant_with_nullable_producer() {
-    check(true, SqlPhysicalEmissionMode::OriginalNativeV1);
-}
-#[test]
 fn numeric_unary_exact_state_max_own_constant_with_nullable_producer() {
-    check(
-        true,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    );
+    check(true);
 }

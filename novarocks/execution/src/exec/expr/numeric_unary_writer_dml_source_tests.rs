@@ -36,8 +36,8 @@ use novarocks_spi::connector::{
 use novarocks_sql::binding::SqlTableBindingAllocator;
 use novarocks_sql::compiler::{
     RootDistributionRequirement, SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl,
-    SqlCompileIntent, SqlCompiler, SqlOptimizeRequest, SqlPhysicalEmissionMode,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    SqlCompileIntent, SqlCompiler, SqlOptimizeRequest, SqlPlannerTableSnapshot,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 use novarocks_sql::planning::dml::{
@@ -50,7 +50,6 @@ use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
 use novarocks_types::schema::ColumnDef;
 
 fn source(
-    mode: SqlPhysicalEmissionMode,
     with_statistics: bool,
     dtype: DataType,
     sql_type: &str,
@@ -88,7 +87,6 @@ fn source(
         novarocks_sql::compiler::noop_constant_evaluator(),
         None,
         super::pure_differential::constant_policy(),
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         control.clone(),
     ))
     .unwrap()
@@ -161,7 +159,6 @@ fn source(
                     requires_power_of_two: true,
                 },
                 DmlFinalizedProviderReadSet::empty(),
-                mode,
             ),
             DmlFinalizedWriteTargetSet::try_new([DmlFinalizedWriteTarget { ordinal, handle }])
                 .unwrap(),
@@ -173,13 +170,10 @@ fn source(
 }
 
 #[test]
-fn numeric_unary_writer_dml_actual_statistics_publishes_in_both_modes() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        let (source, functions) = source(mode, true, DataType::Int64, "BIGINT");
-        assert_writer_selections(&source, &functions, mode);
+fn numeric_unary_writer_dml_actual_statistics_publishes_for_compiled() {
+    {
+        let (source, functions) = source(true, DataType::Int64, "BIGINT");
+        assert_writer_selections(&source, &functions);
         let mut partials = 0;
         let mut finals = 0;
         for fragment in source.plan().fragments().values() {
@@ -210,12 +204,9 @@ fn numeric_unary_writer_dml_actual_statistics_publishes_in_both_modes() {
 }
 
 #[test]
-fn numeric_unary_writer_dml_actual_no_statistics_publishes_in_both_modes() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        let (source, _) = source(mode, false, DataType::Int64, "BIGINT");
+fn numeric_unary_writer_dml_actual_no_statistics_publishes_for_compiled() {
+    {
+        let (source, _) = source(false, DataType::Int64, "BIGINT");
         for fragment in source.plan().fragments().values() {
             for node in fragment.nodes().values() {
                 match &node.kind {
@@ -233,7 +224,6 @@ fn numeric_unary_writer_dml_actual_no_statistics_publishes_in_both_modes() {
 fn assert_writer_selections(
     source: &novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
     functions: &EngineFunctionCatalog,
-    mode: SqlPhysicalEmissionMode,
 ) {
     let control = SqlCompileControl::unbounded();
     let semantics = novarocks_sql::compiler::author_fragment_package_semantics(
@@ -314,7 +304,7 @@ fn assert_writer_selections(
                 assert_eq!(
                     expected.as_ref(),
                     &actual,
-                    "actual DML mode={mode:?} fragment={:?} site={site:?} original request={:?}",
+                    "actual DML mode=compiled fragment={:?} site={site:?} original request={:?}",
                     fragment.id(),
                     materialized_request()
                 );
@@ -338,12 +328,9 @@ fn numeric_unary_writer_dml_actual_narrow_statistics_preserve_exact_selected_con
         (DataType::Int16, "SMALLINT"),
         (DataType::Int32, "INT"),
     ] {
-        for mode in [
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-        ] {
-            let (source, functions) = source(mode, true, dtype.clone(), sql_type);
-            assert_writer_selections(&source, &functions, mode);
+        {
+            let (source, functions) = source(true, dtype.clone(), sql_type);
+            assert_writer_selections(&source, &functions);
         }
     }
 }

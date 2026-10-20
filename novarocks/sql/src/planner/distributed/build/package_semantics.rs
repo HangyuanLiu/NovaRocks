@@ -49,7 +49,7 @@ use super::expression_occurrences::{
     ExpressionOccurrenceError, author_physical_occurrences_from_journal_observed,
 };
 use super::lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError};
-use super::physical_expression_effects::PhysicalCallSourceScope;
+use super::physical_expression_effects::{PhysicalCallSourceScope, PhysicalExpressionEffectsError};
 use super::physical_fragment_effects::{
     PhysicalFragmentEffectsError, PhysicalFragmentEffectsInput, PhysicalRelationalCallSourceScope,
     aggregate_source, author_sql_fragment_effects_observed, writer_source,
@@ -69,6 +69,8 @@ pub enum PackageSemanticsError {
     Occurrence(String),
     Journal(String),
     Effects(String),
+    /// An exact prepared-cast capability refusal, before package extraction.
+    UnsupportedCapability(String),
     Pruning(String),
     /// A captured call's constant policy differs from the statement policy.
     PolicyMismatch(PhysicalCallSite),
@@ -81,6 +83,7 @@ impl fmt::Display for PackageSemanticsError {
             Self::Occurrence(detail) => write!(f, "package expression occurrences: {detail}"),
             Self::Journal(detail) => write!(f, "package call source: {detail}"),
             Self::Effects(detail) => write!(f, "package call effects: {detail}"),
+            Self::UnsupportedCapability(detail) => f.write_str(detail),
             Self::Pruning(detail) => write!(f, "package pruning: {detail}"),
             Self::PolicyMismatch(site) => write!(
                 f,
@@ -116,6 +119,9 @@ impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
     fn from(error: PhysicalFragmentEffectsError) -> Self {
         match error {
             PhysicalFragmentEffectsError::Control(cause) => Self::Control(cause),
+            error @ PhysicalFragmentEffectsError::Expressions(
+                PhysicalExpressionEffectsError::UnsupportedCast { .. },
+            ) => Self::UnsupportedCapability(format!("package call effects: {error:?}")),
             other => Self::Effects(format!("{other:?}")),
         }
     }
@@ -330,4 +336,48 @@ fn author_one(
         calls,
         pruning,
     })
+}
+
+#[cfg(test)]
+mod capability_projection_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_functions::CastPrepareError;
+    use std::sync::Arc;
+
+    #[test]
+    fn package_semantics_keeps_exact_cast_refusals_separate_from_invalid_programs() {
+        let from = DataType::List(Arc::new(Field::new("item", DataType::Int8, true)));
+        let to = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
+            PhysicalExpressionEffectsError::UnsupportedCast { from, to },
+        ));
+        let PackageSemanticsError::UnsupportedCapability(detail) = error else {
+            panic!("exact cast capability identity was lost");
+        };
+        assert!(detail.contains("Int8") && detail.contains("Int64"));
+        for error in [
+            PhysicalExpressionEffectsError::Cast(CastPrepareError::TypeMismatch),
+            PhysicalExpressionEffectsError::InvalidSource("UnsupportedCast diagnostic"),
+        ] {
+            assert!(matches!(
+                PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(error)),
+                PackageSemanticsError::Effects(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn package_semantics_capability_projection_preserves_original_control_causes() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            assert!(matches!(
+                PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause)),
+                PackageSemanticsError::Control(actual) if actual == cause
+            ));
+        }
+    }
 }

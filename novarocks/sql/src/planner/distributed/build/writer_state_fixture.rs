@@ -112,7 +112,6 @@ pub fn writer_state_source_for_test(
     counts: &[usize],
     nullable: &[bool],
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    mode: crate::compiler::SqlPhysicalEmissionMode,
 ) -> SqlAuthoredPhysicalPlan {
     assert_eq!(counts.len(), nullable.len());
     assert!(!counts.is_empty());
@@ -190,7 +189,6 @@ pub fn writer_state_source_for_test(
             functions,
             false,
             crate::constant::test_constant_policy(),
-            mode,
             &setup,
         )
         .unwrap()
@@ -259,7 +257,6 @@ pub fn writer_state_source_for_test(
             functions,
             false,
             crate::constant::test_constant_policy(),
-            mode,
             &setup,
         )
         .unwrap()

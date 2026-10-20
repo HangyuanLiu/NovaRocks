@@ -338,18 +338,34 @@ fn evaluate_expected_error_branch_with_sql_error_descriptors(
 }
 
 fn annotate_failure_with_engine_error_code(message: &str, source: &str) -> String {
-    if message.contains("engine_error_code=") {
-        return message.to_string();
+    let mut labels = Vec::new();
+    if !message.contains("engine_error_code=")
+        && let Some(code) = extract_engine_error_code(source)
+            .or_else(|| extract_engine_error_code(message))
+            .or_else(|| {
+                message
+                    .strip_prefix("target execute failed: ")
+                    .and_then(extract_engine_error_code)
+            })
+    {
+        labels.push(format!("engine_error_code={code}"));
     }
-    extract_engine_error_code(source)
-        .or_else(|| extract_engine_error_code(message))
-        .or_else(|| {
-            message
-                .strip_prefix("target execute failed: ")
-                .and_then(extract_engine_error_code)
-        })
-        .map(|code| format!("engine_error_code={} {}", code, message))
-        .unwrap_or_else(|| message.to_string())
+    if !message.contains("sql_error_code=")
+        && let Some(code) = extract_sql_error_code(source)
+            .or_else(|| extract_sql_error_code(message))
+            .or_else(|| {
+                message
+                    .strip_prefix("target execute failed: ")
+                    .and_then(extract_sql_error_code)
+            })
+    {
+        labels.push(format!("sql_error_code={code}"));
+    }
+    if labels.is_empty() {
+        message.to_string()
+    } else {
+        format!("{} {}", labels.join(" "), message)
+    }
 }
 
 fn expected_engine_error_code_diff_result(
@@ -502,11 +518,6 @@ pub(crate) struct Cli {
     #[arg(long)]
     cluster_launch_profile: Option<novarocks_cluster_harness::LaunchProfile>,
 
-    /// Explicit inert physical-wire candidate artifact for cross-process verification.
-    /// Every role must self-report the candidate and test-controls capabilities.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["dry_run", "no_verify", "update_expected", "list_suites", "list_extensions"])]
-    physical_wire_candidate_binary: Option<PathBuf>,
-
     /// SQL statements applied, in order, to each target case session before its first step.
     #[arg(long = "target-session-sql", value_name = "SQL", action = ArgAction::Append)]
     target_session_sql: Vec<String>,
@@ -543,24 +554,6 @@ fn verify_override(cli: &Cli) -> Option<bool> {
     } else {
         None
     }
-}
-
-fn validate_physical_wire_candidate_args(cli: &Cli) -> Result<()> {
-    if cli.physical_wire_candidate_binary.is_some() {
-        ensure!(
-            cli.cluster_mode == ClusterMode::CrossProcess && cli.mode == Mode::Verify,
-            "--physical-wire-candidate-binary requires --cluster-mode cross-process --mode verify"
-        );
-        ensure!(
-            !cli.dry_run
-                && !cli.no_verify
-                && !cli.update_expected
-                && !cli.list_suites
-                && !cli.list_extensions,
-            "physical-wire candidate selection requires actual result verification"
-        );
-    }
-    Ok(())
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -5022,7 +5015,6 @@ fn validate_dataset_launch_profile(
 }
 
 pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
-    validate_physical_wire_candidate_args(&cli)?;
     let base_dir = resolve_repo_root()?;
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
@@ -5541,21 +5533,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         } else {
             selected_cluster_size
         };
-        let (test_sessions, controls) = if let Some(binary) = &cli.physical_wire_candidate_binary {
-            let plan = control_plan::build_physical_wire_candidate(
-                &prepared_inputs,
-                launch_cluster_size,
-                cluster::startup_timeout(),
-                binary,
-                &cli.target_session_sql,
-            )?;
-            failure_artifacts.record_provenance("physical-wire-candidate-intent".into(), serde_json::json!({
-                "role_launches": plan.planned_launch_summaries(),
-                "remaining_original_budget_millis": plan.deadline().saturating_duration_since(Instant::now()).as_millis(),
-                "status": "inert-intents-not-action-evidence"
-            }));
-            (Some(plan), None)
-        } else if !cli.dry_run && control_plan::required(&prepared_inputs) {
+        let (test_sessions, controls) = if !cli.dry_run && control_plan::required(&prepared_inputs)
+        {
             ensure!(
                 launch_cluster_mode == ClusterMode::CrossProcess,
                 "internal SQL controls require a runner-owned native cross-process launch"
@@ -5600,7 +5579,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             &runner_config,
             launch_profile,
             test_sessions,
-            cli.physical_wire_candidate_binary.as_deref(),
         )?;
         if let Some(evidence) = server_handle.actual_build_information_evidence()? {
             failure_artifacts.record_provenance("actual-role-build-information".into(), evidence);
@@ -6775,6 +6753,60 @@ mod tests {
     }
 
     #[test]
+    fn failure_log_includes_sql_error_code_when_available() {
+        let msg = "target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] compiled implementation unavailable";
+
+        assert_eq!(
+            annotate_failure_with_engine_error_code(msg, msg),
+            format!("sql_error_code=sql.analyze.unavailable_implementation {msg}")
+        );
+        assert_eq!(
+            annotate_failure_with_engine_error_code(
+                "target execute failed",
+                "ERROR 1105 (HY000): [sql.analyze.unavailable_implementation] compiled implementation unavailable"
+            ),
+            "sql_error_code=sql.analyze.unavailable_implementation target execute failed"
+        );
+    }
+
+    #[test]
+    fn failure_log_preserves_existing_code_tags_without_duplicates() {
+        for msg in [
+            "engine_error_code=QueryTimeout target execute failed: [QueryTimeout] slow query",
+            "sql_error_code=sql.analyze.unavailable_implementation target execute failed",
+            "engine_error_code=UnsupportedCompiledShape sql_error_code=sql.analyze.unavailable_implementation target execute failed",
+        ] {
+            assert_eq!(annotate_failure_with_engine_error_code(msg, msg), msg);
+        }
+    }
+
+    #[test]
+    fn failure_log_adds_missing_code_tag_without_replacing_existing_tag() {
+        let msg = "engine_error_code=UnsupportedCompiledShape target execute failed";
+        let annotated = annotate_failure_with_engine_error_code(
+            msg,
+            "[sql.analyze.unavailable_implementation] compiled implementation unavailable",
+        );
+        assert_eq!(
+            annotated,
+            format!("sql_error_code=sql.analyze.unavailable_implementation {msg}")
+        );
+        assert_eq!(
+            annotate_failure_with_engine_error_code(&annotated, &annotated),
+            annotated
+        );
+
+        let msg = "sql_error_code=sql.analyze.unavailable_implementation target execute failed";
+        assert_eq!(
+            annotate_failure_with_engine_error_code(
+                msg,
+                "[UnsupportedCompiledShape] unsupported plan"
+            ),
+            format!("engine_error_code=UnsupportedCompiledShape {msg}")
+        );
+    }
+
+    #[test]
     fn failure_log_leaves_plain_errors_unclassified() {
         let msg = "target execute failed: plain execution error";
 
@@ -6919,51 +6951,23 @@ mod tests {
     }
 
     #[test]
-    fn physical_wire_candidate_cli_requires_actual_cross_process_verify() {
+    fn retired_physical_wire_candidate_cli_is_rejected() {
         use clap::Parser;
-        let ordinary = crate::Cli::try_parse_from(["runner", "--suite", "filter"]).unwrap();
-        assert!(ordinary.physical_wire_candidate_binary.is_none());
-        crate::validate_physical_wire_candidate_args(&ordinary).unwrap();
-        let args = [
+        let ordinary = crate::Cli::try_parse_from(["runner", "--suite", "filter"]);
+        assert!(ordinary.is_ok());
+        let error = crate::Cli::try_parse_from([
             "runner",
             "--suite",
             "filter",
             "--physical-wire-candidate-binary",
-            "/candidate",
+            "/retired",
             "--cluster-mode",
             "cross-process",
             "--mode",
             "verify",
-        ];
-        let candidate = crate::Cli::try_parse_from(args).unwrap();
-        crate::validate_physical_wire_candidate_args(&candidate).unwrap();
-        for extra in [
-            "--dry-run",
-            "--no-verify",
-            "--update-expected",
-            "--list-suites",
-            "--list-extensions",
-        ] {
-            assert!(
-                crate::Cli::try_parse_from(args.into_iter().chain([extra])).is_err(),
-                "{extra}"
-            );
-        }
-        for mode in ["record", "diff"] {
-            let mut invalid = args.to_vec();
-            *invalid.last_mut().unwrap() = mode;
-            let cli = crate::Cli::try_parse_from(invalid).unwrap();
-            assert!(crate::validate_physical_wire_candidate_args(&cli).is_err());
-        }
-        let local = crate::Cli::try_parse_from([
-            "runner",
-            "--suite",
-            "filter",
-            "--physical-wire-candidate-binary",
-            "/candidate",
         ])
-        .unwrap();
-        assert!(crate::validate_physical_wire_candidate_args(&local).is_err());
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

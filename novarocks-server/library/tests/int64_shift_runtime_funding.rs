@@ -41,7 +41,7 @@ fn original_production_frame_values_keep_account_through_alias_last_free() {
         let runtime = runtime(&binding);
         let program = program(name, &binding);
         let input = batch(&program, false, 4096);
-        let mut frame = RuntimeScalarFrameForTest::try_new(
+        let mut frame = RuntimeScalarFrameForTest::try_new_with_allocation_host(
             program.clone(),
             site(&program),
             runtime.clone(),

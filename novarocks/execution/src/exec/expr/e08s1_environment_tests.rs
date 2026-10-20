@@ -19,7 +19,7 @@ use super::e08s1_environment_original_tests::{concat_source, unix_source};
 use novarocks_functions::FunctionBindingError;
 use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_sql::compiler::{
-    SqlCompileControl, SqlCompileError, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
+    SqlCompileControl, SqlCompileError, builtin_sql_function_catalog,
     check_pure_call_definitions_observed,
 };
 use novarocks_type_contract::{
@@ -66,11 +66,8 @@ fn original_concat_binding(
 }
 #[test]
 fn e08s1_environment_same_original_concat_source_and_parameters_pass_without_prepare() {
-    for mode in [
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-    ] {
-        let source = concat_source(mode);
+    {
+        let source = concat_source();
         let c = SqlCompileControl::unbounded();
         check_pure_call_definitions_observed(&source, &c).unwrap();
         let original = builtin_sql_function_catalog().snapshot();
@@ -108,19 +105,14 @@ fn e08s1_environment_same_original_concat_source_and_parameters_pass_without_pre
 }
 #[test]
 fn e08s1_environment_same_journal_absent_original_unixtime_zone_is_named_before_task() {
-    let source = unix_source();
-    let error =
-        check_pure_call_definitions_observed(&source, &SqlCompileControl::unbounded()).unwrap_err();
-    let SqlCompileError::Analyze(error) = error else {
-        panic!("typed environment support refusal: {error}")
+    let failure = unix_source().unwrap_err();
+    let novarocks_sql::compiler::SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) =
+        failure
+    else {
+        panic!("typed environment support refusal: {failure:?}")
     };
     assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
     assert!(error.message().contains("builtin.scalar/from_unixtime/"));
-    assert_eq!(
-        source.emission_mode(),
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        "inspection does not alter original source or execute a task"
-    );
 }
 struct Refuse {
     cause: CompileControlError,
@@ -138,7 +130,7 @@ impl PureCompileControl for Refuse {
 }
 #[test]
 fn e08s1_environment_contract_frontier_preserves_three_compile_causes_and_original_no_work() {
-    let source = concat_source(SqlPhysicalEmissionMode::OriginalNativeV1);
+    let source = concat_source();
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let c = SqlCompileControl::unbounded();

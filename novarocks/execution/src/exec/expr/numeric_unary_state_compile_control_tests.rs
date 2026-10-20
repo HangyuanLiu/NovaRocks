@@ -16,9 +16,7 @@
 // under the License.
 
 //! Every real compile checkpoint on one fresh source transaction preserves cause.
-use novarocks_sql::compiler::{
-    SqlCompileError, SqlPhysicalEmissionMode, ordinary_union_source_for_test,
-};
+use novarocks_sql::compiler::{SqlCompileError, ordinary_union_source_for_test};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::sync::Mutex;
 struct Control {
@@ -45,13 +43,7 @@ fn check(sum: Option<(i64, i64, i64)>, intermediate: bool) {
         trace: Mutex::new(Vec::new()),
         stop: None,
     };
-    ordinary_union_source_for_test(
-        sum,
-        intermediate,
-        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        &success,
-    )
-    .unwrap();
+    ordinary_union_source_for_test(sum, intermediate, &success).unwrap();
     let trace = success.trace.into_inner().unwrap();
     assert!(!trace.is_empty());
     for ordinal in 0..trace.len() {
@@ -64,12 +56,7 @@ fn check(sum: Option<(i64, i64, i64)>, intermediate: bool) {
                 trace: Mutex::new(Vec::new()),
                 stop: Some((ordinal, cause)),
             };
-            let result = ordinary_union_source_for_test(
-                sum,
-                intermediate,
-                SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-                &refused,
-            );
+            let result = ordinary_union_source_for_test(sum, intermediate, &refused);
             let actual = match result {
                 Ok(_) => panic!("publication after a real refusal"),
                 Err(error) => error,

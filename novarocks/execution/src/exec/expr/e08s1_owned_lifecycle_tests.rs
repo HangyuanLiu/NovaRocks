@@ -24,7 +24,7 @@ use novarocks_functions::{
 use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_sql::compiler::{
     SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent, SqlCompiler,
-    SqlPhysicalEmissionMode, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
+    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
     builtin_sql_function_catalog,
 };
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -38,7 +38,7 @@ fn arg(ty: DataType) -> FunctionArgument {
         constant: None,
     }
 }
-fn analyze(sql: &str, mode: SqlPhysicalEmissionMode) -> Result<(), SqlCompileError> {
+fn analyze(sql: &str) -> Result<(), SqlCompileError> {
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let tables = SqlPlannerTableSnapshot::new(&catalog);
     let request = SqlAnalyzeRequest::new(
@@ -51,7 +51,6 @@ fn analyze(sql: &str, mode: SqlPhysicalEmissionMode) -> Result<(), SqlCompileErr
         &EVALUATOR,
         None,
         super::pure_differential::constant_policy(),
-        mode,
         SqlCompileControl::unbounded(),
     );
     SqlCompiler::analyze(request)?.into_pending()?;
@@ -129,12 +128,7 @@ fn e08s1_missing_aggregate_window_and_over_keep_unavailable_span_before_any_fold
         ),
     ] {
         reset();
-        analyze(sql, SqlPhysicalEmissionMode::OriginalNativeV1).unwrap();
-        let error = analyze(
-            sql,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        )
-        .unwrap_err();
+        let error = analyze(sql).unwrap_err();
         let SqlCompileError::Analyze(error) = error else {
             panic!("typed analyze failure: {error}")
         };
@@ -156,11 +150,7 @@ fn e08s1_supported_over_and_invalid_regexp_data_are_not_evaluated_by_static_gate
         "SELECT regexp_count('x', '[')",
     ] {
         reset();
-        analyze(
-            sql,
-            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        )
-        .unwrap();
+        analyze(sql).unwrap();
         assert_eq!(fold_count(), 0);
     }
 }

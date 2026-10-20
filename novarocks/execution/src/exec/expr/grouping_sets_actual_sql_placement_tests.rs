@@ -20,18 +20,17 @@ use super::filter_conjunction_actual_sql_compiler_tests::{compiler_results, sour
 use super::ndv_filter_actual_sql_source_tests::sql_source_with_columns;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use arrow::datatypes::DataType;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlPhysicalEmissionMode};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 
 const ORIGINAL_INPUT: &str = "SELECT GROUPING(a) AS g, a, count(*) AS rows_seen,\n       count(a) AS nonnull_a, count(DISTINCT a) AS distinct_a,\n       sum(a) AS sum_a, sum(b) AS sum_b,\n       array_agg(a ORDER BY b) AS ordered_a\nFROM fixture.t_grouping_input\nGROUP BY ROLLUP(a)\nORDER BY g, a NULLS FIRST;";
 const GROUPING_SET: &str =
     "select v1, sum(v2), min(v2 + v3) from fixture.t0 group by grouping sets((v1, v2));";
-fn sources(mode: SqlPhysicalEmissionMode) -> [(&'static str, SqlAuthoredPhysicalPlan); 2] {
+fn sources() -> [(&'static str, SqlAuthoredPhysicalPlan); 2] {
     [
         (
             "grouping_sets_original_aggregate_input/query2",
             sql_source_with_columns(
                 ORIGINAL_INPUT,
-                mode,
                 &[("a", DataType::Int32), ("b", DataType::Int32)],
             ),
         ),
@@ -39,7 +38,6 @@ fn sources(mode: SqlPhysicalEmissionMode) -> [(&'static str, SqlAuthoredPhysical
             "agg_test_grouping_set/query4",
             sql_source_with_columns(
                 GROUPING_SET,
-                mode,
                 &[
                     ("v1", DataType::Int64),
                     ("v2", DataType::Int64),
@@ -50,18 +48,18 @@ fn sources(mode: SqlPhysicalEmissionMode) -> [(&'static str, SqlAuthoredPhysical
         ),
     ]
 }
-fn source_probe(mode: SqlPhysicalEmissionMode) {
-    for (case, source) in sources(mode) {
+fn source_probe() {
+    for (case, source) in sources() {
         assert!(!source.plan().fragments().is_empty());
         eprintln!(
-            "grouping actual source case={case} mode={mode:?} result={:?} edges={:?}",
+            "grouping actual source case={case} mode=compiled result={:?} edges={:?}",
             source.plan().result_port(),
             source.plan().edges()
         );
         for (fragment_id, fragment) in source.plan().fragments() {
             for node in fragment.nodes().values() {
                 eprintln!(
-                    "grouping actual node case={case} mode={mode:?} fragment={fragment_id:?} node={node:?}"
+                    "grouping actual node case={case} mode=compiled fragment={fragment_id:?} node={node:?}"
                 );
                 for input in &node.inputs {
                     let child = fragment
@@ -92,30 +90,24 @@ fn source_probe(mode: SqlPhysicalEmissionMode) {
         }
     }
 }
-fn permanent_compilation(mode: SqlPhysicalEmissionMode) {
+fn permanent_compilation() {
     let functions = installed_builtin_owner_catalogue();
-    for (case, source) in sources(mode) {
+    for (case, source) in sources() {
         let programs = compiler_results(&source, &functions);
         assert_eq!(programs.len(), source.plan().fragments().len());
         for (fragment, result) in programs {
-            let program = result.unwrap_or_else(|error| panic!("complete original grouping SQL must compile: case={case} mode={mode:?} fragment={fragment:?}: {error:?}"));
+            let program = result.unwrap_or_else(|error| panic!("complete original grouping SQL must compile: case={case} mode=compiled fragment={fragment:?}: {error:?}"));
             assert!(!program.graph().nodes().is_empty());
         }
     }
 }
-#[test]
-fn grouping_sets_actual_original_source_and_packages() {
-    source_probe(SqlPhysicalEmissionMode::OriginalNativeV1);
-}
+
 #[test]
 fn grouping_sets_actual_candidate_source_and_packages() {
-    source_probe(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration);
+    source_probe();
 }
-#[test]
-fn grouping_sets_actual_original_complete_compilation() {
-    permanent_compilation(SqlPhysicalEmissionMode::OriginalNativeV1);
-}
+
 #[test]
 fn grouping_sets_actual_candidate_complete_compilation() {
-    permanent_compilation(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration);
+    permanent_compilation();
 }

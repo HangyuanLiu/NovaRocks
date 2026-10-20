@@ -127,7 +127,6 @@ pub(crate) fn lower_final_physical_plan(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner(
@@ -138,7 +137,6 @@ pub(crate) fn lower_final_physical_plan(
         functions,
         root_allow_throw_exception,
         constant_policy,
-        emission_mode,
         control,
     )
 }
@@ -155,7 +153,6 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner(
@@ -166,7 +163,6 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
         functions,
         root_allow_throw_exception,
         constant_policy,
-        emission_mode,
         control,
     )
 }
@@ -195,7 +191,6 @@ pub(crate) fn lower_final_physical_write_plan(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let FinalWriteLowering {
@@ -212,7 +207,6 @@ pub(crate) fn lower_final_physical_write_plan(
         functions,
         root_allow_throw_exception,
         constant_policy,
-        emission_mode,
         control,
     )?;
     // A write states the runtime filters it can name, for the same reason a
@@ -252,7 +246,6 @@ pub(crate) fn lower_final_change_stream_write_plan(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let FinalChangeStreamWriteLowering {
@@ -268,7 +261,6 @@ pub(crate) fn lower_final_change_stream_write_plan(
         functions,
         root_allow_throw_exception,
         constant_policy,
-        emission_mode,
         control,
     )?;
     dag.validate().map_err(invalid_write)?;
@@ -301,7 +293,6 @@ fn lower_final_physical_plan_inner(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner_with_domains(
@@ -313,7 +304,6 @@ fn lower_final_physical_plan_inner(
         functions,
         root_allow_throw_exception,
         constant_policy,
-        emission_mode,
         control,
     )
 }
@@ -327,7 +317,6 @@ pub(crate) fn lower_final_physical_plan_with_root_semantics(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner_with_domains(
@@ -339,7 +328,6 @@ pub(crate) fn lower_final_physical_plan_with_root_semantics(
         functions,
         root_allow_throw_exception,
         constant_policy,
-        emission_mode,
         control,
     )
 }
@@ -353,7 +341,6 @@ fn lower_final_physical_plan_inner_with_domains(
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let domains = semantics
@@ -368,7 +355,6 @@ fn lower_final_physical_plan_inner_with_domains(
         functions,
         root_allow_throw_exception,
         constant_policy,
-        emission_mode,
         control,
     )?;
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
@@ -416,7 +402,6 @@ fn lower_final_physical_plan_inner_with_domains(
 }
 
 struct ContractLoweringVisitor<'a> {
-    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     root_allow_throw_exception_used: bool,
@@ -1540,12 +1525,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
         root_allow_throw_exception: bool,
         constant_policy: novarocks_constant_contract::ConstantPolicy,
-        emission_mode: crate::compiler::SqlPhysicalEmissionMode,
         control: &'a dyn PureCompileControl,
     ) -> Result<Self, ContractLoweringError> {
         let work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         Ok(Self {
-            emission_mode,
             root_allow_throw_exception,
             constant_policy,
             root_allow_throw_exception_used: false,
@@ -2031,7 +2014,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         mut self,
         result_port: ResultPort,
     ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
-        // Both wire modes publish the guarantee of the same completed value
+        // The compiled path publishes the guarantee of the same completed value
         // graph. The original NULL transaction owns arithmetic/cast/function
         // policy; the result declaration never reconstructs those rules.
         let transaction = self
@@ -2047,16 +2030,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                 return Err(error);
             }
         };
-        let (result_port, result_declaration) = match self.emission_mode {
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1 => (computed, None),
-            crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
-                let declaration = super::lowered_draft::SqlResultDeclaration::capture(
-                    self.plan_version,
-                    result_port,
-                );
-                (computed, Some(declaration))
-            }
-        };
+        let result_declaration =
+            super::lowered_draft::SqlResultDeclaration::capture(self.plan_version, result_port);
+        let result_port = computed;
         let result: Result<Option<SemanticParameters>, ContractLoweringError> = (|| {
             self.plan_builder.set_result_port(result_port)?;
             self.attach_runtime_filter_endpoints()?;
@@ -2215,7 +2191,6 @@ impl<'a> ContractLoweringVisitor<'a> {
             self.plan_builder,
             self.call_sources,
             self.functions,
-            self.emission_mode,
             result_declaration,
         ))
     }
@@ -13315,7 +13290,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &control,
             ));
             assert_eq!(error, cause);
@@ -13374,7 +13348,6 @@ mod tests {
                     crate::functions::builtin_sql_function_catalog().snapshot(),
                     false,
                     crate::constant::test_constant_policy(),
-                    crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                     &control
                 )),
                 cause
@@ -13408,7 +13381,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &control
             )),
             CompileControlError::Cancelled
@@ -13442,7 +13414,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &control,
         )
         .unwrap();
@@ -13915,7 +13886,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )?
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())?
@@ -13960,7 +13930,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -14022,7 +13991,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -14116,7 +14084,6 @@ mod tests {
             crate::compiler::SqlFunctionCatalog::snapshot(&functions),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -14248,7 +14215,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -14345,7 +14311,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -14859,7 +14824,6 @@ mod tests {
                 Arc::clone(&functions),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control,
             )
         };
@@ -14891,7 +14855,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -15072,7 +15035,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap()
@@ -15146,7 +15108,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &control,
         )
         .unwrap();
@@ -15997,7 +15958,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidUnpivot { .. })
@@ -16029,7 +15989,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidRepeat { .. })
@@ -16065,7 +16024,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidTableFunction { .. })
@@ -16104,7 +16062,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             ),
             Err(ContractLoweringError::InvalidWindow { .. })
@@ -16133,7 +16090,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .is_err()
@@ -16161,7 +16117,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -16194,7 +16149,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -17073,7 +17027,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .err()
@@ -17243,7 +17196,6 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(),
-                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &control,
             )
             .unwrap();
@@ -17299,7 +17251,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &control,
         )
         .unwrap();
@@ -17337,7 +17288,6 @@ mod tests {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             crate::constant::test_constant_policy(),
-            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &control,
         )
         .unwrap();

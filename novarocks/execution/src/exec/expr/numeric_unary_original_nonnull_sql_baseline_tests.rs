@@ -56,39 +56,28 @@ use novarocks_sql::compiler::{
 pub(super) fn sql_source(
     sql: &str,
     dtype: DataType,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_semantics(
         sql,
         dtype,
-        emission_mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )
 }
 pub(super) fn sql_source_with_semantics(
     sql: &str,
     dtype: DataType,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    sql_source_with_explicit_single_field(
-        sql,
-        Field::new("k", dtype, false),
-        emission_mode,
-        sql_semantics,
-        None,
-    )
+    sql_source_with_explicit_single_field(sql, Field::new("k", dtype, false), sql_semantics, None)
 }
 /// A fixture source fact is explicit; it is never inferred from test data.
 pub(super) fn sql_source_with_single_field(
     sql: &str,
     field: Field,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_explicit_single_field(
         sql,
         field,
-        emission_mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         None,
     )
@@ -98,12 +87,10 @@ pub(super) fn sql_source_with_single_field(
 pub(super) fn sql_source_with_single_field_and_core_residuals(
     sql: &str,
     field: Field,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_explicit_single_field(
         sql,
         field,
-        emission_mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         Some(false),
     )
@@ -111,29 +98,20 @@ pub(super) fn sql_source_with_single_field_and_core_residuals(
 fn sql_source_with_explicit_single_field(
     sql: &str,
     field: Field,
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    sql_source_with_explicit_fields(
-        sql,
-        &[field],
-        emission_mode,
-        sql_semantics,
-        static_predicate_offer,
-    )
+    sql_source_with_explicit_fields(sql, &[field], sql_semantics, static_predicate_offer)
 }
 /// Explicit original relation declarations for multi-column SQL fixtures.
 /// This shares the one original fact/resume/provider author, never a second plan.
 pub(super) fn sql_source_with_declared_fields(
     sql: &str,
     fields: &[Field],
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_explicit_fields(
         sql,
         fields,
-        emission_mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         None,
     )
@@ -141,24 +119,15 @@ pub(super) fn sql_source_with_declared_fields(
 fn sql_source_with_explicit_fields(
     sql: &str,
     fields: &[Field],
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    try_sql_source_with_explicit_fields(
-        sql,
-        fields,
-        emission_mode,
-        sql_semantics,
-        static_predicate_offer,
-    )
-    .unwrap()
+    try_sql_source_with_explicit_fields(sql, fields, sql_semantics, static_predicate_offer).unwrap()
 }
 
 pub(super) fn try_sql_source_with_declared_fields(
     sql: &str,
     fields: &[Field],
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
 ) -> Result<
     novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
     novarocks_sql::compiler::SqlCompileProgressError,
@@ -166,7 +135,6 @@ pub(super) fn try_sql_source_with_declared_fields(
     try_sql_source_with_explicit_fields(
         sql,
         fields,
-        emission_mode,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         None,
     )
@@ -175,7 +143,6 @@ pub(super) fn try_sql_source_with_declared_fields(
 fn try_sql_source_with_explicit_fields(
     sql: &str,
     fields: &[Field],
-    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
 ) -> Result<
@@ -214,7 +181,6 @@ fn try_sql_source_with_explicit_fields(
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
-        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -328,11 +294,7 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
         ("INT", "-2147483648", DataType::Int32),
     ] {
         let _ = (ty, min); // Values are runtime inputs, never used to manufacture plan types.
-        let source = sql_source(
-            "SELECT -k AS original_negated FROM fixture",
-            dtype.clone(),
-            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
-        );
+        let source = sql_source("SELECT -k AS original_negated FROM fixture", dtype.clone());
         let port = source.plan().result_port().unwrap();
         assert_original_same_owner(port, &source);
         assert_eq!(port.fields.len(), 1);
@@ -374,7 +336,6 @@ fn numeric_unary_original_nonnull_sql_baseline_ordered_labels_and_values_are_act
     let source = sql_source(
         "SELECT -k AS first_alias, k AS original_source, -k AS repeated_alias FROM fixture",
         DataType::Int8,
-        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
     );
     let port = source.plan().result_port().unwrap();
     assert_original_same_owner(port, &source);

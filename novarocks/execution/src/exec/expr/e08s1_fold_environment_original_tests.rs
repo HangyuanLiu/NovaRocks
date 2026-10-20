@@ -18,14 +18,10 @@
 use super::sql_scalar_presence_original_tests::{EVALUATOR, SERIAL, fold_count, reset, session};
 use novarocks_sql::compiler::{
     SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent, SqlCompiler,
-    SqlOptimizeRequest, SqlPhysicalEmissionMode, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
-    SqlStatementInput, builtin_sql_function_catalog,
+    SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlStatementInput,
+    builtin_sql_function_catalog,
 };
-pub(super) fn optimize(
-    sql: &str,
-    mode: SqlPhysicalEmissionMode,
-    max_len: Option<i64>,
-) -> Result<(), SqlCompileError> {
+pub(super) fn optimize(sql: &str, max_len: Option<i64>) -> Result<(), SqlCompileError> {
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let tables = SqlPlannerTableSnapshot::new(&catalog);
     let mut source_session = session();
@@ -43,7 +39,6 @@ pub(super) fn optimize(
         &EVALUATOR,
         None,
         super::pure_differential::constant_policy(),
-        mode,
         control.clone(),
     ))?
     .into_pending()?;
@@ -55,12 +50,7 @@ pub(super) fn optimize(
 fn e08s1_fold_environment_original_concat_missing_limit_still_reaches_child_fold() {
     let _serial = SERIAL.lock().unwrap();
     reset();
-    optimize(
-        "SELECT GROUP_CONCAT(REVERSE('abc'))",
-        SqlPhysicalEmissionMode::OriginalNativeV1,
-        None,
-    )
-    .unwrap();
+    optimize("SELECT GROUP_CONCAT(REVERSE('abc'))", None).unwrap();
     assert!(
         fold_count() > 0,
         "original child calculator is genuinely observed"
@@ -72,7 +62,6 @@ fn e08s1_fold_environment_original_unixtime_absent_zone_still_reaches_child_fold
     reset();
     optimize(
         "SELECT FROM_UNIXTIME(CAST(ABS(CAST(1 AS BIGINT)) AS BIGINT))",
-        SqlPhysicalEmissionMode::OriginalNativeV1,
         None,
     )
     .unwrap();

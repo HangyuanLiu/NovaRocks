@@ -108,7 +108,7 @@ pub enum BoundScanRanges {
 /// `bind` performs only "connector-ranges + static config -> op"; all wire
 /// decoding happens earlier in the decoders. This keeps the connector layer
 /// uniform and free of proto/thrift types. Later KRN-1 phases store an
-/// `Arc<dyn ScanSource>` on `ScanNode` and call `bind` at execution time.
+/// Task-owned `Arc<dyn ScanSource>` values bind their exact assignment at execution time.
 pub trait ScanSource: Send + Sync {
     fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String>;
 
@@ -136,165 +136,6 @@ pub trait ScanSource: Send + Sync {
 #[cfg(test)]
 const _: fn(&dyn ScanSource) = |_scan_source: &dyn ScanSource| {};
 
-#[derive(Clone)]
-pub struct ScanNode {
-    source: Arc<dyn ScanSource>,
-    node_id: Option<i32>,
-    native_runtime_filter_specs:
-        Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
-    conjunct_predicate: Option<ExprId>,
-    output_chunk_schema: ChunkSchemaRef,
-    /// Scan-level limit: the scan stops delivering once it has output this
-    /// many rows.
-    limit: Option<usize>,
-}
-
-/// Test-only static source that binds to a fixed, pre-built op regardless of
-/// ranges. Lets operator/decoder tests keep hand-rolling a `ScanOp` and drop it
-/// onto a static `ScanNode` without a real connector source.
-struct FixedOpScanSource(Arc<dyn ScanOp>);
-
-impl ScanSource for FixedOpScanSource {
-    fn bind(&self, _ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
-        Ok(Arc::clone(&self.0))
-    }
-}
-
-impl ScanNode {
-    /// Split the temporary decoder node without losing the exact runtime
-    /// source that the Task instance must later bind to its scan ranges.
-    pub(crate) fn into_static_fields_with_source(
-        self,
-    ) -> (
-        Arc<dyn ScanSource>,
-        (
-            Option<i32>,
-            Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
-            Option<ExprId>,
-            Option<usize>,
-        ),
-    ) {
-        (
-            self.source,
-            (
-                self.node_id,
-                self.native_runtime_filter_specs,
-                self.conjunct_predicate,
-                self.limit,
-            ),
-        )
-    }
-
-    pub fn new(source: Arc<dyn ScanSource>) -> Self {
-        Self {
-            source,
-            node_id: None,
-            native_runtime_filter_specs: Vec::new(),
-            conjunct_predicate: None,
-            output_chunk_schema: Arc::new(ChunkSchema::empty()),
-            limit: None,
-        }
-    }
-
-    /// Test-only: build a static node whose source binds to `op` regardless of
-    /// ranges. Mirrors the pre-Phase-3 `ScanNode::new(op)` ergonomics for tests.
-    /// Builds a fixed scan source for owner-local tests and test adapters.
-    pub fn new_for_test(op: Arc<dyn ScanOp>) -> Self {
-        Self::new(Arc::new(FixedOpScanSource(op)))
-    }
-
-    pub fn with_node_id(mut self, node_id: i32) -> Self {
-        self.node_id = Some(node_id);
-        self
-    }
-
-    pub fn set_native_runtime_filter_specs(
-        &mut self,
-        specs: Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
-    ) {
-        self.native_runtime_filter_specs = specs;
-    }
-
-    pub fn with_runtime_filter_consumers(
-        mut self,
-        specs: Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
-    ) -> Self {
-        self.native_runtime_filter_specs = specs;
-        self
-    }
-
-    /// Hand this node's runtime-filter consumer contracts to its source.
-    ///
-    /// Call after [`Self::with_runtime_filter_consumers`]: a source that reads
-    /// through a typed connector uses the contracts to subscribe to the live
-    /// filter it will consult per row group.
-    pub fn install_runtime_filter_contracts(mut self) -> Result<Self, String> {
-        if let Some(source) = self
-            .source
-            .with_runtime_filter_contracts(&self.native_runtime_filter_specs)?
-        {
-            self.source = source;
-        }
-        Ok(self)
-    }
-
-    pub fn with_output_chunk_schema(mut self, output_chunk_schema: ChunkSchemaRef) -> Self {
-        self.output_chunk_schema = output_chunk_schema;
-        self
-    }
-
-    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
-        self.limit = limit;
-        self
-    }
-
-    pub fn node_id(&self) -> Option<i32> {
-        self.node_id
-    }
-
-    /// The static scan source. The per-instance `ScanOp` is materialized from
-    /// this plus the instance's `BoundScanRanges` at execution time
-    /// (`materialize_scan_bindings`), not stored on the node.
-    pub fn source(&self) -> Arc<dyn ScanSource> {
-        Arc::clone(&self.source)
-    }
-
-    pub fn native_runtime_filter_specs(
-        &self,
-    ) -> &[crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding] {
-        &self.native_runtime_filter_specs
-    }
-
-    pub fn output_chunk_schema(&self) -> ChunkSchemaRef {
-        Arc::clone(&self.output_chunk_schema)
-    }
-
-    pub fn conjunct_predicate(&self) -> Option<ExprId> {
-        self.conjunct_predicate
-    }
-
-    pub fn with_conjunct_predicate(mut self, predicate: Option<ExprId>) -> Self {
-        self.conjunct_predicate = predicate;
-        self
-    }
-
-    pub fn set_conjunct_predicate(&mut self, predicate: Option<ExprId>) {
-        self.conjunct_predicate = predicate;
-    }
-
-    pub fn limit(&self) -> Option<usize> {
-        self.limit
-    }
-}
-
-impl std::fmt::Debug for ScanNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScanNode")
-            .field("node_id", &self.node_id)
-            .finish_non_exhaustive()
-    }
-}
-
 /// A stream source for tests whose scan is built but never run: claiming it fails.
 #[cfg(test)]
 pub(crate) struct UnusedScanStream;
@@ -308,33 +149,5 @@ impl ScanStreamSource for UnusedScanStream {
         _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream> {
         Err("this test scan is never run".to_string().into())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::{BoundScanRanges, ScanNode, ScanOp, ScanSource};
-
-    #[test]
-    fn freezing_scan_keeps_exact_source_binding_capability() {
-        struct TestSource(Arc<AtomicUsize>);
-        impl ScanSource for TestSource {
-            fn bind(&self, _ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Err("test binding reached".to_string())
-            }
-        }
-        let calls = Arc::new(AtomicUsize::new(0));
-        let source: Arc<dyn ScanSource> = Arc::new(TestSource(Arc::clone(&calls)));
-        let (retained, (node_id, ..)) = ScanNode::new(Arc::clone(&source))
-            .with_node_id(7)
-            .into_static_fields_with_source();
-        drop(source);
-        assert_eq!(node_id, Some(7));
-        assert!(retained.bind(BoundScanRanges::None).is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
