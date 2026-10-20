@@ -40,7 +40,7 @@ SELECT array_sortby([], [], []) AS value;
 SELECT array_sortby([NULL,8,7], [3,1,2]) AS value;
 
 -- query 8
--- @expect_error=Input arrays' size are not equal in array_sortby
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 SELECT array_sortby([1,2,3], [1,2]) AS value;
 
 -- query 9

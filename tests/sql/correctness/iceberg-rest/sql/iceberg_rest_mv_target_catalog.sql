@@ -98,8 +98,6 @@ SELECT COUNT(*) FROM analytics_${uuid0}.mv_orders_${uuid0};
 -- query 12
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG default_catalog;
-DROP MATERIALIZED VIEW IF EXISTS `default`.mv_bad_${uuid0};
 SET CATALOG iceberg_rest_${suite_uuid0};
 DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_orders_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_conflict_${uuid0};
