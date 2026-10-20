@@ -2639,6 +2639,18 @@ pub trait ServerHandle: Send {
         Ok(None)
     }
 
+    /// Read-only exact launch/grant binding for a predeclared finite MV action.
+    fn mv_scheduler_outcome_binding(
+        &self,
+        _grant_id: &str,
+        _catalog: &str,
+        _namespace: &str,
+        _mv: &str,
+        _directory: &Path,
+    ) -> Result<novarocks_failpoint::target_binding::RoleProcessReceipt> {
+        bail!("finite MV scheduler observation requires an authenticated role session")
+    }
+
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
     fn process_resource_identities(
@@ -4966,6 +4978,20 @@ impl ServerHandle for CrossProcessServerHandle {
     fn actual_build_information_evidence(&self) -> Result<Option<serde_json::Value>> {
         self.build_information_evidence().map(Some)
     }
+    fn mv_scheduler_outcome_binding(
+        &self,
+        grant_id: &str,
+        catalog: &str,
+        namespace: &str,
+        mv: &str,
+        directory: &Path,
+    ) -> Result<novarocks_failpoint::target_binding::RoleProcessReceipt> {
+        self.test_sessions
+            .as_ref()
+            .context("MV scheduler observation requires the current FE role session")?
+            .mv_scheduler_outcome_binding(grant_id, catalog, namespace, mv, directory)
+    }
+
     fn target_host(&self) -> Option<&str> {
         Some(self.target_host.as_str())
     }

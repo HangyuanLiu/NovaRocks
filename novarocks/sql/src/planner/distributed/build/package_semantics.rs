@@ -68,6 +68,8 @@ pub enum PackageSemanticsError {
     Control(CompileControlError),
     /// The original constant admission owner, without reclassifying its limit.
     ConstantSource(novarocks_functions::ConstantError),
+    /// A comparison author retained with its original fact and diagnostic.
+    Source(novarocks_failure_contract::SharedFailureCause),
     Occurrence(String),
     Journal(String),
     Effects(String),
@@ -83,6 +85,7 @@ impl fmt::Display for PackageSemanticsError {
         match self {
             Self::Control(cause) => cause.fmt(f),
             Self::ConstantSource(cause) => write!(f, "constant admission limit: {cause}"),
+            Self::Source(cause) => cause.fmt(f),
             Self::Occurrence(detail) => write!(f, "package expression occurrences: {detail}"),
             Self::Journal(detail) => write!(f, "package call source: {detail}"),
             Self::Effects(detail) => write!(f, "package call effects: {detail}"),
@@ -101,6 +104,7 @@ impl std::error::Error for PackageSemanticsError {
         match self {
             Self::Control(cause) => Some(cause),
             Self::ConstantSource(cause) => Some(cause),
+            Self::Source(cause) => Some(cause),
             _ => None,
         }
     }
@@ -113,6 +117,7 @@ impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
         let (class, code) = match self {
             Self::Control(cause) => return cause.failure_fact(),
             Self::ConstantSource(cause) => return cause.failure_fact(),
+            Self::Source(cause) => return cause.failure_fact(),
             Self::Occurrence(_) => (FailureClass::Invariant, 7),
             Self::Journal(_) => (FailureClass::Invariant, 8),
             Self::Effects(_) => (FailureClass::Invariant, 9),
@@ -198,6 +203,12 @@ impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
         };
         match error {
             PhysicalFragmentEffectsError::Control(cause) => Self::Control(cause),
+            PhysicalFragmentEffectsError::Expressions(
+                PhysicalExpressionEffectsError::Comparison(cause),
+            ) => match cause.control_error() {
+                Some(control) => Self::Control(control),
+                None => Self::Source(novarocks_failure_contract::SharedFailureCause::new(cause)),
+            },
             error @ PhysicalFragmentEffectsError::Expressions(
                 PhysicalExpressionEffectsError::UnsupportedCast { .. },
             ) => Self::UnsupportedCapability(format!("package call effects: {error:?}")),
@@ -547,5 +558,158 @@ mod constant_limit_projection_tests {
             assert!(matches!(&error, PackageSemanticsError::Control(actual) if actual == &cause));
             assert_eq!(error.failure_fact(), cause.failure_fact());
         }
+    }
+}
+
+#[cfg(test)]
+mod comparison_source_projection_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+    use novarocks_functions::{ComparisonPrepareError, PreparedComparisonRecipe};
+    use novarocks_type_contract::{ComparisonOperator, FunctionValueType};
+    use std::{error::Error, sync::Arc};
+
+    fn domain(data_type: DataType) -> FunctionValueType {
+        FunctionValueType::from_legacy_declared_projection(data_type, true)
+    }
+
+    fn package(original: ComparisonPrepareError) -> PackageSemanticsError {
+        PackageSemanticsError::from(PhysicalFragmentEffectsError::from(
+            PhysicalExpressionEffectsError::from(original),
+        ))
+    }
+
+    #[test]
+    fn actual_comparison_recipe_refusal_and_mismatch_keep_distinct_original_sources() {
+        let nested = domain(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        ))));
+        let left = domain(DataType::Int32);
+        let right = domain(DataType::Int64);
+        for (left, right, expected_original, expected_class) in [
+            (
+                &nested,
+                &nested,
+                ComparisonPrepareError::Unsupported,
+                FailureClass::Unsupported,
+            ),
+            (
+                &left,
+                &right,
+                ComparisonPrepareError::TypeMismatch,
+                FailureClass::Invariant,
+            ),
+        ] {
+            let original = PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
+                left,
+                right,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap_err();
+            assert_eq!(original, expected_original);
+            let expected = original.failure_fact();
+            assert_eq!(expected.class(), expected_class);
+            let error = package(original.clone());
+            assert_eq!(error.failure_fact(), expected);
+            let PackageSemanticsError::Source(source) = &error else {
+                panic!("comparison source was replaced by a SQL diagnostic");
+            };
+            assert_eq!(
+                source.downcast_ref::<ComparisonPrepareError>(),
+                Some(&original)
+            );
+            assert_eq!(source.detail(), original.to_string());
+            assert_eq!(error.to_string(), original.to_string());
+            let retained = error
+                .source()
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            assert_eq!(retained, source);
+            assert_eq!(
+                retained
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<ComparisonPrepareError>(),
+                Some(&original)
+            );
+        }
+        let invalid = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
+            PhysicalExpressionEffectsError::InvalidSource("comparison unsupported"),
+        ));
+        assert!(matches!(invalid, PackageSemanticsError::Effects(_)));
+        assert_eq!(invalid.failure_fact().class(), FailureClass::Invariant);
+    }
+
+    struct Refuse(CompileControlError);
+    impl PureCompileControl for Refuse {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn actual_comparison_control_refusal_keeps_all_original_control_causes() {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let source = SharedFailureCause::new(LayoutResourceError::SourceModel);
+        let value = domain(DataType::Int32);
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(source.clone()),
+        ] {
+            let original = PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
+                &value,
+                &value,
+                &Refuse(control.clone()),
+            )
+            .unwrap_err();
+            assert_eq!(original.control_error(), Some(control.clone()));
+            let error = package(original);
+            assert_eq!(error.failure_fact(), control.failure_fact());
+            assert!(matches!(error, PackageSemanticsError::Control(actual) if actual == control));
+            // The package boundary must also normalize a directly nested control.
+            let nested = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
+                PhysicalExpressionEffectsError::Comparison(ComparisonPrepareError::Control(
+                    control.clone(),
+                )),
+            ));
+            assert!(matches!(nested, PackageSemanticsError::Control(actual) if actual == control));
+        }
+    }
+
+    #[test]
+    fn comparison_kernel_source_keeps_its_real_invalid_author() {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let kernel =
+            novarocks_functions::KernelFailure::from_domain(LayoutResourceError::SourceModel);
+        let original = ComparisonPrepareError::Kernel(kernel);
+        let expected = original.failure_fact();
+        let error = package(original.clone());
+        assert_eq!(error.failure_fact(), expected);
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        let PackageSemanticsError::Source(source) = error else {
+            panic!("the original kernel source was not retained");
+        };
+        assert_eq!(
+            source.downcast_ref::<ComparisonPrepareError>(),
+            Some(&original)
+        );
+        let comparison = source.downcast_ref::<ComparisonPrepareError>().unwrap();
+        let retained_kernel = comparison
+            .source()
+            .unwrap()
+            .downcast_ref::<novarocks_functions::KernelFailure>()
+            .unwrap();
+        assert!(
+            matches!(comparison, ComparisonPrepareError::Kernel(expected) if expected == retained_kernel)
+        );
+        assert_eq!(retained_kernel.failure_fact(), expected);
     }
 }

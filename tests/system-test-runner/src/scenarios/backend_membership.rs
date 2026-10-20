@@ -17,6 +17,7 @@
 
 //! Process-boundary backend self-registration acceptance.
 
+use super::distributed_writer::{assert_commit_never_invoked, publication_terminals};
 use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
@@ -524,6 +525,10 @@ impl Scenario for PreReadyDmlNoRecovery {
             .context("create DML target table")?;
         drop(setup);
 
+        // This scenario owns a fresh FE and runs no concurrent DML between the
+        // snapshots. The exact token-scoped observation below binds this one
+        // statement; the publication labels independently prove no commit.
+        let publication_before = publication_terminals(context, "write")?;
         let target = 0;
         let old_process_id = context.handle().backend_process_id(target)?;
         let selected = self.intent.take(0)?;
@@ -571,15 +576,24 @@ impl Scenario for PreReadyDmlNoRecovery {
             })?
             .expect_err("a pre-ready external-effect execution must not auto-replan");
         let error_message = format!("{error:#}");
-        ensure!(
-            error_message.contains("KnownUncommitted"),
-            "pre-ready DML without engine/provider isolation proof must return KnownUncommitted, got: {error_message}"
-        );
+        // KnownUncommitted is a typed publication sidecar, not a suffix of
+        // the canonical public execution error (SEP-1).
+        let publication_after = publication_terminals(context, "write")?;
+        assert_commit_never_invoked(
+            publication_before,
+            publication_after,
+            "pre-ready DML without recovery",
+        )
+        .with_context(|| format!("verify failed DML publication: {error_message}"))?;
 
         let deadline = context.deadline();
-        context
+        let terminal = context
             .handle()
             .await_query_lifecycle_statement_observation(&observation, false, deadline)?;
+        ensure!(
+            terminal.attempt_id == 1,
+            "pre-ready DML must retain its original attempt without auto-recovery, got: {terminal:?}"
+        );
         context
             .handle()
             .drain_query_lifecycle_statement_observation(&observation)?;

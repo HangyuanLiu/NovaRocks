@@ -68,8 +68,8 @@ pub(crate) struct ManifestAttemptTransport {
     pub(crate) wire: AttemptWireFacts,
     pub(crate) data_runtime: FrontendDataRuntime,
     pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
-    /// Live membership is used only as residual process-lifecycle evidence. It
-    /// cannot change the frozen manifest or schedule a successor.
+    /// Exact process evidence bounds active pre-ready observation and residual
+    /// convergence. It cannot change the frozen manifest or schedule a successor.
     pub(crate) convergence_source: BackendProcessObservationService,
 }
 
@@ -82,6 +82,9 @@ pub(crate) struct ManifestAssembledRound {
     notify: Arc<tokio::sync::Notify>,
     terminal: Option<NativeAttemptTerminal>,
     pending_terminal: Option<NativeAttemptTerminal>,
+    /// Only an exact Establish transport-unknown may await independent
+    /// process replacement within its original admission receipt horizon.
+    pending_pre_ready_unknown: Option<novarocks_types::BackendProcessId>,
 }
 
 /// The completion fact this Task owner must wait for before it reports the
@@ -216,6 +219,7 @@ pub(crate) fn assemble_manifest_round(
         notify,
         terminal: None,
         pending_terminal: None,
+        pending_pre_ready_unknown: None,
     })
 }
 
@@ -296,6 +300,61 @@ impl ManifestAssembledRound {
         }
     }
 
+    async fn receive_pending(
+        &mut self,
+        drive: &NativeAttemptDrive,
+    ) -> Result<bool, TaskExecutionError> {
+        let report = self.round.receive_without_dispatch();
+        // ACK observers are still settled by their original actor owner.
+        // No authorize_intents call is legal while evidence is pending.
+        let settled = self
+            .actor_gate
+            .settle_terminal_acknowledgements(drive)
+            .await;
+        let report = report?;
+        Ok(!report.is_idle() || settled? != 0)
+    }
+
+    fn record_protocol_failure(&mut self, error: TaskExecutionError) {
+        let unknown = match &error {
+            TaskExecutionError::PreReadyEstablishTransportUnknown { backend } => Some(*backend),
+            _ => None,
+        };
+        if self.pending_terminal.is_none()
+            || (self.pending_pre_ready_unknown.is_some() && unknown.is_none())
+        {
+            self.pending_pre_ready_unknown = unknown;
+            self.pending_terminal = Some(task_protocol_failure(error));
+        }
+    }
+
+    /// A positive exact replacement is a separate originating fact. Neither
+    /// expiry nor uncertainty can supply it, and no recovery policy lives here.
+    fn pending_pre_ready_must_wait(&mut self) -> bool {
+        let Some(backend) = self.pending_pre_ready_unknown else {
+            return false;
+        };
+        if self.convergence.process_replaced(backend) {
+            use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+            use novarocks_query_application::execution_error::{
+                ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+            };
+            self.pending_terminal = Some(NativeAttemptTerminal::Failed(
+                NativeAttemptPreparationFailure::from_input(ExecutionFailureInput::new(
+                    QueryFailureReason::BackendLost.failure_fact(),
+                    SafeDetail::truncating("the frozen pre-ready backend process was replaced"),
+                    ExecutionFailureSite::Backend { process: backend },
+                )),
+            ));
+            self.pending_pre_ready_unknown = None;
+            return false;
+        }
+        self.round
+            .execution()
+            .pre_ready_observation_remaining(backend)
+            .is_some_and(|remaining| !remaining.is_zero())
+    }
+
     /// Runs the active attempt without occupying an OS thread. The method is
     /// borrowed and memoizes its terminal, so cancellation or panic of the
     /// caller's future cannot move the Task owner out of its supervisor.
@@ -308,21 +367,28 @@ impl ManifestAssembledRound {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
         }
+        let mut process_changes: Option<tokio::sync::watch::Receiver<u64>> = None;
+        let mut process_changes_open = true;
         loop {
             let notify = Arc::clone(&self.notify);
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let moved = match self.advance(drive).await {
+            let was_pending_pre_ready = self.pending_pre_ready_unknown.is_some();
+            let advanced = if was_pending_pre_ready {
+                self.receive_pending(drive).await
+            } else {
+                self.advance(drive).await
+            };
+            let moved = match advanced {
                 Ok(moved) => moved,
                 Err(error) => {
                     tracing::warn!(
                         ?error,
                         "Active Task protocol failed before attempt terminal"
                     );
-                    self.pending_terminal
-                        .get_or_insert_with(|| task_protocol_failure(error));
+                    self.record_protocol_failure(error);
                     false
                 }
             };
@@ -341,7 +407,41 @@ impl ManifestAssembledRound {
                     return terminal;
                 }
             }
-            if !success_sealed && self.pending_terminal.is_some() {
+            if !success_sealed
+                && (self.pending_terminal.is_none()
+                    || self.pending_pre_ready_unknown.is_some())
+                && let Some(input) = self.round.execution().selected_task_failure().and_then(novarocks_query_application::execution_error::ExecutionFailureInput::from_selected_task)
+            {
+                // Peer placeholders still wait for their original author.
+                // Task/control inputs retain their real identity and phase.
+                let terminal=NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(input));
+                let pending_unknown = self.pending_pre_ready_unknown.is_some();
+                if self.actor_gate.prepare_convergence() || pending_unknown {
+                    self.terminal=Some(terminal.clone());
+                    return terminal;
+                }
+            }
+            if !success_sealed
+                && self.pending_pre_ready_unknown.is_some()
+                && let Some(reason) = cancellation.reason()
+            {
+                // Publish control without waiting for residual transports
+                // whose abort/close owner is the enclosing supervisor.
+                let _ = self.actor_gate.prepare_convergence();
+                let terminal = cancellation_failure(reason);
+                self.terminal = Some(terminal.clone());
+                return terminal;
+            }
+            if !success_sealed
+                && self.pending_pre_ready_unknown.is_some()
+                && process_changes.is_none()
+            {
+                // Subscribe only for this confirmed unknown, before its first
+                // process read. Ordinary attempts never acquire this observer.
+                process_changes = Some(self.convergence.subscribe_process_changes());
+            }
+            let waiting_for_process = !success_sealed && self.pending_pre_ready_must_wait();
+            if !success_sealed && self.pending_terminal.is_some() && !waiting_for_process {
                 // A Task-protocol failure is already an authoritative attempt
                 // terminal. Closing the actor gate prevents any further
                 // admission, but outstanding actor-owned transport effects
@@ -356,17 +456,6 @@ impl ManifestAssembledRound {
                 self.terminal = Some(terminal.clone());
                 return terminal;
             }
-            if !success_sealed
-                && let Some(input) = self.round.execution().selected_task_failure().and_then(novarocks_query_application::execution_error::ExecutionFailureInput::from_selected_task)
-            {
-                // Peer placeholders still wait for their original author.
-                // Task/control inputs retain their real identity and phase.
-                let terminal=NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(input));
-                if self.actor_gate.prepare_convergence() {
-                    self.terminal=Some(terminal.clone());
-                    return terminal;
-                }
-            }
             let completed = match completion {
                 ManifestAttemptCompletion::AcceptedRootSuccessSeal => {
                     self.round.accepted_root_success_sealed()
@@ -375,7 +464,7 @@ impl ManifestAssembledRound {
                     self.round.attempt_drained() && self.round.execution().worker_contexts_stopped()
                 }
             };
-            if completed && self.actor_gate.prepare_convergence() {
+            if !waiting_for_process && completed && self.actor_gate.prepare_convergence() {
                 let terminal = NativeAttemptTerminal::Completed;
                 self.terminal = Some(terminal.clone());
                 return terminal;
@@ -394,11 +483,18 @@ impl ManifestAssembledRound {
             tokio::select! {
                 _ = notified => {}
                 reason = cancellation.cancelled(), if !success_sealed => {
-                    if self.actor_gate.prepare_convergence() {
+                    if self.actor_gate.prepare_convergence() || waiting_for_process {
                         let terminal = cancellation_failure(reason);
                         self.terminal = Some(terminal.clone());
                         return terminal;
                     }
+                }
+                changed = async {
+                    process_changes.as_mut()
+                        .expect("a pending process read subscribed before observation")
+                        .changed().await
+                }, if waiting_for_process && process_changes_open => {
+                    process_changes_open = changed.is_ok();
                 }
                 _ = tokio::time::sleep(IDLE_RECHECK) => {}
             }
@@ -556,6 +652,12 @@ mod tests {
     struct UnusedConvergenceSource;
 
     impl novarocks_query_application::api::BackendProcessObservationPort for UnusedConvergenceSource {
+        fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+            panic!(
+                "ordinary, sealed, Task-failed or cancelled attempts must not subscribe to process observation"
+            );
+        }
+
         fn observe_process_at_endpoint(
             &self,
             _: novarocks_types::BackendProcessId,
@@ -702,6 +804,7 @@ mod tests {
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
             pending_terminal: None,
+            pending_pre_ready_unknown: None,
         };
         assembled.convergence.begin(
             &mut assembled.round,
@@ -796,6 +899,7 @@ mod tests {
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: Some(NativeAttemptTerminal::Completed),
             pending_terminal: None,
+            pending_pre_ready_unknown: None,
         };
         assembled.convergence.begin(
             &mut assembled.round,
@@ -1104,6 +1208,7 @@ mod tests {
                 notify: Arc::new(tokio::sync::Notify::new()),
                 terminal: None,
                 pending_terminal: None,
+                pending_pre_ready_unknown: None,
             };
             let terminal = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -1240,5 +1345,563 @@ mod tests {
             failure.topology_requirement(),
             novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
         );
+    }
+
+    struct PendingProcessObservation {
+        expected: novarocks_types::BackendProcessId,
+        observation: std::sync::Mutex<
+            Result<
+                BackendProcessObservation,
+                novarocks_query_application::api::BackendTopologyError,
+            >,
+        >,
+        changes: tokio::sync::watch::Sender<u64>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl PendingProcessObservation {
+        fn new(
+            expected: novarocks_types::BackendProcessId,
+            observation: BackendProcessObservation,
+        ) -> Self {
+            let (changes, _) = tokio::sync::watch::channel(0);
+            Self {
+                expected,
+                observation: std::sync::Mutex::new(Ok(observation)),
+                changes,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn replace(&self) {
+            *self.observation.lock().unwrap() = Ok(BackendProcessObservation::Replaced {
+                current_process: novarocks_types::BackendProcessId::new_v7(),
+            });
+            self.changes.send_modify(|epoch| *epoch += 1);
+        }
+    }
+    impl novarocks_query_application::api::BackendProcessObservationPort for PendingProcessObservation {
+        fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+            self.changes.subscribe()
+        }
+        fn observe_process_at_endpoint(
+            &self,
+            expected: novarocks_types::BackendProcessId,
+            endpoint: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+        ) -> Result<BackendProcessObservation, novarocks_query_application::api::BackendTopologyError>
+        {
+            assert_eq!(expected, self.expected);
+            assert_eq!(
+                *endpoint,
+                novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
+                    .unwrap()
+            );
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.observation.lock().unwrap().clone()
+        }
+    }
+
+    fn pending_pre_ready_round(
+        round: TaskRound,
+        source: Arc<dyn novarocks_query_application::api::BackendProcessObservationPort>,
+    ) -> ManifestAssembledRound {
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+        let (_, actor_gate, _) = ActorGatedTaskOperationSink::pair(
+            Arc::new(BackpressuredGateTransport),
+            Arc::new(super::super::status_intake::CountingWake::default()),
+            novarocks_types::NativeCompatibilityId::new([0x41; 32]),
+        );
+        let convergence = NativeAttemptConvergenceOwner::new(
+            &round,
+            source,
+            vec![NativeAttemptConvergenceTarget::new(
+                context,
+                novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let mut assembled = ManifestAssembledRound {
+            round,
+            split_delivery,
+            actor_gate,
+            convergence,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            terminal: None,
+            pending_terminal: None,
+            pending_pre_ready_unknown: None,
+        };
+        assembled.record_protocol_failure(TaskExecutionError::PreReadyEstablishTransportUnknown {
+            backend: context.backend_process_id(),
+        });
+        assembled
+    }
+
+    #[test]
+    fn pending_unknown_uses_original_ticket_horizon_and_only_positive_exact_replacement() {
+        for state in [
+            BackendProcessObservation::Current,
+            BackendProcessObservation::Unobservable,
+            BackendProcessObservation::Replaced {
+                current_process: novarocks_types::BackendProcessId::new_v7(),
+            },
+        ] {
+            let (round, clock) = super::super::tests::pre_ready_observation_round();
+            let backend = round
+                .execution()
+                .graph()
+                .contexts()
+                .next()
+                .unwrap()
+                .backend_process_id();
+            let source = Arc::new(PendingProcessObservation::new(backend, state));
+            let mut assembled = pending_pre_ready_round(round, source.clone());
+            assert!(
+                !assembled
+                    .convergence
+                    .process_replaced(novarocks_types::BackendProcessId::new_v7())
+            );
+            assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let replaced = matches!(state, BackendProcessObservation::Replaced { .. });
+            assert_eq!(assembled.pending_pre_ready_must_wait(), !replaced);
+            if !replaced {
+                clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+                assert!(!assembled.pending_pre_ready_must_wait());
+            }
+            let Some(NativeAttemptTerminal::Failed(failure)) = assembled.pending_terminal else {
+                panic!("expected original failure")
+            };
+            assert_eq!(
+                failure.class(),
+                if replaced {
+                    AttemptFailureClass::RecoverableInfrastructure
+                } else {
+                    AttemptFailureClass::ExecutionFailure
+                }
+            );
+        }
+        // The observer itself cannot authorize a foreign or equal process.
+        for error in [false, true] {
+            let (round, _) = super::super::tests::pre_ready_observation_round();
+            let backend = round
+                .execution()
+                .graph()
+                .contexts()
+                .next()
+                .unwrap()
+                .backend_process_id();
+            let source = Arc::new(PendingProcessObservation::new(
+                backend,
+                BackendProcessObservation::Replaced {
+                    current_process: backend,
+                },
+            ));
+            if error {
+                *source.observation.lock().unwrap() = Err(
+                    novarocks_query_application::api::BackendTopologyError::Unavailable {
+                        message: "original observer".into(),
+                    },
+                );
+            }
+            let mut assembled = pending_pre_ready_round(round, source);
+            assert!(assembled.pending_pre_ready_must_wait());
+            let Some(NativeAttemptTerminal::Failed(failure)) = &assembled.pending_terminal else {
+                panic!("expected original failure")
+            };
+            assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+        }
+    }
+
+    async fn finish_pending_actor(
+        mut logical: novarocks_query_application::test_support::LogicalExecutionTestHarness,
+        context: novarocks_execution_contract::QueryContextRef,
+    ) {
+        logical.abandon_running_attempt();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while logical
+                .stand_down_snapshot(context)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        logical
+            .observe_worker_process_replaced(context)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_unknown_without_query_deadline_observes_replacement_before_original_ticket_expiry()
+     {
+        let (round, _) = super::super::tests::pre_ready_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        assert_eq!(cancellation.deadline(), None);
+        let source = Arc::new(PendingProcessObservation::new(
+            context.backend_process_id(),
+            BackendProcessObservation::Unobservable,
+        ));
+        let mut assembled = pending_pre_ready_round(round, source.clone());
+        let update = async {
+            while source.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            source.replace();
+        };
+        let (terminal, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                assembled.run(
+                    &drive,
+                    cancellation,
+                    ManifestAttemptCompletion::AcceptedRootSuccessSeal
+                ),
+                update,
+            )
+        })
+        .await
+        .unwrap();
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected backend loss")
+        };
+        assert_eq!(
+            failure.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                context.backend_process_id()
+            )
+        );
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+
+    #[tokio::test]
+    async fn pending_unknown_cancellation_returns_original_owner_without_waiting_for_replacement() {
+        let (round, _) = super::super::tests::pre_ready_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, requester, _abort) =
+            terminal_regression_drive(context).await;
+        let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
+        requester.request(CancellationReason::Requested).unwrap();
+        let terminal = assembled
+            .run(
+                &drive,
+                cancellation,
+                ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+            )
+            .await;
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected cancellation")
+        };
+        assert_eq!(failure.class(), AttemptFailureClass::Cancelled);
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+
+    #[tokio::test]
+    async fn pending_unknown_without_query_deadline_stops_at_original_ticket_horizon() {
+        let (round, clock) = super::super::tests::pre_ready_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        assert_eq!(cancellation.deadline(), None);
+        let source = Arc::new(PendingProcessObservation::new(
+            context.backend_process_id(),
+            BackendProcessObservation::Current,
+        ));
+        let mut assembled = pending_pre_ready_round(round, source.clone());
+        let expire = async {
+            while source.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+        };
+        let (terminal, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                assembled.run(
+                    &drive,
+                    cancellation,
+                    ManifestAttemptCompletion::AcceptedRootSuccessSeal
+                ),
+                expire,
+            )
+        })
+        .await
+        .unwrap();
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected original uncertainty")
+        };
+        assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+
+    #[tokio::test]
+    async fn pending_unknown_cannot_hide_an_accepted_originating_task_failure() {
+        let round = super::super::tests::manifest_originating_failure_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
+        let root = assembled.round.execution().graph().root_identity();
+        let terminal = assembled
+            .run(
+                &drive,
+                cancellation,
+                ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+            )
+            .await;
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected original Task failure")
+        };
+        assert_eq!(
+            failure.input().detail().as_str(),
+            "original preparing Task failure"
+        );
+        assert_eq!(
+            failure.input().site(),
+            novarocks_query_application::execution_error::ExecutionFailureSite::Task {
+                identity: root,
+                phase: novarocks_execution_contract::TaskFailurePhase::Preparation,
+            }
+        );
+        assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+
+    #[test]
+    fn pending_unknown_without_original_establish_window_never_invents_a_deadline() {
+        for replaced in [false, true] {
+            let round = super::super::tests::manifest_preparing_observation_round();
+            let backend = round
+                .execution()
+                .graph()
+                .contexts()
+                .next()
+                .unwrap()
+                .backend_process_id();
+            assert_eq!(
+                round.execution().pre_ready_observation_remaining(backend),
+                None
+            );
+            let state = if replaced {
+                BackendProcessObservation::Replaced {
+                    current_process: novarocks_types::BackendProcessId::new_v7(),
+                }
+            } else {
+                BackendProcessObservation::Unobservable
+            };
+            let source = Arc::new(PendingProcessObservation::new(backend, state));
+            let mut assembled = pending_pre_ready_round(round, source);
+            assert!(!assembled.pending_pre_ready_must_wait());
+            let Some(NativeAttemptTerminal::Failed(failure)) = assembled.pending_terminal else {
+                panic!("expected failure")
+            };
+            assert_eq!(
+                failure.class(),
+                if replaced {
+                    AttemptFailureClass::RecoverableInfrastructure
+                } else {
+                    AttemptFailureClass::ExecutionFailure
+                }
+            );
+        }
+    }
+    #[test]
+    fn a_real_unsent_replay_deadline_stops_unknown_observation_without_backend_loss() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureSite, QueryFailureReason,
+        };
+        let (round, error) = super::super::tests::pre_ready_expired_replay_observation_round();
+        assert!(matches!(
+            error,
+            TaskExecutionError::QueueResidenceExpired {
+                kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                ..
+            }
+        ));
+        let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
+        assembled.record_protocol_failure(error);
+        assert_eq!(assembled.pending_pre_ready_unknown, None);
+        assert!(!assembled.pending_pre_ready_must_wait());
+        let Some(NativeAttemptTerminal::Failed(failure)) = assembled.pending_terminal else {
+            panic!("a definitive local deadline must retain its original author");
+        };
+        assert_eq!(
+            failure.input().fact(),
+            QueryFailureReason::TransportDeadline.failure_fact()
+        );
+        assert_eq!(failure.input().site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+    }
+
+    #[tokio::test]
+    async fn pending_unknown_closed_process_watch_keeps_original_ticket_and_failure() {
+        struct ClosedProcessObservation {
+            expected: novarocks_types::BackendProcessId,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl novarocks_query_application::api::BackendProcessObservationPort for ClosedProcessObservation {
+            // The default subscription is closed. Its closure is not a
+            // replacement and must not grant a fresh observation horizon.
+            fn observe_process_at_endpoint(
+                &self,
+                expected: novarocks_types::BackendProcessId,
+                endpoint: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+            ) -> Result<
+                BackendProcessObservation,
+                novarocks_query_application::api::BackendTopologyError,
+            > {
+                assert_eq!(expected, self.expected);
+                assert_eq!(
+                    *endpoint,
+                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
+                        .unwrap()
+                );
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BackendProcessObservation::Unobservable)
+            }
+        }
+        let (round, clock) = super::super::tests::pre_ready_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let source = Arc::new(ClosedProcessObservation {
+            expected: context.backend_process_id(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut assembled = pending_pre_ready_round(round, source.clone());
+        let expire = async {
+            while source.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+        };
+        let (terminal, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                assembled.run(
+                    &drive,
+                    cancellation,
+                    ManifestAttemptCompletion::AcceptedRootSuccessSeal
+                ),
+                expire,
+            )
+        })
+        .await
+        .unwrap();
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected original uncertainty")
+        };
+        assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+    #[tokio::test]
+    async fn pending_receiver_definitive_error_keeps_normal_priority_over_cancel_view() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::execution_error::QueryFailureReason;
+        let round = super::super::tests::pre_ready_invalid_ack_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, requester, _abort) =
+            terminal_regression_drive(context).await;
+        let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
+        requester.request(CancellationReason::Requested).unwrap();
+        // The receiver sees a genuine protocol invariant in this same turn.
+        // Existing non-unknown error priority must not depend on whether an
+        // earlier transport candidate had been awaiting process evidence.
+        let terminal = assembled
+            .run(
+                &drive,
+                cancellation,
+                ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+            )
+            .await;
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected protocol failure")
+        };
+        assert_eq!(
+            failure.input().fact(),
+            QueryFailureReason::PreparationProtocol.failure_fact()
+        );
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+
+    #[tokio::test]
+    async fn pending_receiver_task_failure_cannot_hide_a_later_same_turn_protocol_error() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        let round =
+            super::super::round::pending_task_failure_then_invalid_covered_frame_round().await;
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let root = round.execution().graph().root_identity();
+        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
+        let terminal = assembled
+            .run(
+                &drive,
+                cancellation,
+                ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+            )
+            .await;
+        // The first valid frame really reached its original Task owner before
+        // the second frame failed. No transaction rollback erases that fact.
+        let selected = ExecutionFailureInput::from_selected_task(
+            assembled.round.execution().selected_task_failure().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.fact(),
+            QueryFailureReason::PreparationFailed.failure_fact()
+        );
+        assert_eq!(
+            selected.site(),
+            ExecutionFailureSite::Task {
+                identity: root,
+                phase: novarocks_execution_contract::TaskFailurePhase::Preparation,
+            }
+        );
+        assert_eq!(
+            selected.detail().as_str(),
+            "original Task before invalid frame"
+        );
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("the invalid covered frame must preserve the protocol failure");
+        };
+        assert_eq!(
+            failure.input().fact(),
+            QueryFailureReason::PreparationProtocol.failure_fact()
+        );
+        assert_eq!(failure.input().site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
     }
 }

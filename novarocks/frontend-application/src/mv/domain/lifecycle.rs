@@ -252,6 +252,7 @@ impl From<novarocks_sql::compiler::SqlCompileError> for RefreshError {
             E::DeadlineExceeded => Some(C::DeadlineExceeded),
             E::ResourceExhausted => Some(C::ResourceExhausted),
             E::Analyze(error) => error.control_error(),
+            E::CompilationSource(source) => Some(C::Source(source.clone())),
             _ => None,
         };
         let unavailable_implementation = match &error {

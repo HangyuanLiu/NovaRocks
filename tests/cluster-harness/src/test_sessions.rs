@@ -491,6 +491,58 @@ impl ClusterTestSessionPlan {
             })
             .transpose()
     }
+    /// Validate this finite MV action against the current authenticated FE
+    /// launch. Planned declarations and an observation's self-report are not
+    /// substitutes for the active process receipt.
+    pub(crate) fn mv_scheduler_outcome_binding(
+        &self,
+        grant_id: &str,
+        catalog: &str,
+        namespace: &str,
+        mv: &str,
+        directory: &Path,
+    ) -> Result<RoleProcessReceipt> {
+        ensure!(
+            Instant::now() < self.deadline,
+            "MV scheduler observation original deadline expired"
+        );
+        let active = self
+            .active
+            .get(&RoleSlot::Frontend)
+            .context("MV scheduler observation has no active FE session")?;
+        let mut matching = active
+            .grants
+            .iter()
+            .filter(|grant| grant.domain == "mv" && grant.grant_id == grant_id);
+        let grant = matching
+            .next()
+            .context("MV scheduler observation grant is not active on this FE")?;
+        ensure!(
+            matching.next().is_none(),
+            "ambiguous active MV scheduler observation grant"
+        );
+        ensure!(
+            grant.parameters
+                == serde_json::json!({"action":"scheduler-outcome","catalog":catalog,"namespace":namespace,"mv":mv,"directory":directory}),
+            "MV scheduler observation does not match its exact declared action/target/directory"
+        );
+        let process = active
+            .runner
+            .bound_process()?
+            .context("MV scheduler observation precedes authenticated FE Hello")?;
+        let receipt = self
+            .process_receipt(RoleSlot::Frontend)?
+            .context("MV scheduler observation has no current FE process receipt")?;
+        ensure!(
+            receipt.role == SessionRole::Fe
+                && receipt.session_id == active.runner.declaration().session_id
+                && receipt.launch_id == active.runner.declaration().launch_id
+                && receipt.process_id == process,
+            "MV scheduler observation receipt differs from the current authenticated FE launch"
+        );
+        Ok(receipt)
+    }
+
     pub fn domain_secret(&self, role: RoleSlot, domain: &str, key: &str) -> Result<Option<String>> {
         // Authentication material remains private and is never part of evidence.
         let Some(active) = self.active.get(&role) else {
@@ -1166,13 +1218,14 @@ mod tests {
         plan: &mut ClusterTestSessionPlan,
         index: usize,
     ) -> std::os::unix::net::UnixStream {
+        start_role_hello_at(plan, RoleSlot::Backend(index))
+    }
+    fn start_role_hello_at(
+        plan: &mut ClusterTestSessionPlan,
+        role: RoleSlot,
+    ) -> std::os::unix::net::UnixStream {
         use std::io::Write;
-        let intent = plan
-            .intents
-            .get_mut(&RoleSlot::Backend(index))
-            .unwrap()
-            .pop_front()
-            .unwrap();
+        let intent = plan.intents.get_mut(&role).unwrap().pop_front().unwrap();
         let declaration = intent.declaration;
         let runner = RunnerSession::start_until(declaration.clone(), plan.deadline).unwrap();
         let mut peer =
@@ -1183,7 +1236,7 @@ mod tests {
         .unwrap();
         let body=serde_json::to_vec(&serde_json::json!({"kind":"hello","session_id":declaration.session_id,
             "launch_id":declaration.launch_id,"role":declaration.role,
-            "process_id":novarocks_types::BackendProcessId::new_v7().to_string(),"handshake_secret":declaration.handshake_secret})).unwrap();
+            "process_id":match role { RoleSlot::Frontend => novarocks_types::FrontendProcessId::new_v7().to_string(), RoleSlot::Backend(_) => novarocks_types::BackendProcessId::new_v7().to_string() },"handshake_secret":declaration.handshake_secret})).unwrap();
         peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         peer.write_all(&body).unwrap();
         while runner.bound_process().unwrap().is_none() {
@@ -1191,7 +1244,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         plan.active.insert(
-            RoleSlot::Backend(index),
+            role,
             ActiveLaunch {
                 runner,
                 grants: declaration.domain_grants,
@@ -1199,6 +1252,61 @@ mod tests {
         );
         peer
     }
+    #[test]
+    fn mv_scheduler_binding_requires_current_authenticated_fe_and_exact_grant() {
+        let mut plan =
+            ClusterTestSessionPlan::new(Instant::now() + Duration::from_secs(10)).unwrap();
+        let directory = plan.reserve_transport("mv-outcome-test").unwrap();
+        let reference = plan.reserve_launch(RoleSlot::Frontend).unwrap();
+        plan.authorize_launch(&reference, vec![DomainGrant { domain:"mv".into(), grant_id:"outcome-a".into(),
+            parameters:serde_json::json!({"action":"scheduler-outcome","catalog":"ice","namespace":"ns","mv":"orders","directory":directory}) }], vec![]).unwrap();
+        // Merely planning a matching grant is insufficient.
+        assert!(
+            plan.mv_scheduler_outcome_binding("outcome-a", "ice", "ns", "orders", &directory)
+                .is_err()
+        );
+        let peer = start_role_hello_at(&mut plan, RoleSlot::Frontend);
+        let receipt = plan
+            .mv_scheduler_outcome_binding("outcome-a", "ice", "ns", "orders", &directory)
+            .unwrap();
+        assert_eq!(receipt.session_id, reference.session_id);
+        assert_eq!(
+            receipt,
+            plan.process_receipt(RoleSlot::Frontend).unwrap().unwrap()
+        );
+        for (grant, catalog, namespace, mv, path) in [
+            ("different", "ice", "ns", "orders", directory.clone()),
+            ("outcome-a", "other", "ns", "orders", directory.clone()),
+            ("outcome-a", "ice", "other", "orders", directory.clone()),
+            ("outcome-a", "ice", "ns", "other", directory.clone()),
+            ("outcome-a", "ice", "ns", "orders", directory.join("other")),
+        ] {
+            assert!(
+                plan.mv_scheduler_outcome_binding(grant, catalog, namespace, mv, &path)
+                    .is_err()
+            );
+        }
+        plan.active.get_mut(&RoleSlot::Frontend).unwrap().grants[0].domain =
+            "another-domain".into();
+        assert!(
+            plan.mv_scheduler_outcome_binding("outcome-a", "ice", "ns", "orders", &directory)
+                .is_err()
+        );
+        plan.active.get_mut(&RoleSlot::Frontend).unwrap().grants[0].domain = "mv".into();
+        plan.active.get_mut(&RoleSlot::Frontend).unwrap().grants[0].parameters["action"] =
+            serde_json::json!("scheduler-hold");
+        assert!(
+            plan.mv_scheduler_outcome_binding("outcome-a", "ice", "ns", "orders", &directory)
+                .is_err()
+        );
+        plan.end_role(RoleSlot::Frontend).unwrap();
+        assert!(
+            plan.mv_scheduler_outcome_binding("outcome-a", "ice", "ns", "orders", &directory)
+                .is_err()
+        );
+        drop(peer);
+    }
+
     #[test]
     fn three_selected_permissions_with_only_two_actual_bindings_retire_without_fake_execution() {
         let mut plan =

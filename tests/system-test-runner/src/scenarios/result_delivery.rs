@@ -17,14 +17,16 @@
 
 use super::result_delivery_support::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation, TextResultObservation};
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
+use crate::scenarios::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use anyhow::{Context, Result, ensure};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::{QueryLifecycleStatementObservation, ServerHandle};
 use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
 use novarocks_proto_models::{novarocks as proto, result as result_proto};
 use prost::Message;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
@@ -59,11 +61,11 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         )),
         Box::new(WireBoundary("result-delivery/large-row-cross-u24")),
         Box::new(RootReadRefusal),
-        Box::new(ContextRootRetention(RootProtocolMode::None)),
-        Box::new(ContextRootRetention(RootProtocolMode::ZeroAck)),
-        Box::new(ContextRootRetention(RootProtocolMode::FinalAck)),
-        Box::new(ContextRootRetention(RootProtocolMode::OneByte)),
-        Box::new(ContextRootRetention(RootProtocolMode::MinimumNewRow)),
+        Box::new(ContextRootRetention::new(RootProtocolMode::None)),
+        Box::new(ContextRootRetention::new(RootProtocolMode::ZeroAck)),
+        Box::new(ContextRootRetention::new(RootProtocolMode::FinalAck)),
+        Box::new(ContextRootRetention::new(RootProtocolMode::OneByte)),
+        Box::new(ContextRootRetention::new(RootProtocolMode::MinimumNewRow)),
     ]
 }
 
@@ -591,7 +593,7 @@ enum RootProtocolMode {
     OneByte,
     MinimumNewRow,
 }
-struct ContextRootRetention(RootProtocolMode);
+struct ContextRootRetention(RootProtocolMode, SqlIntentOwner);
 
 impl Scenario for ContextRootRetention {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -615,12 +617,58 @@ impl Scenario for ContextRootRetention {
         }
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        if self.0 == RootProtocolMode::None {
+            return Ok(None);
+        }
+        let manifest = self.retention_manifest()?;
+        Ok(Some(self.1.freeze(
+            vec![StatementSpec {
+                sql: manifest.sql,
+                faults: vec![],
+                observations: (0..cluster_size)
+                    .map(|index| (index, "grpc-fragment", None))
+                    .collect(),
+            }],
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        ensure!(
-            context.handle().be_count() == 3,
-            "root retention requires native 1FE+3BE"
-        );
-        let manifest: RetentionManifest = serde_json::from_str(
+        let mut observation = None;
+        let result = self.run_retention(context, &mut observation);
+        let cleanup = observation.as_ref().map_or(Ok(()), |observation| {
+            context
+                .handle()
+                .drain_query_lifecycle_statement_observation(observation)
+        });
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary), Err(cleanup)) => {
+                anyhow::bail!("{primary:#}; root observation cleanup: {cleanup:#}")
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+}
+
+impl ContextRootRetention {
+    fn new(mode: RootProtocolMode) -> Self {
+        Self(mode, SqlIntentOwner::default())
+    }
+
+    fn retention_manifest(&self) -> Result<RetentionManifest> {
+        Ok(serde_json::from_str(
             if self.0 == RootProtocolMode::MinimumNewRow {
                 include_str!(
                     "../../../../docs/testing/mem-1-m07/inputs/minimum-new-row-retention-freeze-v1.json"
@@ -634,7 +682,19 @@ impl Scenario for ContextRootRetention {
                     "../../../../docs/testing/mem-1-m07/inputs/root-context-retention-freeze-v1.json"
                 )
             },
-        )?;
+        )?)
+    }
+
+    fn run_retention(
+        &self,
+        context: &mut ScenarioContext,
+        observation: &mut Option<QueryLifecycleStatementObservation>,
+    ) -> Result<()> {
+        ensure!(
+            context.handle().be_count() == 3,
+            "root retention requires native 1FE+3BE"
+        );
+        let manifest = self.retention_manifest()?;
         ensure!(
             manifest.schema_version == 1
                 && manifest.topology == "1FE+3BE"
@@ -698,6 +758,9 @@ impl Scenario for ContextRootRetention {
         let (ready, metadata_ready) = tokio::sync::oneshot::channel();
         let (resume, resume_read) = tokio::sync::oneshot::channel();
         let sql = manifest.sql.clone();
+        if self.0 != RootProtocolMode::None {
+            *observation = Some(self.1.take(0)?.arm(context, connection_id, &sql)?);
+        }
         let job = runtime.spawn(async move {
             stream
                 .observe_text_query_with_metadata_pause(

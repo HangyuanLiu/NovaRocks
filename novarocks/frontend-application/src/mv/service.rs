@@ -511,6 +511,14 @@ fn run_scheduled_refreshes(
             // for every due MV. Keeping the activity lease and governed root local
             // to the same transition makes `complete` the exact terminal
             // observation before the next event starts.
+            #[cfg(novarocks_dev_controls)]
+            let outcome_admission = dependencies.readiness.test_controls().and_then(|controls| {
+                match controls.scheduler_request_admitted(&request.target, request.projection().mv_id,
+                    request.projection().facts.source_revision()) {
+                    Ok(admission) => admission,
+                    Err(error) => { tracing::warn!(reason = %error, "finite MV scheduler admission observation failed"); None }
+                }
+            });
             let disposition =
                 execute_scheduled_refresh(dependencies, &request, cancellation, &result_capacity);
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
@@ -529,6 +537,13 @@ fn run_scheduled_refreshes(
                 disposition,
                 now_unix_millis(),
             );
+            #[cfg(novarocks_dev_controls)]
+            if let Some(admission) = outcome_admission
+                && let Some(controls) = dependencies.readiness.test_controls()
+                && let Err(error) = controls.scheduler_request_completed(admission, &_decision)
+            {
+                tracing::warn!(reason = %error, "finite MV scheduler terminal observation failed");
+            }
             if completed {
                 let _ = maintenance_wakeup_tx.try_send(());
             }
@@ -907,6 +922,12 @@ mod compile_control_tests {
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
+            CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("router".into()),
+            )),
+            CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+            )),
         ] {
             let error = preparation_application_error(RefreshError::from(
                 novarocks_sql::compiler::SqlCompileError::from(control.clone()),

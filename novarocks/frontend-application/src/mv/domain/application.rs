@@ -310,6 +310,9 @@ impl MvApplicationError {
                 Some(novarocks_type_contract::CompileControlError::ResourceExhausted)
             }
             novarocks_sql::compiler::SqlCompileError::Analyze(error) => error.control_error(),
+            novarocks_sql::compiler::SqlCompileError::CompilationSource(source) => Some(
+                novarocks_type_contract::CompileControlError::Source(source.clone()),
+            ),
             _ => None,
         };
         let unavailable_implementation = match &error {
@@ -567,6 +570,41 @@ mod compile_error_tests {
             assert_eq!(message, expected);
             assert!(!message.starts_with("[sql.analyze.unavailable_implementation] "));
             assert_eq!(control, None);
+        }
+    }
+
+    #[test]
+    fn mv_application_and_create_keep_the_original_compile_source() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("router".into()),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+        ] {
+            let source = SharedFailureCause::new(original);
+            let fact = source.failure_fact();
+            let compile = SqlCompileError::CompilationSource(source.clone());
+            let application = MvApplicationError::from_compile(compile.clone());
+            let provider = MvCreateProviderError::from_compile(compile);
+            for control in [
+                application.compile_control_error(),
+                provider.compile_control_error(),
+            ] {
+                let Some(CompileControlError::Source(carried)) = control else {
+                    panic!("keep the original compile source");
+                };
+                assert_eq!(
+                    carried, source,
+                    "SharedFailureCause equality is Arc identity"
+                );
+                assert_eq!(carried.failure_fact(), fact);
+                assert!(
+                    carried
+                        .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+                        .is_some()
+                );
+            }
+            assert_eq!(application.unavailable_implementation(), None);
+            assert_eq!(provider.unavailable_implementation(), None);
         }
     }
 

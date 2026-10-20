@@ -1433,6 +1433,68 @@ mod compile_control_tests {
             );
         }
     }
+    #[test]
+    fn comparison_source_survives_freeze_encode_and_the_actual_session_consumer() {
+        use crate::query_execution::package_freeze::PackageFreezeError;
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        use novarocks_functions::ComparisonPrepareError;
+        use novarocks_query_application::execution_error::ExecutionFailureSite;
+        use novarocks_sql::compiler::PackageSemanticsError;
+        for (original, class, public_code) in [
+            (
+                ComparisonPrepareError::Unsupported,
+                FailureClass::Unsupported,
+                "UnsupportedCompiledShape",
+            ),
+            (
+                ComparisonPrepareError::TypeMismatch,
+                FailureClass::Invariant,
+                "query.execution.invariant",
+            ),
+        ] {
+            let original_source = SharedFailureCause::new(original.clone());
+            let expected = original_source.failure_fact();
+            assert_eq!(expected.class(), class);
+            let encoded =
+                novarocks_plan_codec::PhysicalEncodeError::from(PackageFreezeError::Semantics(
+                    PackageSemanticsError::Source(original_source.clone()),
+                ));
+            let error = FrontendQueryCompilerError::from_encode(encoded);
+            let FrontendQueryCompilerError::Source(retained) = &error else {
+                panic!("the encoded source must remain typed");
+            };
+            let retained = retained.clone();
+            let Some(novarocks_plan_codec::PhysicalEncodeError::Source(freeze_source)) =
+                retained.downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+            else {
+                panic!("retain the actual physical encode source");
+            };
+            let Some(PackageFreezeError::Semantics(PackageSemanticsError::Source(actual))) =
+                freeze_source.downcast_ref::<PackageFreezeError>()
+            else {
+                panic!("retain the exact comparison source below its wrappers");
+            };
+            assert_eq!(actual, &original_source);
+            assert_eq!(actual.detail(), original_source.detail());
+            assert_eq!(
+                actual.downcast_ref::<ComparisonPrepareError>(),
+                Some(&original)
+            );
+            let service = service(error);
+            let failure = service.execution_failure().unwrap();
+            assert_eq!(failure.fact(), expected);
+            assert_eq!(failure.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(failure.descriptor().descriptor.code.as_str(), public_code);
+            assert_eq!(
+                service.message(),
+                format!("[{public_code}] pure compilation failed in its source domain")
+            );
+            assert_eq!(
+                service.compile_control_error(),
+                Some(CompileControlError::Source(retained))
+            );
+        }
+    }
 }
 
 #[cfg(test)]

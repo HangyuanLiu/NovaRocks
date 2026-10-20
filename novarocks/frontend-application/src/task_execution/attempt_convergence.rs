@@ -132,6 +132,26 @@ impl NativeAttemptConvergenceOwner {
         }
     }
 
+    /// The same exact process-evidence source serves pending pre-ready
+    /// observation and residual convergence. It grants no scheduling authority.
+    pub(crate) fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.source.subscribe_process_changes()
+    }
+
+    pub(crate) fn process_replaced(&self, backend: novarocks_types::BackendProcessId) -> bool {
+        let Some(target) = self
+            .targets
+            .iter()
+            .find(|target| target.context.backend_process_id() == backend)
+        else {
+            return false;
+        };
+        matches!(
+            self.source.observe_process_at_endpoint(backend, &target.endpoint),
+            Ok(BackendProcessObservation::Replaced { current_process }) if current_process != backend
+        )
+    }
+
     /// Read only facts already accepted by the original covered owner, plus
     /// exact process replacement at the original endpoint. Unobservable is
     /// never success. Normal drain must also consume its original Release ACK.
@@ -161,19 +181,12 @@ impl NativeAttemptConvergenceOwner {
                 convergence.push(NativeContextConvergence::never_established(target.context));
                 continue;
             }
-            match self
-                .source
-                .observe_process_at_endpoint(target.context.backend_process_id(), &target.endpoint)
-            {
-                Ok(BackendProcessObservation::Replaced { .. }) => {
-                    convergence.push(NativeContextConvergence::worker_process_replaced(
-                        target.context,
-                    ));
-                }
-                Ok(
-                    BackendProcessObservation::Current | BackendProcessObservation::Unobservable,
-                )
-                | Err(_) => return None,
+            if self.process_replaced(target.context.backend_process_id()) {
+                convergence.push(NativeContextConvergence::worker_process_replaced(
+                    target.context,
+                ));
+            } else {
+                return None;
             }
         }
         Some(convergence.into_boxed_slice())

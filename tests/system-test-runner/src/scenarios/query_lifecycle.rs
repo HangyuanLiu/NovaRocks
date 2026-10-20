@@ -9,6 +9,7 @@ use novarocks_cluster_harness::{
     QueryLifecycleStructuredSnapshot, ServerHandle,
     native_fault_proxy::{ProxyDirection, ProxyMode},
 };
+use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
@@ -802,12 +803,14 @@ struct Nid2Fence {
     marker: &'static str,
     /// What the misstated value was, for the accepted-action line.
     subject: &'static str,
+    /// An exact typed preparation failure expected for this statement, if set.
+    expected_failure_fact: Option<FailureFact>,
     /// Substrings the client-visible error must carry.
     ///
-    /// Both halves matter. The first is the shape of the refusal --- which
-    /// `TaskExecutionError` variant answered --- and the second names the fence
-    /// inside it, so a statement that failed for an unrelated reason cannot
-    /// satisfy the case. A bare `expect_err` would have been satisfied by any
+    /// Both halves matter. The canonical public code and safe detail must
+    /// agree with the expected projection. A token-scoped backend marker and,
+    /// where set, the exact statement failure additionally bind the fence.
+    /// A bare `expect_err` would have been satisfied by any
     /// failure at all, including one the fault did not cause.
     error_fragments: &'static [&'static str],
 }
@@ -889,7 +892,11 @@ impl Scenario for Nid2CreateRejected {
                 fault: "create-task-rejected-after-apply",
                 marker: "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY",
                 subject: "a CreateTask rejection answered after the task was admitted",
-                error_fragments: &["failed closed", "runner-owned CreateTask rejection"],
+                expected_failure_fact: None,
+                error_fragments: &[
+                    "[query.execution.invariant]",
+                    "runner-owned CreateTask rejection",
+                ],
             },
         )
     }
@@ -976,7 +983,8 @@ impl Scenario for Nid2CreateReceiptForeignTask {
                 fault: "create-task-receipt-foreign-task",
                 marker: "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK",
                 subject: "a CreateTask acknowledgement naming a task the request never addressed",
-                error_fragments: &["failed closed", "InvalidStateOrRequest"],
+                expected_failure_fact: None,
+                error_fragments: &["[query.execution.invariant]", "InvalidStateOrRequest"],
             },
         )
     }
@@ -1059,7 +1067,16 @@ impl Scenario for Nid2ForeignStatusProcess {
                 fault: "task-status-foreign-process",
                 marker: "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS",
                 subject: "a task status event naming a backend process other than its own",
-                error_fragments: &["no longer observable", "process_mismatch"],
+                // QueryFailureReason::PreparationProtocol is the SEP-1
+                // projection of a fatal non-transport participant violation.
+                expected_failure_fact: Some(FailureFact::new(
+                    FailureClass::Invariant,
+                    FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(9).unwrap()),
+                )),
+                error_fragments: &[
+                    "[query.execution.invariant]",
+                    "frontend task protocol could not continue",
+                ],
             },
         )
     }
@@ -1086,20 +1103,27 @@ fn run_nid2_fence(
         context.mysql_port(),
         context.deadline(),
     )?;
-    selected.arm(context, connection.connection_id(), NID2_FENCE_QUERY)?;
+    let observation = selected.arm(context, connection.connection_id(), NID2_FENCE_QUERY)?;
     let tokens = vec![selected.token.clone(); REQUIRED_BACKENDS];
     context.action(format!(
         "armed NID-2 {} across every Backend participant with tokens {tokens:?}",
         fence.fault
     ));
 
-    let observed = observe_nid2_fence(context, fence, &tokens, &mut connection);
+    let observed = observe_nid2_fence(context, fence, &tokens, &observation, &mut connection);
     let cleared = context
         .handle()
         .clear_query_lifecycle_faults()
         .with_context(|| format!("clear {} tokens", fence.fault));
     let closed = connection.finish();
-    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(cleared, closed);
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_observation(&observation)
+        .context("drain NID-2 statement observation");
+    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(
+        crate::scenarios::paimon::scan_statement_actor::combine(cleared, closed),
+        drained,
+    );
     let (backend, error) =
         crate::scenarios::paimon::scan_statement_actor::combine(observed, cleanup)?;
     await_resource_convergence(context, &baseline)?;
@@ -1116,6 +1140,7 @@ fn observe_nid2_fence(
     context: &mut ScenarioContext,
     fence: &Nid2Fence,
     tokens: &[String],
+    observation: &novarocks_cluster_harness::QueryLifecycleStatementObservation,
     connection: &mut mysql::Conn,
 ) -> Result<(usize, String)> {
     let error = match connection.query::<i64, _>(NID2_FENCE_QUERY) {
@@ -1140,6 +1165,21 @@ fn observe_nid2_fence(
     // early. The previous form read once and accepted any nonzero count, which
     // could be satisfied by an earlier scenario's marker in the same log.
     let backend = await_token_scoped_marker(context, fence.marker, tokens)?;
+    if let Some(expected) = fence.expected_failure_fact {
+        let deadline = context.deadline();
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(observation, false, deadline)
+            .context("read exact NID-2 statement failure")?;
+        ensure!(
+            terminal.attempt_id == 1
+                && terminal.failure_fact == Some(expected)
+                && terminal.failure_site
+                    == Some(novarocks_cluster_harness::QueryLifecycleFailureSite::Coordinator),
+            "{} must retain the original attempt's exact preparation failure {expected:?}, got {terminal:?}",
+            fence.fault,
+        );
+    }
     Ok((backend, error))
 }
 

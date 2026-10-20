@@ -125,6 +125,10 @@ struct ReleasedLease {
 struct ReleasedEstablish {
     request: Arc<EstablishQueryContext>,
     first_sent_at: MonotonicInstant,
+    /// Original admission receipt horizon, copied before its ticket is redeemed.
+    /// This only bounds process-evidence observation after an unknown issue;
+    /// it is neither a Worker stop fact nor replay or lease authorization.
+    observation_expiry: Option<MonotonicInstant>,
     awaiting_outcome: bool,
 }
 
@@ -141,6 +145,9 @@ struct ReleasedAdmission {
 struct GrantedAdmission {
     receipt: QueryContextAdmissionTicketReceipt,
     conservative_expiry: MonotonicInstant,
+    /// Present only when this Task owner captured the actual admission
+    /// request's first send. An adopted ticket has no same-clock send fact.
+    observation_expiry: Option<MonotonicInstant>,
     /// A frontend-local upper bound on the Worker's ticket expiry.
     ///
     /// The Worker issued the ticket no later than the receipt reached this
@@ -284,6 +291,7 @@ impl QueryContextOwner {
         self.admission_ticket = Some(GrantedAdmission {
             receipt,
             conservative_expiry: now.saturating_add(receipt.valid_for().get()),
+            observation_expiry: None,
             reissue_not_before: now.saturating_add(receipt.valid_for().get()),
         });
         // The replacement remains authorized. Holding a ticket already makes
@@ -488,9 +496,25 @@ impl QueryContextOwner {
         self.establish = Some(ReleasedEstablish {
             request: Arc::clone(&request),
             first_sent_at: now,
+            observation_expiry: granted.observation_expiry,
             awaiting_outcome: true,
         });
         Ok(Some(OperationIntent::EstablishQueryContext(request)))
+    }
+
+    /// Remaining original ticket horizon on this owner's own clock. A replay
+    /// never renews it; consuming this observation bound grants no operation.
+    pub(crate) fn pre_ready_observation_remaining(
+        &self,
+        now: MonotonicInstant,
+    ) -> Option<Duration> {
+        if self.establish_acknowledged {
+            return None;
+        }
+        self.establish
+            .as_ref()
+            .and_then(|released| released.observation_expiry)
+            .map(|expiry| expiry.saturating_duration_since(now))
     }
 
     /// The next renewal, if one is due.
@@ -868,6 +892,7 @@ impl QueryContextOwner {
         self.admission_ticket = Some(GrantedAdmission {
             receipt: *receipt,
             conservative_expiry,
+            observation_expiry: Some(conservative_expiry),
             reissue_not_before: now.saturating_add(receipt.valid_for().get()),
         });
         Ok(())

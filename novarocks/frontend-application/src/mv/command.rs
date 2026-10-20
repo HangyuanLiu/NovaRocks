@@ -473,6 +473,11 @@ fn mv_command_error(
                 novarocks_type_contract::CompileControlError::ResourceExhausted,
             )
         }
+        novarocks_sql::compiler::SqlCompileError::CompilationSource(source) => {
+            novarocks_query_application::api::CommandError::from_compile_control(
+                novarocks_type_contract::CompileControlError::Source(source),
+            )
+        }
         novarocks_sql::compiler::SqlCompileError::Analyze(error) => match error.control_error() {
             Some(error) => {
                 novarocks_query_application::api::CommandError::from_compile_control(error)
@@ -1143,6 +1148,33 @@ mod refresh_refusal_projection_tests {
         assert_eq!(user.kind(), CommandErrorKind::Failed);
         assert_eq!(user.compile_control_error(), None);
         assert_eq!(user.to_string(), expected_user);
+    }
+
+    #[test]
+    fn refresh_prepare_step_source_reaches_command_without_reauthoring() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("router".into()),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+        ] {
+            let source = SharedFailureCause::new(original);
+            let fact = source.failure_fact();
+            let failure = prepare_failure(SqlCompileError::CompilationSource(source.clone()));
+            assert_eq!(failure.unavailable_implementation(), None);
+            let SqlCompileError::CompilationSource(carried) = mv_compile_error(failure) else {
+                panic!("command reconstruction must retain the compile source");
+            };
+            assert_eq!(carried, source);
+            assert_eq!(carried.failure_fact(), fact);
+            let user = mv_command_error(SqlCompileError::CompilationSource(carried));
+            let Some(CompileControlError::Source(carried)) = user.compile_control_error() else {
+                panic!("the final command must retain the same source");
+            };
+            assert_eq!(user.kind(), CommandErrorKind::Failed);
+            assert_eq!(carried, source);
+            assert_eq!(carried.failure_fact(), fact);
+            assert_eq!(user.to_string(), source.to_string());
+        }
     }
 
     #[test]

@@ -592,6 +592,18 @@ impl TaskRound {
     /// of sitting in the dispatcher for a whole turn while the credential it
     /// replaces keeps expiring.
     pub(crate) fn turn(&mut self) -> Result<TurnReport, TaskExecutionError> {
+        self.turn_with_dispatch(true)
+    }
+
+    /// Keep the original ACK/covered-status receiver and its domain ordering
+    /// while a pre-ready unknown awaits exact process evidence. No input pump
+    /// or normal operation admission is authorized by this turn. Previously
+    /// actor-authorized Abort effects keep their exact lifecycle dispatch.
+    pub(crate) fn receive_without_dispatch(&mut self) -> Result<TurnReport, TaskExecutionError> {
+        self.turn_with_dispatch(false)
+    }
+
+    fn turn_with_dispatch(&mut self, dispatch: bool) -> Result<TurnReport, TaskExecutionError> {
         let mut report = TurnReport::default();
         if self.normal_drain_started
             || self.terminal_cleanup_started
@@ -807,18 +819,24 @@ impl TaskRound {
             }
         }
 
-        if !self.normal_drain_started
-            && !self.terminal_cleanup_started
-            && self.execution.failure_cause().is_none()
-        {
-            for pump in &mut self.pumps {
-                if !pump.closing {
-                    report.pumped += pump.owner.drive(&mut self.execution)?;
+        if dispatch {
+            if !self.normal_drain_started
+                && !self.terminal_cleanup_started
+                && self.execution.failure_cause().is_none()
+            {
+                for pump in &mut self.pumps {
+                    if !pump.closing {
+                        report.pumped += pump.owner.drive(&mut self.execution)?;
+                    }
                 }
             }
         }
-
-        let pumped = match self.execution.pump(self.establish.as_ref()) {
+        let pumped = if dispatch {
+            self.execution.pump(self.establish.as_ref())
+        } else {
+            self.execution.pump_pending_actor_aborts()
+        };
+        let pumped = match pumped {
             Ok(pumped) => pumped,
             Err(error) => {
                 self.settle_definitely_unsent_expired_actor_aborts()?;
@@ -1593,4 +1611,151 @@ fn participant_observation_failure(state: SubscriptionState) -> ParticipantObser
         }
         _ => ParticipantObservationFailure::Transport(state.as_str()),
     }
+}
+
+#[cfg(test)]
+mod pre_ready_receiver_tests {
+    use super::*;
+    use novarocks_execution_contract::{SafeDetail, TaskFailure, TaskFailurePhase};
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::execution_error::{ExecutionFailureInput, QueryFailureReason};
+    use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
+
+    #[tokio::test]
+    async fn pending_receiver_applies_originating_task_failure_through_original_covered_domain() {
+        let mut round = super::super::tests::manifest_preparing_observation_round();
+        let identity = round.execution().graph().root_identity();
+        let context = round
+            .execution()
+            .graph()
+            .task(identity.task_id())
+            .unwrap()
+            .context();
+        let intake = Arc::new(
+            ObservationIntake::for_task_attempt(
+                Arc::new(super::super::status_intake::CountingWake::default()),
+                Arc::new(super::super::clock::ManualClock::new()),
+            )
+            .unwrap(),
+        );
+        round.observation_intake = Some(Arc::clone(&intake));
+        let publisher = intake.subscribe().unwrap();
+        let fact = QueryFailureReason::PreparationFailed.failure_fact();
+        let failure = TaskFailure::new_in_phase(
+            fact,
+            SafeDetail::truncating("original preparation producer"),
+            TaskFailurePhase::Preparation,
+        );
+        let status = novarocks_execution_contract::TaskStatus::try_new_with_installed(
+            identity,
+            novarocks_execution_contract::TaskStatusVersion::new(2).unwrap(),
+            novarocks_execution_contract::TaskState::Failing,
+            Some(novarocks_execution_contract::TerminationDetail::Failed(
+                failure,
+            )),
+            novarocks_execution_contract::TaskOutputFacts::new(false),
+            false,
+        )
+        .unwrap();
+        publisher
+            .reserve_read()
+            .await
+            .publish(
+                super::super::status_intake::ObservationFrame::Covered {
+                    context,
+                    generation: 1,
+                    event: CoveredStatusStreamEvent {
+                        fact: CoveredStatusStreamFact::Status(status),
+                        source_revision: None,
+                    },
+                },
+                256,
+            )
+            .unwrap();
+        let report = round.receive_without_dispatch().unwrap();
+        assert_eq!(report.operations, 0);
+        assert_eq!(report.status_events, 1);
+        let selected = round.execution().selected_task_failure().unwrap();
+        let input = ExecutionFailureInput::from_selected_task(selected).unwrap();
+        assert_eq!(input.fact(), fact);
+        assert_eq!(
+            input.site(),
+            novarocks_query_application::execution_error::ExecutionFailureSite::Task {
+                identity,
+                phase: TaskFailurePhase::Preparation,
+            },
+        );
+        assert_eq!(input.detail().as_str(), "original preparation producer");
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn pending_task_failure_then_invalid_covered_frame_round() -> TaskRound {
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailure, TaskFailurePhase, TaskOutputFacts, TaskState, TaskStatus,
+        TaskStatusVersion, TerminationDetail,
+    };
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::execution_error::QueryFailureReason;
+    use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
+    let mut round = super::tests::manifest_preparing_observation_round();
+    let root = round.execution().graph().root_identity();
+    let context = round
+        .execution()
+        .graph()
+        .task(root.task_id())
+        .unwrap()
+        .context();
+    let foreign_task = novarocks_types::TaskId::new(u32::MAX).unwrap();
+    assert!(round.execution().graph().task(foreign_task).is_none());
+    let foreign = novarocks_execution_contract::TaskIdentity::new(
+        root.query_execution_id(),
+        root.stage_id(),
+        foreign_task,
+        root.backend_process_id(),
+    );
+    let intake = Arc::new(
+        ObservationIntake::for_task_attempt(
+            Arc::new(super::status_intake::CountingWake::default()),
+            Arc::new(super::clock::ManualClock::new()),
+        )
+        .unwrap(),
+    );
+    round.observation_intake = Some(Arc::clone(&intake));
+    // Each real bounded subscription owns one pending frame. Publish in this
+    // exact order before the single receiver turn, without sleeps or retries.
+    let first = intake.subscribe().unwrap();
+    let second = intake.subscribe().unwrap();
+    for (publisher, identity) in [(&first, root), (&second, foreign)] {
+        let failure = TaskFailure::new_in_phase(
+            QueryFailureReason::PreparationFailed.failure_fact(),
+            SafeDetail::truncating("original Task before invalid frame"),
+            TaskFailurePhase::Preparation,
+        );
+        let status = TaskStatus::try_new_with_installed(
+            identity,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Failing,
+            Some(TerminationDetail::Failed(failure)),
+            TaskOutputFacts::new(false),
+            false,
+        )
+        .unwrap();
+        publisher
+            .reserve_read()
+            .await
+            .publish(
+                super::status_intake::ObservationFrame::Covered {
+                    context,
+                    generation: 1,
+                    event: CoveredStatusStreamEvent {
+                        fact: CoveredStatusStreamFact::Status(status),
+                        source_revision: None,
+                    },
+                },
+                256,
+            )
+            .unwrap();
+    }
+    round
 }

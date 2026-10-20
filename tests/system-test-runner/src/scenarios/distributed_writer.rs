@@ -382,7 +382,7 @@ fn peak_ceiling(before: &[WriteCounters]) -> f64 {
 /// so an absent sample means the frontend changed its vocabulary and is
 /// reported rather than silently treated as zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PublicationTerminals {
+pub(super) struct PublicationTerminals {
     pre_dispatch_uncommitted: f64,
     pre_dispatch_unknown: f64,
     pre_dispatch_committed_succeeded: f64,
@@ -406,7 +406,7 @@ impl PublicationTerminals {
     }
 }
 
-fn publication_terminals(
+pub(super) fn publication_terminals(
     context: &mut ScenarioContext,
     family: &str,
 ) -> Result<PublicationTerminals> {
@@ -458,7 +458,7 @@ fn assert_committed_once(
 /// expected value rather than a comparison that quietly stops discriminating.
 /// The statement must additionally have settled as known-uncommitted before
 /// dispatch, which is the disposition that tells a client the retry is safe.
-fn assert_commit_never_invoked(
+pub(super) fn assert_commit_never_invoked(
     before: PublicationTerminals,
     after: PublicationTerminals,
     case: &str,
@@ -482,6 +482,22 @@ fn assert_commit_never_invoked(
         (
             "pre_dispatch known_committed/failed",
             after.pre_dispatch_committed_failed - before.pre_dispatch_committed_failed,
+        ),
+        (
+            "dispatch_possible known_uncommitted",
+            after.dispatch_uncommitted - before.dispatch_uncommitted,
+        ),
+        (
+            "dispatch_possible commit_unknown",
+            after.dispatch_unknown - before.dispatch_unknown,
+        ),
+        (
+            "dispatch_possible known_committed/succeeded",
+            after.dispatch_committed_succeeded - before.dispatch_committed_succeeded,
+        ),
+        (
+            "dispatch_possible known_committed/failed",
+            after.dispatch_committed_failed - before.dispatch_committed_failed,
         ),
     ] {
         if delta.abs() > f64::EPSILON {
@@ -2866,6 +2882,47 @@ fn await_deadline_abort_terminals(
 #[cfg(test)]
 mod controlled_writer_tests {
     use super::*;
+
+    #[test]
+    fn pre_dispatch_uncommitted_requires_one_terminal_and_all_other_labels_unchanged() {
+        let before = PublicationTerminals {
+            pre_dispatch_uncommitted: 10.0,
+            pre_dispatch_unknown: 10.0,
+            pre_dispatch_committed_succeeded: 10.0,
+            pre_dispatch_committed_failed: 10.0,
+            dispatch_uncommitted: 10.0,
+            dispatch_unknown: 10.0,
+            dispatch_committed_succeeded: 10.0,
+            dispatch_committed_failed: 10.0,
+        };
+        let mut after = before;
+        after.pre_dispatch_uncommitted += 1.0;
+        assert!(assert_commit_never_invoked(before, after, "one original attempt").is_ok());
+        assert!(assert_commit_never_invoked(before, before, "missing terminal").is_err());
+        let mut duplicate = after;
+        duplicate.pre_dispatch_uncommitted += 1.0;
+        assert!(assert_commit_never_invoked(before, duplicate, "duplicate terminal").is_err());
+
+        let changes: [fn(&mut PublicationTerminals); 7] = [
+            |value| value.pre_dispatch_unknown += 1.0,
+            |value| value.pre_dispatch_committed_succeeded += 1.0,
+            |value| value.pre_dispatch_committed_failed += 1.0,
+            |value| value.dispatch_uncommitted += 1.0,
+            |value| value.dispatch_unknown += 1.0,
+            |value| value.dispatch_committed_succeeded += 1.0,
+            |value| value.dispatch_committed_failed += 1.0,
+        ];
+        for change in changes {
+            let mut wrong = after;
+            change(&mut wrong);
+            assert!(assert_commit_never_invoked(before, wrong, "another terminal").is_err());
+        }
+        // An unchanged sum must not hide individual label changes.
+        let mut balanced = after;
+        balanced.dispatch_uncommitted += 1.0;
+        balanced.dispatch_unknown -= 1.0;
+        assert!(assert_commit_never_invoked(before, balanced, "balanced labels").is_err());
+    }
 
     #[test]
     fn fault_matrix_has_only_targeted_write_permissions() {

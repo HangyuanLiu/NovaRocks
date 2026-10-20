@@ -431,7 +431,7 @@ impl FailureProjection for crate::ComparisonPrepareError {
         match self {
             Self::Control(source) => source.failure_fact(),
             Self::Kernel(source) => source.failure_fact(),
-            Self::Unsupported => fact(FailureClass::Dependency, 602),
+            Self::Unsupported => fact(FailureClass::Unsupported, 602),
             Self::TypeMismatch => fact(FailureClass::Invariant, 603),
         }
     }
@@ -456,5 +456,115 @@ impl FailureProjection for crate::CastPrepareError {
             Self::Unsupported => fact(FailureClass::Dependency, 606),
             Self::TypeMismatch => fact(FailureClass::Invariant, 607),
         }
+    }
+}
+
+#[cfg(test)]
+mod comparison_failure_tests {
+    use super::*;
+    use crate::{ComparisonPrepareError, PreparedComparisonRecipe};
+    use arrow_schema::{DataType, Field};
+    use novarocks_type_contract::{
+        ComparisonOperator, CompileControlError, CompilePhase, FunctionValueType,
+        PureCompileControl,
+    };
+    use std::{error::Error, sync::Arc};
+
+    struct CompileControl(Option<CompileControlError>);
+    impl PureCompileControl for CompileControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            self.0.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    fn value(data_type: DataType) -> FunctionValueType {
+        FunctionValueType::from_legacy_declared_projection(data_type, true)
+    }
+
+    #[test]
+    fn actual_comparison_recipe_authors_capability_and_mismatch_as_distinct_facts() {
+        let nested = value(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        ))));
+        let int32 = value(DataType::Int32);
+        let int64 = value(DataType::Int64);
+        let control = CompileControl(None);
+        let supported =
+            PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &int32, &int32, &control)
+                .unwrap();
+        assert_eq!(supported.left_type(), &int32);
+        assert_eq!(supported.right_type(), &int32);
+        for (left, right, expected, class, reason) in [
+            (
+                &nested,
+                &nested,
+                ComparisonPrepareError::Unsupported,
+                FailureClass::Unsupported,
+                602,
+            ),
+            (
+                &int32,
+                &int64,
+                ComparisonPrepareError::TypeMismatch,
+                FailureClass::Invariant,
+                603,
+            ),
+        ] {
+            let error =
+                PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, left, right, &control)
+                    .unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(error.failure_fact(), fact(class, reason));
+            assert_eq!(error.failure_fact().reason().domain(), domain::KERNEL.get());
+            assert!(error.source().is_none());
+            let source = novarocks_failure_contract::SharedFailureCause::new(error.clone());
+            assert_eq!(source.failure_fact(), error.failure_fact());
+            assert_eq!(source.detail(), error.to_string());
+            assert_eq!(
+                source.downcast_ref::<ComparisonPrepareError>(),
+                Some(&error)
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_control_and_kernel_keep_their_original_authors() {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let int32 = value(DataType::Int32);
+        let source =
+            novarocks_failure_contract::SharedFailureCause::new(LayoutResourceError::SourceModel);
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(source),
+        ] {
+            let error = PreparedComparisonRecipe::try_new(
+                ComparisonOperator::Eq,
+                &int32,
+                &int32,
+                &CompileControl(Some(control.clone())),
+            )
+            .unwrap_err();
+            assert_eq!(error, ComparisonPrepareError::Control(control.clone()));
+            assert_eq!(error.failure_fact(), control.failure_fact());
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&control)
+            );
+        }
+        let kernel = KernelFailure::from_domain(LayoutResourceError::SourceModel);
+        let error = ComparisonPrepareError::Kernel(kernel.clone());
+        assert_eq!(error.failure_fact(), kernel.failure_fact());
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.source().unwrap().downcast_ref::<KernelFailure>(),
+            Some(&kernel)
+        );
     }
 }

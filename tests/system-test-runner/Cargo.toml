@@ -43,6 +43,7 @@ novarocks-functions.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-plan-codec.workspace = true
 novarocks-type-contract.workspace = true
+novarocks-query-application.workspace = true
 novarocks-failpoint.workspace = true
 novarocks-execution.workspace = true
 novarocks-execution-contract.workspace = true
