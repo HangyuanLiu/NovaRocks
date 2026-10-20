@@ -511,6 +511,126 @@ class Run(unittest.TestCase):
         self.assertEqual(rehearsal['scopes'][0]['gated_units'],[str(unit)])
         self.assertFalse(rehearsal['qualifies_for_admission'])
 
+    def post_compat_main_owner_fixture(self, program, exit_code=0):
+        library=self.repo/'tools/ci/lib';library.mkdir(parents=True,exist_ok=True)
+        (library/'build_capabilities.sh').write_text("""ci_prepare_main() {
+  printf '%s\\n' "$1" >"$REFRESH_CALLS"
+  [ "$REFRESH_OWNER_EXIT" -eq 0 ] || return "$REFRESH_OWNER_EXIT"
+  "$REFRESH_PYTHON" - "$1.cargo.jsonl" "$REFRESH_PROGRAM" <<'CARGO'
+import json,sys
+names=('novarocks','novarocks-sql-test','novarocks-system-tests','novarocks-error-manifest')
+with open(sys.argv[1],'w') as stream:
+    for name in names:
+        stream.write(json.dumps({'reason':'compiler-artifact','executable':sys.argv[2],
+            'target':{'name':name,'kind':['bin']},'profile':{'test':False}})+'\\n')
+CARGO
+  "$REFRESH_PYTHON" "$REFRESH_ARTIFACT_SCRIPT" collect "$1.cargo.jsonl" "$1"
+}
+ci_capture_main_builds() { printf '%s\\n' "$1" "$2" >"$REFRESH_BUILD_INFO_CALLS"; }
+""")
+        return {'REFRESH_PROGRAM':str(program),'REFRESH_OWNER_EXIT':str(exit_code),
+                'REFRESH_PYTHON':sys.executable,
+                'REFRESH_ARTIFACT_SCRIPT':str(Path(run.__file__).resolve().parents[1]/'cargo-artifacts.py'),
+                'REFRESH_CALLS':str(self.base/'refresh-owner-calls'),
+                'REFRESH_BUILD_INFO_CALLS':str(self.base/'refresh-build-info-calls')}
+
+    def test_compatibility_stage_renews_own_receipt_before_next_descriptor_without_retargeting(self):
+        for compatibility_exit in (0,1):
+            with self.subTest(compatibility_exit=compatibility_exit):
+                program=(self.base/'main-program').resolve();program.write_text('initial canonical main');program.chmod(0o755)
+                old_receipt={name:{'path':str(program),'sha256':run.identity_snapshot.digest(program)}
+                             for name in ('novarocks','novarocks-sql-test','novarocks-system-tests','novarocks-error-manifest')}
+                self.native['receipt']=copy.deepcopy(old_receipt)
+                put(self.inputs/'artifacts.json',old_receipt)
+                put(self.inputs/'selected-tests.json',{'original_selection':'unchanged'})
+                put(self.inputs/'selected-tests.command.json',{'argv':['original-nextest','list']})
+                (self.inputs/'artifacts.json.cargo.jsonl').write_text('initial original Cargo stream')
+                previous={p.name:p.read_bytes() for p in self.inputs.iterdir() if p.is_file()}
+                first={'name':'native-compatibility','tier':'full'}
+                later={'name':'selected system program preparation','tier':'admission'}
+                chosen=dict(self.chosen,stages=[first,later])
+                scopes=[self.scope('stage',first['name']),self.scope('stage',later['name'])]
+                identities=copy.deepcopy([scope.identity for scope in scopes])
+                calls=[]
+                real_run=subprocess.run
+                guard=Path(run.__file__).resolve().parents[1]/'cargo-artifacts.py'
+                def descriptor(repo,native,item,output):
+                    receipt=json.loads((Path(native['inputs'])/'artifacts.json').read_text())
+                    self.assertEqual(native['receipt'],receipt)
+                    actual=real_run([sys.executable,str(guard),'verify',str(Path(native['inputs'])/'artifacts.json'),'novarocks'],capture_output=True,text=True)
+                    if actual.returncode:
+                        raise subprocess.CalledProcessError(actual.returncode,actual.args,actual.stdout,actual.stderr)
+                    self.assertEqual(actual.stdout.strip(),str(program))
+                    return {'env_inputs':[]}
+                def invoked(root,repo,kind,name,units,argv,spec,materials,environment):
+                    calls.append(name)
+                    if name==first['name']:
+                        program.write_text('actual restored main after native variants')
+                        return compatibility_exit
+                    self.assertEqual(environment['NOVAROCKS_BIN'],str(program))
+                    return 0
+                owner_env=self.post_compat_main_owner_fixture(program)
+                with mock.patch.object(run,'stage_spec',side_effect=descriptor),mock.patch.object(run,'invoke',side_effect=invoked),mock.patch.dict(os.environ,owner_env):
+                    _,_,attempt=run.execute(self.repo,self.base/('post-compat-'+str(compatibility_exit)),self.native,chosen,scopes)
+                self.assertEqual(calls,[first['name'],later['name']])
+                self.assertEqual([scope.identity for scope in scopes],identities,'program refresh must not rewrite target scopes')
+                refresh=next((attempt/'stage-runtime').glob('*/development-program-refresh'))
+                for name,data in previous.items():self.assertEqual((refresh/'before'/name).read_bytes(),data)
+                for name,data in previous.items():
+                    if name not in ('artifacts.json','artifacts.json.cargo.jsonl'):self.assertEqual((self.inputs/name).read_bytes(),data)
+                self.assertEqual(json.loads((refresh/'after/artifacts.json').read_text()),self.native['receipt'])
+                self.assertEqual(Path(owner_env['REFRESH_CALLS']).read_text().strip(),str(self.inputs/'artifacts.json'))
+                self.assertTrue(Path(owner_env['REFRESH_BUILD_INFO_CALLS']).is_file())
+                self.assertEqual(self.native['inputs'],str(self.inputs),'canonical seven input paths remain owned in place')
+                errors=json.loads((attempt/'execution.json').read_text())['errors']
+                self.assertEqual([error.get('exit') for error in errors],[1] if compatibility_exit else [])
+                self.assertEqual(json.loads((attempt/'selection.json').read_text())['executed_scope_keys'],sorted(scope.key for scope in scopes))
+
+    def test_failed_post_compat_refresh_preserves_failure_guard_and_independent_static(self):
+        program=(self.base/'failed-main').resolve();program.write_text('old main');program.chmod(0o755)
+        receipt={'novarocks':{'path':str(program),'sha256':run.identity_snapshot.digest(program)}}
+        self.native['receipt']=copy.deepcopy(receipt);put(self.inputs/'artifacts.json',receipt)
+        before=(self.inputs/'artifacts.json').read_bytes()
+        first={'name':'native-compatibility','tier':'full'}
+        guarded={'name':'selected system program preparation','tier':'admission'}
+        independent={'name':'CI build inputs','tier':'admission'}
+        calls=[]
+        real_run=subprocess.run
+        guard=Path(run.__file__).resolve().parents[1]/'cargo-artifacts.py'
+        def descriptor(repo,native,item,output):
+            if item['name']==guarded['name']:
+                actual=real_run([sys.executable,str(guard),'verify',str(Path(native['inputs'])/'artifacts.json'),'novarocks'],capture_output=True,text=True)
+                if actual.returncode:
+                    raise subprocess.CalledProcessError(actual.returncode,actual.args,actual.stdout,actual.stderr)
+            return {'env_inputs':[]}
+        def invoked(root,repo,kind,name,*args):
+            calls.append(name)
+            if name==first['name']:
+                program.write_text('changed by compatibility')
+                return 1
+            return 0
+        stages=[first,guarded,independent]
+        with mock.patch.object(run,'stage_spec',side_effect=descriptor),mock.patch.object(run,'invoke',side_effect=invoked),mock.patch.dict(os.environ,self.post_compat_main_owner_fixture(program,17)):
+            _,_,attempt=run.execute(self.repo,self.base/'failed-main-refresh',self.native,dict(self.chosen,stages=stages),[self.scope('stage',item['name']) for item in stages])
+        self.assertEqual((self.inputs/'artifacts.json').read_bytes(),before)
+        self.assertEqual(self.native['receipt'],receipt)
+        self.assertEqual(calls,[first['name'],independent['name']],'original guard rejects stale input; independent static continues')
+        errors=json.loads((attempt/'execution.json').read_text())['errors']
+        self.assertEqual(errors[0]['exit'],1)
+        self.assertEqual(errors[1]['kind'],'artifact-preparation')
+        self.assertIn('development main-program refresh failed',errors[1]['error'])
+        self.assertEqual(errors[2]['name'],guarded['name'])
+        refresh=next((attempt/'stage-runtime').glob('*/development-program-refresh'))
+        self.assertEqual(json.loads((refresh/'exit.json').read_text())['code'],17)
+        self.assertEqual((refresh/'before/artifacts.json').read_bytes(),before)
+        self.assertEqual((refresh/'after/artifacts.json').read_bytes(),before)
+
+    def test_unrelated_stage_does_not_refresh_development_programs(self):
+        item={'name':'CI build inputs','tier':'admission'}
+        with mock.patch.object(run,'stage_spec',return_value={'env_inputs':[]}),mock.patch.object(run,'invoke',return_value=0),mock.patch.object(run,'refresh_development_programs') as refresh:
+            run.execute(self.repo,self.base/'unrelated-no-refresh',self.native,dict(self.chosen,stages=[item]),[self.scope('stage',item['name'])])
+        refresh.assert_not_called()
+
     def test_variant_preparation_executes_existing_owner_helper(self):
         library=self.repo/'tools/ci/lib';library.mkdir(parents=True)
         actual=Path(run.__file__).resolve().parents[1]/'lib/identity_snapshot.py'

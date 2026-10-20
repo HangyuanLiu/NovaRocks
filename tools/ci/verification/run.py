@@ -293,6 +293,38 @@ BINDINGS
     native['system_variants_prepared']=True
 
 
+def refresh_development_programs(repo, native, output):
+    """Let the existing main-graph producer renew its own receipt after variants."""
+    inputs=Path(native['inputs'])
+    output=Path(output)/'development-program-refresh'
+    output.mkdir(parents=True,exist_ok=False)
+    # Preserve the previous canonical inputs and raw Cargo streams before their
+    # owning producer updates artifacts.json in place. Never infer new hashes.
+    shutil.copytree(inputs,output/'before',symlinks=True)
+    shell = ('source "$1/tools/ci/lib/build_capabilities.sh"; REPO_ROOT="$1"; '
+             'ci_prepare_main "$2/artifacts.json" && ci_capture_main_builds "$2/artifacts.json" "$3/build-info"')
+    argv=['bash','-c',shell,'refresh-development-programs',str(Path(repo).resolve()),str(inputs),str(output)]
+    write_record(output/'command.json',{'argv':argv,'cwd':str(repo),
+        'previous_inputs':str(inputs),'previous_receipt':native['receipt'],
+        'meaning':'Original main-graph producer only; no test execution or target identity rewrite.'})
+    code=None
+    try:
+        with (output/'stdout.log').open('xb') as out,(output/'stderr.log').open('xb') as err:
+            code=subprocess.run(argv,cwd=repo,env=rust_environment(repo,native),stdout=out,stderr=err).returncode
+    finally:
+        write_record(output/'exit.json',{'code':code})
+        shutil.copytree(inputs,output/'after',symlinks=True)
+    if code:
+        raise ValueError('development main-program refresh failed; see '+str(output))
+    receipt=json.loads((inputs/'artifacts.json').read_text())
+    if set(receipt)!=set(native['receipt']):
+        raise ValueError('development main-program refresh changed the bound program set')
+    for entry in receipt.values():
+        if identity_snapshot.digest(entry['path'])!=entry['sha256']:
+            raise ValueError('refreshed development artifact changed: '+entry['path'])
+    native['receipt']=receipt
+
+
 def invoke(root,repo,kind,name,units,argv,spec,materials,environment=None):
     environment=dict(os.environ if environment is None else environment)
     started=invocation_record.start(root,repo,kind,name,[str(unit) for unit in units],[str(a) for a in argv],spec,environment)
@@ -826,6 +858,16 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
                        'execution_identity':[str(output/'rust-stage/identity/nextest.json'),str(output/'rust-stage/identity/doctest.json')]}
         code=invoke(attempt,repo,'stage',item['name'],[unit],stage_argv(repo,native,item,output),spec,materials,env)
         if code:record_error('stage',item['name'],code=code)
+        if item['name']=='native-compatibility' and code is not None:
+            # Its native owner restores main using a stage-local receipt. Renew
+            # the development owner's receipt through that same build producer;
+            # frozen scopes and all previous observations remain unchanged.
+            try:
+                refresh_development_programs(repo,native,output)
+            except (OSError,ValueError,subprocess.SubprocessError) as error:
+                record_error('artifact-preparation','development programs after native-compatibility',error=error)
+            else:
+                env.update(rust_environment(repo,native))
     try:
         system_items=[item for item in chosen['system_scenarios'] if 'system-scenario:'+item['name'] in selected_keys]
         if system_items and not native.get('system_variants_prepared'):
