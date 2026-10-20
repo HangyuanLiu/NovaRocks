@@ -45,6 +45,9 @@ pub type Profiler = RuntimeProfile;
 pub fn merge_pipeline_profiles(profiler: &Profiler) -> Profiler {
     let merged = Profiler::new(profiler.name());
     merged.set_metadata(profiler.metadata());
+    if let Some(identity) = profiler.compiled_operator() {
+        merged.set_compiled_operator(identity);
+    }
     merged.copy_all_info_strings_from(profiler);
     merged.copy_all_counters_from(profiler);
 
@@ -192,9 +195,28 @@ pub struct RuntimeProfileTree {
     pub root: ProfileNode,
 }
 
+/// Physical diagnostic sources for one runtime factory, separate from routing.
+/// Several runtime factories may reference the same physical owner. This is
+/// not a copy of a local operator identity or its cost-ownership record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledOperatorProfile {
+    pub sources: Box<[novarocks_local_program::DiagnosticSourceNodeId]>,
+    pub label: String,
+}
+
+impl CompiledOperatorProfile {
+    pub fn single_plan_node_id(&self) -> Option<i32> {
+        match self.sources.as_ref() {
+            [source] => i32::try_from(source.get()).ok(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileNode {
     pub name: String,
+    pub compiled_operator: Option<Arc<CompiledOperatorProfile>>,
     pub node_id: i32,
     pub counters: Vec<ProfileCounter>,
     pub info_strings: BTreeMap<String, String>,
@@ -214,6 +236,7 @@ pub struct ProfileCounter {
 
 #[derive(Debug)]
 struct RuntimeProfileInner {
+    compiled_operator: Mutex<Option<Arc<CompiledOperatorProfile>>>,
     name: RwLock<String>,
     metadata: AtomicI64,
     counters: Mutex<HashMap<String, CounterEntry>>,
@@ -234,6 +257,7 @@ impl RuntimeProfile {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(RuntimeProfileInner {
+                compiled_operator: Mutex::new(None),
                 name: RwLock::new(name.into()),
                 metadata: AtomicI64::new(0),
                 counters: Mutex::new(HashMap::new()),
@@ -263,6 +287,23 @@ impl RuntimeProfile {
 
     pub fn set_metadata(&self, md: i64) {
         self.inner.metadata.store(md, Ordering::Relaxed);
+    }
+
+    pub fn compiled_operator(&self) -> Option<Arc<CompiledOperatorProfile>> {
+        self.inner
+            .compiled_operator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_compiled_operator(&self, identity: Arc<CompiledOperatorProfile>) {
+        self.set_metadata(i64::from(identity.single_plan_node_id().unwrap_or(-1)));
+        *self
+            .inner
+            .compiled_operator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(identity);
     }
 
     pub fn get_child(&self, name: &str) -> Option<RuntimeProfile> {
@@ -524,6 +565,9 @@ impl RuntimeProfile {
 
         let merged = RuntimeProfile::new(first.name());
         merged.set_metadata(first.metadata());
+        if let Some(identity) = first.compiled_operator() {
+            merged.set_compiled_operator(identity);
+        }
         merged.copy_all_info_strings_from(first);
 
         let all_counter_names: BTreeSet<String> = profiles
@@ -603,6 +647,7 @@ impl RuntimeProfile {
 
         ProfileNode {
             name: self.name(),
+            compiled_operator: self.compiled_operator(),
             node_id: metadata_to_proto_node_id(self.metadata()),
             counters,
             info_strings,

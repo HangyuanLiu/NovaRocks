@@ -143,8 +143,33 @@ impl From<SqlSourceJournalError> for PackageSemanticsError {
         }
     }
 }
+/// Only the typed constant owner can identify structural constant limits.
+/// Similar diagnostic text from invalid sources or real control never qualifies.
+fn constant_limit_from_effects(error: &PhysicalFragmentEffectsError) -> Option<&'static str> {
+    use super::physical_aggregate_requests::PhysicalAggregateRequestError as A;
+    use super::physical_expression_effects::PhysicalExpressionEffectsError as E;
+    use super::physical_scalar_requests::PhysicalScalarRequestError as S;
+    use super::physical_table_requests::PhysicalTableRequestError as T;
+    use super::physical_window_requests::PhysicalWindowRequestError as W;
+    use super::physical_writer_requests::PhysicalWriterRequestError as R;
+    match error {
+        PhysicalFragmentEffectsError::Expressions(E::Argument(argument))
+        | PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument)))
+        | PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument)))
+        | PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument))
+        | PhysicalFragmentEffectsError::TableRequest(T::Argument(argument))
+        | PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument))) => {
+            argument.constant_limit()
+        }
+        _ => None,
+    }
+}
+
 impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
     fn from(error: PhysicalFragmentEffectsError) -> Self {
+        if let Some(detail) = constant_limit_from_effects(&error) {
+            return Self::UnsupportedCapability(format!("constant admission limit: {detail}"));
+        }
         match error {
             PhysicalFragmentEffectsError::Control(cause) => Self::Control(cause),
             error @ PhysicalFragmentEffectsError::Expressions(
@@ -406,6 +431,56 @@ mod capability_projection_tests {
                 PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause.clone())),
                 PackageSemanticsError::Control(actual) if actual == cause
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod constant_limit_projection_tests {
+    use super::super::physical_aggregate_requests::PhysicalAggregateRequestError as A;
+    use super::super::physical_call_arguments::PhysicalArgumentError;
+    use super::super::physical_scalar_requests::PhysicalScalarRequestError as S;
+    use super::super::physical_table_requests::PhysicalTableRequestError as T;
+    use super::super::physical_window_requests::PhysicalWindowRequestError as W;
+    use super::super::physical_writer_requests::PhysicalWriterRequestError as R;
+    use super::*;
+    use novarocks_functions::ConstantError;
+
+    fn argument() -> PhysicalArgumentError {
+        PhysicalArgumentError::from(ConstantError::Limit("rows exceed policy"))
+    }
+
+    #[test]
+    fn typed_limits_survive_all_physical_call_argument_wrappers() {
+        use PhysicalExpressionEffectsError as E;
+        let errors = [
+            PhysicalFragmentEffectsError::Expressions(E::Argument(argument())),
+            PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument()))),
+            PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument()))),
+            PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument())),
+            PhysicalFragmentEffectsError::TableRequest(T::Argument(argument())),
+            PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument()))),
+        ];
+        for error in errors {
+            assert!(
+                matches!(PackageSemanticsError::from(error), PackageSemanticsError::UnsupportedCapability(detail) if detail == "constant admission limit: rows exceed policy")
+            );
+        }
+        let error = PhysicalFragmentEffectsError::Expressions(E::Argument(
+            PhysicalArgumentError::from(ConstantError::Invalid("rows exceed policy")),
+        ));
+        assert!(matches!(
+            PackageSemanticsError::from(error),
+            PackageSemanticsError::Effects(_)
+        ));
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            assert!(
+                matches!(PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause)), PackageSemanticsError::Control(actual) if actual == cause)
+            );
         }
     }
 }

@@ -184,6 +184,45 @@ impl PureFunctionMetadataOwner for WindowOffsetOwner {
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
     }
+    fn admit_selected_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        work.step()?;
+        self.declaration.effect_declaration(&selected.overload)?;
+        if !(1..=3).contains(&logical_argument_count)
+            || selected.argument_types.len() != logical_argument_count
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "LEAD/LAG admission differs from its canonical value channel count".into(),
+            ));
+        }
+        // Only the third channel installs a DefaultValueRecipe. One/two-argument
+        // nested and encoded sources keep their existing selected-copy boundary.
+        let supported = if logical_argument_count == 3 {
+            let (FunctionArgumentType::Value(source), FunctionResultType::Scalar(target)) =
+                (&selected.argument_types[2], &selected.result_type)
+            else {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "LEAD/LAG default admission requires exact scalar value channels".into(),
+                ));
+            };
+            DefaultValueRecipe::supports_profile(source, target)
+        } else {
+            true
+        };
+        work.finish()?;
+        if supported {
+            Ok(())
+        } else {
+            Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ))
+        }
+    }
 }
 
 impl FunctionEffectOwner for WindowOffsetOwner {

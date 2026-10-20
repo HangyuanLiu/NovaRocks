@@ -302,6 +302,56 @@ fn start_partitioned_read(
     })
 }
 
+fn ordinary_frontend_has_test_controls(records: &serde_json::Value) -> Result<bool> {
+    let mut captures = records
+        .as_array()
+        .context("ordinary peer build captures are not an array")?
+        .iter()
+        .filter(|record| record["launch_capture"] == "fe.build-info.json");
+    let capture = captures
+        .next()
+        .context("ordinary peer omitted its original FE build capture")?;
+    ensure!(
+        captures.next().is_none(),
+        "ordinary peer repeats its FE build capture"
+    );
+    let info = &capture["build_info"];
+    ensure!(
+        info["schema_version"] == 1 && info["package"] == "novarocks-server",
+        "ordinary peer FE build identity is invalid"
+    );
+    let mut owners = info["capabilities"]
+        .as_array()
+        .context("ordinary FE omitted owner capabilities")?
+        .iter()
+        .filter(|owner| owner["owner"] == "novarocks-frontend-application");
+    let owner = owners
+        .next()
+        .context("ordinary FE omitted application capabilities")?;
+    ensure!(
+        owners.next().is_none(),
+        "ordinary FE repeats application capabilities"
+    );
+    let capabilities = owner["compiled_capabilities"]
+        .as_array()
+        .context("ordinary FE capabilities are invalid")?;
+    ensure!(
+        capabilities.iter().all(serde_json::Value::is_string),
+        "ordinary FE capability is not a string"
+    );
+    Ok(capabilities
+        .iter()
+        .any(|capability| capability == "test-controls"))
+}
+
+fn ordinary_call_refusal_matches(message: &str, controls_compiled: bool) -> bool {
+    if controls_compiled {
+        message.contains("MV test CALL requires explicit authorization")
+    } else {
+        message.contains("unsupported") && message.contains("novarocks_imv_stateless_rebuild")
+    }
+}
+
 #[derive(Default)]
 struct DistributedBaseline {
     intent: SqlIntentOwner,
@@ -339,6 +389,8 @@ impl DistributedBaseline {
                 "ordinary baseline requires native 1FE+3BE, got 1FE+{}BE",
                 peer.be_count()
             );
+            let controls_compiled =
+                ordinary_frontend_has_test_controls(&peer.build_information_evidence()?)?;
             let baseline = peer
                 .query_execution_resource_snapshot()?
                 .context("binary baseline peer did not expose the public query-resource oracle")?;
@@ -359,7 +411,7 @@ impl DistributedBaseline {
                                 ensure!(
                                     error.code == 1105
                                         && error.state == "HY000"
-                                        && error.message == "MV test CALL requires explicit authorization",
+                                        && ordinary_call_refusal_matches(&error.message, controls_compiled),
                                     "ordinary test-only CALL returned another SQL failure: {error}"
                                 );
                             }
@@ -1091,32 +1143,21 @@ fn observe_nid2_fence(
     Ok((backend, error))
 }
 
-/// Arms one fault on every backend and returns each arming's token.
-///
-/// Every backend is armed because the fence is not about placement: the
-/// scheduler places this query's tasks without regard to where an arming sits,
-/// and a query with no split assignment can establish a single context. Arming
-/// one backend would make the case a coin flip on which one that is. Each arm
-/// carries its own token, which is what keeps the assertion scoped to this
-/// scenario rather than to whatever the shared backend logs already hold.
+/// Select the finite all-backend fault set for this exact connected submission.
+/// No trigger file or fresh token may nominate an unrelated next statement.
 pub(super) fn arm_on_every_backend(
     context: &mut ScenarioContext,
+    selected: &SelectedStatement,
     fault: &'static str,
-) -> Result<Vec<String>> {
-    let mut tokens = Vec::with_capacity(REQUIRED_BACKENDS);
-    for backend_index in 0..REQUIRED_BACKENDS {
-        context
-            .handle()
-            .arm_query_lifecycle_fault(backend_index, fault)
-            .with_context(|| format!("arm {fault} for BE[{backend_index}]"))?;
-        let token = context
-            .handle()
-            .armed_query_lifecycle_fault_token(backend_index, fault)
-            .with_context(|| format!("read the {fault} token armed for BE[{backend_index}]"))?
-            .with_context(|| format!("armed {fault} for BE[{backend_index}] has no token"))?;
-        tokens.push(token);
-    }
-    Ok(tokens)
+    connection_id: u32,
+    sql: &str,
+) -> Result<novarocks_cluster_harness::QueryLifecycleStatementObservation> {
+    ensure!(
+        selected.faults.len() == REQUIRED_BACKENDS
+            && (0..REQUIRED_BACKENDS).all(|index| selected.faults.contains(&(index, fault))),
+        "all-backend arming differs from the exact finite fault set"
+    );
+    selected.arm(context, connection_id, sql)
 }
 
 /// Waits until some backend logged `marker` carrying one of `tokens`.
@@ -1326,13 +1367,6 @@ pub(super) fn resource_snapshot(
         .context("cross-process harness did not expose the query-resource oracle")
 }
 
-pub(super) fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> {
-    Ok(context
-        .handle()
-        .query_lifecycle_structured_snapshot()?
-        .and_then(|snapshot| snapshot.execution_id))
-}
-
 fn execute_baseline_query(connection: &mut mysql::Conn, ordinal: &str) -> Result<()> {
     let rows: Vec<i64> = connection
         .query(BASELINE_QUERY)
@@ -1342,17 +1376,6 @@ fn execute_baseline_query(connection: &mut mysql::Conn, ordinal: &str) -> Result
         "{ordinal} distributed baseline query returned unexpected rows: {rows:?}"
     );
     Ok(())
-}
-
-pub(super) fn await_terminal_snapshot(
-    context: &mut ScenarioContext,
-    before_execution_id: Option<&str>,
-) -> Result<QueryLifecycleStructuredSnapshot> {
-    let deadline = context.deadline();
-    context
-        .handle()
-        .await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline)
-        .context("await a new typed query lifecycle terminal snapshot")
 }
 
 fn assert_process_attribution(snapshots: &[&QueryLifecycleStructuredSnapshot]) -> Result<()> {
@@ -1485,4 +1508,49 @@ pub(super) fn await_resource_convergence(
 
 fn bounded_io_timeout(context: &ScenarioContext, operation: &str) -> Result<Duration> {
     Ok(context.remaining(operation)?.min(IO_TIMEOUT_CAP))
+}
+
+#[cfg(test)]
+mod ordinary_call_authorization_tests {
+    use super::*;
+
+    fn captures(capabilities: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{"launch_capture":"fe.build-info.json", "build_info":{
+            "schema_version":1, "package":"novarocks-server", "capabilities":[{
+                "owner":"novarocks-frontend-application", "compiled_capabilities":capabilities
+            }]
+        }}])
+    }
+
+    #[test]
+    fn ordinary_negative_call_uses_the_actual_frontend_capability_without_granting_mv() {
+        assert!(
+            ordinary_frontend_has_test_controls(&captures(serde_json::json!(["test-controls"])))
+                .unwrap()
+        );
+        assert!(!ordinary_frontend_has_test_controls(&captures(serde_json::json!([]))).unwrap());
+        assert!(ordinary_frontend_has_test_controls(&serde_json::json!([])).is_err());
+        assert!(ordinary_frontend_has_test_controls(&captures(serde_json::json!([7]))).is_err());
+        let duplicate = captures(serde_json::json!([]))[0].clone();
+        assert!(
+            ordinary_frontend_has_test_controls(&serde_json::json!([duplicate, duplicate]))
+                .is_err()
+        );
+        let authorized_only = "MV test CALL requires explicit authorization";
+        let uncompiled = "unsupported procedure novarocks_imv_stateless_rebuild";
+        assert!(ordinary_call_refusal_matches(authorized_only, true));
+        assert!(!ordinary_call_refusal_matches(uncompiled, true));
+        assert!(ordinary_call_refusal_matches(uncompiled, false));
+        assert!(!ordinary_call_refusal_matches(authorized_only, false));
+        for controls in [true, false] {
+            assert!(!ordinary_call_refusal_matches(
+                "permission denied",
+                controls
+            ));
+            assert!(!ordinary_call_refusal_matches(
+                "unsupported unrelated_procedure",
+                controls
+            ));
+        }
+    }
 }

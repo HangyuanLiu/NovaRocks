@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Borrowed construction facts for the already installed Values constructors.
-//! Arrow 58.4 interleave.rs selects primitive/bytes or the original Mutable
-//! fallback. No concat or substitute interleave executes in this resource body.
+//! Construction facts and the original nested Values constructor.
+//! Arrow 58.4 uses primitive/bytes interleave or MutableArrayData. The nested
+//! constructor below borrows the existing multi-source operation's sole invoice.
 use super::{
     CopyConstructionError, CopyError, CopyMode, CopyObservation, CopyOperationFacts,
     ScratchCoverage, add, mul, mutable_constructor_geometry, take_host, validate_interleave_plan,
@@ -1015,5 +1015,340 @@ mod tests {
         drop(opaque);
         assert_eq!(bytes, facts.metadata_upper_bytes());
         assert!(facts.retained_new_backing_upper() > 0);
+    }
+}
+
+/// Select the original flat Interleave or multi-source Mutable constructor.
+/// Exact source attributes and actual range/dictionary/offset extents remain
+/// the construction author's responsibility, separate from this type gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValuesCopyKind {
+    Interleave,
+    Extend,
+}
+
+pub fn values_copy_kind_observed(
+    ty: &DataType,
+    mut observe: impl FnMut() -> Result<(), crate::KernelFailure>,
+) -> Result<ValuesCopyKind, CopyError> {
+    fn visit(
+        ty: &DataType,
+        depth: usize,
+        visited: &mut usize,
+        observe: &mut impl FnMut() -> Result<(), crate::KernelFailure>,
+    ) -> Result<(), CopyError> {
+        observe().map_err(CopyError::Control)?;
+        *visited = visited
+            .checked_add(1)
+            .ok_or_else(|| CopyError::arithmetic(None))?;
+        if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
+            || *visited > novarocks_type_contract::MAX_VALUE_TYPE_NODES
+        {
+            return Err(CopyError::Invalid(
+                "Values copy type exceeds the frozen recursive type bounds",
+            ));
+        }
+        if ty.primitive_width().is_some() {
+            return Ok(());
+        }
+        match ty {
+            DataType::Null
+            | DataType::Boolean
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Utf8View
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_) => Ok(()),
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::ListView(child)
+            | DataType::LargeListView(child)
+            | DataType::FixedSizeList(child, _)
+            | DataType::Map(child, _) => visit(child.data_type(), depth + 1, visited, observe),
+            DataType::Struct(fields) => {
+                for field in fields {
+                    visit(field.data_type(), depth + 1, visited, observe)?;
+                }
+                Ok(())
+            }
+            DataType::Union(fields, _) => {
+                if fields.is_empty() {
+                    return Err(CopyError::unsupported(ty));
+                }
+                for (_, field) in fields.iter() {
+                    visit(field.data_type(), depth + 1, visited, observe)?;
+                }
+                Ok(())
+            }
+            DataType::Dictionary(key, value) => {
+                visit(key, depth + 1, visited, observe)?;
+                visit(value, depth + 1, visited, observe)
+            }
+            DataType::RunEndEncoded(ends, values) => {
+                visit(ends.data_type(), depth + 1, visited, observe)?;
+                visit(values.data_type(), depth + 1, visited, observe)
+            }
+            _ => Err(CopyError::unsupported(ty)),
+        }
+    }
+    visit(ty, 1, &mut 0, &mut observe)?;
+    Ok(
+        if ty.primitive_width().is_some()
+            || matches!(
+                ty,
+                DataType::Boolean
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Binary
+                    | DataType::LargeBinary
+            )
+        {
+            ValuesCopyKind::Interleave
+        } else {
+            ValuesCopyKind::Extend
+        },
+    )
+}
+
+/// Execute the selected nested Values copy already modeled by the sole
+/// multi-source preflight. The compiler's constant backing and runtime's mixed
+/// cells share this actual constructor. Source payload custody stays with the
+/// caller's original retained holds; this port creates no memory authority.
+pub fn copy_nested_values_construction<H>(
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    creation: &mut ValueSchemaCreation<'_, H>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, CopyConstructionError<H>> {
+    fn reserve<T, H>(
+        count: usize,
+        creation: &mut ValueSchemaCreation<'_, H>,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Vec<T>, CopyConstructionError<H>> {
+        let layout = std::alloc::Layout::array::<T>(count)
+            .map_err(|source| CopyError::layout::<T>(count, source))?;
+        work.flush().map_err(CopyError::Control)?;
+        creation
+            .request_layout(layout)
+            .map_err(CopyConstructionError::Creator)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| CopyError::Control(crate::KernelFailure::ResourceExhausted))?;
+        work.flush().map_err(CopyError::Control)?;
+        Ok(values)
+    }
+    let observed = KernelControlObservation::new(control);
+    let mut work = EvaluationCheckpoints::new(&observed);
+    work.flush().map_err(CopyError::Control)?;
+    let mut borrowed = reserve::<&dyn Array, H>(sources.len(), creation, &mut work)?;
+    for source in sources {
+        borrowed.push(source.as_ref());
+        work.step().map_err(CopyError::Control)?;
+    }
+    let mut segments = reserve::<super::ExtendSegment, H>(choices.len(), creation, &mut work)?;
+    for &(source, row) in choices {
+        segments.push(super::ExtendSegment {
+            source,
+            start: row,
+            len: 1,
+            repeats: 1,
+            nulls: 0,
+        });
+        work.step().map_err(CopyError::Control)?;
+    }
+    work.flush().map_err(CopyError::Control)?;
+    super::preflight_extend_multi_construction(
+        &borrowed,
+        &segments,
+        choices.len(),
+        creation,
+        &observed,
+    )?;
+    let mut data = reserve::<ArrayData, H>(sources.len(), creation, &mut work)?;
+    for source in sources {
+        work.flush().map_err(CopyError::Control)?;
+        data.push(source.to_data());
+        work.flush().map_err(CopyError::Control)?;
+    }
+    let mut refs = reserve::<&ArrayData, H>(data.len(), creation, &mut work)?;
+    for source in &data {
+        refs.push(source);
+        work.step().map_err(CopyError::Control)?;
+    }
+    work.flush().map_err(CopyError::Control)?;
+    let mut output = arrow_data::transform::MutableArrayData::new(refs, true, choices.len());
+    work.flush().map_err(CopyError::Control)?;
+    for &(source, row) in choices {
+        work.flush().map_err(CopyError::Control)?;
+        output.extend(
+            source,
+            row,
+            row.checked_add(1)
+                .ok_or_else(|| CopyError::arithmetic(Some(row as u128 + 1)))?,
+        );
+        work.flush().map_err(CopyError::Control)?;
+    }
+    let output = arrow_array::make_array(output.freeze());
+    work.finish().map_err(CopyError::Control)?;
+    Ok(output)
+}
+
+#[cfg(test)]
+mod values_copy_tests {
+    use super::*;
+    use crate::KernelFailure;
+    use arrow_array::{Int64Array, ListArray, types::Int64Type};
+    use std::sync::{Arc, Mutex};
+
+    struct Control(Option<KernelFailure>);
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= crate::MAX_UNOBSERVED_KERNEL_WORK);
+            self.0.clone().map_or(Ok(()), Err)
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            panic!("Values construction must never wait");
+        }
+    }
+    fn sources() -> Vec<ArrayRef> {
+        let field = Arc::new(
+            arrow_schema::Field::new("source-item", DataType::Int64, true)
+                .with_metadata([("nested.unknown".into(), "keep-cross-pool".into())].into()),
+        );
+        [
+            ListArray::from_iter_primitive::<Int64Type, _, _>([Some(vec![Some(10), None]), None]),
+            ListArray::from_iter_primitive::<Int64Type, _, _>([Some(vec![]), Some(vec![Some(20)])]),
+        ]
+        .into_iter()
+        .map(|array| {
+            Arc::new(ListArray::new(
+                field.clone(),
+                array.offsets().clone(),
+                array.values().clone(),
+                array.nulls().cloned(),
+            )) as ArrayRef
+        })
+        .collect()
+    }
+    #[test]
+    fn values_shared_admission_and_nested_constructor_preserve_exact_order() {
+        let sources = sources();
+        assert_eq!(
+            values_copy_kind_observed(sources[0].data_type(), || Ok(())).unwrap(),
+            ValuesCopyKind::Extend
+        );
+        assert_eq!(
+            values_copy_kind_observed(&DataType::Int64, || Ok(())).unwrap(),
+            ValuesCopyKind::Interleave
+        );
+        let requests = Mutex::new(Vec::new());
+        let opaque = Mutex::new(Vec::new());
+        let mut request = |layout: std::alloc::Layout| {
+            requests.lock().unwrap().push(layout.size());
+            Ok::<_, ()>(())
+        };
+        let mut observe = |bytes| {
+            opaque.lock().unwrap().push(bytes);
+            Ok::<_, ()>(())
+        };
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut observe,
+        );
+        let output = copy_nested_values_construction(
+            &sources,
+            &[(1, 1), (0, 0), (0, 1), (1, 0)],
+            &mut creation,
+            &Control(None),
+        )
+        .unwrap();
+        let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(output.data_type(), sources[0].data_type());
+        let DataType::List(field) = output.data_type() else {
+            panic!("List")
+        };
+        assert_eq!(
+            field.metadata().get("nested.unknown").map(String::as_str),
+            Some("keep-cross-pool")
+        );
+        assert_eq!(output.len(), 4);
+        let value = output.value(0);
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(20)]
+        );
+        let value = output.value(1);
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(10), None]
+        );
+        assert!(output.is_null(2));
+        assert_eq!(output.value_length(3), 0);
+        assert!(requests.lock().unwrap().iter().any(|bytes| *bytes > 0));
+        assert!(opaque.lock().unwrap().iter().any(|bytes| *bytes > 0));
+    }
+    #[derive(Debug, Eq, PartialEq)]
+    struct OriginalRefusal;
+    #[test]
+    fn values_nested_construction_preserves_creator_and_control_causes() {
+        let sources = sources();
+        let mut request = |_| Err(OriginalRefusal);
+        let mut opaque = |_| Ok(());
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        assert!(matches!(
+            copy_nested_values_construction(&sources, &[(0, 0)], &mut creation, &Control(None)),
+            Err(CopyConstructionError::Creator(OriginalRefusal))
+        ));
+        let mut request = |_| Ok(());
+        let mut opaque = |_| Err(OriginalRefusal);
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        assert!(matches!(
+            copy_nested_values_construction(&sources, &[(0, 0)], &mut creation, &Control(None)),
+            Err(CopyConstructionError::Creator(OriginalRefusal))
+        ));
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            let mut request = |_| Ok::<_, ()>(());
+            let mut opaque = |_| Ok::<_, ()>(());
+            let mut creation = ValueSchemaCreation::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                &mut request,
+                &mut opaque,
+            );
+            assert!(
+                matches!(copy_nested_values_construction(&sources, &[(0, 0)], &mut creation,
+                &Control(Some(cause.clone()))), Err(CopyConstructionError::Copy(CopyError::Control(actual))) if actual == cause)
+            );
+            assert!(
+                matches!(values_copy_kind_observed(sources[0].data_type(), || Err(cause.clone())),
+                Err(CopyError::Control(actual)) if actual == cause)
+            );
+        }
     }
 }

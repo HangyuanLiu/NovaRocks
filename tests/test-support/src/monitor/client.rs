@@ -560,6 +560,31 @@ impl OwnedMonitor {
     }
 
     pub fn final_record(&self) -> Result<Option<Final>> {
+        self.final_record_with_poll(|| self.poll_monitor())
+    }
+
+    fn final_record_with_poll(
+        &self,
+        poll_monitor: impl FnOnce() -> Result<Option<ExitStatus>>,
+    ) -> Result<Option<Final>> {
+        if let Some(record) = self.read_final_record()? {
+            return Ok(Some(record));
+        }
+        if let Some(status) = poll_monitor()? {
+            // Final is written before monitor exit. It may have been appended
+            // after our first read, so only the post-exit read can prove absence.
+            if let Some(record) = self.read_final_record()? {
+                return Ok(Some(record));
+            }
+            bail!(
+                "monitor exited {status} without a complete Final; diagnostics={}",
+                self.material.path.display()
+            );
+        }
+        Ok(None)
+    }
+
+    fn read_final_record(&self) -> Result<Option<Final>> {
         // Active appends may expose an unfinished final line; never accept it.
         for value in self.records()? {
             ensure!(value["schema"] == 1, "unsupported monitor record schema");
@@ -595,12 +620,6 @@ impl OwnedMonitor {
                     errors,
                 }));
             }
-        }
-        if let Some(status) = self.poll_monitor()? {
-            bail!(
-                "monitor exited {status} without a complete Final; diagnostics={}",
-                self.material.path.display()
-            );
         }
         Ok(None)
     }
@@ -694,6 +713,106 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::io::{Seek, SeekFrom};
+
+    fn monitor_fixture(root: &Path) -> (OwnedMonitor, mpsc::Sender<std::io::Result<ExitStatus>>) {
+        fs::create_dir(root).unwrap();
+        let record = root.join("record.jsonl");
+        fs::write(&record, b"{\"schema\":1,\"event\":\"Started\"}\n").unwrap();
+        let run = Arc::new(run_retention::RunContext {
+            root: root.to_owned(),
+            formal: false,
+            pin: File::create(root.join("pin")).unwrap(),
+            directory: File::open(root).unwrap(),
+        });
+        let material = Arc::new(Material {
+            path: root.to_owned(),
+            run,
+            release: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (completion, receive) = mpsc::channel();
+        (
+            OwnedMonitor {
+                control: None,
+                completion: receive,
+                monitor_status: Mutex::new(None),
+                pid: std::process::id(),
+                material,
+                stdout: File::open("/dev/null").unwrap(),
+                stderr: File::open("/dev/null").unwrap(),
+                liveness_generation: Mutex::new(Some(0)),
+            },
+            completion,
+        )
+    }
+
+    #[test]
+    fn final_written_between_initial_read_and_monitor_exit_is_not_unknown() {
+        let root = std::env::temp_dir().join(format!("nr-final-race-{}", run_retention::unique()));
+        let (monitor, completion) = monitor_fixture(&root);
+        let final_frame = serde_json::json!({
+            "schema":1, "event":"Final", "status_raw":17 << 8,
+            "owner_lost":false, "cleanup_complete":true, "errors":[]
+        });
+        let final_record = monitor
+            .final_record_with_poll(|| {
+                // This synchronous poll boundary runs only after the initial read.
+                // The stand-in monitor writes Final and actually exits before its
+                // owned wait result becomes visible. No timing assumption is used.
+                let status = Command::new("/bin/sh")
+                    .args(["-c", "printf '%s\\n' \"$1\" >> \"$2\"", "final-race"])
+                    .arg(final_frame.to_string())
+                    .arg(root.join("record.jsonl"))
+                    .status()?;
+                assert!(status.success());
+                completion.send(Ok(status)).unwrap();
+                monitor.poll_monitor()
+            })
+            .unwrap()
+            .expect("post-exit Final must be observed");
+        assert_eq!(final_record.status.code(), Some(17));
+        assert!(!final_record.owner_lost);
+        assert!(final_record.cleanup_complete);
+        assert!(final_record.errors.is_empty());
+        assert!(monitor.poll_monitor().unwrap().unwrap().success());
+        drop(monitor);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exited_monitor_still_requires_a_complete_and_valid_final() {
+        for (suffix, expected) in [
+            ("", "without a complete Final"),
+            (
+                "{\"schema\":1,\"event\":\"Final\"}",
+                "without a complete Final",
+            ),
+            (
+                "{\"schema\":1,\"event\":\"Final\"}\n",
+                "monitor Final lacks original status",
+            ),
+            (
+                "{\"schema\":2,\"event\":\"Final\"}\n",
+                "unsupported monitor record schema",
+            ),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("nr-final-invalid-{}", run_retention::unique()));
+            let (monitor, completion) = monitor_fixture(&root);
+            let error = monitor
+                .final_record_with_poll(|| {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(root.join("record.jsonl"))?
+                        .write_all(suffix.as_bytes())?;
+                    completion.send(Ok(ExitStatus::from_raw(0))).unwrap();
+                    monitor.poll_monitor()
+                })
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            drop(monitor);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn post_write_query_error_prevents_another_query_but_preserves_cleanup_control() {

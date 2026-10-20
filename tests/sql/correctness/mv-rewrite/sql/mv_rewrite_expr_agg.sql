@@ -204,18 +204,23 @@ SELECT k1, AVG(k9) FROM t1 GROUP BY k1;
 SELECT k1, AVG(k9) AS a FROM t1 GROUP BY k1 ORDER BY k1;
 
 -- query 29
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW mv_cond;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.mv_cond;
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.mv_plain;
 
 -- query 30
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.t1 FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.t1 FORCE;
 
 -- query 31
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 32
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mvrw_${uuid0};
+DROP CATALOG IF EXISTS mvrw_${uuid0};

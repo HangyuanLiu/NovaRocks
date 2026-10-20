@@ -208,13 +208,14 @@ impl FrontendMvProductAdapter {
     ) -> Result<(), MvApplicationError> {
         let _gate_lease = self.acquire_activity_lease(&target, owner, execution)?;
         let attempt = self.product_service.reserve_refresh_attempt();
-        let prepared = preparation
-            .prepare_step(MvRefreshPreparationRequest {
+        let prepared = prepare_refresh_step(
+            preparation,
+            MvRefreshPreparationRequest {
                 statement,
                 target,
                 attempt: attempt.clone(),
-            })
-            .map_err(preparation_application_error)?;
+            },
+        )?;
         if prepared.attempt != attempt {
             return Err(MvApplicationError::new(
                 crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
@@ -263,6 +264,16 @@ impl FrontendMvProductAdapter {
     }
 }
 
+/// Preserve SQL preparation facts before entering the product execution phase.
+pub(super) fn prepare_refresh_step(
+    preparation: &dyn MvRefreshPreparationService,
+    request: MvRefreshPreparationRequest,
+) -> Result<PreparedMvRefresh, MvApplicationError> {
+    preparation
+        .prepare_step(request)
+        .map_err(preparation_application_error)
+}
+
 fn preparation_application_error(
     error: crate::mv::domain::lifecycle::RefreshError,
 ) -> MvApplicationError {
@@ -280,6 +291,7 @@ fn preparation_application_error(
     };
     MvApplicationError::new(kind, error.message.clone())
         .with_compile_control(error.compile_control_error())
+        .with_unavailable_implementation(error.unavailable_implementation().cloned())
 }
 
 #[derive(Clone)]

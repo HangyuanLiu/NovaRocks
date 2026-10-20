@@ -179,6 +179,7 @@ pub(crate) mod round_cast_text;
 pub mod round_core;
 mod round_owner;
 mod rounding_binding;
+mod sleep_owner;
 mod string_append_trailing;
 mod string_append_trailing_owner;
 mod string_binary;

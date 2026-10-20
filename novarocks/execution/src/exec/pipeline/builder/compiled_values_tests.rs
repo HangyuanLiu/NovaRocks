@@ -94,6 +94,8 @@ fn constant_pools() -> Vec<ConstantPool> {
 enum Cell {
     /// A literal already of the column type.
     Literal(LiteralValue),
+    /// A checked constant already of the complete column type.
+    Constant(u32, u32),
     /// `CAST(constant AS BIGINT)` over an analyzed source constant.
     Cast(u32, u32),
     /// `9223372036854775807 + 1`, whose evaluation fails with a row error.
@@ -110,21 +112,26 @@ fn column_types() -> [FunctionValueType; 2] {
 /// `SELECT c0, c1 FROM (VALUES ...)`, with the common BIGINT type assigned
 /// by cast cells exactly as the FE authors it.
 fn values_program(rows: &[Vec<Cell>]) -> Arc<LocalProgram> {
-    let pools = constant_pools();
+    values_program_with_sources(rows, constant_pools(), &column_types())
+}
+fn values_program_with_sources(
+    rows: &[Vec<Cell>],
+    pools: Vec<ConstantPool>,
+    types: &[FunctionValueType],
+) -> Arc<LocalProgram> {
     // The package constant namespace is closed: publish only cited pools.
     let mut constants = ConstantPools::empty();
     for (id, pool) in pools.iter().enumerate() {
         let cited = rows
             .iter()
             .flatten()
-            .any(|cell| matches!(cell, Cell::Cast(source, _) if *source as usize == id));
+            .any(|cell| matches!(cell, Cell::Cast(source, _) | Cell::Constant(source, _) if *source as usize == id));
         if cited {
             constants
                 .insert(ConstantPoolId::new(id as u32), pool.clone())
                 .unwrap();
         }
     }
-    let types = column_types();
     let mut builder = FragmentBuilder::new(FragmentId::new(57));
     let columns = types
         .iter()
@@ -150,6 +157,16 @@ fn values_program(rows: &[Vec<Cell>]) -> Arc<LocalProgram> {
                 Cell::Literal(value) => builder
                     .add_expression(VALUES, ty, ExprKind::Literal(value.clone()))
                     .unwrap(),
+                Cell::Constant(source, ordinal) => builder
+                    .add_expression(
+                        VALUES,
+                        ty,
+                        ExprKind::Constant(ConstantReference {
+                            pool: ConstantPoolId::new(*source),
+                            ordinal: *ordinal,
+                        }),
+                    )
+                    .unwrap(),
                 Cell::Cast(source, ordinal) => {
                     let constant = builder
                         .add_expression(
@@ -167,7 +184,7 @@ fn values_program(rows: &[Vec<Cell>]) -> Arc<LocalProgram> {
                             ty,
                             ExprKind::Cast {
                                 expr: constant,
-                                target: DataType::Int64,
+                                target: types[column].data_type().clone(),
                                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                                 allow_throw_exception: ALLOW,
                             },
@@ -561,3 +578,82 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
 
 #[path = "compiled_root_result_boundary_tests.rs"]
 pub(crate) mod root_result_boundary_tests;
+
+#[test]
+fn values_nested_mixed_cells_materialize_original_order_nulls_and_exact_list_fields() {
+    use arrow::array::{ListArray, types::Int64Type};
+    let first: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(10), None]),
+        None,
+    ]));
+    let second: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![]),
+        Some(vec![Some(20)]),
+    ]));
+    let third: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some(
+        vec![Some(30), Some(40)],
+    )]));
+    let pools = [first, second, third]
+        .into_iter()
+        .map(|array| pool(array, true))
+        .collect::<Vec<_>>();
+    let ty = pools[0].value_type().clone();
+    let program = values_program_with_sources(
+        &[
+            vec![Cell::Constant(0, 0)],
+            vec![Cell::Cast(1, 0)],
+            vec![Cell::Constant(2, 0)],
+            vec![Cell::Cast(0, 1)],
+            vec![Cell::Cast(1, 1)],
+        ],
+        pools,
+        &[ty.clone()],
+    );
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("nested Values actual construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let chunks = super::family_fixture::run_with_tracker(&program, tracker.clone());
+    let mut rows = Vec::new();
+    for chunk in &chunks {
+        assert_eq!(
+            chunk.record_batch().schema().field(0).data_type(),
+            ty.data_type()
+        );
+        assert!(chunk.record_batch().schema().field(0).is_nullable());
+        let array = chunk
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for row in 0..array.len() {
+            rows.push(if array.is_null(row) {
+                None
+            } else {
+                let value = array.value(row);
+                Some(
+                    value
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                )
+            });
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![
+            Some(vec![Some(10), None]),
+            Some(vec![]),
+            Some(vec![Some(30), Some(40)]),
+            None,
+            Some(vec![Some(20)]),
+        ]
+    );
+    assert!(
+        tracker.peak() > 0,
+        "actual construction remains under its runtime owner"
+    );
+}

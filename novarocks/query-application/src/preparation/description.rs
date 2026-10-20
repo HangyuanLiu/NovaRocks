@@ -552,17 +552,20 @@ mod tests {
 
     #[tokio::test]
     async fn m07_completed_output_preserves_exact_producer_domains() {
+        // The completed-output contract owns domain and alias preservation, not the
+        // unavailable to_bitmap scalar. Source-free bitmap_agg preserves Bitmap;
+        // bitmap_to_string independently crosses from that domain to Physical.
         use novarocks_type_contract::ValueLogicalType as T;
         for (sql, domain) in [
             ("select json_object('k', 1) as value", T::Json),
-            ("select to_bitmap(1) as value", T::Bitmap),
+            ("select bitmap_agg(1) as value", T::Bitmap),
             ("select hll_hash(cast(1 as bigint)) as value", T::Hll),
             (
                 "select percentile_hash(cast(1 as double)) as value",
                 T::Percentile,
             ),
             (
-                "select bitmap_to_binary(to_bitmap(1)) as value",
+                "select bitmap_to_string(bitmap_agg(1)) as value",
                 T::Physical,
             ),
             (

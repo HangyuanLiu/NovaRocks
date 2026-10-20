@@ -1814,3 +1814,153 @@ fn installed_numeric_defaults_keep_safe_nulls_float_bits_and_original_window_lat
         }
     }
 }
+
+fn admit_offset_profile(
+    fixture: &Fixture,
+    control: &dyn PureCompileControl,
+) -> Result<(), FunctionBindingError> {
+    let declaration = fixture
+        .catalog
+        .pure_overload_declaration_observed(
+            &fixture.function,
+            FunctionKind::Window,
+            &fixture.selected.overload,
+            &CompileControl::default(),
+        )
+        .unwrap();
+    declaration.admit_selected_lifecycle_observed(
+        &fixture.selected,
+        fixture.arguments.len(),
+        PureCallLifecycle::Window,
+        control,
+    )
+}
+
+#[test]
+fn lead_lag_static_default_admission_matches_original_recipe_profiles() {
+    for name in NAMES {
+        for (value, default, supported) in [
+            (DataType::Int64, DataType::Utf8, true),
+            (DataType::Utf8, DataType::Int64, true),
+            (DataType::Int32, DataType::Float64, true),
+            (DataType::Boolean, DataType::Boolean, false),
+            (
+                DataType::Decimal128(10, 2),
+                DataType::Decimal128(10, 2),
+                false,
+            ),
+            (DataType::Utf8, DataType::Float64, false),
+        ] {
+            let fixture = default_fixture(
+                name,
+                FunctionValueType::new(value, false),
+                FunctionValueType::new(default, true),
+                DecimalOverflowPolicy::ReportError,
+            );
+            let FunctionArgumentType::Value(default) = &fixture.selected.argument_types[2] else {
+                panic!("the actual selected default type");
+            };
+            let FunctionResultType::Scalar(target) = &fixture.selected.result_type else {
+                panic!("the actual selected result type");
+            };
+            assert_eq!(
+                crate::builtin::window_default::DefaultValueRecipe::supports_profile(
+                    default, target
+                ),
+                supported
+            );
+            let admission = admit_offset_profile(&fixture, &CompileControl::default());
+            if supported {
+                admission.unwrap();
+                fixture
+                    .prepare(options(false), &CompileControl::default())
+                    .unwrap();
+            } else {
+                assert!(matches!(admission,
+                    Err(FunctionBindingError::UnavailableImplementation(overload))
+                        if overload == fixture.selected.overload));
+                assert!(matches!(
+                    fixture.prepare(options(false), &CompileControl::default()),
+                    Err(FunctionSpecializationFailure::Kernel(
+                        KernelFailure::InvalidProgram(_)
+                    ))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn lead_lag_without_default_keep_nested_source_admission() {
+    let nested = FunctionValueType::new(
+        DataType::Struct(vec![Arc::new(Field::new("original", DataType::Int32, false))].into()),
+        true,
+    );
+    for name in NAMES {
+        for fixture in [
+            Fixture::new(name, nested.clone(), DecimalOverflowPolicy::ReportError),
+            Fixture::offset(
+                name,
+                nested.clone(),
+                cv(Some(1), false),
+                DecimalOverflowPolicy::ReportError,
+            ),
+        ] {
+            admit_offset_profile(&fixture, &CompileControl::default()).unwrap();
+            fixture
+                .prepare(options(false), &CompileControl::default())
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn lead_lag_static_admission_keeps_every_original_control_refusal() {
+    let fixture = default_fixture(
+        "lead",
+        FunctionValueType::new(DataType::Boolean, false),
+        FunctionValueType::new(DataType::Boolean, false),
+        DecimalOverflowPolicy::ReportError,
+    );
+    let baseline = CompileControl::default();
+    assert!(matches!(
+        admit_offset_profile(&fixture, &baseline),
+        Err(FunctionBindingError::UnavailableImplementation(_))
+    ));
+    let trace = baseline.trace.lock().unwrap().clone();
+    for stop in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = CompileControl {
+                trace: Mutex::default(),
+                refusal: Some((stop, cause)),
+            };
+            assert!(matches!(admit_offset_profile(&fixture,&control),
+                Err(FunctionBindingError::Control(actual)) if actual == cause));
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+        }
+    }
+    let declaration = fixture
+        .catalog
+        .pure_overload_declaration_observed(
+            &fixture.function,
+            FunctionKind::Window,
+            &fixture.selected.overload,
+            &CompileControl::default(),
+        )
+        .unwrap();
+    let mut foreign = fixture.selected.as_ref().clone();
+    foreign.overload = FunctionOverloadId::try_new("fixture/foreign-window-overload").unwrap();
+    assert!(matches!(
+        declaration.admit_selected_lifecycle_observed(
+            &foreign,
+            3,
+            PureCallLifecycle::Window,
+            &CompileControl::default()
+        ),
+        Err(FunctionBindingError::InvalidBinding(_))
+    ));
+}

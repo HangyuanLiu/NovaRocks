@@ -1873,3 +1873,60 @@ fn c16_p1_scalar_invocation_data_requires_real_invocation_abi_at_registration() 
     );
     assert!(register_owner(Arc::new(owner), &[PureKernelAbi::ScalarInvocationV1]).is_ok());
 }
+
+/// One definition's seal is checked against an independently authored record.
+/// Server tests separately cover the complete production catalogue composition.
+#[test]
+fn actual_builtin_sleep_seals_only_with_its_exact_controlled_wait_record() {
+    let mut catalogue = EngineFunctionCatalogBuilder::new();
+    crate::builtin::catalogue::contribute_builtin_functions(&mut catalogue).unwrap();
+    let definition = catalogue
+        .definition("sleep", FunctionKind::Scalar)
+        .unwrap()
+        .clone();
+    let binding = definition.binding.as_ref().unwrap();
+    let attachment = binding.pure.as_ref().expect("actual SLEEP pure owner");
+    assert_eq!(
+        binding.declaration.function_id().as_str(),
+        "builtin.scalar/sleep/v1"
+    );
+    assert_eq!(binding.declaration.overloads().len(), 1);
+    let declared = &binding.declaration.overloads()[0];
+    let expected = PureImplementationDeclaration {
+        overload: overload_id("builtin.scalar/sleep/(i64)->bool;strict;legacy"),
+        implementation: implementation("builtin.scalar/sleep/selected-v1"),
+        abi: PureKernelAbi::ScalarV1,
+    };
+    assert_eq!(declared.identity, expected.overload);
+    assert_eq!(attachment.implementations.as_ref(), &[expected.clone()]);
+    let effects = declared.effects.as_ref().unwrap();
+    assert_eq!(effects.value_stability, FunctionVolatility::Volatile);
+    assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
+    assert_eq!(effects.instance_state, FunctionInstanceState::None);
+    assert_eq!(
+        effects.observable_effects,
+        ObservableEffects {
+            rng_sampling: false,
+            warnings: false,
+            controlled_wait: true,
+        }
+    );
+    assert!(effects.environment_dependencies.is_empty());
+    assert!(matches!(
+        builder(definition.clone()).seal_pure([]),
+        Err(PureCatalogError::InstalledManifestMismatch)
+    ));
+    let record = InstalledPureKernel {
+        function: id("builtin.scalar/sleep/v1"),
+        kind: FunctionKind::Scalar,
+        implementation: expected,
+        aggregate_state_format: None,
+    };
+    let sealed = builder(definition).seal_pure([record]).unwrap();
+    assert!(
+        sealed
+            .metadata()
+            .definition_by_id(&id("builtin.scalar/sleep/v1"))
+            .is_some()
+    );
+}

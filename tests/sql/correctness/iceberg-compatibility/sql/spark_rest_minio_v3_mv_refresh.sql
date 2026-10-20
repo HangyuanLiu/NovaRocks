@@ -91,6 +91,8 @@ FROM mv_spark_refresh_${uuid0}
 ORDER BY id;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW mv_spark_refresh_${uuid0};
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0} FORCE;
+SET CATALOG iceberg_compat_${suite_uuid0};
+DROP MATERIALIZED VIEW IF EXISTS nr_compat_${suite_uuid0}.mv_spark_refresh_${uuid0};
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0} FORCE;

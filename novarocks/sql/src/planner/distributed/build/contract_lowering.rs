@@ -3219,9 +3219,19 @@ impl<'a> ContractLoweringVisitor<'a> {
             &provider_values_by_request_ordinal,
         )?;
         let relation = match contract.request.relation() {
-            ProviderReadRelationNeed::Metadata { kind, .. } => {
+            ProviderReadRelationNeed::Metadata { .. } => {
+                let kind = contract.metadata_kind.as_ref().ok_or_else(|| {
+                    ContractLoweringError::ProviderRead {
+                        detail: "metadata read has no provider-accepted metadata kind".to_string(),
+                    }
+                })?;
+                let kind = MetadataRelationKind::try_new(kind.as_str()).map_err(|error| {
+                    ContractLoweringError::ProviderRead {
+                        detail: error.to_string(),
+                    }
+                })?;
                 Relation::Metadata(MetadataRelation {
-                    kind: metadata_relation_kind(*kind)?,
+                    kind,
                     read: contract.read,
                     work_source: contract.work_source,
                     selection_digest: contract.selection_digest,
@@ -12472,26 +12482,10 @@ fn expression_kind_name(kind: &ExprKind) -> &'static str {
     }
 }
 
-fn metadata_relation_kind(
-    kind: crate::planner::table::SqlMetadataTableKind,
-) -> Result<MetadataRelationKind, ContractLoweringError> {
-    let name = match kind {
-        crate::planner::table::SqlMetadataTableKind::Snapshots => "iceberg.snapshots",
-        crate::planner::table::SqlMetadataTableKind::History => "iceberg.history",
-        crate::planner::table::SqlMetadataTableKind::Refs => "iceberg.refs",
-        crate::planner::table::SqlMetadataTableKind::Files => "iceberg.files",
-        crate::planner::table::SqlMetadataTableKind::Manifests => "iceberg.manifests",
-        crate::planner::table::SqlMetadataTableKind::Partitions => "iceberg.partitions",
-        crate::planner::table::SqlMetadataTableKind::Entries => "iceberg.entries",
-    };
-    MetadataRelationKind::try_new(name).map_err(|error| ContractLoweringError::ProviderRead {
-        detail: error.to_string(),
-    })
-}
-
 #[derive(Debug)]
 pub(crate) enum ContractLoweringError {
     ComparisonCoercion(novarocks_type_contract::ComparisonCoercionFailure),
+    UnsupportedCapability(&'static str),
     CallRequests(novarocks_physical_plan::CallRequestError),
     Control(CompileControlError),
     AggregateSource(AggregateRequestCaptureError),
@@ -12792,6 +12786,9 @@ impl fmt::Display for ContractLoweringError {
                 formatter,
                 "{context} expected expression type {expected:?}, got {actual:?}"
             ),
+            Self::UnsupportedCapability(detail) => {
+                write!(formatter, "constant admission limit: {detail}")
+            }
             Self::InvalidLiteral { kind, detail } => {
                 write!(formatter, "invalid {kind} literal: {detail}")
             }
@@ -12850,8 +12847,8 @@ impl From<novarocks_constant_contract::ConstantError> for ContractLoweringError 
     fn from(error: novarocks_constant_contract::ConstantError) -> Self {
         match error {
             novarocks_constant_contract::ConstantError::Control(error) => Self::Control(error),
-            novarocks_constant_contract::ConstantError::Limit(_) => {
-                Self::Control(CompileControlError::ResourceExhausted)
+            novarocks_constant_contract::ConstantError::Limit(detail) => {
+                Self::UnsupportedCapability(detail)
             }
             error => Self::InvalidLiteral {
                 kind: "checked constant",
@@ -12865,6 +12862,7 @@ impl From<novarocks_physical_plan::ConstantReferenceError> for ContractLoweringE
     fn from(error: novarocks_physical_plan::ConstantReferenceError) -> Self {
         match error {
             novarocks_physical_plan::ConstantReferenceError::Control(error) => Self::Control(error),
+            novarocks_physical_plan::ConstantReferenceError::Constant(error) => Self::from(error),
             error => Self::InvalidLiteral {
                 kind: "checked constant",
                 detail: error.to_string(),
@@ -12888,6 +12886,14 @@ impl From<SqlOperationalProjectionError> for ContractLoweringError {
     fn from(error: SqlOperationalProjectionError) -> Self {
         match error {
             SqlOperationalProjectionError::Control(cause) => Self::Control(cause),
+            SqlOperationalProjectionError::Constant(
+                novarocks_constant_contract::ConstantError::Limit(detail),
+            )
+            | SqlOperationalProjectionError::Reference(
+                novarocks_physical_plan::ConstantReferenceError::Constant(
+                    novarocks_constant_contract::ConstantError::Limit(detail),
+                ),
+            ) => Self::UnsupportedCapability(detail),
             error => Self::InvalidFunctionBinding {
                 detail: format!("scalar operational source: {error}"),
             },
@@ -12955,6 +12961,9 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
             ContractLoweringError::Control(error) => Self::from(error),
             ContractLoweringError::ComparisonCoercion(cause) => {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
+            }
+            ContractLoweringError::UnsupportedCapability(detail) => {
+                Self::from(novarocks_constant_contract::ConstantError::Limit(detail))
             }
             error => Self::Compilation(error.to_string()),
         }
@@ -14748,6 +14757,7 @@ mod tests {
             sql_binding: binding,
             request: ProviderReadRequestBinding::from_need(&need),
             read,
+            metadata_kind: None,
             work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: vec![
@@ -18573,4 +18583,47 @@ fn register_constant_source_observed(
         pool,
         ordinal: value.ordinal(),
     })
+}
+
+#[cfg(test)]
+mod constant_limit_category_tests {
+    use super::*;
+    use crate::compiler::SqlCompileError;
+    use novarocks_constant_contract::ConstantError;
+    use novarocks_physical_plan::ConstantReferenceError;
+
+    #[test]
+    fn direct_reference_and_operational_constant_limits_keep_their_typed_category() {
+        let sources = [
+            ContractLoweringError::from(ConstantError::Limit("row limit")),
+            ContractLoweringError::from(ConstantReferenceError::Constant(ConstantError::Limit(
+                "row limit",
+            ))),
+            ContractLoweringError::from(SqlOperationalProjectionError::from(ConstantError::Limit(
+                "row limit",
+            ))),
+            ContractLoweringError::from(SqlOperationalProjectionError::from(
+                ConstantReferenceError::Constant(ConstantError::Limit("row limit")),
+            )),
+        ];
+        for source in sources {
+            assert!(matches!(
+                source,
+                ContractLoweringError::UnsupportedCapability("row limit")
+            ));
+            assert!(
+                matches!(SqlCompileError::from(source), SqlCompileError::UnsupportedCapability(message) if message == "constant admission limit: row limit")
+            );
+        }
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let source = ContractLoweringError::from(ConstantReferenceError::Constant(
+                ConstantError::Control(cause),
+            ));
+            assert_eq!(SqlCompileError::from(source), SqlCompileError::from(cause));
+        }
+    }
 }

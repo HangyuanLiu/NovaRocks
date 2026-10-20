@@ -166,18 +166,22 @@ SELECT k3, substring(k4, 1, 7) AS month, SUM(v1) AS sv
 FROM t1 WHERE k2 = 'a' GROUP BY k3, substring(k4, 1, 7) ORDER BY k3, month;
 
 -- query 21
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW month_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.month_mv;
 
 -- query 22
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.t1 FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.t1 FORCE;
 
 -- query 23
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 24
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mvrw_${uuid0};
+DROP CATALOG IF EXISTS mvrw_${uuid0};

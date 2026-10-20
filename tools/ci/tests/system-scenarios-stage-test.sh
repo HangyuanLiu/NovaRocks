@@ -101,14 +101,14 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
-python3 - "$artifact_root/${scenario//\//-}" "${FAKE_SCENARIO_CLEANUP:-ok}" <<'TEARDOWN'
+python3 - "$artifact_root/${scenario//\//-}" "${FAKE_SCENARIO_CLEANUP:-ok}" "$scenario" "${FAKE_COLLECTION_EVIDENCE:-}" "${FAKE_SCENARIO_FAILURE:-}" <<'TEARDOWN'
 import json,sys
 from pathlib import Path
 root=Path(sys.argv[1]);root.mkdir(parents=True,exist_ok=True)
 if sys.argv[2]!='missing':
     resource=[] if sys.argv[2]=='ok' else [{"state":sys.argv[2]}]
-    (root/'scenario-teardown.json').write_text(json.dumps({"fixture":{"launch_config":"ok","teardown":{"status":"ok"},"resources":resource},"cluster":{"launch":"ok","shutdown":"ok","partial_cleanup":None}}))
-(root/'scenario-evidence.json').write_text(json.dumps({"outcome":"Passed"}))
+    (root/'scenario-teardown.json').write_text(json.dumps({"schema":1,"fixture":{"launch_config":"ok","teardown":{"status":"ok"},"resources":resource},"cluster":{"launch":"ok","shutdown":"ok","partial_cleanup":None}}))
+(root/'scenario-evidence.json').write_text(json.dumps({"schema_version":5,"scenario":sys.argv[3],"outcome":("failed" if sys.argv[3]==sys.argv[5] else "passed") if sys.argv[4] else "Passed"}))
 TEARDOWN
 printf '%s\n' "$scenario" >>"$FAKE_SCENARIO_CALLS"
 if [ "$scenario" = "${FAKE_SCENARIO_FAILURE:-}" ]; then echo 'original scenario error' >&2; exit "${FAKE_SCENARIO_EXIT:-23}"; fi
@@ -320,5 +320,52 @@ assert len(records)==1 and records[0]['exit']['code']==29
 assert records[0]['cleanup']['summary']=='unknown'
 ASSERT_REQUIREMENT
 unset FAKE_REQUIREMENTS_FAILURE
+
+# Explicit collection retains the original failure and visits later independent
+# scenarios only after native identity, terminal and cleanup facts are complete.
+export FAKE_COLLECTION_EVIDENCE=1 FAKE_SCENARIO_FAILURE=alpha/one FAKE_SCENARIO_EXIT=1
+CI_COLLECT_ALL=true
+CI_RUN_DIR="$tmpdir/collection-complete"; mkdir -p "$CI_RUN_DIR"
+CI_SUMMARY="$CI_RUN_DIR/summary.md"; ci_init_summary_state
+: >"$FAKE_SCENARIO_CALLS"
+code=0
+ci_run_system_scenarios "$runner" "$binary" '' '' "$tmpdir/base" "$CI_RUN_DIR/artifacts" 3 30 "$tmpdir/invocation-selection" collect-all || code=$?
+[ "$code" = 1 ] && [ "$CI_SYSTEM_COLLECTION_COMPLETE" = true ]
+[ "$(cat "$FAKE_SCENARIO_CALLS")" = $'alpha/one\nbeta/two' ]
+python3 - "$CI_RUN_DIR" <<'ASSERT_COLLECTION'
+import json,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+records=[json.loads(p.read_text()) for p in sorted((root/'invocations').glob('*.json')) if not p.name.endswith('.started.json')]
+assert [row['exit']['code'] for row in records]==[1,0]
+assert all(json.loads(p.read_text())['safe_to_continue'] for p in (root/'collection/system').glob('*.json'))
+ASSERT_COLLECTION
+# PASS without cleanup is not safe, and a real failure with unknown cleanup
+# cannot let a later scenario run. The default still stops at its first error.
+for mode in missing cleanup_failed; do
+  for first_exit in 0 1; do
+    export FAKE_SCENARIO_CLEANUP="$mode" FAKE_SCENARIO_EXIT="$first_exit"
+    if [ "$first_exit" = 0 ]; then unset FAKE_SCENARIO_FAILURE; else export FAKE_SCENARIO_FAILURE=alpha/one; fi
+    CI_RUN_DIR="$tmpdir/collection-$mode-$first_exit"; mkdir -p "$CI_RUN_DIR"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"; ci_init_summary_state
+    : >"$FAKE_SCENARIO_CALLS"
+    code=0
+    ci_run_system_scenarios "$runner" "$binary" '' '' "$tmpdir/base" "$CI_RUN_DIR/artifacts" 3 30 "$tmpdir/invocation-selection" collect-all || code=$?
+    [ "$code" != 0 ] && [ "$CI_SYSTEM_COLLECTION_COMPLETE" = false ]
+    [ "$(cat "$FAKE_SCENARIO_CALLS")" = alpha/one ]
+  done
+done
+# A caller without the explicit policy keeps fail-fast even with a similarly
+# named inherited variable; the compatibility entry has no new policy argument.
+CI_COLLECT_ALL=true
+unset FAKE_SCENARIO_CLEANUP
+export FAKE_SCENARIO_FAILURE=alpha/one FAKE_SCENARIO_EXIT=23
+CI_RUN_DIR="$tmpdir/default-still-failfast"; mkdir -p "$CI_RUN_DIR"
+CI_SUMMARY="$CI_RUN_DIR/summary.md"; ci_init_summary_state
+: >"$FAKE_SCENARIO_CALLS"
+code=0
+ci_run_system_scenarios "$runner" "$binary" '' '' "$tmpdir/base" "$CI_RUN_DIR/artifacts" 3 30 "$tmpdir/invocation-selection" || code=$?
+[ "$code" = 23 ] && [ "$(cat "$FAKE_SCENARIO_CALLS")" = alpha/one ]
+unset FAKE_COLLECTION_EVIDENCE FAKE_SCENARIO_FAILURE FAKE_SCENARIO_EXIT
 
 echo 'system-scenarios-stage-test: PASS'

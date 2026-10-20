@@ -3190,6 +3190,16 @@ mod tests {
                     encoded(ConnectorCodecCategory::ReadView),
                 ),
             },
+            metadata_kind: matches!(
+                need.relation(),
+                crate::compiler::ProviderReadRelationNeed::Metadata { .. }
+            )
+            .then(|| {
+                novarocks_spi::connector::read_stack::ConnectorReadMetadataKind::try_new(
+                    "$fixture-metadata",
+                )
+                .expect("fixture metadata kind")
+            }),
             work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: Box::from([crate::compiler::ProviderReadColumnFact::new(
@@ -4330,6 +4340,9 @@ mod tests {
 
     #[test]
     fn m07_ctas_source_keeps_exact_producer_domains_until_target_admission() {
+        // CTAS source admission must preserve domains regardless of which producer
+        // authored them. Use the installed bitmap_agg and bitmap_to_string owners
+        // instead of the unavailable to_bitmap scalar; all domain oracles stay exact.
         use crate::compiler::*;
         use novarocks_physical_plan::ResultValueDomain as Domain;
         for (sql, expected) in [
@@ -4337,8 +4350,8 @@ mod tests {
                 "select percentile_hash(cast(1 as double)) as v",
                 Domain::Percentile,
             ),
-            ("select to_bitmap(1) as v", Domain::Bitmap),
-            ("select bitmap_to_binary(to_bitmap(1)) as v", Domain::Plain),
+            ("select bitmap_agg(1) as v", Domain::Bitmap),
+            ("select bitmap_to_string(bitmap_agg(1)) as v", Domain::Plain),
         ] {
             let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
             let snapshot = SqlPlannerTableSnapshot::new(&catalog);

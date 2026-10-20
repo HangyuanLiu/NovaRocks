@@ -943,3 +943,46 @@ fn caller_envelope_original_token_control_and_wide_source_quantum_are_exact() {
         assert_eq!(foreign.trace(), before);
     }
 }
+
+#[test]
+fn package_envelope_preserves_the_unbound_scalar_root_declaration() {
+    use novarocks_result_contract::{
+        FrozenRootOutput, RootOutputContract, RootProfileId, ScalarField, ScalarSchema,
+        ScalarValueType,
+    };
+    let expected = RootOutputContract::new(
+        RootProfileId::V1,
+        FrozenRootOutput::ScalarValue(
+            ScalarSchema::try_new(ScalarField {
+                nullable: false,
+                value_type: ScalarValueType::SignedInteger(64),
+            })
+            .unwrap(),
+        ),
+    );
+    let mut raw = encoded(&fragment(p::FragmentSink::Noop, false)).0;
+    raw.sink = Some(wire::FragmentSink {
+        kind: Some(wire::fragment_sink::Kind::RootResult(
+            novarocks_proto_codec::root_result::encode_root_contract(&expected),
+        )),
+    });
+    raw.nodes = vec![wire::PhysicalNode {
+        id: u32::MAX,
+        output: Some(wire::OutputPort {
+            node_id: Some(u32::MAX),
+            value_ids: vec![0],
+        }),
+        ..Default::default()
+    }];
+    // The envelope owns only header vocabulary; this raw fixture does not
+    // independently publish or certify a complete physical package.
+    let mut bound = limits();
+    bound.max_input_nodes = 1;
+    bound.max_allocation_request_bytes = root_projection_request_bytes().unwrap() * 2 + 4096;
+    bound.max_coexisting_source_and_request_bytes = SOURCE + bound.max_allocation_request_bytes;
+    let (decoded, _) = decode(&raw, bound, &Control::default()).unwrap();
+    assert_eq!(
+        decoded.sink,
+        p::FragmentSink::RootResult(Box::new(expected))
+    );
+}

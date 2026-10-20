@@ -15,13 +15,27 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
+-- query 1
 CREATE DATABASE IF NOT EXISTS ${case_db};
+
+-- query 2
 CREATE TABLE ${case_db}.base (id int)
 TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true");
+
+-- query 3
 -- @expect_error=storage_engine='starrocks'
 CREATE MATERIALIZED VIEW ${case_db}.mv_bad
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'starrocks')
 AS SELECT id FROM ${case_db}.base;
-DROP TABLE ${case_db}.base;
-DROP DATABASE ${case_db};
+
+-- query 4
+-- @cleanup=true
+-- @skip_result_check=true
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_bad;
+DROP TABLE IF EXISTS ${case_db}.base;
+
+-- query 5
+-- @cleanup=true
+-- @skip_result_check=true
+DROP DATABASE IF EXISTS ${case_db};

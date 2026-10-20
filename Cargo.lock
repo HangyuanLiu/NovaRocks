@@ -4096,6 +4096,7 @@ dependencies = [
  "hex",
  "novarocks-catalog-application",
  "novarocks-failpoint",
+ "novarocks-functions",
  "novarocks-query-application",
  "novarocks-spi",
  "novarocks-sql",

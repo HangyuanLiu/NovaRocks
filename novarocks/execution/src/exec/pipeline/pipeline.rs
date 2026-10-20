@@ -183,6 +183,9 @@ impl Pipeline {
                 }
                 if let Some(driver_profiler) = driver_profiler.as_ref() {
                     let op_profile = driver_profiler.child(op.name().to_string());
+                    if let Some(identity) = factory.compiled_operator_profile() {
+                        op_profile.set_compiled_operator(Arc::clone(identity));
+                    }
                     let profiles = OperatorProfiles::new(op_profile);
                     op.set_profiles(profiles.clone());
                     operator_profiles.push(profiles);

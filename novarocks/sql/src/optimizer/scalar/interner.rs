@@ -64,7 +64,7 @@ impl From<InternerError> for SqlCompileError {
         match value {
             InternerError::Control(error) => error.into(),
             InternerError::Type(error) => Self::Compilation(error.to_string()),
-            InternerError::Constant(ConstantError::Limit(_)) => Self::ResourceExhausted,
+            InternerError::Constant(error @ ConstantError::Limit(_)) => Self::from(error),
             InternerError::Constant(error) => Self::Compilation(error.to_string()),
         }
     }
@@ -548,11 +548,8 @@ fn intern_inner(
     if let Err(InternerError::Control(error)) = &result {
         return Err(error.clone().into());
     }
-    if matches!(
-        &result,
-        Err(InternerError::Constant(ConstantError::Limit(_)))
-    ) {
-        return Err(SqlCompileError::ResourceExhausted);
+    if let Err(InternerError::Constant(error @ ConstantError::Limit(_))) = &result {
+        return Err(SqlCompileError::from(error.clone()));
     }
     work.finish()?;
     let (fingerprint, existing) = result.map_err(SqlCompileError::from)?;

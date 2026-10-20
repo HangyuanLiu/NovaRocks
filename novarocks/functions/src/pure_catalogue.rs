@@ -304,7 +304,12 @@ impl PureOverloadDeclaration<'_> {
         }
         self.attachment
             .metadata_owner
-            .admit_selected_profile_observed(selected, logical_argument_count, control)
+            .admit_selected_lifecycle_profile_observed(
+                selected,
+                logical_argument_count,
+                lifecycle,
+                control,
+            )
     }
     /// Check the actual owner's frozen semantic references without preparing
     /// a kernel, evaluating constants or refining runtime effects again.
@@ -386,6 +391,18 @@ pub trait PureFunctionMetadataOwner:
     ) -> Result<(), FunctionBindingError> {
         control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
         Ok(())
+    }
+    /// Admit only the static profile for this actual invocation lifecycle.
+    /// Existing owners retain their exact profile hook; an owner whose window
+    /// adapter has a narrower boundary may refine only that lifecycle.
+    fn admit_selected_lifecycle_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        _lifecycle: PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.admit_selected_profile_observed(selected, logical_argument_count, control)
     }
     /// An owner with semantic dependencies supplies its original checker.
     /// The empty-dependency branch grants only this exact environment shape;

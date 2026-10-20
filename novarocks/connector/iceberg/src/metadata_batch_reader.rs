@@ -223,46 +223,30 @@ pub fn metadata_table_output_columns(
     }
 }
 
-fn partition_source_type(
+pub(crate) fn partition_source_type(
     metadata: &TableMetadata,
     source_id: i32,
-) -> Option<&crate::iceberg::spec::Type> {
-    metadata
-        .current_schema()
-        .field_by_id(source_id)
-        .map(|field| field.field_type.as_ref())
-        .or_else(|| {
-            metadata.schemas_iter().find_map(|schema| {
-                schema
-                    .field_by_id(source_id)
-                    .map(|field| field.field_type.as_ref())
-            })
-        })
+) -> Result<crate::iceberg::spec::Type, String> {
+    crate::read_snapshot::partition_source_types(metadata, metadata.current_schema(), source_id)
+        .map(|(resolved, _)| crate::iceberg::spec::Type::Primitive(resolved))
 }
 
-fn partition_struct_type(metadata: &TableMetadata) -> Result<DataType, String> {
+pub(crate) fn partition_struct_type(metadata: &TableMetadata) -> Result<DataType, String> {
     let mut specs = metadata.partition_specs_iter().cloned().collect::<Vec<_>>();
     specs.sort_by_key(|spec| spec.spec_id());
     let mut fields: Vec<Arc<Field>> = Vec::new();
     for spec in specs {
         for partition_field in spec.fields() {
-            let source_type = partition_source_type(metadata, partition_field.source_id)
-                .ok_or_else(|| {
+            let source_type = partition_source_type(metadata, partition_field.source_id)?;
+            let result_type = partition_field
+                .transform
+                .result_type(&source_type)
+                .map_err(|error| {
                     format!(
-                        "iceberg partition field {} references missing source field id {}",
-                        partition_field.name, partition_field.source_id
+                        "infer iceberg partition field {} type: {error}",
+                        partition_field.name
                     )
                 })?;
-            let result_type =
-                partition_field
-                    .transform
-                    .result_type(source_type)
-                    .map_err(|error| {
-                        format!(
-                            "infer iceberg partition field {} type: {error}",
-                            partition_field.name
-                        )
-                    })?;
             let arrow_type = iceberg_type_to_arrow_type(&result_type)?;
             if let Some(existing) = fields
                 .iter()

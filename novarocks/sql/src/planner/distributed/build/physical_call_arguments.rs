@@ -45,7 +45,6 @@ impl From<ConstantError> for PhysicalArgumentError {
     fn from(error: ConstantError) -> Self {
         match error {
             ConstantError::Control(cause) => Self::Control(cause),
-            ConstantError::Limit(_) => Self::Control(CompileControlError::ResourceExhausted),
             other => Self::Constant(other),
         }
     }
@@ -57,10 +56,19 @@ impl From<ConstantReferenceError> for PhysicalArgumentError {
             | ConstantReferenceError::Constant(ConstantError::Control(cause)) => {
                 Self::Control(cause)
             }
-            ConstantReferenceError::Constant(ConstantError::Limit(_)) => {
-                Self::Control(CompileControlError::ResourceExhausted)
-            }
             other => Self::Reference(other),
+        }
+    }
+}
+
+impl PhysicalArgumentError {
+    pub(crate) fn constant_limit(&self) -> Option<&'static str> {
+        match self {
+            Self::Constant(ConstantError::Limit(detail))
+            | Self::Reference(ConstantReferenceError::Constant(ConstantError::Limit(detail))) => {
+                Some(*detail)
+            }
+            _ => None,
         }
     }
 }

@@ -407,8 +407,18 @@ fn mv_compile_error(
 ) -> novarocks_sql::compiler::SqlCompileError {
     match error.compile_control_error() {
         Some(error) => error.into(),
-        None => novarocks_sql::compiler::SqlCompileError::Compilation(error.to_string()),
+        None => match error.unavailable_implementation() {
+            Some(analyze) => novarocks_sql::compiler::SqlCompileError::Analyze(analyze.clone()),
+            None => novarocks_sql::compiler::SqlCompileError::Compilation(error.to_string()),
+        },
     }
+}
+
+#[cfg(test)]
+pub(super) fn project_product_failure_for_test(
+    error: crate::mv::domain::application::MvApplicationError,
+) -> novarocks_query_application::api::CommandError {
+    mv_command_error(mv_compile_error(error))
 }
 
 /// Role-local implementation of the Query Application MV consumer. It owns
@@ -440,38 +450,48 @@ impl MaterializedViewCommandConsumer for FrontendMvCommandConsumer {
                 command_context.connector_context(),
                 context.execution(),
             )
-            .map_err(|error| match error {
-                novarocks_sql::compiler::SqlCompileError::Cancelled => {
-                    novarocks_query_application::api::CommandError::from_compile_control(
-                        novarocks_type_contract::CompileControlError::Cancelled,
-                    )
-                }
-                novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
-                    novarocks_query_application::api::CommandError::from_compile_control(
-                        novarocks_type_contract::CompileControlError::DeadlineExceeded,
-                    )
-                }
-                novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
-                    novarocks_query_application::api::CommandError::from_compile_control(
-                        novarocks_type_contract::CompileControlError::ResourceExhausted,
-                    )
-                }
-                novarocks_sql::compiler::SqlCompileError::Analyze(error) => match error
-                    .control_error()
+            .map_err(mv_command_error)
+    }
+}
+
+fn mv_command_error(
+    error: novarocks_sql::compiler::SqlCompileError,
+) -> novarocks_query_application::api::CommandError {
+    match error {
+        novarocks_sql::compiler::SqlCompileError::Cancelled => {
+            novarocks_query_application::api::CommandError::from_compile_control(
+                novarocks_type_contract::CompileControlError::Cancelled,
+            )
+        }
+        novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
+            novarocks_query_application::api::CommandError::from_compile_control(
+                novarocks_type_contract::CompileControlError::DeadlineExceeded,
+            )
+        }
+        novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+            novarocks_query_application::api::CommandError::from_compile_control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+        }
+        novarocks_sql::compiler::SqlCompileError::Analyze(error) => match error.control_error() {
+            Some(error) => {
+                novarocks_query_application::api::CommandError::from_compile_control(error)
+            }
+            None => novarocks_query_application::api::CommandError::new(
+                novarocks_query_application::api::CommandErrorKind::Failed,
+                if error.kind()
+                    == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
                 {
-                    Some(error) => {
-                        novarocks_query_application::api::CommandError::from_compile_control(error)
-                    }
-                    None => novarocks_query_application::api::CommandError::new(
-                        novarocks_query_application::api::CommandErrorKind::Failed,
-                        error.to_string(),
-                    ),
+                    error.to_user_error(None).to_string()
+                } else {
+                    error.to_string()
                 },
-                error => novarocks_query_application::api::CommandError::new(
-                    novarocks_query_application::api::CommandErrorKind::Failed,
-                    error.to_string(),
-                ),
-            })
+            ),
+        },
+        error => novarocks_query_application::api::CommandError::new(
+            novarocks_query_application::api::CommandErrorKind::Failed,
+            error.to_string(),
+        ),
     }
 }
 
@@ -1029,6 +1049,160 @@ mod tests {
                 panic!("expected typed EXPLAIN REFRESH MATERIALIZED VIEW");
             };
             assert_eq!(lower_typed_explain_level(explain.level), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod refresh_refusal_projection_tests {
+    use super::{mv_command_error, mv_compile_error};
+    use crate::mv::domain::application::MvApplicationErrorKind;
+    use crate::mv::domain::lifecycle::RefreshError;
+    use crate::mv::service::prepare_refresh_step;
+    use crate::query_execution::mv_assembly::refresh_handoff::{
+        MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
+    };
+    use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+    use novarocks_mv_application::service::MvKeyedProductService;
+    use novarocks_query_application::api::CommandErrorKind;
+    use novarocks_sql::{
+        analyze_error::{AnalyzeError, AnalyzeErrorKind},
+        compiler::SqlCompileError,
+        planning::mv::{MvRefreshStatement, SqlMvTarget},
+    };
+    use novarocks_type_contract::CompileControlError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RefusingPreparation {
+        expected: MvRefreshPreparationRequest,
+        error: SqlCompileError,
+        calls: AtomicUsize,
+    }
+
+    impl MvRefreshPreparationService for RefusingPreparation {
+        fn prepare_step(
+            &self,
+            request: MvRefreshPreparationRequest,
+        ) -> Result<PreparedMvRefresh, RefreshError> {
+            assert_eq!(request, self.expected);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(RefreshError::from(self.error.clone()))
+        }
+    }
+
+    fn prepare_failure(
+        error: SqlCompileError,
+    ) -> crate::mv::domain::application::MvApplicationError {
+        let request = MvRefreshPreparationRequest {
+            statement: MvRefreshStatement {
+                name_parts: vec!["db".into(), "mv".into()],
+                full: true,
+            },
+            target: SqlMvTarget {
+                catalog: Some("iceberg".into()),
+                database: "db".into(),
+                name: "mv".into(),
+            },
+            attempt: MvKeyedProductService::default().reserve_refresh_attempt(),
+        };
+        let preparation = RefusingPreparation {
+            expected: request.clone(),
+            error,
+            calls: AtomicUsize::new(0),
+        };
+        let failure = match prepare_refresh_step(&preparation, request) {
+            Ok(_) => panic!("the preparation port must refuse before execution"),
+            Err(failure) => failure,
+        };
+        assert_eq!(preparation.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failure.kind(), MvApplicationErrorKind::InvalidRequest);
+        failure
+    }
+
+    #[test]
+    fn refresh_prepare_step_missing_implementation_reaches_command_sql_code() {
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/prepare-step/missing-pure-v1").unwrap(),
+        ));
+        let SqlCompileError::Analyze(expected) = &compile else {
+            panic!("the binding owner must return typed analysis");
+        };
+        let expected_user = expected.to_user_error(None).to_string();
+        let failure = prepare_failure(compile.clone());
+        let projected = mv_compile_error(failure);
+        let SqlCompileError::Analyze(analyze) = &projected else {
+            panic!("command reconstruction must keep the typed analysis cause");
+        };
+        assert_eq!(analyze, expected);
+        assert_eq!(analyze.kind(), AnalyzeErrorKind::UnavailableImplementation);
+        assert_eq!(
+            analyze.code().as_str(),
+            "sql.analyze.unavailable_implementation"
+        );
+        let user = mv_command_error(projected);
+        assert_eq!(user.kind(), CommandErrorKind::Failed);
+        assert_eq!(user.compile_control_error(), None);
+        assert_eq!(user.to_string(), expected_user);
+    }
+
+    #[test]
+    fn refresh_prepare_step_diagnostic_text_does_not_gain_refusal_identity() {
+        let message = "unsupported diagnostic: UnavailableImplementation UnsupportedCompiledShape";
+        for compile in [
+            SqlCompileError::Analyze(AnalyzeError::internal(message)),
+            SqlCompileError::Compilation(message.into()),
+        ] {
+            let failure = prepare_failure(compile);
+            assert_eq!(failure.unavailable_implementation(), None);
+            let projected = mv_compile_error(failure);
+            assert!(
+                matches!(&projected, SqlCompileError::Compilation(actual) if actual == message)
+            );
+            let user = mv_command_error(projected);
+            assert_eq!(user.kind(), CommandErrorKind::Failed);
+            assert_eq!(user.compile_control_error(), None);
+            assert_eq!(user.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn refresh_prepare_step_control_keeps_command_cause_and_rollback_policy() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for compile in [
+                SqlCompileError::from(control),
+                SqlCompileError::Analyze(AnalyzeError::control(control)),
+            ] {
+                let refresh = RefreshError::from(compile.clone());
+                assert!(refresh.kind.should_rollback_after_commit());
+                assert_eq!(refresh.compile_control_error(), Some(control));
+                assert_eq!(refresh.unavailable_implementation(), None);
+                let failure = prepare_failure(compile);
+                assert_eq!(failure.compile_control_error(), Some(control));
+                assert_eq!(failure.unavailable_implementation(), None);
+                let user = mv_command_error(mv_compile_error(failure));
+                assert_eq!(user.compile_control_error(), Some(control));
+                assert_eq!(user.to_string(), control.to_string());
+                assert_eq!(
+                    user.kind(),
+                    if control == CompileControlError::Cancelled {
+                        CommandErrorKind::Cancelled
+                    } else {
+                        CommandErrorKind::Failed
+                    }
+                );
+            }
+            let missing = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+                FunctionOverloadId::try_new("fixture/mv/controlled/missing-pure-v1").unwrap(),
+            ));
+            let failure = prepare_failure(missing).with_compile_control(Some(control));
+            assert!(failure.unavailable_implementation().is_some());
+            let user = mv_command_error(mv_compile_error(failure));
+            assert_eq!(user.compile_control_error(), Some(control));
+            assert_eq!(user.to_string(), control.to_string());
         }
     }
 }

@@ -383,7 +383,7 @@ pub(crate) fn freeze_one_read(
     // 1. Freeze the relation family this read names. Admission already
     //    resolved the name, so a provider that now reports nothing means the
     //    pin is gone rather than that the query named an unknown relation.
-    let (handle, metadata_work_source) = open_relation(
+    let (handle, metadata_work_source, frozen_metadata_kind) = open_relation(
         metadata.as_ref(),
         session,
         &table,
@@ -521,6 +521,7 @@ pub(crate) fn freeze_one_read(
             input_version,
             relation: relation_payload,
         },
+        metadata_kind: frozen_metadata_kind,
         work_source,
         selection_digest: frozen.selection_digest(),
         schema,
@@ -631,7 +632,14 @@ fn open_relation(
     relation: &ProviderReadRelationNeed,
     admitted: &AdmittedRead,
     name: &str,
-) -> Result<(ConnectorReadTableHandle, Option<ConnectorReadWorkSource>), String> {
+) -> Result<
+    (
+        ConnectorReadTableHandle,
+        Option<ConnectorReadWorkSource>,
+        Option<ConnectorReadMetadataKind>,
+    ),
+    String,
+> {
     use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
 
     // A cohort is frozen as a freeze of its own rather than as a table read
@@ -649,7 +657,7 @@ fn open_relation(
                     // FE neither interprets it nor substitutes generic reopening.
                     return metadata
                         .adopt_frozen_source(session, source)
-                        .map(|handle| (handle, None))
+                        .map(|handle| (handle, None, None))
                         .map_err(|error| {
                             format!("provider read of {name} cannot adopt its original frozen source: {error}")
                         });
@@ -666,7 +674,7 @@ fn open_relation(
                 .ok_or_else(|| {
                     format!("provider read of {name} exposes no pinned file set read")
                 })
-                .map(|handle| (handle, None))
+                .map(|handle| (handle, None, None))
             }
             (
                 ProviderReadRelationNeed::TableExecute { .. },
@@ -685,7 +693,7 @@ fn open_relation(
                 .ok_or_else(|| {
                     format!("provider read of {name} exposes no table-execute relation")
                 })
-                .map(|handle| (handle, None)),
+                .map(|handle| (handle, None, None)),
             _ => Err(unsupported_family(relation)),
         };
     }
@@ -697,7 +705,7 @@ fn open_relation(
             .ok_or_else(|| {
                 format!("provider read of {name} is no longer resolvable after admission pinned it")
             })
-            .map(|handle| (handle, None)),
+            .map(|handle| (handle, None, None)),
         ProviderReadRelationNeed::Metadata { kind, version, .. } => {
             let request = ConnectorReadMetadataRequest::try_new(
                 metadata_kind(*kind)?,
@@ -721,7 +729,11 @@ fn open_relation(
                     ConnectorReadWorkSource::WholeRelation
                 }
             };
-            Ok((plan.into_handle(), Some(work_source)))
+            Ok((
+                plan.into_handle(),
+                Some(work_source),
+                Some(request.kind().clone()),
+            ))
         }
         ProviderReadRelationNeed::Delta {
             from_snapshot_id,
@@ -738,7 +750,7 @@ fn open_relation(
             )
             .map_err(|error| format!("provider read of {name} cannot open change window: {error}"))?
             .ok_or_else(|| format!("provider read of {name} exposes no change window"))
-            .map(|handle| (handle, None)),
+            .map(|handle| (handle, None, None)),
         ProviderReadRelationNeed::MvTarget {
             target_snapshot_id, ..
         } => {
@@ -770,7 +782,7 @@ fn open_relation(
                     format!("provider read of {name} cannot open frozen MV target: {error}")
                 })?
                 .ok_or_else(|| format!("provider read of {name} exposes no frozen MV target"))
-                .map(|handle| (handle, None))
+                .map(|handle| (handle, None, None))
         }
         _ => Err(unsupported_family(relation)),
     }

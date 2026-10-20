@@ -325,24 +325,18 @@ fn physical_call_request_legacy_literal_uses_the_sole_factory_and_preserves_erro
     };
     assert!(matches!(
         invoke(&node, &empty, low, &Control::good()),
-        Err(PhysicalArgumentError::Control(
-            CompileControlError::ResourceExhausted
-        ))
+        Err(PhysicalArgumentError::Constant(ConstantError::Limit(_)))
     ));
     let control = Control::good();
     assert!(matches!(
         invoke(&node, &empty, low, &control),
-        Err(PhysicalArgumentError::Control(
-            CompileControlError::ResourceExhausted
-        ))
+        Err(PhysicalArgumentError::Constant(ConstantError::Limit(_)))
     ));
     let direct_control = Control::good();
     let mut work = CompileCheckpoints::try_new(&direct_control, PHASE).unwrap();
     assert!(matches!(
         author_physical_argument_observed(&node, &empty, low, PHASE, &mut work),
-        Err(PhysicalArgumentError::Control(
-            CompileControlError::ResourceExhausted
-        ))
+        Err(PhysicalArgumentError::Constant(ConstantError::Limit(_)))
     ));
     assert_eq!(control.trace(), direct_control.trace());
 }

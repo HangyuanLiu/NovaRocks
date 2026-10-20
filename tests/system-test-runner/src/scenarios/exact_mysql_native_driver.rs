@@ -1038,7 +1038,7 @@ async fn census(context: &mut ScenarioContext, deadline: Instant) -> Result<Cens
                 "novarocks_backend_worker_reservation_last_published_unixtime_seconds",
                 &[],
             )? > 0;
-        for class in ["binary", "control", "root_result"] {
+        for class in ["ordinary", "control", "root_result"] {
             for phase in ["running", "waiting"] {
                 idle &= metric(
                     rows,

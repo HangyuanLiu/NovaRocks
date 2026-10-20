@@ -294,6 +294,12 @@ fn lower_core_with_creation<H>(
             match value {
                 Cell::Constant(_) => constant_cells[ordinal] += 1,
                 Cell::Dynamic(definition) => {
+                    work.flush()?;
+                    selected_copy::values_copy_kind_observed(output.ty.data_type(), || {
+                        CompileCopyControl(work.control()).checkpoint(1)
+                    })
+                    .map_err(|cause| copy_error(cause, node.id))?;
+                    work.flush()?;
                     if dynamic.len() == dynamic.capacity() {
                         let additional = dynamic.len().max(4);
                         reserve_created(&mut dynamic, additional, work, creation)?;
@@ -457,27 +463,47 @@ fn lower_core_with_creation<H>(
                 copied
             } else {
                 work.flush()?;
-                selected_copy::preflight_interleave_construction(
-                    ty.data_type(),
-                    &sources,
-                    &choices,
-                    creation,
-                    &CompileCopyControl(work.control()),
-                )
-                .map_err(|error| copy_construction_error(error, node.id))?;
-                let mut borrowed: Vec<&dyn Array> = Vec::new();
-                reserve_created(&mut borrowed, sources.len(), work, creation)?;
-                for source in &sources {
-                    borrowed.push(source.as_ref());
-                    work.step()?;
+                match selected_copy::values_copy_kind_observed(ty.data_type(), || {
+                    CompileCopyControl(work.control()).checkpoint(1)
+                })
+                .map_err(|cause| copy_error(cause, node.id))?
+                {
+                    selected_copy::ValuesCopyKind::Interleave => {
+                        selected_copy::preflight_interleave_construction(
+                            ty.data_type(),
+                            &sources,
+                            &choices,
+                            creation,
+                            &CompileCopyControl(work.control()),
+                        )
+                        .map_err(|error| copy_construction_error(error, node.id))?;
+                        let mut borrowed: Vec<&dyn Array> = Vec::new();
+                        reserve_created(&mut borrowed, sources.len(), work, creation)?;
+                        for source in &sources {
+                            borrowed.push(source.as_ref());
+                            work.step()?;
+                        }
+                        work.flush()?;
+                        let copied = interleave(&borrowed, &choices);
+                        let copied = copied.map_err(|source| {
+                            values_array_error(ValuesArrayOperation::Interleave, source)
+                        })?;
+                        work.flush()?;
+                        copied
+                    }
+                    selected_copy::ValuesCopyKind::Extend => {
+                        work.flush()?;
+                        let copied = selected_copy::copy_nested_values_construction(
+                            &sources,
+                            &choices,
+                            creation,
+                            &CompileCopyControl(work.control()),
+                        )
+                        .map_err(|cause| copy_construction_error(cause, node.id))?;
+                        work.flush()?;
+                        copied
+                    }
                 }
-                work.flush()?;
-                let copied = interleave(&borrowed, &choices);
-                let copied = copied.map_err(|source| {
-                    values_array_error(ValuesArrayOperation::Interleave, source)
-                })?;
-                work.flush()?;
-                copied
             }
         };
         let column = crate::array_projection::normalize_constant_column_with_creation(

@@ -251,17 +251,17 @@ mv_refresh_scheduler_max_failure_backoff_ms = 2000
         if role == "fe":
             value += '''
 [runtime.frontend_constant_policy]
-# Explicit author limits; these are not allocation grants or inferred defaults.
-max_rows = 1048576
-max_array_nodes = 1048576
-max_logical_elements = 16777216
-max_retained_buffer_bytes = 1073741824
+# Frozen compiled-package constant policy (ADR-0185); no deployment override.
+max_rows = 4096
+max_array_nodes = 4096
+max_logical_elements = 65536
+max_retained_buffer_bytes = 8388608
 max_type_depth = 64
 max_type_nodes = 4096
-max_dictionary_depth = 64
-max_metadata_bytes = 1048576
-max_library_validation_work = 1073741824
-max_library_validation_bytes = 4294967296
+max_dictionary_depth = 8
+max_metadata_bytes = 65536
+max_library_validation_work = 33554432
+max_library_validation_bytes = 33554432
 '''
         purpose = "metadata" if role == "fe" else "data"
         value += f'''\n[[connector.credentials]]
@@ -570,8 +570,9 @@ def worktree_main(argv: list[str] | None = None) -> int:
                 if shared:
                     if args.profile != 'stock' or args.hook_image:
                         raise runtime.RuntimeFailure('InvalidConfiguration', 'hook profile requires an isolated request')
-                    if os.environ.get('NOVA_FIXTURE_CATALOG_TEMPLATE'):
-                        owner.templates = {'os': HERE / 'templates/object-store.yml', 'cat': Path(os.environ['NOVA_FIXTURE_CATALOG_TEMPLATE']).resolve()}
+                    for kind, variable in (('os', 'NOVA_FIXTURE_OBJECT_STORE_TEMPLATE'), ('cat', 'NOVA_FIXTURE_CATALOG_TEMPLATE')):
+                        if os.environ.get(variable):
+                            owner.templates[kind] = Path(os.environ[variable]).resolve()
                     result = owner.bind(env_id, entry, config, bom)
                 else:
                     result = isolated_start(config, settings['NOVA_ENV_COMPOSE_PROJECT'], entry, args.profile, args.hook_image, bom)

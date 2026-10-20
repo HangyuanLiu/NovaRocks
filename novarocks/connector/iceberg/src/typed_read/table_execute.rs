@@ -54,7 +54,7 @@ pub(crate) fn rewrite_position_delete_pseudo_column(
     metadata: IcebergMetadataColumn,
 ) -> Result<super::IcebergColumnHandle, ConnectorError> {
     use crate::iceberg::spec::{NestedField, Type};
-    super::IcebergColumnHandle::base_column(&NestedField::optional(
+    super::IcebergColumnHandle::base_column(&NestedField::required(
         metadata.field_id(),
         name,
         Type::Primitive(metadata.declared_type()),
@@ -1033,6 +1033,29 @@ mod tests {
             REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.map(|(name, _)| name),
             ["file_path", "pos"]
         );
+        // The procedure's exact file/position pair is required in Iceberg's
+        // position-delete schema, independently of optional scan aliases.
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        let execution = crate::distributed_rewrite::delete_artifact_execution_schema(&mut creation)
+            .expect("the real frozen rewrite output");
+        for (ordinal, (name, metadata)) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS
+            .into_iter()
+            .enumerate()
+        {
+            let column = rewrite_position_delete_pseudo_column(name, metadata).unwrap();
+            assert_eq!(column.base_field_id(), metadata.field_id());
+            assert!(!column.nullable(), "{name}");
+            let field = &execution.schema().fields()[ordinal];
+            assert_eq!(field.name(), name);
+            assert!(!field.is_nullable(), "{name}");
+            assert!(!execution.binding(ordinal).unwrap().nullable(), "{name}");
+        }
     }
 
     #[test]

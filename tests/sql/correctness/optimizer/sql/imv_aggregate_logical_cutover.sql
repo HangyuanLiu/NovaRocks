@@ -89,8 +89,10 @@ INSERT INTO imv_agg_cut_${uuid0}.ns_${uuid0}.orders VALUES
 EXPLAIN REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
 
 -- query 5
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW agg_mv_${uuid0};
-DROP TABLE imv_agg_cut_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE imv_agg_cut_${uuid0}.ns_${uuid0};
-DROP CATALOG imv_agg_cut_${uuid0};
+SET CATALOG imv_agg_cut_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv_${uuid0};
+DROP TABLE IF EXISTS imv_agg_cut_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP DATABASE IF EXISTS imv_agg_cut_${uuid0}.ns_${uuid0};
+DROP CATALOG IF EXISTS imv_agg_cut_${uuid0};

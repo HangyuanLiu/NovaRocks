@@ -8686,8 +8686,6 @@ pub(crate) mod tests {
                         value_type: novarocks_result_contract::ScalarValueType::SignedInteger(64),
                     },
                 )
-                .unwrap()
-                .bind_native_slots(&[0])
                 .unwrap(),
             ),
             &[],

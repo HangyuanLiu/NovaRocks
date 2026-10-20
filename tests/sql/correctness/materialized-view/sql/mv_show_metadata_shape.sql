@@ -65,6 +65,6 @@ SHOW MATERIALIZED VIEWS FROM ${case_db};
 -- query 5
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW ${case_db}.orders_shape_mv;
-DROP TABLE ${case_db}.orders_shape FORCE;
-DROP DATABASE ${case_db};
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.orders_shape_mv;
+DROP TABLE IF EXISTS ${case_db}.orders_shape FORCE;
+DROP DATABASE IF EXISTS ${case_db};

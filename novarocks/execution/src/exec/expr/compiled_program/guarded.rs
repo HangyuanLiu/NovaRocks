@@ -3138,7 +3138,7 @@ mod result_creator_continuation_tests {
         let tracker =
             crate::runtime::mem_tracker::MemTracker::new_root("real-selected-creator-pins");
         let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
-            crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone());
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
         let source = input_source::retain_result_type(
             Arc::new(Int32Array::from(vec![Some(11), None, Some(7)])),
             &source_type,

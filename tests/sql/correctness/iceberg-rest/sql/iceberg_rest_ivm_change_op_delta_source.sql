@@ -118,7 +118,9 @@ FROM orders_sum_mv_${uuid0}
 ORDER BY customer;
 
 -- query 15
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW orders_sum_mv_${uuid0};
-DROP MATERIALIZED VIEW orders_projection_mv_${uuid0};
-DROP DATABASE ivm_${uuid0} FORCE;
+SET CATALOG iceberg_rest_${suite_uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ivm_${uuid0}.orders_sum_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ivm_${uuid0}.orders_projection_mv_${uuid0};
+DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} FORCE;
