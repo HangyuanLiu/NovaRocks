@@ -18,6 +18,8 @@
 -- @order_sensitive=true
 -- @tags=iceberg_dml,cow,cast
 -- Compare COW assignment conversion with the same SELECT CAST value author.
+-- query 1
+-- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_cow_assignment_conversion FORCE;
 CREATE TABLE ${case_db}.t_cow_assignment_conversion (
   id INT,
@@ -36,11 +38,14 @@ INSERT INTO ${case_db}.t_cow_assignment_conversion VALUES
   (1, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required'),
   (2, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required');
 
+-- query 2
 SELECT CAST(CAST(12.345 AS DECIMAL(8,3)) AS DECIMAL(8,2)) AS d,
        CAST('2024-02-29' AS DATE) AS dt,
        CAST('2024-02-29 12:34:56.123456' AS DATETIME) AS ts,
        CAST('123' AS INT) AS n,
        CAST(NULL AS STRING) AS nullable_text;
+-- query 3
+-- @skip_result_check=true
 UPDATE ${case_db}.t_cow_assignment_conversion
 SET d = CAST(12.345 AS DECIMAL(8,3)),
     dt = '2024-02-29',
@@ -48,18 +53,28 @@ SET d = CAST(12.345 AS DECIMAL(8,3)),
     n = '123',
     nullable_text = NULL
 WHERE id = 1;
+-- query 4
 SELECT d, dt, ts, n, nullable_text
 FROM ${case_db}.t_cow_assignment_conversion WHERE id = 1;
 
+-- query 5
 SELECT CAST(CAST(-12.345 AS DECIMAL(8,3)) AS DECIMAL(8,2)) AS d,
        CAST(CAST(2147483648 AS BIGINT) AS INT) AS n;
+-- query 6
+-- @skip_result_check=true
 UPDATE ${case_db}.t_cow_assignment_conversion
 SET d = CAST(-12.345 AS DECIMAL(8,3)), n = CAST(2147483648 AS BIGINT)
 WHERE id = 2;
+-- query 7
 SELECT d, n FROM ${case_db}.t_cow_assignment_conversion WHERE id = 2;
 
+-- query 8
 SELECT CAST(NULL AS STRING) AS required_text;
+-- query 9
 -- @expect_error=signed COW required field contains NULL
 UPDATE ${case_db}.t_cow_assignment_conversion SET required_text = NULL WHERE id = 1;
+-- query 10
 SELECT id, required_text FROM ${case_db}.t_cow_assignment_conversion ORDER BY id;
+-- query 11
+-- @skip_result_check=true
 DROP TABLE ${case_db}.t_cow_assignment_conversion FORCE;

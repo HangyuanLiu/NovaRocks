@@ -1,0 +1,24 @@
+-- query 2
+d	dt	ts	n	nullable_text
+12.35	2024-02-29	2024-02-29 12:34:56.123456	123	NULL
+
+-- query 4
+d	dt	ts	n	nullable_text
+12.35	2024-02-29	2024-02-29 12:34:56.123456	123	NULL
+
+-- query 5
+d	n
+-12.35	NULL
+
+-- query 7
+d	n
+-12.35	NULL
+
+-- query 8
+required_text
+NULL
+
+-- query 10
+id	required_text
+1	required
+2	required

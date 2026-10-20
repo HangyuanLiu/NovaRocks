@@ -46,7 +46,7 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out" | grep -Fx 'F3_FIXED_SPARK_CREATED'
 
 -- query 2
-SELECT id,hex(raw) AS raw_hex,hex(st.f) AS nested_hex,n
+SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,hex(CAST(st.f AS VARBINARY)) AS nested_hex,n
 FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} ORDER BY id;
 
 -- query 3
@@ -58,7 +58,7 @@ UPDATE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_fixed_cow_${
 SET raw=raw,st=st WHERE id=1;
 
 -- query 5
-SELECT id,hex(raw) AS raw_hex,hex(st.f) AS nested_hex,n
+SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,hex(CAST(st.f AS VARBINARY)) AS nested_hex,n
 FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} ORDER BY id;
 
 -- query 6
