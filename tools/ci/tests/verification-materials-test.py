@@ -212,6 +212,50 @@ class Materials(unittest.TestCase):
         records[6] = {'kind': 'fixture', 'start': 'failed', 'shutdown': {'status': 'not_called'}, 'resources': []}
         self.assertEqual(sql_cleanup(records), 'ok')
 
+    def test_sql_case_cleanup_flag_survives_aggregate_failure_and_missing_closure(self):
+        for failure in (
+            {'class':'error','cleanup':True},
+            {'class':'error','primary_failure':{'class':'error','cleanup':True}},
+            {'class':'error','additional_failures':[{'class':'error','cleanup':True}]},
+            {'class':'error','primary_failure':{'class':'error','additional_failures':[
+                {'class':'error','primary_failure':{'class':'error','cleanup':True}}]}}):
+            with self.subTest(failure=failure):
+                records=self.sql()
+                records[2].update(status='fail',failure=failure)
+                path=self.sql_file(records)
+                before=path.read_bytes()
+                observations,errors=read_sql(path,'now')
+                self.assertEqual(errors,[])
+                self.assertEqual([o.cleanup for o in observations],['violation','ok'])
+                self.assertEqual(observations[0].failure,failure)
+                self.assertEqual(path.read_bytes(),before)
+                incomplete=[r for r in records if r['kind'] not in ('suite','end')]
+                observations,_=read_sql(self.sql_file(incomplete),'now')
+                self.assertEqual([o.cleanup for o in observations],['violation','unknown'])
+                self.assertFalse(observations[0].record_complete)
+
+    def test_sql_generic_errors_and_diagnostic_cleanup_text_are_not_cleanup_facts(self):
+        for failure in (
+            {'class':'error','error':'cleanup failed'},
+            {'class':'error','cleanup':False},
+            {'class':'error','cleanup':'true'},
+            {'class':'error','cleanup':1},
+            {'class':'error','diagnostic':{'cleanup':True}},
+            {'class':'error','primary_failure':{'class':'error','error':'cleanup failed'},
+             'additional_failures':[{'class':'error','cleanup':False}]}
+        ):
+            with self.subTest(failure=failure):
+                records=self.sql()
+                records[2].update(status='fail',failure=failure)
+                observations,_=read_sql(self.sql_file(records),'now')
+                self.assertEqual([o.cleanup for o in observations],['ok','ok'])
+                incomplete=[r for r in records if r['kind'] not in ('suite','end')]
+                observations,_=read_sql(self.sql_file(incomplete),'now')
+                self.assertEqual([o.cleanup for o in observations],['unknown','unknown'])
+                records[4]['cleanup']['status']='failed'
+                observations,_=read_sql(self.sql_file(records),'now')
+                self.assertTrue(all(o.cleanup=='violation' for o in observations))
+
     def rust(self, terminated=True, doctest=False, tool='[store]\ndir = "/attempt/A"\n'):
         self.put('inputs/prepared.json', {'schema': 1, 'profile': 'default', 'config_sha256': 'config'})
         self.put('inputs/test-artifacts.json', {'schema': 1, 'binaries': {'pkg::integration': {'sha256': 'binary'}}})

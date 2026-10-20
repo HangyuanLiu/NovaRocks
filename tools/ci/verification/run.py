@@ -33,7 +33,7 @@ import identity_snapshot
 import invocation_record
 from .compose import compose
 from .dispositions import Dispositions
-from .materials import read_attempt, read_rust, read_sql, sql_scope_identity, read_monitor_cleanup
+from .materials import read_attempt, read_rust, read_sql, sql_scope_identity, read_monitor_cleanup, _sql_case_cleanup_failed
 from .model import Attempt, Scope, UnitKey
 from .record import write_record
 from .select import (select, changed_paths, sql_case_arguments,
@@ -209,15 +209,17 @@ def scopes(repo, native, chosen):
 
 def system_argv(native,item,output):
     repo=Path(native.get('repo', Path(__file__).resolve().parents[3]))
-    argv = [native['receipt']['novarocks-system-tests']['path'], '--only',item['name'],
-        '--binary',native['receipt']['novarocks']['path'],'--config',str(repo/'tools/ci/fixtures/system-scenarios-base.toml'),
-        '--artifact-root',str(output),'--cluster-size','3','--timeout-secs','900']
+    # Match the native shell owner's argv order as well as its effective inputs.
+    argv = [native['receipt']['novarocks-system-tests']['path'],
+        '--binary',native['receipt']['novarocks']['path']]
     for role in ('compatible','other-island'):
         binding = native.get('system_variants', {}).get(role)
         if binding:
             if identity_snapshot.digest(binding['path']) != binding['sha256']:
                 raise ValueError('prepared System variant changed: ' + role)
             argv += ['--' + role + '-binary', binding['path']]
+    argv += ['--config',str(repo/'tools/ci/fixtures/system-scenarios-base.toml'),
+        '--artifact-root',str(output),'--cluster-size','3','--timeout-secs','900','--only',item['name']]
     return argv
 
 
@@ -239,11 +241,9 @@ def stage_argv(repo,native,item,output):
 
 def system_spec(native,item):
     declaration=item['declaration']
-    files={'runner':native['receipt']['novarocks-system-tests']['path'],'server':native['receipt']['novarocks']['path']}
-    base=Path(native.get('repo', Path(__file__).resolve().parents[3]))/'tools/ci/fixtures/system-scenarios-base.toml'
-    files['base_config']=str(base)
-    return {'inputs':[],'files':files,'env_inputs':declaration.get('env_inputs') or [],'declaration':declaration,
-            'declared':declaration.get('initial_state') is not None}
+    # execution_spec captures the actual runner, programs and config from argv.
+    return {'inputs':[],'env_inputs':declaration.get('env_inputs') or [],'declaration':declaration,
+            'declared':declaration.get('env_inputs') is not None}
 
 
 def prepare_system_variants(repo, native, chosen, root):
@@ -533,6 +533,26 @@ def _producer_cleanup_checks(observation, attempt, run_command, cache):
             raw=path.read_bytes()
             if not raw.endswith(b'\n'):raise ValueError('unfinished SQL result record')
             records=[json.loads(line) for line in raw.splitlines()]
+            suite_name,case_name=observation.unit.id.split('/',1)
+            if observation.ref.partition('#')[2]!=observation.unit.id:
+                raise ValueError('SQL cleanup reference does not identify the observed case')
+            cases=[value for value in records if value.get('kind')=='case'
+                   and value.get('suite')==suite_name and value.get('case')==case_name
+                   and value.get('lifecycle_id')==observation.lifecycle]
+            closures=[value for value in records if value.get('kind')=='suite'
+                      and value.get('suite')==suite_name
+                      and value.get('lifecycle_id')==observation.lifecycle]
+            if len(cases)!=1 or len(closures)!=1:
+                checks.append({'ref':observation.ref,'domain':'case/suite','ok':False,
+                               'reason':'exact SQL case and suite cleanup lifecycle records are missing or ambiguous'})
+            else:
+                if _sql_case_cleanup_failed(cases[0].get('failure')):
+                    checks.append({'ref':observation.ref,'domain':'case','ok':False,
+                                   'reason':'case cleanup failed; no exact independent case cleanup confirmation is available'})
+                suite_status=closures[0].get('cleanup',{}).get('status')
+                if suite_status!='ok':
+                    checks.append({'ref':observation.ref,'domain':'suite','ok':False,
+                                   'reason':'suite cleanup failed or is unknown; no exact independent suite cleanup confirmation is available'})
             fixtures=[value for value in records if value.get('kind')=='fixture']
             servers=[value for value in records if value.get('kind')=='server']
             if not fixtures or (any(value.get('kind')=='selection' for value in records) and not servers):

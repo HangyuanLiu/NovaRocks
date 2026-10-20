@@ -136,6 +136,22 @@ def system_cleanup(teardown, monitors=()):
     return "ok"
 
 
+def _sql_case_cleanup_failed(failure):
+    """Read explicit producer cleanup facts only, including aggregate failures."""
+    pending = [failure]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, dict):
+            continue
+        if current.get("cleanup") is True:
+            return True
+        pending.append(current.get("primary_failure"))
+        additional = current.get("additional_failures")
+        if isinstance(additional, list):
+            pending.extend(additional)
+    return False
+
+
 def sql_cleanup(records):
     fixtures = [value for value in records if value.get("kind") == "fixture"]
     servers = [value for value in records if value.get("kind") == "server"]
@@ -273,7 +289,9 @@ def read_sql(path, attempt_id, declarations=(), invocation=None):
                 status = value.get("status", "not_run")
                 if status not in {"pass", "fail", "not_run"}:
                     status = "unknown"
-                scope_cleanup = "violation" if end.get("cleanup", {}).get("status") == "failed" else cleanup
+                scope_cleanup = ("violation" if (
+                    end.get("cleanup", {}).get("status") == "failed"
+                    or _sql_case_cleanup_failed(value.get("failure"))) else cleanup)
                 if end.get("cleanup", {}).get("status") not in {"ok", "failed"} and scope_cleanup != "violation":
                     scope_cleanup = "unknown"
                 stable = (end.get("inputs_stable") is True

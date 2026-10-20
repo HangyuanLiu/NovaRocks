@@ -393,6 +393,77 @@ class Run(unittest.TestCase):
             'materials':{'evidence':str(evidence),'teardown':str(teardown)},'cleanup':{'source':'producer','summary':'unknown','refs':[str(teardown)]+refs}})
         return attempt
 
+    def sql_cleanup_attempt(self,failure=None,suite_cleanup='ok',unrelated=False,replay=False):
+        attempt=run.exclusive(self.base/'sql-cleanup');put(attempt/'selection.json',{'schema':1})
+        records=[
+            {'kind':'run','schema':1,'mode':'verify','verification':{'verify_enabled':True},
+             'platform':{'system':'fixture','machine':'fixture','release':'fixture'}},
+            {'kind':'selection','suites':[{'suite':'s','inputs_sha256':'inputs','verify_enabled':True,
+             'declaration':{'scope':'suite','initial_state':'isolated','env_inputs':[]},'cases':[{'case':'a'}]}]},
+            {'kind':'case','suite':'s','case':'a','lifecycle_id':'actual','status':'fail','failure':failure,
+             'oracle':{'required':[{'step':1,'kind':'result_set'}],'executed':[]}},
+            {'kind':'suite','suite':'s','lifecycle_id':'actual','inputs_end_sha256':'inputs',
+             'inputs_stable':True,'executed_cases':['a'],'cleanup':{'status':suite_cleanup}},
+            {'kind':'server','cleanup':{'status':'ok'}},
+            {'kind':'fixture','shutdown':{'status':'ok'},'resources':[]},
+            {'kind':'end','completed':True,'exit_code':1}]
+        if unrelated:
+            records[4:4]=[
+                {'kind':'case','suite':'other','case':'a','lifecycle_id':'actual','failure':{'cleanup':True}},
+                {'kind':'case','suite':'s','case':'b','lifecycle_id':'actual','failure':{'cleanup':True}},
+                {'kind':'suite','suite':'s','lifecycle_id':'other','cleanup':{'status':'failed'}}]
+        if replay:
+            records[4:4]=[
+                {'kind':'case','suite':'s','case':'a','lifecycle_id':'replay','status':'pass',
+                 'oracle':{'required':[{'step':1,'kind':'result_set'}],
+                           'executed':[{'step':1,'kind':'result_set','outcome':'pass'}]}},
+                {'kind':'suite','suite':'s','lifecycle_id':'replay','inputs_end_sha256':'inputs',
+                 'inputs_stable':True,'executed_cases':['a'],'cleanup':{'status':'ok'}}]
+        path=attempt/'sql/results.jsonl';path.parent.mkdir()
+        path.write_text(''.join(json.dumps(row)+'\n' for row in records))
+        put(attempt/'invocations/0001-s.json',{'schema':1,'kind':'sql-suite','seq':1,
+            'units':['sql-case:s/a'],'materials':{'sql_results':str(path)},
+            'inputs_start':{},'inputs_end':{},'inputs_stable':True,'ended_at':'now','exit':{'code':1}})
+        return attempt,path
+
+    def test_sql_cleanup_confirmation_cannot_clear_case_or_suite_failure_with_other_owners_ok(self):
+        primary={'class':'error_code','error_code':'NR-KNOWN','statement_index':1}
+        for failure,closure,domain in (
+            ({'class':'error','cleanup':True},'ok','case'),
+            ({'class':'error','primary_failure':dict(primary,cleanup=True)},'ok','case'),
+            ({'class':'error','primary_failure':primary,
+              'additional_failures':[{'class':'error','cleanup':True}]},'ok','case'),
+            (primary,'failed','suite')):
+            with self.subTest(failure=failure,closure=closure):
+                attempt,path=self.sql_cleanup_attempt(failure,closure,unrelated=True,replay=True)
+                before=path.read_bytes();calls=[]
+                def absent(argv,**kwargs):
+                    calls.append(argv);return subprocess.CompletedProcess(argv,0,'','')
+                value,_=run.cleanup_confirmation(attempt,run_command=absent)
+                self.assertEqual(len(value['confirmations']),1)
+                confirmation=value['confirmations'][0]
+                self.assertFalse(confirmation['complete'])
+                self.assertEqual(confirmation['summary'],'unknown')
+                self.assertTrue(any(c.get('domain')==domain and not c['ok']
+                                    and 'independent' in c.get('reason','') for c in confirmation['checks']))
+                self.assertEqual(path.read_bytes(),before)
+                self.assertEqual(calls,[])
+
+    def test_sql_generic_error_has_no_invented_cleanup_or_unrelated_lifecycle_failure(self):
+        failure={'class':'error','primary_failure':{'class':'error_code','error_code':'NR-KNOWN'},
+                 'additional_failures':[{'class':'error','error':'cleanup in diagnostic text only'}]}
+        attempt,path=self.sql_cleanup_attempt(failure,unrelated=True)
+        before=path.read_bytes();observations=run.owned_attempt(attempt).observations
+        self.assertEqual(len(observations),1)
+        self.assertEqual(observations[0].cleanup,'ok')
+        value,_=run.cleanup_confirmation(attempt)
+        self.assertEqual(value['confirmations'],[])
+        checks=run._producer_cleanup_checks(observations[0],attempt,
+              lambda argv,**kwargs:subprocess.CompletedProcess(argv,0,'',''),{})
+        self.assertTrue(checks)
+        self.assertTrue(all(c['ok'] for c in checks))
+        self.assertEqual(path.read_bytes(),before)
+
     def test_cleanup_confirmation_queries_only_exact_resources_and_loads_repeated_attempts(self):
         attempt=self.system_attempt()
         calls=[]

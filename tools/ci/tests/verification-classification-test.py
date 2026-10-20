@@ -232,4 +232,36 @@ class Classification(unittest.TestCase):
                 self.assertEqual(result['rows'][0]['failure']['primary_failure'],primary)
 
 
+    def test_all_quarantined_cases_cannot_hide_explicit_case_cleanup_failure(self):
+        self.fail_a();self.quarantine_a()
+        other=copy.deepcopy(self.dispositions['quarantine'][0]);other['unit']='sql-case:s/b'
+        self.dispositions['quarantine'].append(other)
+        primary={'class':'error_code','error_code':'NR-EXACT','statement_index':1}
+        for failure in (
+            {'class':'error','cleanup':True},
+            {'class':'error','primary_failure':dict(primary,cleanup=True)},
+            {'class':'error','primary_failure':primary,
+             'additional_failures':[{'class':'error','cleanup':True,'error':'session close failed'}]}):
+            with self.subTest(failure=failure):
+                self.records[2]['failure']=failure
+                result=self.evaluate(True)
+                self.assertEqual(result['status'],'FAIL')
+                self.assertTrue(all(row['status']=='QUARANTINED' for row in result['rows']))
+                self.assertFalse(result['composition']['layer_ok'])
+                obligations=result['composition']['scopes'][0]['cleanup_obligations']
+                self.assertEqual(len(obligations),1)
+                self.assertEqual(obligations[0]['summary'],'violation')
+
+    def test_all_quarantined_generic_control_failure_has_no_invented_cleanup(self):
+        self.fail_a();self.quarantine_a()
+        other=copy.deepcopy(self.dispositions['quarantine'][0]);other['unit']='sql-case:s/b'
+        self.dispositions['quarantine'].append(other)
+        self.records[2]['failure']={'class':'error',
+            'primary_failure':{'class':'error_code','error_code':'NR-EXACT'},
+            'additional_failures':[{'class':'error','error':'cleanup is only diagnostic text'}]}
+        result=self.evaluate(True)
+        self.assertEqual(result['status'],'PASS')
+        self.assertTrue(all(row['status']=='QUARANTINED' for row in result['rows']))
+        self.assertEqual(result['composition']['scopes'][0]['cleanup_obligations'],[])
+
 if __name__ == '__main__': unittest.main()
