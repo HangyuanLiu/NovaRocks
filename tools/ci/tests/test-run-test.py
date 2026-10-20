@@ -185,6 +185,82 @@ class Materials(unittest.TestCase):
         self.assertFalse(result["registration_closed"])
         self.assertFalse((root / "Closed").exists())
 
+    def test_normal_domain_exit_keeps_cleanup_deadline_local_to_each_domain(self):
+        for first_exit in (0, 1):
+            with self.subTest(first_exit=first_exit):
+                executor = run.Executor()
+                clock = [1000.0]
+                with mock.patch.object(run.time, "monotonic", side_effect=lambda: clock[0]):
+                    first, first_cleanup, first_deadline = run.execute_domain(
+                        executor, self.root / ("first-" + str(first_exit)),
+                        [sys.executable, "-c", "raise SystemExit(" + str(first_exit) + ")"],
+                        "process", os.environ.copy())
+                    # This independent domain starts after the previous cleanup
+                    # budget expired. No real signal or control failure occurred.
+                    clock[0] = first_deadline + 1
+                    second, second_cleanup, second_deadline = run.execute_domain(
+                        executor, self.root / ("second-" + str(first_exit)),
+                        [sys.executable, "-c", "raise SystemExit(0)"],
+                        "process", os.environ.copy())
+                self.assertEqual(first["returncode"], first_exit)
+                self.assertEqual(first["errors"], [])
+                self.assertTrue(first_cleanup["ok"])
+                self.assertEqual(first_deadline, 1030.0)
+                self.assertEqual(second["returncode"], 0)
+                self.assertEqual(second["errors"], [])
+                self.assertEqual(second["cancelled"], [])
+                self.assertTrue(second_cleanup["ok"])
+                self.assertEqual(second_deadline, 1061.0)
+                self.assertIsNone(executor.deadline)
+
+    def test_real_cancellation_budget_is_not_renewed_by_exit_or_idle_signal(self):
+        executor = run.Executor()
+        clock = [1000.0]
+        executor.signals.append(signal.SIGTERM)
+        with mock.patch.object(run.time, "monotonic", side_effect=lambda: clock[0]):
+            result, collected, deadline = run.execute_domain(
+                executor, self.root / "real-cancel",
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                "process", os.environ.copy())
+            self.assertEqual(result["returncode"], -signal.SIGTERM)
+            self.assertEqual(result["cancelled"], [signal.SIGTERM])
+            self.assertEqual(deadline, 1030.0)
+            self.assertTrue(collected["ok"])
+            clock[0] = 1015.0
+            executor.signals.append(signal.SIGINT)
+            executor.observe_idle()
+        self.assertEqual(executor.deadline, 1030.0)
+        self.assertEqual(executor.cancelled, [signal.SIGTERM, signal.SIGINT])
+
+    def test_cancel_queued_with_actual_child_exit_still_pins_the_original_budget(self):
+        for original_deadline in (None, 1010.0):
+            with self.subTest(original_deadline=original_deadline):
+                executor = run.Executor()
+                executor.deadline = original_deadline
+                real_waitpid = os.waitpid
+                injected = []
+                def waitpid(pid, options):
+                    child, status = real_waitpid(pid, options)
+                    if child and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+                        self.assertFalse(injected)
+                        injected.append(True)
+                        # Model a signal arriving in the same turn as actual
+                        # exit, before Executor's final queued-signal drain.
+                        executor.signals.append(signal.SIGTERM)
+                    return child, status
+                with mock.patch.object(run.time, "monotonic", return_value=1000.0), \
+                        mock.patch.object(run.os, "waitpid", side_effect=waitpid):
+                    result, collected, deadline = run.execute_domain(
+                        executor, self.root / ("exit-cancel-" + str(original_deadline)),
+                        [sys.executable, "-c", "raise SystemExit(0)"],
+                        "process", os.environ.copy())
+                self.assertEqual(result["returncode"], 0)
+                self.assertEqual(result["cancelled"], [signal.SIGTERM])
+                self.assertEqual(executor.cancelled, [signal.SIGTERM])
+                self.assertTrue(collected["ok"])
+                self.assertEqual(deadline, original_deadline or 1030.0)
+                self.assertEqual(executor.deadline, original_deadline or 1030.0)
+
     def test_post_spawn_record_or_display_failure_still_waits_actual_child(self):
         for kind in ("record", "display"):
             with self.subTest(kind=kind):

@@ -479,7 +479,8 @@ class Executor:
             live = False
             result["wait_status"] = status
             result["returncode"] = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
-            self.deadline = self.deadline or time.monotonic() + 30
+            # Normal exit gets a local cleanup budget in execute_domain.
+            # Persistent deadlines belong only to cancellation/control failure.
         try:
             write_json(root / "executor.json", result)
             display = Display(paths)
@@ -562,6 +563,7 @@ class Executor:
                 if number in CANCEL:
                     self.cancelled.append(number)
                     result["cancelled"].append(number)
+                    self.deadline = self.deadline or time.monotonic() + 30
             if display is not None:
                 try:
                     result["display"] = display.finish()
