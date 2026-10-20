@@ -37,15 +37,31 @@ use crate::source_custody_resources::{
     SourceCustodyRequestFacts, SourceRequestPricing, model_failure,
 };
 
-/// Declaration order is significant: all original buffers die before their
-/// host charge. Keeping the whole original group alive also prevents releasing
-/// one group's admission while a different derived buffer still aliases it.
-struct OriginalBacking<C> {
+/// Construction failure destroys the original loan before its admitted
+/// custody. After construction the one-time loan moves to the wrapping frame;
+/// a surviving buffer must not keep its siblings' payload allocations alive.
+struct OriginalArray {
     original: ArrayRef,
     data: ArrayData,
+}
+struct OriginalBacking<C> {
+    loan: std::sync::Mutex<Option<OriginalArray>>,
     custody: C,
 }
-struct BufferCustodian<C>(HostShared<OriginalBacking<C>>);
+impl<C> OriginalBacking<C> {
+    fn new(original: ArrayRef, data: ArrayData, custody: C) -> Self {
+        Self {
+            loan: std::sync::Mutex::new(Some(OriginalArray { original, data })),
+            custody,
+        }
+    }
+}
+/// Each custom buffer pins only its own immutable backing. Declaration order
+/// releases that backing before the last shared custody/grant is released.
+struct BufferCustodian<C> {
+    source: Buffer,
+    owner: HostShared<OriginalBacking<C>>,
+}
 // The shared block is immutable. Neither observation nor unwinding changes its
 // custody; its last-reference Drop destroys backing before releasing admission.
 impl<C> RefUnwindSafe for BufferCustodian<C> {}
@@ -465,9 +481,11 @@ fn wrap_buffer<C: Send + Sync + 'static>(
     work.flush()?;
     let offset = source.ptr_offset();
     let length = checked_add(offset, source.len())?;
-    let allocation: Arc<dyn arrow_buffer::alloc::Allocation> =
-        Arc::new(BufferCustodian(owner.clone()));
-    // SAFETY: OriginalBacking pins the original immutable allocation. Its
+    let allocation: Arc<dyn arrow_buffer::alloc::Allocation> = Arc::new(BufferCustodian {
+        source: source.clone(),
+        owner: owner.clone(),
+    });
+    // SAFETY: this custodian pins the SAME original immutable Buffer. Its
     // initialized prefix includes offset + len (the exact original Buffer
     // view). We never expose spare, potentially uninitialized capacity.
     let wrapped = unsafe { Buffer::from_custom_allocation(source.data_ptr(), length, allocation) }
@@ -475,6 +493,85 @@ fn wrap_buffer<C: Send + Sync + 'static>(
     work.flush()?;
     Ok(wrapped)
 }
+/// Arrow's ArrayData builder removes a zero-null-count bitmap, including when
+/// entered through PrimitiveArray::to_data. Borrow that actual typed bitmap
+/// before normalization; never synthesize validity from the logical null count.
+fn normalized_primitive_nulls<'a>(
+    original: &'a dyn Array,
+    data: &ArrayData,
+) -> Option<&'a NullBuffer> {
+    if original.data_type().is_primitive() && data.nulls().is_none() {
+        original.nulls()
+    } else {
+        None
+    }
+}
+
+/// The existing ArrayData visitor plus the SAME original primitive bitmap
+/// omitted by to_data. This runs under the earlier operation reservation,
+/// before settlement; its payload identity is observed once with other buffers.
+fn custody_original_metadata(
+    original: &dyn Array,
+    data: &ArrayData,
+    work: &mut EvaluationCheckpoints<'_>,
+    mut backing: Option<&mut dyn CustodyBackingObservation>,
+) -> Result<usize, KernelFailure> {
+    let mut bytes = match backing.as_deref_mut() {
+        None => custody_metadata_with_backing(data, work, None)?,
+        Some(observer) => custody_metadata_with_backing(data, work, Some(observer))?,
+    };
+    if let Some(nulls) = normalized_primitive_nulls(original, data) {
+        bytes = checked_add(bytes, custom_buffer_metadata()?)?;
+        if let Some(observer) = backing {
+            observer.buffer(nulls.buffer(), work)?;
+        }
+    }
+    Ok(bytes)
+}
+
+fn wrap_nulls<C: Send + Sync + 'static>(
+    nulls: Option<&NullBuffer>,
+    owner: &HostShared<OriginalBacking<C>>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<NullBuffer>, KernelFailure> {
+    match nulls {
+        None => Ok(None),
+        Some(nulls) => {
+            let buffer = wrap_buffer(nulls.buffer(), owner, work)?;
+            let bits = BooleanBuffer::new(buffer, nulls.offset(), nulls.len());
+            // SAFETY: the original validated bitmap's bytes, offset, length and
+            // cached null count are unchanged. Custody is the only difference.
+            Ok(Some(unsafe {
+                NullBuffer::new_unchecked(bits, nulls.null_count())
+            }))
+        }
+    }
+}
+
+/// Rebuild the actual primitive through its public typed constructor, which
+/// retains Some(all-valid) instead of normalizing it through ArrayDataBuilder.
+/// Both original allocations still use the SAME Buffer custody transform.
+fn wrap_primitive<T: arrow_array::ArrowPrimitiveType, C: Send + Sync + 'static>(
+    original: &arrow_array::PrimitiveArray<T>,
+    owner: &HostShared<OriginalBacking<C>>,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<ArrayRef, KernelFailure> {
+    work.flush()?;
+    let values = arrow_buffer::ScalarBuffer::<T::Native>::from(wrap_buffer(
+        original.values().inner(),
+        owner,
+        work,
+    )?);
+    let nulls = wrap_nulls(original.nulls(), owner, work)?;
+    let result = arrow_array::PrimitiveArray::<T>::try_new(values, nulls)
+        .map_err(|_| invalid("primitive custody changed the original bitmap length"))?
+        .with_data_type(original.data_type().clone());
+    work.flush()?;
+    let result = Arc::new(result) as ArrayRef;
+    work.flush()?;
+    Ok(result)
+}
+
 fn wrap_data<C: Send + Sync + 'static>(
     original: &ArrayData,
     owner: &HostShared<OriginalBacking<C>>,
@@ -497,16 +594,7 @@ fn wrap_data<C: Send + Sync + 'static>(
         children.push(wrap_data(child, owner, work)?);
         work.step()?;
     }
-    let nulls = match original.nulls() {
-        None => None,
-        Some(nulls) => {
-            let buffer = wrap_buffer(nulls.buffer(), owner, work)?;
-            let bits = BooleanBuffer::new(buffer, nulls.offset(), nulls.len());
-            // SAFETY: the original validated bitmap's bytes, offset, length and
-            // cached null count are unchanged. Custody is the only difference.
-            Some(unsafe { NullBuffer::new_unchecked(bits, nulls.null_count()) })
-        }
-    };
+    let nulls = wrap_nulls(original.nulls(), owner, work)?;
     work.flush()?;
     // SAFETY: every structural field and every visible byte comes from the
     // same original ArrayData. No field, logical offset, validity bit, child
@@ -583,7 +671,7 @@ fn retain_result_backing_with(
     work.flush()?;
     let data = original.to_data();
     work.flush()?;
-    let metadata = custody_metadata_upper_bound(&data, work)?;
+    let metadata = custody_original_metadata(original.as_ref(), &data, work, None)?;
     if metadata > reservation.remaining_bytes() {
         return Err(invalid(
             "result custody exceeds its actual host operation reservation",
@@ -599,11 +687,7 @@ fn retain_result_backing_with(
     work.flush()?;
     charge.reconcile_under_reservation(retained, reservation)?;
     let owner = make_owner(
-        OriginalBacking {
-            original,
-            data,
-            custody: charge,
-        },
+        OriginalBacking::new(original, data, charge),
         allocator,
         work,
     )?;
@@ -627,11 +711,7 @@ fn granted_original_group<C: Send + Sync + 'static>(
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<HostShared<OriginalBacking<C>>, KernelFailure> {
     HostShared::try_new(
-        OriginalBacking {
-            original,
-            data,
-            custody,
-        },
+        OriginalBacking::new(original, data, custody),
         allocator,
         work,
     )
@@ -771,14 +851,23 @@ pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + '
         None => None,
     };
     let mut settlement = CopyBackingSettlement::new(allocator.clone());
-    for source in source_data.iter() {
-        custody_metadata_with_backing(source, work, Some(&mut settlement))?;
+    for (ordinal, data) in source_data.iter().enumerate() {
+        let source = packet
+            .source
+            .source_array_at(ordinal)
+            .ok_or_else(|| invalid("copied backing owner has no exact source ordinal"))?;
+        custody_original_metadata(source, data, work, Some(&mut settlement))?;
     }
     if let Some(index_data) = &index_data {
-        custody_metadata_with_backing(index_data, work, Some(&mut settlement))?;
+        let indices = packet
+            .source
+            .index_array()
+            .ok_or_else(|| invalid("copied backing owner has no original index array"))?;
+        custody_original_metadata(indices, index_data, work, Some(&mut settlement))?;
     }
     settlement.source_phase = false;
-    let metadata = custody_metadata_with_backing(&data, work, Some(&mut settlement))?;
+    let metadata =
+        custody_original_metadata(packet.original.as_ref(), &data, work, Some(&mut settlement))?;
     let new_buffer_stock = settlement.new_bytes;
     if new_buffer_stock > facts.retained_new_backing_upper() {
         return Err(invalid(
@@ -820,7 +909,25 @@ fn wrap_original_group<C: Send + Sync + 'static>(
     owner: HostShared<OriginalBacking<C>>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
-    let data = wrap_data(&owner.data, &owner, work)?;
+    // No callback runs while this private one-time extraction lock is held.
+    // The local loan is destroyed before the owner parameter on every exit,
+    // including a refusal partway through wrapping or final observation.
+    let loan = {
+        let mut slot = owner
+            .loan
+            .lock()
+            .map_err(|_| invalid("original custody loan is poisoned"))?;
+        slot.take()
+            .ok_or_else(|| invalid("original custody loan was already consumed"))?
+    };
+    if normalized_primitive_nulls(loan.original.as_ref(), &loan.data).is_some() {
+        let original = loan.original.as_ref();
+        return arrow_array::downcast_primitive_array!(
+            original => { wrap_primitive(original, &owner, work) }
+            _ => Err(invalid("primitive custody requires its exact typed Arrow carrier")),
+        );
+    }
+    let data = wrap_data(&loan.data, &owner, work)?;
     work.flush()?;
     let result =
         if data.buffers().is_empty() && data.child_data().is_empty() && data.nulls().is_none() {
@@ -828,7 +935,7 @@ fn wrap_original_group<C: Send + Sync + 'static>(
             // the actual backing owner without inventing a validity buffer.
             Arc::new(BufferlessResult {
                 values: make_array(data),
-                owner,
+                owner: owner.clone(),
             }) as ArrayRef
         } else {
             make_array(data)
@@ -982,7 +1089,8 @@ impl<C: Send + Sync + 'static> SourceBackingOwner<C> {
 
 /// Source lease and newly admitted metadata have different responsibilities.
 /// The original shared source owner is destroyed before its wrapping metadata
-/// charge, while OriginalBacking destroys its data/payload aliases first.
+/// charge. Each buffer custodian destroys its own payload alias before the
+/// last shared source/metadata custody exits.
 struct SourceCustody<C: Send + Sync + 'static> {
     source: SourceBackingOwner<C>,
     metadata: OpaqueRetainedCharge,
@@ -1056,14 +1164,14 @@ impl<'source, C: Send + Sync + 'static> PreparedSourceCustody<'source, C> {
         let data = self.original.to_data();
         work.flush()?;
         let owner = HostShared::try_new_direct(
-            OriginalBacking {
-                original: Arc::clone(self.original),
+            OriginalBacking::new(
+                Arc::clone(self.original),
                 data,
-                custody: SourceCustody {
+                SourceCustody {
                     source: source.clone(),
                     metadata,
                 },
-            },
+            ),
             source.allocator.clone(),
             work,
         )?;
@@ -1095,7 +1203,7 @@ pub fn retain_source_backing<C: Send + Sync + 'static>(
         // its actual variable buffer/child tables without any value decoding.
         let data = original.to_data();
         work.flush()?;
-        let actual_metadata = custody_metadata_upper_bound(&data, &mut work)?;
+        let actual_metadata = custody_original_metadata(original.as_ref(), &data, &mut work, None)?;
         if actual_metadata > reservation.remaining_bytes() {
             return Err(invalid(
                 "source custody exceeds its admitted structural envelope",
@@ -1103,14 +1211,14 @@ pub fn retain_source_backing<C: Send + Sync + 'static>(
         }
         metadata.reconcile_under_reservation(actual_metadata, &mut reservation)?;
         let owner = HostShared::try_new(
-            OriginalBacking {
+            OriginalBacking::new(
                 original,
                 data,
-                custody: SourceCustody {
+                SourceCustody {
                     source: source.clone(),
                     metadata,
                 },
-            },
+            ),
             source.allocator.clone(),
             &mut work,
         )?;
@@ -1193,5 +1301,370 @@ mod buffer_adoption_structure_tests {
             Err(CopyConstructionError::Creator("original caller boundary"))
         ));
         assert_eq!(calls, 1);
+    }
+}
+
+#[cfg(test)]
+mod primitive_validity_custody_tests {
+    use super::*;
+    use crate::source_custody_direct_tests::{Control, Host, Owner, causes};
+    use arrow_array::{Int8Array, Int16Array, Int32Array, Int64Array, TimestampNanosecondArray};
+    use arrow_buffer::ScalarBuffer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn all_valid(offset: usize, len: usize) -> NullBuffer {
+        // This is a real original bitmap allocation with a non-byte-aligned
+        // view, not a replacement invented by custody after normalization.
+        let bytes = (offset + len).div_ceil(8);
+        NullBuffer::new(BooleanBuffer::new(
+            Buffer::from_vec(vec![u8::MAX; bytes]),
+            offset,
+            len,
+        ))
+    }
+
+    fn retain_source(
+        original: ArrayRef,
+        host: Arc<Host>,
+        drops: Arc<AtomicUsize>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, KernelFailure> {
+        let source = SourceBackingOwner::try_from_owned(Owner(drops), host, control)?;
+        retain_source_backing(original, &source, control)
+    }
+
+    #[test]
+    fn arrow_result_custody_all_valid_primitive_slices_keep_original_allocations_and_last_owner() {
+        for bitmap_last in [false, true] {
+            let values = ScalarBuffer::from((0..17).collect::<Vec<i32>>()).slice(2, 9);
+            let original: ArrayRef = Arc::new(Int32Array::new(values, Some(all_valid(3, 9))));
+            let array = original.as_any().downcast_ref::<Int32Array>().unwrap();
+            let value_pointer = array.values().inner().data_ptr();
+            let value_offset = array.values().inner().ptr_offset();
+            let bitmap_pointer = array.nulls().unwrap().buffer().data_ptr();
+            assert_eq!(array.nulls().unwrap().null_count(), 0);
+            assert!(original.to_data().nulls().is_none());
+
+            let host = Arc::new(Host::default());
+            let drops = Arc::new(AtomicUsize::new(0));
+            let result =
+                retain_source(original, host.clone(), drops.clone(), &Control::default()).unwrap();
+            let array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(array.values().as_ref(), &[2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            assert_eq!(array.values().inner().data_ptr(), value_pointer);
+            assert_eq!(array.values().inner().ptr_offset(), value_offset);
+            let nulls = array
+                .nulls()
+                .expect("retain the actual original all-valid bitmap");
+            assert_eq!(nulls.buffer().data_ptr(), bitmap_pointer);
+            assert_eq!(nulls.offset(), 3);
+            assert_eq!(nulls.len(), 9);
+            assert_eq!(nulls.null_count(), 0);
+            let slice = result.slice(1, 5);
+            let sliced = slice.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(sliced.values().as_ref(), &[3, 4, 5, 6, 7]);
+            assert_eq!(sliced.nulls().unwrap().buffer().data_ptr(), bitmap_pointer);
+            assert_eq!(sliced.nulls().unwrap().offset(), 4);
+            let values = sliced.values().inner().clone();
+            let bitmap = sliced.nulls().unwrap().buffer().clone();
+            drop(slice);
+            drop(result);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            let last = if bitmap_last {
+                drop(values);
+                bitmap
+            } else {
+                drop(bitmap);
+                values
+            };
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert!(host.ledger.lock().unwrap().opaque > 0);
+            std::thread::spawn(move || drop(last)).join().unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            host.zero();
+        }
+    }
+
+    struct TrackedBuffer {
+        backing: Buffer,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for TrackedBuffer {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn tracked_buffer(backing: Buffer, drops: Arc<AtomicUsize>) -> Buffer {
+        let pointer = backing.data_ptr();
+        let offset = backing.ptr_offset();
+        let len = offset.checked_add(backing.len()).unwrap();
+        let view_len = backing.len();
+        let owner = Arc::new(TrackedBuffer { backing, drops });
+        // SAFETY: owner owns exactly the supplied immutable Buffer, whose
+        // initialized base prefix is len bytes. No allocation layout, spare
+        // capacity, provenance or lifetime is inferred from a raw address.
+        unsafe { Buffer::from_custom_allocation(pointer, len, owner) }
+            .slice_with_length(offset, view_len)
+    }
+
+    #[test]
+    fn arrow_result_custody_each_original_buffer_frees_before_its_sibling_in_both_orders() {
+        for has_null in [false, true] {
+            for bitmap_last in [false, true] {
+                let value_drops = Arc::new(AtomicUsize::new(0));
+                let bitmap_drops = Arc::new(AtomicUsize::new(0));
+                let values =
+                    tracked_buffer(Buffer::from_vec((0..17i32).collect()), value_drops.clone());
+                let mut bitmap = vec![u8::MAX; 2];
+                if has_null {
+                    bitmap[0] &= !(1 << 5);
+                }
+                let bitmap = tracked_buffer(Buffer::from_vec(bitmap), bitmap_drops.clone());
+                let values = ScalarBuffer::<i32>::new(values, 2, 9);
+                let nulls = NullBuffer::new(BooleanBuffer::new(bitmap, 3, 9));
+                let original: ArrayRef = Arc::new(Int32Array::new(values, Some(nulls)));
+                let host = Arc::new(Host::default());
+                let owner_drops = Arc::new(AtomicUsize::new(0));
+                let result = retain_source(
+                    original,
+                    host.clone(),
+                    owner_drops.clone(),
+                    &Control::default(),
+                )
+                .unwrap();
+                let array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+                assert_eq!(array.values().as_ref(), &[2, 3, 4, 5, 6, 7, 8, 9, 10]);
+                assert_eq!(array.null_count(), usize::from(has_null));
+                let values = array.values().inner().clone();
+                let bitmap = array.nulls().unwrap().buffer().clone();
+                drop(result);
+                assert_eq!(value_drops.load(Ordering::SeqCst), 0);
+                assert_eq!(bitmap_drops.load(Ordering::SeqCst), 0);
+                let (first, last, first_drops, last_drops) = if bitmap_last {
+                    (values, bitmap, value_drops, bitmap_drops)
+                } else {
+                    (bitmap, values, bitmap_drops, value_drops)
+                };
+                std::thread::spawn(move || drop(first)).join().unwrap();
+                assert_eq!(
+                    first_drops.load(Ordering::SeqCst),
+                    1,
+                    "the first physical source allocation is no longer pinned by the sibling"
+                );
+                assert_eq!(last_drops.load(Ordering::SeqCst), 0);
+                assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+                assert!(
+                    host.ledger.lock().unwrap().opaque > 0,
+                    "shared metadata custody remains until the actual last alias"
+                );
+                std::thread::spawn(move || drop(last)).join().unwrap();
+                assert_eq!(last_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+                host.zero();
+            }
+        }
+    }
+
+    #[test]
+    fn arrow_result_custody_original_primitive_bitmap_presence_and_metadata_are_exact() {
+        let mut originals: Vec<ArrayRef> = Vec::new();
+        macro_rules! signed {
+            ($array:ty, $native:ty) => {
+                originals.push(Arc::new(<$array>::new(
+                    ScalarBuffer::from(vec![7 as $native, 11 as $native]),
+                    Some(all_valid(1, 2)),
+                )));
+            };
+        }
+        signed!(Int8Array, i8);
+        signed!(Int16Array, i16);
+        signed!(Int32Array, i32);
+        signed!(Int64Array, i64);
+        originals.push(Arc::new(
+            TimestampNanosecondArray::new(
+                ScalarBuffer::from(vec![7_i64, 11]),
+                Some(all_valid(1, 2)),
+            )
+            .with_timezone("UTC"),
+        ));
+        originals.push(Arc::new(Int32Array::from(vec![7, 11])));
+        originals.push(Arc::new(Int32Array::from(vec![Some(7), None])));
+        originals.push(Arc::new(Int32Array::new(
+            ScalarBuffer::from(Vec::<i32>::new()),
+            Some(all_valid(3, 0)),
+        )));
+        for original in originals {
+            let control = Control::default();
+            let data = original.to_data();
+            let normalized = normalized_primitive_nulls(original.as_ref(), &data).is_some();
+            let plain =
+                custody_metadata_upper_bound(&data, &mut EvaluationCheckpoints::new(&control))
+                    .unwrap();
+            let actual = custody_original_metadata(
+                original.as_ref(),
+                &data,
+                &mut EvaluationCheckpoints::new(&control),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                actual - plain,
+                if normalized {
+                    custom_buffer_metadata().unwrap()
+                } else {
+                    0
+                }
+            );
+            let expected_type = original.data_type().clone();
+            let expected_nulls = original.nulls().map(|nulls| {
+                (
+                    nulls.buffer().data_ptr(),
+                    nulls.offset(),
+                    nulls.len(),
+                    nulls.null_count(),
+                )
+            });
+            let host = Arc::new(Host::default());
+            let drops = Arc::new(AtomicUsize::new(0));
+            let result = retain_source(original, host.clone(), drops.clone(), &control).unwrap();
+            assert_eq!(result.data_type(), &expected_type);
+            assert_eq!(
+                result.nulls().map(|nulls| {
+                    (
+                        nulls.buffer().data_ptr(),
+                        nulls.offset(),
+                        nulls.len(),
+                        nulls.null_count(),
+                    )
+                }),
+                expected_nulls,
+            );
+            drop(result);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            host.zero();
+        }
+    }
+
+    #[test]
+    fn arrow_result_custody_copy_settlement_observes_actual_normalized_bitmap_identity() {
+        let original: ArrayRef = Arc::new(Int32Array::new(
+            ScalarBuffer::from(vec![7_i32, 11]),
+            Some(all_valid(1, 2)),
+        ));
+        let host = Arc::new(Host::default());
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let control = Control::default();
+        let mut work = EvaluationCheckpoints::new(&control);
+        let mut settlement = CopyBackingSettlement::new(allocator.clone());
+        let data = original.to_data();
+        custody_original_metadata(original.as_ref(), &data, &mut work, Some(&mut settlement))
+            .unwrap();
+        assert_eq!(settlement.identities.len(), 2);
+        settlement.source_phase = false;
+        custody_original_metadata(original.as_ref(), &data, &mut work, Some(&mut settlement))
+            .unwrap();
+        assert_eq!(settlement.new_bytes, 0, "the source bitmap is an alias");
+        let copied: ArrayRef = Arc::new(Int32Array::new(
+            original
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .clone(),
+            Some(all_valid(1, 2)),
+        ));
+        let new_bitmap_capacity = copied.nulls().unwrap().buffer().capacity();
+        custody_original_metadata(
+            copied.as_ref(),
+            &copied.to_data(),
+            &mut work,
+            Some(&mut settlement),
+        )
+        .unwrap();
+        assert_eq!(settlement.identities.len(), 3);
+        assert_eq!(settlement.new_bytes, new_bitmap_capacity);
+        drop(settlement);
+        drop(allocator);
+        host.zero();
+    }
+
+    #[test]
+    fn arrow_result_custody_original_output_bitmap_loan_keeps_its_actual_charge() {
+        let host = Arc::new(Host::default());
+        let charge = OpaqueRetainedCharge::try_new(host.clone()).unwrap();
+        let mut reservation = charge.reserve_operation(1 << 20).unwrap();
+        let original: ArrayRef = Arc::new(Int16Array::new(
+            ScalarBuffer::from(vec![7_i16, 11]),
+            Some(all_valid(1, 2)),
+        ));
+        let bitmap_pointer = original.nulls().unwrap().buffer().data_ptr();
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let control = Control::default();
+        let result = retain_result_backing(
+            original,
+            charge,
+            &mut reservation,
+            allocator,
+            &mut EvaluationCheckpoints::new(&control),
+        )
+        .unwrap();
+        drop(reservation);
+        let bitmap = result.values.nulls().unwrap().buffer().clone();
+        assert_eq!(bitmap.data_ptr(), bitmap_pointer);
+        drop(result);
+        assert!(host.ledger.lock().unwrap().opaque > 0);
+        drop(bitmap);
+        host.zero();
+    }
+
+    #[test]
+    fn arrow_result_custody_all_valid_primitive_preserves_each_original_control_failure() {
+        struct Refusal {
+            calls: AtomicUsize,
+            stop: usize,
+            cause: KernelFailure,
+        }
+        impl KernelEvaluationControl for Refusal {
+            fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == self.stop {
+                    Err(self.cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+                panic!("custody never waits")
+            }
+        }
+        let original: ArrayRef = Arc::new(Int32Array::new(
+            ScalarBuffer::from(vec![7_i32, 11]),
+            Some(all_valid(1, 2)),
+        ));
+        let control = Control::default();
+        let host = Arc::new(Host::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        drop(retain_source(original.clone(), host.clone(), drops.clone(), &control).unwrap());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        host.zero();
+        let checkpoints = control.trace.lock().unwrap().len();
+        assert!(checkpoints > 0);
+        for cause in causes() {
+            for stop in 0..checkpoints {
+                let host = Arc::new(Host::default());
+                let drops = Arc::new(AtomicUsize::new(0));
+                let control = Refusal {
+                    calls: AtomicUsize::new(0),
+                    stop,
+                    cause: cause.clone(),
+                };
+                assert!(matches!(
+                    retain_source(original.clone(), host.clone(), drops.clone(), &control),
+                    Err(actual) if actual == cause
+                ));
+                assert_eq!(control.calls.load(Ordering::SeqCst), stop + 1);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                host.zero();
+            }
+        }
     }
 }

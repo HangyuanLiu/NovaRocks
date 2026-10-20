@@ -205,10 +205,19 @@ pub(super) struct CapturedInputSource {
 impl CapturedInputSource {
     pub(super) fn continuation(
         &self,
-        array: &ArrayRef,
+        _array: &ArrayRef,
         control: &dyn novarocks_functions::KernelEvaluationControl,
     ) -> Result<ArrayContinuation, novarocks_functions::KernelFailure> {
-        ArrayContinuation::capture(array, &self.host, control)
+        let mut work = novarocks_functions::EvaluationCheckpoints::new(control);
+        work.flush()?;
+        // This is the original finite source captured from the actual Chunk,
+        // not a replacement inferred from the output Array's equal datatype.
+        let result = ArrayContinuation {
+            backing: ContinuationBacking::InputStorage(self.backing.clone()),
+            host: Some(self.host.clone()),
+        };
+        work.finish()?;
+        Ok(result)
     }
 
     pub(super) fn retain(
@@ -228,9 +237,10 @@ impl CapturedInputSource {
     }
 }
 
-/// An explicit continuation of the actual Array creator. Copies inherit this
-/// owner; an equal current result type cannot replace the source creator.
-/// Capture always precedes wrapping the new copy, so no output owns itself.
+/// A finite continuation of an actual source or creator backing. Copies inherit
+/// this owner; an equal current type cannot replace the original creator.
+/// Input loans may retain their real Array; fresh result creators retain their
+/// actual type backing independently of the newly produced payload buffers.
 #[derive(Clone)]
 pub(super) struct ArrayContinuation {
     backing: ContinuationBacking,
@@ -239,6 +249,9 @@ pub(super) struct ArrayContinuation {
 #[derive(Clone)]
 enum ContinuationBacking {
     Array(novarocks_functions::SourceBackingOwner<ArrayRef>),
+    InputStorage(novarocks_functions::SourceBackingOwner<FiniteSourceStorage>),
+    ResultCreator(novarocks_functions::SourceBackingOwner<novarocks_functions::FunctionValueType>),
+    Pair(novarocks_functions::SourceBackingOwner<[ArrayContinuation; 2]>),
     Constant(novarocks_functions::ConstantValue),
     Sources(novarocks_functions::SourceBackingOwner<Vec<ArrayContinuation>>),
 }
@@ -306,6 +319,33 @@ impl ArrayContinuation {
             host: Some(host.clone()),
         }))
     }
+    /// Keep the previous actual source independently of a new result creator.
+    /// The fixed pair is paid as one real typed host block; no unadmitted Vec
+    /// or whole output Array is introduced to carry these finite owner pins.
+    pub(super) fn retaining_previous(
+        self,
+        previous: Option<Self>,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<Self, novarocks_functions::KernelFailure> {
+        let Some(previous) = previous else {
+            return Ok(self);
+        };
+        let host = self.host.clone().ok_or_else(|| {
+            super::invalid("compiled creator continuation requires its actual allocation host")
+        })?;
+        let mut work = novarocks_functions::EvaluationCheckpoints::new(control);
+        let backing = novarocks_functions::SourceBackingOwner::try_from_owned_direct(
+            [previous, self],
+            host.clone(),
+            &mut work,
+        )?;
+        work.finish()?;
+        Ok(Self {
+            backing: ContinuationBacking::Pair(backing),
+            host: Some(host),
+        })
+    }
+
     pub(super) fn retain(
         &self,
         output: ArrayRef,
@@ -338,6 +378,11 @@ impl ArrayContinuation {
                 retain(output, &backing, host, &mut work)?
             }
             ContinuationBacking::Array(backing) => retain(output, backing, host, &mut work)?,
+            ContinuationBacking::InputStorage(backing) => retain(output, backing, host, &mut work)?,
+            ContinuationBacking::ResultCreator(backing) => {
+                retain(output, backing, host, &mut work)?
+            }
+            ContinuationBacking::Pair(backing) => retain(output, backing, host, &mut work)?,
             ContinuationBacking::Sources(backing) => retain(output, backing, host, &mut work)?,
         };
         work.finish()?;
@@ -511,9 +556,21 @@ pub(super) fn retain_result_type(
     allocator: Option<&std::sync::Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     control: &dyn novarocks_functions::KernelEvaluationControl,
 ) -> Result<ArrayRef, novarocks_functions::KernelFailure> {
+    retain_result_type_with_creator(array, result_type, allocator, control).map(|(array, _)| array)
+}
+
+/// Author the canonical result exactly once and return that SAME created
+/// backing as a finite continuation. This pin contains the real result type
+/// owner, not its output payload buffers or an equal source's creator.
+pub(super) fn retain_result_type_with_creator(
+    array: ArrayRef,
+    result_type: &novarocks_functions::FunctionValueType,
+    allocator: Option<&std::sync::Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<(ArrayRef, Option<ArrayContinuation>), novarocks_functions::KernelFailure> {
     let layout = result_type.typed_binding().layout();
     if layout.storage_lifetime().is_pure() && layout.arrow_backing_storage_lifetime().is_pure() {
-        return Ok(array);
+        return Ok((array, None));
     }
     let host = allocator.ok_or_else(|| {
         super::invalid("compiled result Arrow creator requires its actual allocation host")
@@ -530,6 +587,10 @@ pub(super) fn retain_result_type(
     let mut reservation =
         authority.reserve_operation(prepared.request_facts().global_peak_upper())?;
     let array = prepared.retain(&backing, &mut reservation, &mut work)?;
+    let creator = ArrayContinuation {
+        backing: ContinuationBacking::ResultCreator(backing),
+        host: Some(host.clone()),
+    };
     work.finish()?;
-    Ok(array)
+    Ok((array, Some(creator)))
 }

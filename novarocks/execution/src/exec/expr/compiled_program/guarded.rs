@@ -152,7 +152,9 @@ impl OwnedValue {
         Ok(match value {
             Self::Selected(array, errors) => {
                 let array = custody.retain(array, control)?;
-                let owner = custody.continuation(&array, control)?;
+                let owner = custody
+                    .continuation(&array, control)?
+                    .retaining_previous(_previous, control)?;
                 Self::Selected(array, errors).with_continuation(Some(owner))
             }
             value => value.with_continuation(_previous),
@@ -174,8 +176,12 @@ impl OwnedValue {
                 Self::Constant(value).with_continuation(owner.or(previous))
             }
             Self::Selected(array, errors) => {
-                let (array, owner) =
-                    Self::retain_arrow_creator(array, ty, allocator, previous, control)?;
+                let (array, creator) =
+                    input_source::retain_result_type_with_creator(array, ty, allocator, control)?;
+                let owner = match creator {
+                    Some(creator) => Some(creator.retaining_previous(previous, control)?),
+                    None => previous,
+                };
                 Self::Selected(array, errors).with_continuation(owner)
             }
             Self::Source(array, domain) => {
@@ -3072,3 +3078,121 @@ fn validate_membership_phase(
 #[cfg(test)]
 #[path = "copy_continuation_tests.rs"]
 mod copy_continuation_tests;
+
+#[cfg(test)]
+mod result_creator_continuation_tests {
+    use super::*;
+    use arrow::array::{Array, Int32Array};
+    use novarocks_type_contract::{
+        FunctionValueType, ValueLayout, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Creator(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Creator {}
+    impl Drop for Creator {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct Active;
+    impl KernelEvaluationControl for Active {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            panic!("creator retention must not wait")
+        }
+    }
+    fn declared(drops: &Arc<AtomicUsize>) -> FunctionValueType {
+        let semantic = FunctionValueType::new(DataType::Int32, true);
+        FunctionValueType::try_from_value(
+            semantic.value_type().clone(),
+            ValueLayout::try_new(
+                &DataType::Int32,
+                ValueTypeStorageLifetime::held(Arc::new(Creator(drops.clone()))),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// This exercises the actual guarded Selected-result branch and then its
+    /// actual continuation wrapper. The unchanged Server GLOBAL Frame tests
+    /// separately assert per-physical-allocation last free through the complete
+    /// installed bitwise/shift kernel chain; this test asserts creator identity.
+    #[test]
+    fn fresh_selected_creator_pin_does_not_own_output_array_and_preserves_previous_source_creator()
+    {
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let canonical_drops = Arc::new(AtomicUsize::new(0));
+        let source_type = declared(&source_drops);
+        let canonical = declared(&canonical_drops);
+        assert_eq!(source_type, canonical);
+        assert!(
+            !source_type
+                .typed_binding()
+                .layout()
+                .shares_storage(canonical.typed_binding().layout())
+        );
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("real-selected-creator-pins");
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone());
+        let source = input_source::retain_result_type(
+            Arc::new(Int32Array::from(vec![Some(11), None, Some(7)])),
+            &source_type,
+            Some(&host),
+            &Active,
+        )
+        .unwrap();
+        let source_array = Arc::downgrade(&source);
+        let previous = input_source::ArrayContinuation::capture(&source, &host, &Active).unwrap();
+        drop(source);
+        drop(source_type);
+        let value = OwnedValue::Selected(
+            Arc::new(Int32Array::from(vec![Some(22), None, Some(14)])),
+            Box::default(),
+        )
+        .with_continuation(Some(previous))
+        .retaining_result_type(&canonical, Some(&host), &Active)
+        .unwrap();
+        drop(canonical);
+        let OwnedValue::Continued(value, owner) = value else {
+            panic!("actual creator pin");
+        };
+        let OwnedValue::Selected(array, errors) = *value else {
+            panic!("actual compact result");
+        };
+        assert!(errors.is_empty());
+        let output_array = Arc::downgrade(&array);
+        let output = owner.retain(array, &Active).unwrap();
+        drop(owner);
+        assert!(
+            output_array.upgrade().is_none(),
+            "a fresh creator continuation must not keep the whole output Array"
+        );
+        assert!(
+            source_array.upgrade().is_some(),
+            "the previous real source loan is preserved independently"
+        );
+        let array = output.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(
+            array.iter().collect::<Vec<_>>(),
+            vec![Some(22), None, Some(14)]
+        );
+        let values = array.values().inner().clone();
+        let bitmap = array.nulls().unwrap().buffer().clone();
+        drop(output);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(canonical_drops.load(Ordering::SeqCst), 0);
+        drop(values);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(canonical_drops.load(Ordering::SeqCst), 0);
+        std::thread::spawn(move || drop(bitmap)).join().unwrap();
+        assert!(source_array.upgrade().is_none());
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(canonical_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.current(), 0);
+    }
+}
