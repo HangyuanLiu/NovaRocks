@@ -1109,7 +1109,7 @@ fn reclaim_fixture(
 }
 
 /// Force-removes every container, volume, and network Compose labelled with
-/// this project. Returns an error only if something survives.
+/// this project. Success requires verified empty final resource listings.
 fn remove_project_docker_state(repo_root: &Path, compose_project: &str) -> Result<()> {
     let label = format!("label=com.docker.compose.project={compose_project}");
 
@@ -1130,16 +1130,34 @@ fn remove_project_docker_state(repo_root: &Path, compose_project: &str) -> Resul
         let _ = run_docker(repo_root, &["volume", "rm", volume]);
     }
 
+    confirm_fixture_project_cleanup(compose_project, |args| docker_ids(repo_root, args))
+}
+
+/// A successful removal requires a successful final listing of every resource
+/// family. Failed observation is an error, never evidence that no resource remains.
+fn confirm_fixture_project_cleanup(
+    compose_project: &str,
+    mut list: impl FnMut(&[&str]) -> Result<Vec<String>>,
+) -> Result<()> {
+    let label = format!("label=com.docker.compose.project={compose_project}");
     let mut remaining = Vec::new();
-    if let Ok(left) = docker_ids(repo_root, &["ps", "-aq", "--filter", &label])
-        && !left.is_empty()
-    {
-        remaining.push(format!("{} container(s)", left.len()));
-    }
-    if let Ok(left) = docker_ids(repo_root, &["volume", "ls", "-q", "--filter", &label])
-        && !left.is_empty()
-    {
-        remaining.push(format!("volume(s) {}", left.join(", ")));
+    for (family, args) in [
+        ("container", vec!["ps", "-aq", "--filter", label.as_str()]),
+        (
+            "network",
+            vec!["network", "ls", "-q", "--filter", label.as_str()],
+        ),
+        (
+            "volume",
+            vec!["volume", "ls", "-q", "--filter", label.as_str()],
+        ),
+    ] {
+        let left = list(&args).with_context(|| {
+            format!("confirm Docker project {compose_project} {family} cleanup")
+        })?;
+        if !left.is_empty() {
+            remaining.push(format!("{family}(s) {}", left.join(", ")));
+        }
     }
     if remaining.is_empty() {
         Ok(())
@@ -3066,5 +3084,55 @@ mod tests {
                 .unwrap()
         );
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cleanup_confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_final_listing_never_confirms_release() {
+        for unavailable in 0..3 {
+            let mut call = 0;
+            let error = confirm_fixture_project_cleanup("nr-isolated-rest-test", |_| {
+                let index = call;
+                call += 1;
+                if index == unavailable {
+                    Err(anyhow::anyhow!("Docker enumeration unavailable"))
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+            .expect_err("failed final listing cannot confirm cleanup");
+            assert!(format!("{error:#}").contains("Docker enumeration unavailable"));
+        }
+    }
+
+    #[test]
+    fn each_residual_family_refuses_release_including_networks() {
+        for residual in 0..3 {
+            let mut call = 0;
+            let error = confirm_fixture_project_cleanup("nr-isolated-rest-test", |args| {
+                let index = call;
+                call += 1;
+                assert!(args.contains(&"label=com.docker.compose.project=nr-isolated-rest-test"));
+                Ok(if index == residual {
+                    vec!["remaining-owned-resource".into()]
+                } else {
+                    Vec::new()
+                })
+            })
+            .expect_err("a resource survived cleanup");
+            assert_eq!(call, 3);
+            assert!(format!("{error:#}").contains("remaining-owned-resource"));
+        }
+        let mut calls = Vec::new();
+        confirm_fixture_project_cleanup("nr-isolated-rest-test", |args| {
+            calls.push(args[0].to_string());
+            Ok(Vec::new())
+        })
+        .expect("all three empty listings confirm release");
+        assert_eq!(calls, ["ps", "network", "volume"]);
     }
 }
