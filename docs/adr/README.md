@@ -113,6 +113,7 @@ code-anchors:
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
+- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
 
@@ -211,6 +212,7 @@ code-anchors:
 不得以 all-in-one 便利、feature-specific flow 或共享 runtime state 绕过边界。协议必须正面处理重复、延迟、乱序、
 丢失、过期 ownership 与进程失败，使分布式生命周期可测试、可观察并可独立演进。
 
+- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
@@ -523,8 +525,9 @@ debug/test 开关归启动进程环境。跨域 wire section 不因名字相似�
 NotFound；Connector 不让通用 field lookup 遮蔽 table-format invariant；Frontend router 不根据文本或错误字符串重猜 SQL
 statement family。边界层只能传递或编码 owner 的事实，测试只能验证既定契约，不能成为第二错误 authority。
 
+- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
 - ADR-0088 — SQL、Iceberg 与 MV 的错误为何必须在各自 owner 内、跨域 fallback 前收敛（active）
-- ADR-0095 — SQL analyze 错误为何以 typed code/span 穿过 Frontend、由 MySQL 边界映射（active）
+- ADR-0095 — SQL analyze 错误为何以 typed code/span 穿过 Frontend、由 MySQL 边界映射（active；已知非 Analyze 执行事实的不透明化由 ADR-0187 部分替代，Analyze 与历史 MV 规则保留）
 
 ### test-fixtures
 

@@ -547,6 +547,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
 
     /// Reserve the exact original registration/attempt custody before Native
     /// activation. This grants no new work, actor, permit, or dispatch authority.
+    // Design: ADR-0187 (docs/adr/ADR-0187-receiver-owned-steps-and-single-task-conclusion.md)
     pub(crate) fn reserve_active_native_owner(
         &self,
         registration: &LogicalExecutionRegistration,

@@ -10,10 +10,10 @@ provenance:
   - "discussion: 2026-08-18 domain-owned SQL error contracts"
   - "PR: pending — domain-owned SQL error contract convergence"
 code-anchors:
-  - "novarocks/sql/src/parser/recursive_cte.rs (try_unroll_cte)"
-  - "novarocks/connector/iceberg/src/catalog_control/catalog_mutation.rs (alter_schema)"
-  - "novarocks/sql/src/syntax.rs (parse_optional_mv_admitted_statement)"
-  - "novarocks/frontend/src/mv/command.rs (MvCommandExecutor::try_execute)"
+  - "novarocks/sql/src/analyzer/query_prepass/mod.rs (try_unroll_cte)"
+  - "novarocks/connector/iceberg/src/catalog_control/catalog_mutation.rs (prepare_schema_updates)"
+  - "novarocks/query-application/src/sql.rs (parse_optional_single_statement)"
+  - "novarocks/frontend-application/src/mv/command.rs (MvCommandExecutor::try_execute_typed_call)"
 ---
 
 ## 问题

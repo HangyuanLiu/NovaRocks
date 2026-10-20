@@ -1209,6 +1209,7 @@ impl TaskStatusOwner {
         pending
     }
 
+    // Design: ADR-0187 (docs/adr/ADR-0187-receiver-owned-steps-and-single-task-conclusion.md)
     fn submit_prepared_with_installed(
         &self,
         mut candidate: PreparedTaskConclusion,

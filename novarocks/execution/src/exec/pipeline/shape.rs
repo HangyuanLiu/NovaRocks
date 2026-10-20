@@ -128,6 +128,7 @@ pub enum PreparationStep {
     },
 }
 
+// Design: ADR-0187 (docs/adr/ADR-0187-receiver-owned-steps-and-single-task-conclusion.md)
 pub trait InputPreparation<K>: Send {
     /// None means the exact raw input may be accepted. This does not authorize
     /// every later allocation performed by preparation or calculation.

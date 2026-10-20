@@ -274,6 +274,7 @@ impl FailureFact {
 
 /// Implemented where the reason is known. Wrappers delegate this projection;
 /// they never classify another domain's concrete error type or its Display.
+// Design: ADR-0187 (docs/adr/ADR-0187-receiver-owned-steps-and-single-task-conclusion.md)
 pub trait FailureProjection {
     fn failure_fact(&self) -> FailureFact;
 }
