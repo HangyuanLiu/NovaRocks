@@ -100,14 +100,11 @@ fn constants() -> ConstantPolicy {
         max_library_validation_bytes: 1 << 20,
     }
 }
-fn interpreter() -> CompiledPackageInterpreter<std::io::Error> {
-    let providers =
-        novarocks_connector_contract::PureProviderProgramCatalog::<std::io::Error>::try_new(
-            &[],
-            vec![],
-            &Control,
-        )
-        .unwrap();
+fn interpreter() -> CompiledPackageInterpreter<std::convert::Infallible> {
+    let providers = novarocks_connector_contract::PureProviderProgramCatalog::<
+        std::convert::Infallible,
+    >::try_new(&[], vec![], &Control)
+    .unwrap();
     CompiledPackageInterpreter::new(
         FragmentDecodeResourceModel::try_new(&Control).unwrap(),
         decode_limits(),
@@ -511,8 +508,7 @@ fn functions() -> PureEngineFunctionCatalog {
 #[test]
 fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body() {
     use novarocks_execution::runtime::{
-        fragment::ExecutionFailureCause,
-        preparation_memory::{PreparationMemoryRefusal, PreparationMemoryStop},
+        fragment::ExecutionFailureCause, preparation_memory::PreparationMemoryRefusal,
         preparation_metadata::PreparationMetadataFailure,
     };
     use novarocks_worker::TestPreparationIntent;
@@ -554,6 +550,9 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
     assert!(owner.stop(TestPreparationIntent::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
+    let accepted = loan
+        .checkpoint()
+        .expect_err("original Worker accepted abort");
     let error = prepare_project_metadata_for_test(
         second,
         site,
@@ -565,14 +564,13 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
     )
     .err()
     .expect("original Worker stop precedes another admission");
-    assert_eq!(
-        error.cause(),
-        &ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
-            PreparationMemoryRefusal::Stopped(PreparationMemoryStop::Abort(
-                novarocks_execution_contract::AbortCause::QueryFailed
-            ))
-        ))
-    );
+    let ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
+        PreparationMemoryRefusal::Interrupted(original),
+    )) = error.cause()
+    else {
+        panic!("expected original Worker interruption: {error:?}");
+    };
+    assert!(std::ptr::eq(original.cause(), accepted.cause()));
     assert!(journal.body.settlement.is_none());
     assert!(journal.capacity.is_none());
 }

@@ -462,13 +462,10 @@ pub(super) fn program_for_arguments(
 ) -> Arc<LocalProgram> {
     let functions = functions_for_names(names);
     let bytes = source_for_arguments(name, types, &functions);
-    let providers =
-        novarocks_connector_contract::PureProviderProgramCatalog::<std::io::Error>::try_new(
-            &[],
-            vec![],
-            &Control,
-        )
-        .unwrap();
+    let providers = novarocks_connector_contract::PureProviderProgramCatalog::<
+        std::convert::Infallible,
+    >::try_new(&[], vec![], &Control)
+    .unwrap();
     let interpreter = CompiledPackageInterpreter::new(
         FragmentDecodeResourceModel::try_new(&Control).unwrap(),
         decode_limits(),

@@ -383,6 +383,7 @@ pub fn execution_descriptor_for_code(code: ErrorCodeId) -> Option<SqlExecutionEr
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use crate::api::QueryExecutionError;
     use novarocks_execution_contract::failure::{
         FailureEvidence, ResourceDimension, ResourceFacts, ResourceScope,
     };

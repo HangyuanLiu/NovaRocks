@@ -3079,6 +3079,122 @@ mod terminal_signal_tests {
         ));
     }
 
+    struct NoOutputEndBuffered {
+        output: Option<Chunk>,
+        ends: Arc<AtomicUsize>,
+    }
+    impl OperatorLifecycle for NoOutputEndBuffered {
+        fn name(&self) -> &str {
+            "NO_OUTPUT_END_BUFFERED"
+        }
+    }
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for NoOutputEndBuffered {}
+    impl crate::exec::pipeline::shape::TransformKernel for NoOutputEndBuffered {
+        fn start(&self) -> crate::exec::pipeline::shape::TransformStart {
+            crate::exec::pipeline::shape::TransformStart::Ready
+        }
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: super::super::input::PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            panic!("the source is already at EOS")
+        }
+        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            Ok(StepResult::new(self.output.take(), NextStep::NeedInput, 1))
+        }
+        fn end_input(
+            &mut self,
+            _: &mut StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
+            assert!(
+                self.output.is_none(),
+                "the computing continuation must drain first"
+            );
+            self.ends.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::exec::pipeline::shape::TransformInputEnd::Finished)
+        }
+        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            panic!("no-output EOS must not require a payload step")
+        }
+    }
+
+    #[test]
+    fn no_output_eos_control_preserves_the_last_real_edge_while_downstream_is_full() {
+        let terminal_observable = Arc::new(Observable::new());
+        let terminal_ready = Arc::new(AtomicBool::new(false));
+        let terminal_pushed = Arc::new(AtomicUsize::new(0));
+        let ends = Arc::new(AtomicUsize::new(0));
+        let array = Arc::new(arrow::array::Int32Array::from(vec![7]));
+        let actual_storage = Arc::downgrade(&array);
+        let chunk = crate::exec::chunk::typed_fixture::columns(
+            &["value"],
+            &[novarocks_types::SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            )],
+            vec![array],
+            1,
+        );
+        let mut driver = PipelineDriver::new(
+            3,
+            vec![
+                Box::new(ControlledReadinessOperator {
+                    name: "SOURCE_EOS",
+                    next: FixtureStep::Finished,
+                    after_output: FixtureStep::Finished,
+                    observable: Arc::new(Observable::new()),
+                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    NoOutputEndBuffered {
+                        output: Some(chunk),
+                        ends: ends.clone(),
+                    },
+                )),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    RecoveringTerminal {
+                        ready: terminal_ready.clone(),
+                        pushed: terminal_pushed.clone(),
+                        observable: terminal_observable.clone(),
+                    },
+                )),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+        assert_eq!(
+            driver.process(Duration::from_secs(1)),
+            DriverState::Blocked(BlockedReason::OutputFull)
+        );
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        assert_eq!(terminal_pushed.load(Ordering::SeqCst), 0);
+        assert!(
+            driver.edge_chunks[1].is_some(),
+            "the completed producer's last edge remains demanded"
+        );
+        assert!(
+            actual_storage.upgrade().is_some(),
+            "real Arrow storage remains owned by the edge"
+        );
+        terminal_ready.store(true, Ordering::Release);
+        terminal_observable.notify_observers();
+        driver.set_ready();
+        assert_eq!(
+            driver.process(Duration::from_secs(1)),
+            DriverState::Finished
+        );
+        assert_eq!(terminal_pushed.load(Ordering::SeqCst), 1);
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        assert!(driver.edge_chunks[1].is_none());
+        assert!(
+            actual_storage.upgrade().is_none(),
+            "the actual consumed payload retires before Driver Drop"
+        );
+    }
+
     #[test]
     fn retained_internal_output_resumes_from_the_downstream_generation() {
         let source_observable = Arc::new(Observable::new());

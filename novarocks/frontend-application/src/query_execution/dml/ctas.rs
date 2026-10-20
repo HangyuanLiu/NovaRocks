@@ -2535,7 +2535,42 @@ mod typed_compile_source_tests {
                 .downcast_ref::<novarocks_functions::ConstantError>()
                 .is_some()
         );
-        assert_eq!(failure.compile_control_error(), None);
+        let control = failure
+            .compile_control_error()
+            .expect("the rich source sidecar must survive");
+        assert_eq!(
+            control,
+            novarocks_type_contract::CompileControlError::Source(source.clone())
+        );
+        assert_eq!(control.failure_fact(), source.failure_fact());
+        let input = failure.execution_failure().unwrap();
+        assert_eq!(input.fact(), source.failure_fact());
+        assert_eq!(input.fact().class(), FailureClass::Resource);
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            input.attempt_class(),
+            novarocks_query_application::coordination::AttemptFailureClass::ResourceGovernance
+        );
+        let service =
+            novarocks_query_application::session_error::QueryServiceError::from_compile_control(
+                control,
+            );
+        assert_eq!(
+            service.execution_failure().unwrap().fact(),
+            source.failure_fact()
+        );
+        assert_eq!(
+            service.compile_control_error(),
+            Some(novarocks_type_contract::CompileControlError::Source(source))
+        );
+        assert_ne!(
+            service.kind(),
+            novarocks_query_application::session_error::QueryServiceErrorKind::Interrupted
+        );
+        assert_ne!(
+            service.kind(),
+            novarocks_query_application::session_error::QueryServiceErrorKind::Timeout
+        );
         assert_eq!(failure.user_error(None), None);
     }
 

@@ -263,6 +263,7 @@ impl novarocks_execution_contract::failure::FailureProjection for RegistryFixtur
             TaskFailureCategory::Exchange => (FailureClass::Dependency, 65003),
             TaskFailureCategory::Protocol => (FailureClass::Invariant, 65004),
             TaskFailureCategory::Internal => (FailureClass::Unexpected, 65005),
+            TaskFailureCategory::Unsupported => (FailureClass::Unsupported, 65006),
         };
         FailureFact::new(
             class,
@@ -3475,6 +3476,7 @@ fn accepted_preparation_projects_author_facts_and_keeps_phase_and_identity_acros
                     TaskFailureCategory::Execution
                 }
                 TaskFailureCategory::ResourceExhausted => TaskFailureCategory::ResourceExhausted,
+                TaskFailureCategory::Unsupported => TaskFailureCategory::Unsupported,
             };
             assert_eq!(failure.category(), expected_task_category);
             assert_eq!(failure.phase(), TaskFailurePhase::Preparation);
@@ -3484,6 +3486,7 @@ fn accepted_preparation_projects_author_facts_and_keeps_phase_and_identity_acros
                 TaskFailureCategory::Execution => "Data failure (reason 10:65001)",
                 TaskFailureCategory::Internal => "Unexpected failure (reason 10:65005)",
                 TaskFailureCategory::ResourceExhausted => "Resource failure (reason 10:65002)",
+                TaskFailureCategory::Unsupported => "Unsupported failure (reason 10:65006)",
             };
             assert_eq!(failure.detail().as_str(), expected_summary);
             assert!(

@@ -666,28 +666,10 @@ fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
         | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
         ProtocolErrorKind::Conflict => tonic::Status::already_exists(detail),
         ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
+        ProtocolErrorKind::Domain(source) => status_from_domain_source(source),
         ProtocolErrorKind::CompileControl(cause) => match cause {
             novarocks_type_contract::CompileControlError::Source(source) => {
-                use novarocks_failure_contract::{FailureClass, FailureProjection};
-                let fact = source.failure_fact();
-                // The original cause is local. RPC diagnostics only publish
-                // neutral facts, never the caller's arbitrary source Display.
-                let detail = format!(
-                    "native preparation {:?} refusal (reason {})",
-                    fact.class(),
-                    fact.reason()
-                );
-                match fact.class() {
-                    FailureClass::Data => tonic::Status::invalid_argument(detail),
-                    FailureClass::Dependency => tonic::Status::unavailable(detail),
-                    FailureClass::Resource => tonic::Status::resource_exhausted(detail),
-                    FailureClass::Representation => tonic::Status::data_loss(detail),
-                    FailureClass::Invariant | FailureClass::Unexpected => {
-                        tonic::Status::internal(detail)
-                    }
-                    // A control observation is not necessarily this RPC caller's cancellation.
-                    FailureClass::Control => tonic::Status::aborted(detail),
-                }
+                status_from_domain_source(source)
             }
             novarocks_type_contract::CompileControlError::Cancelled => {
                 tonic::Status::cancelled(detail)
@@ -702,8 +684,63 @@ fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
     }
 }
 
+fn status_from_domain_source(
+    source: &novarocks_failure_contract::SharedFailureCause,
+) -> tonic::Status {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let fact = source.failure_fact();
+    // The original cause is local. RPC diagnostics only publish
+    // neutral facts, never the caller's arbitrary source Display.
+    let detail = format!(
+        "native preparation {:?} refusal (reason {})",
+        fact.class(),
+        fact.reason()
+    );
+    match fact.class() {
+        FailureClass::Data => tonic::Status::invalid_argument(detail),
+        FailureClass::Unsupported => tonic::Status::unimplemented(detail),
+        FailureClass::Dependency => tonic::Status::unavailable(detail),
+        FailureClass::Resource => tonic::Status::resource_exhausted(detail),
+        FailureClass::Representation => tonic::Status::data_loss(detail),
+        FailureClass::Invariant | FailureClass::Unexpected => tonic::Status::internal(detail),
+        // A control observation is not necessarily this RPC caller's cancellation.
+        FailureClass::Control => tonic::Status::aborted(detail),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn domain_source_uses_neutral_transport_projection_without_publishing_private_text() {
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        for (original, expected) in [
+            (LayoutResourceError::SourceModel, tonic::Code::Internal),
+            (
+                LayoutResourceError::Arithmetic,
+                tonic::Code::ResourceExhausted,
+            ),
+        ] {
+            let error = novarocks_proto_codec::ProtocolError::from_domain(
+                novarocks_proto_codec::FieldPath::root("original"),
+                original,
+            );
+            let status = super::status_from_contract_error(error);
+            assert_eq!(status.code(), expected);
+            assert!(status.message().contains("reason"));
+            assert!(!status.message().contains("allocation"));
+        }
+        let error = novarocks_proto_codec::ProtocolError::from_domain(
+            novarocks_proto_codec::FieldPath::root("original"),
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Cancelled,
+                "private authentication token",
+            ),
+        );
+        let status = super::status_from_contract_error(error);
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert!(!status.message().contains("private authentication token"));
+    }
 
     #[test]
     fn caller_control_source_projects_actual_category_without_cancellation_guess() {
@@ -711,22 +748,32 @@ mod tests {
             CompileControlError, owned_resources::layout::LayoutResourceError,
         };
         for (raw, expected) in [
-            (LayoutResourceError::SourceModel, tonic::Code::Internal),
             (
-                LayoutResourceError::Arithmetic,
+                CompileControlError::from_domain(LayoutResourceError::SourceModel),
+                tonic::Code::Internal,
+            ),
+            (
+                CompileControlError::from_domain(LayoutResourceError::Arithmetic),
                 tonic::Code::ResourceExhausted,
+            ),
+            (
+                CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                        "private capability detail".into(),
+                    ),
+                )),
+                tonic::Code::Unimplemented,
             ),
         ] {
             let error = novarocks_proto_codec::ProtocolError::new(
                 novarocks_proto_codec::FieldPath::root("original"),
-                novarocks_proto_codec::ProtocolErrorKind::CompileControl(
-                    CompileControlError::from_domain(raw),
-                ),
+                novarocks_proto_codec::ProtocolErrorKind::CompileControl(raw),
                 "Cancelled: misleading diagnostic",
             );
             let status = super::status_from_contract_error(error);
             assert_eq!(status.code(), expected);
             assert!(!status.message().contains("misleading diagnostic"));
+            assert!(!status.message().contains("private capability detail"));
             assert!(status.message().contains("reason"));
         }
     }

@@ -977,25 +977,44 @@ fn writer_private_primary_control_keeps_the_cause_after_compiled_read_work() {
 }
 
 #[test]
-fn ordinary_node_error_observes_stage_tail_and_tail_control_stays_fatal() {
+fn ordinary_node_error_keeps_the_exact_read_cause_and_actual_control_prefix() {
     let package = checked_package(Some("missing"), 1, 1, None, true);
     let port = Port::new("alpha", Behavior::Normal);
     let catalog = catalogue(&port, true, true);
+    let check_original = |result| {
+        assert!(matches!(result, Err(ProviderPreparationError::Read { node,
+            error: PureProviderProgramError::Catalog(PureProviderCatalogError::MissingProvider(provider))
+        }) if node == NodeId::new(u32::MAX) && provider == id("missing")));
+    };
     let baseline = Control::default();
-    assert!(
-        matches!(validate_fragment_providers(Arc::clone(&package),&catalog,&baseline),Err(ProviderPreparationError::Read { node,.. }) if node==NodeId::new(u32::MAX))
-    );
+    check_original(validate_fragment_providers(
+        Arc::clone(&package),
+        &catalog,
+        &baseline,
+    ));
     let trace = baseline.trace.lock().unwrap().clone();
-    assert_eq!(trace.last(), Some(&0));
+    assert_eq!(trace, [0, 0, 0]);
     for cause in causes() {
+        for at in 1..=trace.len() {
+            let control = Control {
+                trace: Mutex::default(),
+                refusal: Some((cause.clone(), Refuse::Call(at))),
+            };
+            assert!(
+                matches!(validate_fragment_providers(Arc::clone(&package), &catalog, &control), Err(ProviderPreparationError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+        }
         let control = Control {
             trace: Mutex::default(),
-            refusal: Some((cause.clone(), Refuse::Call(trace.len()))),
+            refusal: Some((cause, Refuse::Call(trace.len() + 1))),
         };
-        assert!(
-            matches!(validate_fragment_providers(Arc::clone(&package),&catalog,&control),Err(ProviderPreparationError::Control(error)) if error==cause)
-        );
-        assert_eq!(control.trace.lock().unwrap().len(), trace.len());
+        check_original(validate_fragment_providers(
+            Arc::clone(&package),
+            &catalog,
+            &control,
+        ));
+        assert_eq!(*control.trace.lock().unwrap(), trace);
     }
     assert_eq!(port.reads.load(Ordering::Relaxed), 0);
     assert_eq!(port.writes.load(Ordering::Relaxed), 0);

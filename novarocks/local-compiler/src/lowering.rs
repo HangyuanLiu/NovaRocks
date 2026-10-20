@@ -2514,7 +2514,6 @@ mod capability_admission_tests {
                 FunctionBindingError::UnknownFunction,
             )),
             FragmentCompileError::Invalid("unsupported is diagnostic text"),
-            FragmentCompileError::from("unsupported is diagnostic text".to_owned()),
             FragmentCompileError::Control(CompileControlError::Cancelled),
             FragmentCompileError::Control(CompileControlError::ResourceExhausted),
         ] {

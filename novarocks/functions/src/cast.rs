@@ -1802,7 +1802,11 @@ impl PreparedCastRecipe {
                             self.result.data_type(),
                             value,
                         );
-                        let error = RowDataError::new(ordinal, &message);
+                        let error = RowDataError::with_reason(
+                            ordinal,
+                            crate::DataFailureReason::NumericOutOfRange,
+                            &message,
+                        );
                         work.flush()?;
                         Ok(CastRowResult::RowError(error))
                     }
@@ -1906,7 +1910,11 @@ impl PreparedCastRecipe {
                                 "Expr evaluate meet error: CAST failed: from {:?} to {:?}: {} conflict with range of {}",
                                 self.source.data_type(), self.result.data_type(), source as f64, name,
                             );
-                            let error = RowDataError::new(ordinal, &message);
+                            let error = RowDataError::with_reason(
+                            ordinal,
+                            crate::DataFailureReason::NumericOutOfRange,
+                            &message,
+                        );
                             work.flush()?;
                             CastRowResult::RowError(error)
                         }

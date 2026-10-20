@@ -1162,7 +1162,9 @@ mod tests {
         SAFE_DETAIL_MAX_BYTES, SafeDetail, SafeFieldPath, TaskOutputFacts, TaskState, TaskStatus,
         TaskStatusError, TaskStatusVersion,
     };
-    use crate::{TaskFailure, TaskFailurePhase, TaskIdentity, TerminationDetail};
+    use crate::{
+        TaskFailure, TaskFailureCategory, TaskFailurePhase, TaskIdentity, TerminationDetail,
+    };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };

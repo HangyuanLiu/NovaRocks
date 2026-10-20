@@ -971,9 +971,9 @@ mod tests {
                 decoded.package().clone(),
             )
             .map_err(|error| {
-                HostRejection::new(
+                HostRejection::from_domain(
                     novarocks_execution_contract::TaskFailureCategory::Protocol,
-                    format!("static package is not decodable: {error}"),
+                    novarocks_plan_codec::physical_package_v2::PackageWireError::Protobuf(error),
                 )
             })?;
             use novarocks_proto_models::physical_package_v2::fragment_sink::Kind;
@@ -983,9 +983,16 @@ mod tests {
                 .and_then(|fragment| fragment.sink.as_ref())
                 .and_then(|sink| sink.kind.as_ref())
                 .ok_or_else(|| {
-                    HostRejection::new(
+                    HostRejection::from_domain(
                         novarocks_execution_contract::TaskFailureCategory::Protocol,
-                        "static package has no sink",
+                        novarocks_proto_codec::ProtocolError::new(
+                            FieldPath::root("frozen_fragment")
+                                .field("package")
+                                .field("fragment")
+                                .field("sink"),
+                            novarocks_proto_codec::ProtocolErrorKind::MissingField,
+                            "static package has no sink",
+                        ),
                     )
                 })?;
             let sink_kind = match kind {

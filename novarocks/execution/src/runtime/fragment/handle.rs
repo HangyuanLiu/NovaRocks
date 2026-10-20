@@ -94,6 +94,7 @@ type ReceiverConstruction = (
 
 #[cfg(test)]
 mod owner_tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};

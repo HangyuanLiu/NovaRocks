@@ -300,7 +300,7 @@ impl novarocks_failure_contract::FailureProjection for ConnectorError {
                 ConnectorErrorKind::InvalidRequest => (Class::Data, 1),
                 ConnectorErrorKind::NotFound => (Class::Dependency, 2),
                 ConnectorErrorKind::PermissionDenied => (Class::Dependency, 3),
-                ConnectorErrorKind::Unsupported => (Class::Data, 4),
+                ConnectorErrorKind::Unsupported => (Class::Unsupported, 4),
                 ConnectorErrorKind::Cancelled => (Class::Control, 5),
                 ConnectorErrorKind::DeadlineExceeded => (Class::Control, 6),
                 ConnectorErrorKind::ResourceExhausted => (Class::Resource, 7),
@@ -326,6 +326,25 @@ impl novarocks_failure_contract::FailureProjection for ConnectorError {
 mod failure_projection_tests {
     use super::*;
     use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn unsupported_retains_its_connector_reason_without_reclassifying_a_domain_source() {
+        let error = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "cancelled dependency refused",
+        );
+        assert_eq!(error.failure_fact().class(), FailureClass::Unsupported);
+        assert_eq!(error.failure_fact().reason().code(), 4);
+        let source = ConnectorError::new(ConnectorErrorKind::Unavailable, "unsupported capability");
+        let fact = source.failure_fact();
+        let wrapper = ConnectorError::from_domain(ConnectorErrorKind::Unsupported, source.clone());
+        assert_eq!(wrapper.failure_fact(), fact);
+        let preserved = std::error::Error::source(&wrapper)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap();
+        assert_eq!(preserved.downcast_ref::<ConnectorError>(), Some(&source));
+    }
+
     #[test]
     fn external_credentials_and_replaced_targets_keep_distinct_dependency_reasons() {
         let credentials =

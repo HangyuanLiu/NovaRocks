@@ -317,6 +317,7 @@ fn every_decimal_overflow_policy_is_independent_and_allow_adds_only_multiplicati
                         panic!("numeric overflow disappeared")
                     };
                     assert_eq!(error.selected_ordinal(), 9);
+                    assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
                     let name = match op {
                         Add => "add",
                         Subtract => "sub",

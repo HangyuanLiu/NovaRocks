@@ -1691,12 +1691,107 @@ pub(crate) fn spi_codec_error(error: ConnectorWriteCodecError) -> ConnectorCodec
         ProtocolErrorKind::CompileControl(cause) => {
             ConnectorCodecErrorKind::CompileControl(cause.clone())
         }
+        ProtocolErrorKind::Domain(source) => ConnectorCodecErrorKind::Domain(source.clone()),
     };
     ConnectorCodecError::new(path, kind, protocol.detail())
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn write_codec_bridge_keeps_real_decode_capacity_quantities_and_unsupported_reason() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{
+            ConnectorCodecError, ConnectorCodecErrorKind, ConnectorDecodeLedger,
+            ConnectorDecodeLimits, ConnectorFieldPath,
+        };
+        let mut ledger =
+            ConnectorDecodeLedger::new(ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap());
+        ledger.charge_raw(7).unwrap();
+        let known = ledger.charge_raw(2).unwrap_err();
+        let unknown = ConnectorCodecError::new(
+            ConnectorFieldPath::root("original"),
+            ConnectorCodecErrorKind::Capacity,
+            "unknown quantities",
+        );
+        let unsupported = ConnectorCodecError::new(
+            ConnectorFieldPath::root("original"),
+            ConnectorCodecErrorKind::Unsupported,
+            "actual capability refusal",
+        );
+        for original in [known, unknown, unsupported] {
+            let fact = original.failure_fact();
+            let protocol = novarocks_proto_codec::ProtocolError::from_domain(
+                novarocks_proto_codec::FieldPath::root("provider_payload").index(7),
+                original.clone(),
+            );
+            let returned = super::spi_codec_error(
+                novarocks_proto_codec::connector_write::ConnectorWriteCodecError::new(
+                    "iceberg", protocol,
+                ),
+            );
+            assert_eq!(returned.failure_fact(), fact);
+            assert_eq!(returned.path().to_string(), "provider_payload[7]");
+            assert!(returned.compile_control_error().is_none());
+            let shared = std::error::Error::source(&returned)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            assert_eq!(
+                shared.downcast_ref::<ConnectorCodecError>(),
+                Some(&original)
+            );
+            if let Some(resource) = fact.resource() {
+                assert_eq!(
+                    (
+                        resource.requested,
+                        resource.required_growth,
+                        resource.committed,
+                        resource.limit,
+                        resource.live
+                    ),
+                    (Some(2), Some(2), Some(7), Some(8), None)
+                );
+            } else {
+                assert!(returned.failure_fact().resource().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn write_codec_bridge_keeps_domain_fact_and_original_source() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let original = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+            "provider data refused",
+        );
+        let fact = original.failure_fact();
+        let protocol = novarocks_proto_codec::ProtocolError::from_domain(
+            novarocks_proto_codec::FieldPath::root("provider_payload").index(7),
+            original.clone(),
+        );
+        let error = super::spi_codec_error(
+            novarocks_proto_codec::connector_write::ConnectorWriteCodecError::new(
+                "iceberg", protocol,
+            ),
+        );
+        assert!(matches!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorCodecErrorKind::Domain(_)
+        ));
+        assert!(error.compile_control_error().is_none());
+        assert_eq!(error.path().to_string(), "provider_payload[7]");
+        assert_eq!(error.failure_fact(), fact);
+        let shared = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            shared.downcast_ref::<novarocks_spi::connector::ConnectorError>(),
+            Some(&original)
+        );
+    }
 
     #[test]
     fn write_codec_bridge_keeps_pure_compile_control_cause() {

@@ -151,6 +151,10 @@ fn actual_schema_tracker_refusal_is_projected_as_resource_without_text_inference
 #[test]
 fn compiled_capability_refusal_does_not_reclassify_content_or_control_failures() {
     use super::{CompiledPackageError, compiled_package_rejection};
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
+    use novarocks_local_compiler::FragmentCompileError;
+    use novarocks_physical_plan::NodeId;
+    use novarocks_plan_codec::physical_package_v2::PackageDecodeError;
     use novarocks_type_contract::CompileControlError;
     let identity = TaskIdentity::new(
         QueryExecutionId::new(QueryId::new(97421, 97422), AttemptId::new(1).unwrap()).unwrap(),
@@ -160,12 +164,17 @@ fn compiled_capability_refusal_does_not_reclassify_content_or_control_failures()
     );
     for (error, expected) in [
         (
-            CompiledPackageError::Unsupported("FULL OUTER hash join".into()),
+            CompiledPackageError::Compile(FragmentCompileError::Unsupported {
+                node: Some(NodeId::new(7)),
+                feature: "FULL OUTER hash join",
+            }),
             TaskFailureCategory::Unsupported,
         ),
         (
-            CompiledPackageError::Refused("unsupported diagnostic from malformed package".into()),
-            TaskFailureCategory::Protocol,
+            CompiledPackageError::Decode(PackageDecodeError::Invalid(
+                "unsupported diagnostic from malformed package",
+            )),
+            TaskFailureCategory::Execution,
         ),
         (
             CompiledPackageError::Control(CompileControlError::ResourceExhausted),
@@ -180,9 +189,49 @@ fn compiled_capability_refusal_does_not_reclassify_content_or_control_failures()
             TaskFailureCategory::Execution,
         ),
     ] {
-        assert_eq!(
-            compiled_package_rejection(identity, error).category(),
-            expected
-        );
+        let expected_fact = error.failure_fact();
+        let projected = compiled_package_rejection(identity, error);
+        assert_eq!(projected.category(), expected);
+        assert_eq!(projected.failure_fact(), expected_fact);
+        assert!(projected.detail().as_str().len() <= 512);
+        let original = crate::backend_test_support::find_source::<CompiledPackageError>(&projected)
+            .expect("the whole original compiled package cause remains available");
+        assert_eq!(original.failure_fact(), expected_fact);
+        match original {
+            CompiledPackageError::Compile(_) => {
+                assert_eq!(expected_fact.class(), FailureClass::Unsupported);
+                assert_eq!(
+                    expected_fact.reason().domain(),
+                    domain::LOCAL_COMPILER.get()
+                );
+                assert_eq!(expected_fact.reason().code(), 1);
+                assert!(matches!(
+                    crate::backend_test_support::find_source::<FragmentCompileError>(&projected),
+                    Some(FragmentCompileError::Unsupported {
+                        node: Some(node),
+                        feature: "FULL OUTER hash join",
+                    }) if *node == NodeId::new(7)
+                ));
+            }
+            CompiledPackageError::Decode(_) => {
+                assert_eq!(expected_fact.class(), FailureClass::Data);
+                assert_eq!(expected_fact.reason().domain(), domain::PLAN_CODEC.get());
+                assert_eq!(expected_fact.reason().code(), 38);
+                assert!(matches!(
+                    crate::backend_test_support::find_source::<PackageDecodeError>(&projected),
+                    Some(PackageDecodeError::Invalid(
+                        "unsupported diagnostic from malformed package",
+                    ))
+                ));
+            }
+            CompiledPackageError::Control(cause) => {
+                assert_eq!(expected_fact, cause.failure_fact());
+                assert_eq!(
+                    crate::backend_test_support::find_source::<CompileControlError>(&projected),
+                    Some(cause),
+                );
+            }
+            _ => panic!("the test's exact original author must not be replaced"),
+        }
     }
 }

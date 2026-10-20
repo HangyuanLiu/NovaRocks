@@ -204,11 +204,7 @@ pub fn validate_fragment_providers<E: Error + 'static>(
                 writes,
             })
         })();
-    if matches!(&result, Err(ProviderPreparationError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, ProviderPreparationError::Control)
 }
 
 #[cfg(test)]

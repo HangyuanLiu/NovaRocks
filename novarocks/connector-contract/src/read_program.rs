@@ -150,15 +150,18 @@ impl ConnectorReadProgramRecipe {
                     }
                 },
             )?;
-            let header_shape = ConnectorReadRelationRecipe::validate_canonical_header_shape(
+            ConnectorReadRelationRecipe::validate_canonical_header_shape(
                 frozen.scan.recipe(),
                 &canonical,
-            );
+            )
+            .map_err(|error| {
+                ConnectorReadProgramCompileError::Contract(ConnectorError::from_domain(
+                    ConnectorErrorKind::InvalidRequest,
+                    error,
+                ))
+            })?;
             work.step()
                 .map_err(ConnectorReadProgramCompileError::Control)?;
-            header_shape.map_err(|error| {
-                ConnectorReadProgramCompileError::Contract(invalid(error.to_string()))
-            })?;
             for (original, canonical) in frozen
                 .scan
                 .recipe()
@@ -203,12 +206,7 @@ impl ConnectorReadProgramRecipe {
                 .map_err(ConnectorReadProgramCompileError::Control)?;
             Ok(Self(canonical))
         })();
-        if matches!(&result, Err(ConnectorReadProgramCompileError::Control(_))) {
-            return result;
-        }
-        work.finish()
-            .map_err(ConnectorReadProgramCompileError::Control)?;
-        result
+        work.finish_result(result, ConnectorReadProgramCompileError::Control)
     }
 
     pub const fn frozen(&self) -> &FrozenConnectorRead {
@@ -505,7 +503,7 @@ mod tests {
         ));
     }
     #[test]
-    fn ordinary_provider_and_contract_failures_observe_the_original_tail() {
+    fn ordinary_provider_and_contract_failures_keep_their_first_error_and_actual_control_prefix() {
         struct Refusing;
         impl ConnectorReadProgramCompiler for Refusing {
             type Error = ConnectorError;
@@ -520,36 +518,91 @@ mod tests {
                 )))
             }
         }
-        struct Tail(std::sync::Mutex<usize>);
+        struct Tail {
+            trace: std::sync::Mutex<Vec<u32>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
         impl PureCompileControl for Tail {
-            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-                let mut count = self.0.lock().unwrap();
-                *count += 1;
-                if *count == 3 {
-                    Err(CompileControlError::DeadlineExceeded)
-                } else {
-                    Ok(())
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                let mut trace = self.trace.lock().unwrap();
+                trace.push(units);
+                match &self.refusal {
+                    Some((at, cause)) if trace.len() == *at => Err(cause.clone()),
+                    _ => Ok(()),
                 }
             }
         }
         let frozen =
             FrozenConnectorRead::try_new(scan(), crate::read_public::tests::public()).unwrap();
-        let tail = Tail(std::sync::Mutex::new(0));
-        assert!(matches!(
-            ConnectorReadProgramRecipe::try_compile_with_provider(&frozen, &Refusing, &tail),
-            Err(ConnectorReadProgramCompileError::Control(
-                CompileControlError::DeadlineExceeded
-            ))
-        ));
-        assert_eq!(*tail.0.lock().unwrap(), 3);
-        let tail = Tail(std::sync::Mutex::new(0));
-        assert!(matches!(
-            ConnectorReadProgramRecipe::try_compile_with_provider(&frozen, &Compiler(true), &tail),
-            Err(ConnectorReadProgramCompileError::Control(
-                CompileControlError::DeadlineExceeded
-            ))
-        ));
-        assert_eq!(*tail.0.lock().unwrap(), 3);
+        for provider in [true, false] {
+            let run = |control: &Tail| {
+                if provider {
+                    ConnectorReadProgramRecipe::try_compile_with_provider(
+                        &frozen, &Refusing, control,
+                    )
+                } else {
+                    ConnectorReadProgramRecipe::try_compile_with_provider(
+                        &frozen,
+                        &Compiler(true),
+                        control,
+                    )
+                }
+            };
+            let baseline = Tail {
+                trace: Default::default(),
+                refusal: None,
+            };
+            let expected = run(&baseline).unwrap_err();
+            let original = match &expected {
+                ConnectorReadProgramCompileError::Provider(cause) if provider => cause,
+                ConnectorReadProgramCompileError::Contract(cause) if !provider => cause,
+                other => panic!("original refusal changed: {other:?}"),
+            };
+            let trace = baseline.trace.lock().unwrap().clone();
+            assert_eq!(trace, [0, 0]);
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                for at in 1..=trace.len() {
+                    let control = Tail {
+                        trace: Default::default(),
+                        refusal: Some((at, cause.clone())),
+                    };
+                    assert!(
+                        matches!(run(&control), Err(ConnectorReadProgramCompileError::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                }
+                let control = Tail {
+                    trace: Default::default(),
+                    refusal: Some((trace.len() + 1, cause)),
+                };
+                let actual = run(&control).unwrap_err();
+                let returned = match &actual {
+                    ConnectorReadProgramCompileError::Provider(cause) if provider => cause,
+                    ConnectorReadProgramCompileError::Contract(cause) if !provider => cause,
+                    other => panic!("late control replaced original refusal: {other:?}"),
+                };
+                use novarocks_failure_contract::FailureProjection;
+                assert_eq!(returned.failure_fact(), original.failure_fact());
+                assert_eq!(returned.kind(), original.kind());
+                assert_eq!(returned.message(), original.message());
+                if !provider {
+                    let shared = returned
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+                        .unwrap();
+                    assert_eq!(
+                        shared.downcast_ref::<crate::ConnectorReadRelationRecipeError>(),
+                        Some(&crate::ConnectorReadRelationRecipeError::PublicFactsMismatch)
+                    );
+                }
+                assert_eq!(*control.trace.lock().unwrap(), trace);
+            }
+        }
     }
 
     #[test]

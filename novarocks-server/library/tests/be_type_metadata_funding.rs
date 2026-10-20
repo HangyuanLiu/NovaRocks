@@ -305,21 +305,26 @@ fn original_type_host_keeps_real_capacity_and_stop_refusals_before_body() {
     assert!(owner.stop(TestPreparationIntent::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
+    let loan = owner.loan();
+    let accepted = loan
+        .checkpoint()
+        .expect_err("original Worker accepted abort");
     let mut stopped = TypeMaterializationJournal::default();
-    assert!(matches!(
-        materialize_package_types_for_test(
-            &source,
-            SOURCE_INVOICE,
-            decode_limits().types,
-            &Control,
-            &binding,
-            &owner.loan(),
-            &mut stopped
-        ),
-        Err(ProjectionFailure::Host(
-            TypeMaterializationRefusal::Stopped(TestPreparationIntent::Abort(_))
-        ))
-    ));
+    let error = materialize_package_types_for_test(
+        &source,
+        SOURCE_INVOICE,
+        decode_limits().types,
+        &Control,
+        &binding,
+        &loan,
+        &mut stopped,
+    )
+    .err()
+    .expect("original Worker stop precedes another admission");
+    let ProjectionFailure::Host(TypeMaterializationRefusal::Interrupted(original)) = error else {
+        panic!("expected original Worker interruption: {error:?}");
+    };
+    assert!(std::ptr::eq(original.cause(), accepted.cause()));
     assert!(stopped.body.settlement.is_none());
     assert!(
         stopped.capacity.is_none(),

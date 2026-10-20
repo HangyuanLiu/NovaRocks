@@ -97,8 +97,9 @@ pub trait StepOperator: Send {
     }
     fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult;
     fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult>;
-    /// Signal input EOS once. Payload production and finalization advance only
-    /// through drive, after the driver obtains output/root capacity.
+    /// Signal input EOS once. Payload-producing finalization advances only
+    /// through admitted drive. An explicit no-payload EOS control may finish
+    /// data work without another output/root grant; physical exit is separate.
     fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()>;
 }
 
@@ -289,6 +290,15 @@ pub enum TransformStart {
     Finished,
 }
 
+/// EOS control after every accepted input and computation continuation drained.
+/// This contains no payload: data-producing finalization still needs an admitted
+/// output step. Neither variant proves physical owner exit or a Task conclusion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransformInputEnd {
+    NeedsOutputStep,
+    Finished,
+}
+
 pub trait TransformKernel: Send {
     fn poll_control(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
         Ok(ControlStep::Active)
@@ -316,6 +326,12 @@ pub trait TransformKernel: Send {
     fn drive(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         Ok(StepResult::new(None, NextStep::NeedInput, 0))
     }
+    /// Once-only EOS metadata. No input is accepted, columns read, storage
+    /// materialized, or output produced here. A kernel with final output must
+    /// retain the conservative result and use finish/drive after admission.
+    fn end_input(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<TransformInputEnd> {
+        Ok(TransformInputEnd::NeedsOutputStep)
+    }
     fn finish(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         Ok(StepResult::new(None, NextStep::Finished, 0))
     }
@@ -329,6 +345,7 @@ pub struct Transform<K, P> {
     needs_input: bool,
     finishing: bool,
     finish_started: bool,
+    end_input_started: bool,
     next: NextStep,
     failure: Option<crate::runtime::fragment::ExecutionFailure>,
 }
@@ -346,6 +363,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> Transform<K, P> {
             needs_input,
             finishing: false,
             finish_started: false,
+            end_input_started: false,
             next,
             failure: None,
         }
@@ -367,6 +385,31 @@ impl<K: TransformKernel, P: InputPreparation<K>> Transform<K, P> {
         self.needs_input = false;
         failure
     }
+    fn end_input_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        if !self.finishing
+            || !self.needs_input
+            || self.receiver.is_occupied()
+            || self.finish_started
+            || self.end_input_started
+        {
+            return Ok(ControlStep::Active);
+        }
+        // Save the once-only phase before invoking the actual kernel author.
+        self.end_input_started = true;
+        let end = ctx.perform(
+            crate::runtime::fragment::PipelineOperation::Finishing,
+            |ctx| self.kernel.end_input(ctx),
+        )?;
+        match end {
+            TransformInputEnd::NeedsOutputStep => Ok(ControlStep::Active),
+            TransformInputEnd::Finished => {
+                self.finish_started = true;
+                self.needs_input = false;
+                self.next = NextStep::Finished;
+                Ok(ControlStep::Withdrawn)
+            }
+        }
+    }
     fn record(&mut self, mut step: StepResult) -> StepResult {
         self.needs_input = matches!(step.next, NextStep::NeedInput);
         if self.finishing && self.needs_input {
@@ -384,7 +427,13 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
         if matches!(self.next, NextStep::Finished) {
             return Ok(ControlStep::Active);
         }
-        let result = self.kernel.poll_control(ctx);
+        let result = self
+            .kernel
+            .poll_control(ctx)
+            .and_then(|control| match control {
+                ControlStep::Active => self.end_input_control(ctx),
+                other => Ok(other),
+            });
         match result {
             Ok(ControlStep::Withdrawn) => {
                 self.receiver.discard();
@@ -468,6 +517,9 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
                 ReceiverPreparation::Empty
                     if self.finishing && self.needs_input && !self.finish_started =>
                 {
+                    if matches!(self.end_input_control(ctx)?, ControlStep::Withdrawn) {
+                        return Ok(StepResult::new(None, NextStep::Finished, 0));
+                    }
                     self.finish_started = true;
                     ctx.perform(PipelineOperation::Finishing, |ctx| self.kernel.finish(ctx))
                 }
@@ -911,5 +963,131 @@ mod tests {
         assert_eq!(counts.applied.load(Ordering::SeqCst), 2);
         assert_eq!(counts.finished.load(Ordering::SeqCst), 1);
         assert_eq!(counts.prepared.load(Ordering::SeqCst), 1);
+    }
+    struct NoOutputEnd {
+        counts: Arc<Counts>,
+        ends: Arc<AtomicUsize>,
+    }
+    impl TransformKernel for NoOutputEnd {
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            input: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            self.counts.applied.fetch_add(1, Ordering::SeqCst);
+            Ok(StepResult::new(
+                Some(input.into_uncovered_chunk()?),
+                NextStep::NeedInput,
+                2,
+            ))
+        }
+        fn end_input(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<TransformInputEnd> {
+            self.ends.fetch_add(1, Ordering::SeqCst);
+            Ok(TransformInputEnd::Finished)
+        }
+        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            panic!("no-output EOS must not invoke payload finalization")
+        }
+    }
+    #[test]
+    fn no_output_eos_waits_for_accepted_preparation_then_publishes_once_without_output_work() {
+        let counts = Arc::new(Counts::default());
+        let ends = Arc::new(AtomicUsize::new(0));
+        let mut operator = Transform::new(
+            NoOutputEnd {
+                counts: counts.clone(),
+                ends: ends.clone(),
+            },
+            Prepare {
+                counts: counts.clone(),
+                refuse: false,
+                pause: true,
+                fail: false,
+            },
+        );
+        let control = RuntimeErrorState::default();
+        let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
+        let mut ctx = StepContext::new(&control, &mut turn);
+        assert!(matches!(
+            operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
+            InputResult::Accepted(Ok(_))
+        ));
+        operator.finish(&mut ctx).unwrap();
+        assert!(matches!(
+            operator.poll_control(&mut ctx).unwrap(),
+            ControlStep::Active
+        ));
+        assert_eq!(ends.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            operator.drive(&mut ctx).unwrap().next,
+            NextStep::Yield
+        ));
+        assert!(matches!(
+            operator.poll_control(&mut ctx).unwrap(),
+            ControlStep::Active
+        ));
+        assert_eq!(ends.load(Ordering::SeqCst), 0);
+        let last = operator.drive(&mut ctx).unwrap();
+        assert!(last.output.is_some());
+        assert_eq!(counts.accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.prepared.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.applied.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            operator.poll_control(&mut ctx).unwrap(),
+            ControlStep::Withdrawn
+        ));
+        assert!(matches!(
+            operator.poll_control(&mut ctx).unwrap(),
+            ControlStep::Active
+        ));
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        assert!(operator.drive(&mut ctx).unwrap().output.is_none());
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+    }
+
+    struct ProducingEnd(Arc<AtomicUsize>);
+    impl TransformKernel for ProducingEnd {
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            panic!("this finalizer has no input")
+        }
+        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(StepResult::new(Some(chunk()), NextStep::Finished, 2))
+        }
+    }
+    #[test]
+    fn conservative_eos_control_does_not_run_a_payload_producing_finalizer() {
+        let counts = Arc::new(Counts::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut operator = Transform::new(
+            ProducingEnd(calls.clone()),
+            Prepare {
+                counts,
+                refuse: false,
+                pause: false,
+                fail: false,
+            },
+        );
+        let control = RuntimeErrorState::default();
+        let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
+        let mut ctx = StepContext::new(&control, &mut turn);
+        operator.finish(&mut ctx).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                operator.poll_control(&mut ctx).unwrap(),
+                ControlStep::Active
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let tail = operator.drive(&mut ctx).unwrap();
+        assert_eq!(tail.output.unwrap().len(), 2);
+        assert!(matches!(tail.next, NextStep::Finished));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(operator.drive(&mut ctx).unwrap().output.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

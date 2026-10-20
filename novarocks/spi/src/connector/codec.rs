@@ -122,6 +122,7 @@ pub enum ConnectorCodecErrorKind {
     Capacity,
     VersionMismatch,
     CompileControl(CompileControlError),
+    Domain(novarocks_failure_contract::SharedFailureCause),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +152,16 @@ impl ConnectorCodecError {
             resource: None,
             contract: None,
         }
+    }
+
+    /// Add codec location while retaining the producer's exact failure facts.
+    pub fn from_domain<E>(path: ConnectorFieldPath, cause: E) -> Self
+    where
+        E: Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
+    {
+        let source = novarocks_failure_contract::SharedFailureCause::new(cause);
+        let detail = source.detail().to_owned();
+        Self::new(path, ConnectorCodecErrorKind::Domain(source), detail)
     }
 
     pub const fn path(&self) -> &ConnectorFieldPath {
@@ -198,6 +209,7 @@ impl Error for ConnectorCodecError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
             ConnectorCodecErrorKind::CompileControl(error) => Some(error),
+            ConnectorCodecErrorKind::Domain(source) => Some(source),
             _ => self
                 .contract
                 .as_ref()
@@ -224,10 +236,11 @@ impl novarocks_failure_contract::FailureProjection for ConnectorCodecError {
             ConnectorCodecErrorKind::DuplicateField => (163, FailureClass::Invariant),
             ConnectorCodecErrorKind::UnknownField => (164, FailureClass::Invariant),
             ConnectorCodecErrorKind::InconsistentFields => (165, FailureClass::Invariant),
-            ConnectorCodecErrorKind::Unsupported => (166, FailureClass::Dependency),
+            ConnectorCodecErrorKind::Unsupported => (166, FailureClass::Unsupported),
             ConnectorCodecErrorKind::Capacity => (167, FailureClass::Resource),
             ConnectorCodecErrorKind::VersionMismatch => (168, FailureClass::Invariant),
             ConnectorCodecErrorKind::CompileControl(error) => return error.failure_fact(),
+            ConnectorCodecErrorKind::Domain(source) => return source.failure_fact(),
         };
         let fact = FailureFact::new(
             class,
@@ -952,6 +965,59 @@ mod tests {
         assert!(!error.detail().contains("canary"));
         assert!(error.detail().contains("password=[REDACTED]"));
         assert!(error.detail().len() <= MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES);
+    }
+
+    #[test]
+    fn codec_domain_keeps_exact_resource_fact_source_and_bounded_path_context() {
+        use novarocks_failure_contract::{
+            FailureProjection, ResourceDimension, SharedFailureCause,
+        };
+        let original = capacity("bytes", ResourceDimension::Bytes, 2, 7, 8);
+        let fact = original.failure_fact();
+        let codec = ConnectorCodecError::from_domain(
+            ConnectorFieldPath::root("read_columns").index(17),
+            original.clone(),
+        );
+        assert!(matches!(codec.kind(), ConnectorCodecErrorKind::Domain(_)));
+        assert!(codec.compile_control_error().is_none());
+        assert_eq!(codec.path().to_string(), "read_columns[17]");
+        assert_eq!(codec.failure_fact(), fact);
+        let resource = fact.resource().unwrap();
+        assert_eq!(
+            (
+                resource.requested,
+                resource.required_growth,
+                resource.committed,
+                resource.limit,
+                resource.live
+            ),
+            (Some(2), Some(2), Some(7), Some(8), None)
+        );
+        let shared = codec
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            shared.downcast_ref::<ConnectorCodecError>(),
+            Some(&original)
+        );
+        let moved = codec.clone().with_path(ConnectorFieldPath::root("outer"));
+        assert_eq!(moved.failure_fact(), fact);
+        assert_eq!(
+            moved.source().unwrap().downcast_ref::<SharedFailureCause>(),
+            Some(shared)
+        );
+        let unsupported = ConnectorCodecError::new(
+            ConnectorFieldPath::root("capability"),
+            ConnectorCodecErrorKind::Unsupported,
+            "unavailable resource refused",
+        );
+        assert_eq!(
+            unsupported.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Unsupported
+        );
+        assert_eq!(unsupported.failure_fact().reason().code(), 166);
     }
 
     #[test]

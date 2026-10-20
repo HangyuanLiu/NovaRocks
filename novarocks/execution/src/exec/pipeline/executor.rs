@@ -597,7 +597,9 @@ mod tests {
     use novarocks_types::QueryId;
     use novarocks_types::SlotId;
 
-    use super::PreparedPipelineExecution;
+    use super::{
+        PreparedPipelineExecution, prepare_compiled_program_pipeline_execution_with_profiler,
+    };
     use crate::exec::pipeline::operator_factory::OperatorFactory;
 
     fn test_execution_runtime() -> Arc<ExecutionRuntime> {
@@ -1456,6 +1458,7 @@ mod tests {
                     "cancellation pipeline actual construction",
                 )),
                 Some(Arc::clone(&runtime)),
+                Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             ));
             let output = ResultSinkHandle::new();
             let graph = super::PipelineGraph {
@@ -1471,7 +1474,6 @@ mod tests {
                 graph,
                 Duration::from_millis(10),
                 Box::new(ResultSinkFactory::new(output.clone())),
-                Vec::new(),
                 None,
                 None,
                 1,

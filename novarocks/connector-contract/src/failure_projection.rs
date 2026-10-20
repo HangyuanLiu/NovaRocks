@@ -191,11 +191,11 @@ impl FailureProjection for crate::PureProviderCatalogError {
             ),
             E::ReadUnavailable(_) => fact(
                 ContractReason::ProviderReadUnavailable,
-                FailureClass::Dependency,
+                FailureClass::Unsupported,
             ),
             E::WriteUnavailable(_) => fact(
                 ContractReason::ProviderWriteUnavailable,
-                FailureClass::Dependency,
+                FailureClass::Unsupported,
             ),
         }
     }
@@ -227,6 +227,40 @@ impl<E: std::error::Error + FailureProjection> FailureProjection
 mod pure_provider_projection_tests {
     use super::*;
     use std::{convert::Infallible, error::Error};
+    #[test]
+    fn absent_provider_remains_dependency_while_declared_capability_refusals_keep_their_reasons() {
+        let provider = crate::ConnectorProviderId::parse("iceberg").unwrap();
+        for (source, class, code) in [
+            (
+                crate::PureProviderCatalogError::MissingProvider(provider.clone()),
+                FailureClass::Dependency,
+                146,
+            ),
+            (
+                crate::PureProviderCatalogError::ReadUnavailable(provider.clone()),
+                FailureClass::Unsupported,
+                147,
+            ),
+            (
+                crate::PureProviderCatalogError::WriteUnavailable(provider),
+                FailureClass::Unsupported,
+                148,
+            ),
+        ] {
+            let fact = source.failure_fact();
+            assert_eq!(fact.class(), class);
+            assert_eq!(fact.reason().code(), code);
+            let wrapper = crate::PureProviderProgramError::<Infallible>::Catalog(source);
+            assert_eq!(wrapper.failure_fact(), fact);
+            assert!(
+                wrapper
+                    .source()
+                    .unwrap()
+                    .is::<crate::PureProviderCatalogError>()
+            );
+        }
+    }
+
     #[test]
     fn installed_catalog_invariant_and_unavailable_provider_are_distinct_original_facts() {
         let provider = crate::ConnectorProviderId::parse("iceberg").unwrap();

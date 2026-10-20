@@ -54,11 +54,7 @@ impl ConnectorWriteRecipeCompiler for IcebergWriteRecipeCompiler {
     ) -> Result<ConnectorWriteRecipeDraft, Failure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
         let result = compile(draft, control, &mut work);
-        if matches!(&result, Err(Failure::Control(_))) {
-            return result;
-        }
-        work.finish()?;
-        result
+        work.finish_result(result, Failure::Control)
     }
 }
 

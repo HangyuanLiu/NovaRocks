@@ -289,6 +289,7 @@ fn timestamp_widening_boundaries_and_us_ns_error_ignore_allow_and_decimal_policy
                             panic!("us->ns must keep its original error")
                         };
                         assert_eq!(error.selected_ordinal(), row);
+                        assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
                         let raw = match row {
                             2 => lo - 1,
                             3 => hi + 1,

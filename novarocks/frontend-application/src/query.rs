@@ -4399,18 +4399,30 @@ mod tests {
             let error = crate::dml::error::DmlError::compile_control(cause.clone())
                 .with_publication_terminal(terminal.clone());
             let result = dml_result::<()>(Err(error));
-            let Err(RoutedExecutionError::Publication {
-                message,
+            let Err(RoutedExecutionError::Execution {
+                input,
                 terminal: actual,
                 compile_control,
             }) = result
             else {
-                panic!("both publication and original control must survive")
+                panic!("the originating input, publication and rich source must survive")
             };
-            assert_eq!(actual, terminal);
+            assert_eq!(input.fact(), expected);
+            assert_eq!(
+                input.site(),
+                novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator
+            );
+            assert_eq!(actual, Some(terminal.clone()));
             assert_eq!(compile_control, Some(cause.clone()));
-            let service = QueryServiceError::with_publication_terminal(message, actual)
-                .with_compile_control(compile_control);
+            let service = routed_execution_service_error(RoutedExecutionError::Execution {
+                input: input.clone(),
+                terminal: actual,
+                compile_control,
+            });
+            assert_eq!(service.execution_failure(), Some(&input));
+            assert_eq!(service.user_error(), Some(&input.user_error()));
+            assert_ne!(service.kind(), QueryServiceErrorKind::Interrupted);
+            assert_ne!(service.kind(), QueryServiceErrorKind::Timeout);
             assert_eq!(service.publication_terminal(), Some(&terminal));
             assert_eq!(service.compile_control_error(), Some(cause.clone()));
             assert_eq!(

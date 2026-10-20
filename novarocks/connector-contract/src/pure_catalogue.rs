@@ -277,11 +277,7 @@ impl<E: Error + 'static> PureProviderProgramCatalog<E> {
             work.step()?;
             Ok(recipe)
         })();
-        if matches!(&result, Err(PureProviderProgramError::Control(_))) {
-            return result;
-        }
-        work.finish()?;
-        result
+        work.finish_result(result, PureProviderProgramError::Control)
     }
 
     pub fn compile_write(
@@ -309,11 +305,7 @@ impl<E: Error + 'static> PureProviderProgramCatalog<E> {
             work.step()?;
             Ok(recipe)
         })();
-        if matches!(&result, Err(PureProviderProgramError::Control(_))) {
-            return result;
-        }
-        work.finish()?;
-        result
+        work.finish_result(result, PureProviderProgramError::Control)
     }
 }
 

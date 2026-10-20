@@ -403,7 +403,7 @@ mod capability_projection_tests {
             CompileControlError::ResourceExhausted,
         ] {
             assert!(matches!(
-                PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause)),
+                PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause.clone())),
                 PackageSemanticsError::Control(actual) if actual == cause
             ));
         }

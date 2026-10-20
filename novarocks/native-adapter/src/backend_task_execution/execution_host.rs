@@ -2536,6 +2536,7 @@ pub(crate) mod tests {
         TaskCompletionSupervisor, TaskOperatorStatisticsSink, TaskQueryContextFacts,
         internal_failure, report_terminal,
     };
+    use crate::backend_task_execution::CompiledPackageError;
     use crate::task_query_context_options::query_options_fingerprint;
 
     use std::collections::BTreeSet;
@@ -2846,13 +2847,7 @@ pub(crate) mod tests {
         let original = ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::Internal(
             novarocks_functions::KernelDiagnostic::new("ResourceExhausted: cancelled"),
         ));
-        for category in [
-            TaskFailureCategory::Internal,
-            TaskFailureCategory::Protocol,
-            TaskFailureCategory::ResourceExhausted,
-        ] {
-            assert_eq!(failure_category(&original), TaskFailureCategory::Internal);
-        }
+        assert_eq!(failure_category(&original), TaskFailureCategory::Internal);
     }
 
     fn unexpected_fixture_failure(
@@ -2976,6 +2971,121 @@ pub(crate) mod tests {
             preparation.scope(),
         )
         .map(|installed| installed.facts())
+    }
+
+    /// One real compiled VALUES row and the supported Result sink. Its original
+    /// result buffer is independent of another task's bounded Root CPU pool.
+    fn compiled_result_body(dop: u32) -> Body {
+        let mut body =
+            Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]);
+        body.set_dop(dop);
+        body.mutate_package(|package| {
+            package
+                .fragment
+                .as_mut()
+                .unwrap()
+                .sink
+                .as_mut()
+                .unwrap()
+                .kind = Some(
+                novarocks_proto_models::physical_package_v2::fragment_sink::Kind::Result(
+                    Default::default(),
+                ),
+            );
+            assert!(
+                package.result.is_some(),
+                "the supported Result sink retains its exact port"
+            );
+        });
+        body
+    }
+
+    fn install_compiled_result(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+        owner: Arc<TaskStatusOwner>,
+    ) -> Result<PreparedTaskFacts, HostRejection> {
+        establish_fixture_context(host, descriptor.identity());
+        let preparation =
+            novarocks_worker::TestPreparationControl::from_status(owner, Duration::from_millis(1));
+        let body = compiled_result_body(u32::try_from(descriptor.pipeline_dop().get()).unwrap());
+        let installation =
+            host.install_receiver(descriptor, body.input(descriptor), preparation.scope())?;
+        let (facts, root) = installation.into_parts();
+        assert_eq!(facts.sink_kind(), FragmentSinkKind::Result);
+        assert!(
+            root.is_none(),
+            "the supported Result sink owns no bounded Root producer"
+        );
+        Ok(facts)
+    }
+
+    /// The real Result reader consumes and ACKs its original data/EOS. This
+    /// repeats the production EndAcknowledged -> output-drained publication;
+    /// the caller still waits for the independent physical runtime convergence.
+    fn await_compiled_result_terminal(owner: &TaskStatusOwner) -> TaskState {
+        use novarocks_execution_contract::ResultByteLimit;
+        use novarocks_worker::result_buffer::{TryFetchTypedResult, wait_fetch_task_typed};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut acknowledged = None;
+        let mut data_packets = 0;
+        let mut saw_eos = false;
+        let mut drained = false;
+        // Keep await_terminal's original 600 x 10ms limit. No output state is
+        // manufactured while the actual Result buffer is pending.
+        for _ in 0..600 {
+            if !drained {
+                match runtime.block_on(wait_fetch_task_typed(
+                    owner.identity(),
+                    acknowledged,
+                    Duration::ZERO,
+                    ResultByteLimit::new(64 * 1024).unwrap(),
+                )) {
+                    TryFetchTypedResult::Ready(packet) => {
+                        if packet.eos {
+                            assert_eq!(data_packets, 1, "the actual VALUES row must be delivered");
+                            assert!(packet.payload.is_empty());
+                            saw_eos = true;
+                        } else {
+                            assert!(!saw_eos);
+                            assert!(
+                                !packet.payload.is_empty(),
+                                "the producer emitted real typed IPC"
+                            );
+                            data_packets += 1;
+                        }
+                        acknowledged = Some(packet.packet_seq);
+                    }
+                    TryFetchTypedResult::EndAcknowledged => {
+                        assert!(saw_eos, "only the original EOS receipt authorizes drain");
+                        let advance = owner.note_root_result_drained();
+                        assert!(!matches!(
+                            advance,
+                            StatusAdvance::Illegal { .. }
+                                | StatusAdvance::Rejected(_)
+                                | StatusAdvance::VersionExhausted
+                        ));
+                        drained = true;
+                    }
+                    TryFetchTypedResult::NotReady => {}
+                    TryFetchTypedResult::Error(error) => {
+                        panic!("actual Result read failed: {error:?}")
+                    }
+                }
+            }
+            if owner.is_terminal() {
+                assert!(
+                    drained,
+                    "a successful fixture consumes its real result before return"
+                );
+                return owner.state();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("task did not reach a terminal state: {:?}", owner.state());
     }
 
     /// A direct-host test's real Context pin for a bounded CountOnly root.
@@ -4224,10 +4334,10 @@ pub(crate) mod tests {
             .expect_err("a static sink branch must agree with its assigned edge");
         assert_protocol_refusal(
             &rejection,
-            TaskFailureCategory::Execution,
+            TaskFailureCategory::Protocol,
             6,
             novarocks_proto_codec::error::ProtocolErrorKind::InconsistentFields,
-            FieldPath::root("plan_fragment").field("sink"),
+            FieldPath::root("fragment_package").field("sink"),
             "static sink branch partitioning disagrees with its assigned edge",
         );
         assert_nothing_prepared(&host, &facts);
@@ -7087,16 +7197,14 @@ pub(crate) mod tests {
             failure.phase(),
             novarocks_execution_contract::TaskFailurePhase::Preparation
         );
-        assert_eq!(failure.detail(), refused.detail().unwrap());
-        assert_eq!(
-            failure.fact().class(),
-            novarocks_execution_contract::failure::FailureClass::Data
+        // The operation receipt adds the exact Task context, while the Task
+        // tombstone keeps the original compiler-authored safe cause projection.
+        assert_eq!(failure.detail().as_str(), "Invariant failure (reason 19:2)");
+        use novarocks_execution_contract::failure::FailureProjection;
+        let author = novarocks_local_compiler::FragmentCompileError::Invalid(
+            "DOP is outside physical domain",
         );
-        assert_eq!(
-            failure.fact().reason().domain(),
-            novarocks_execution_contract::failure::domain::PROTOCOL.get()
-        );
-        assert_eq!(failure.fact().reason().code(), 6);
+        assert_eq!(failure.fact(), author.failure_fact());
 
         let replay = fixture.create(&descriptor, &Body::values(2));
         assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
@@ -7380,11 +7488,12 @@ pub(crate) mod tests {
         let sibling_descriptor = consistent_descriptor(sibling, UniqueId::new(91_231, 2));
         let (sibling_status, sibling_reporter) =
             planned_reporter_with_native_health(&host, sibling);
-        install(&host, &sibling_descriptor, sibling_status.clone()).unwrap();
+        install_compiled_result(&host, &sibling_descriptor, sibling_status.clone()).unwrap();
         sibling_status.note_installed();
         let sibling_runnable = submit_committed(&host, &sibling_descriptor, sibling_reporter);
-        let sibling_terminal = await_terminal(&sibling_status);
+        let sibling_terminal = await_compiled_result_terminal(&sibling_status);
         await_runtime_convergence(&sibling_status);
+        novarocks_worker::result_buffer::discard_task(sibling);
         host.remove_receiver(&sibling_descriptor);
         let before = (
             preparation.rollback_exited(),
@@ -7578,11 +7687,17 @@ pub(crate) mod tests {
         );
         host.install_receiver(
             &descriptor,
-            Body::values(1).input(&descriptor),
+            compiled_result_body(1).input(&descriptor),
             preparation.scope(),
         )
         .unwrap();
-        let kernel = host.task_runtime(task).unwrap().preparation.clone();
+        let runtime = host.task_runtime(task).unwrap();
+        assert!(
+            runtime.root_channel.is_none(),
+            "the foreign Root owns the only Root slot"
+        );
+        let kernel = runtime.preparation.clone();
+        drop(runtime);
         let data = Arc::new(vec![73_u8; 8192]);
         let weak = Arc::downgrade(&data);
         let primary_drops = Arc::new(AtomicUsize::new(0));
@@ -7706,13 +7821,17 @@ pub(crate) mod tests {
         );
         let sibling_descriptor = consistent_descriptor(sibling, UniqueId::new(91_209, 2));
         let (sibling_owner, sibling_reporter) = planned_reporter_for(sibling);
-        install(&host, &sibling_descriptor, sibling_owner.clone()).unwrap();
+        install_compiled_result(&host, &sibling_descriptor, sibling_owner.clone()).unwrap();
         host.install_inbound_capability(&sibling_descriptor)
             .unwrap();
         sibling_owner.note_installed();
         let sibling_runnable = submit_committed(&host, &sibling_descriptor, sibling_reporter);
-        assert_eq!(await_terminal(&sibling_owner), TaskState::Finished);
+        assert_eq!(
+            await_compiled_result_terminal(&sibling_owner),
+            TaskState::Finished
+        );
         await_runtime_convergence(&sibling_owner);
+        novarocks_worker::result_buffer::discard_task(sibling);
         let root_stopped_while_cleanup_queued = owner.convergence().actual_stopped();
         pause.open();
         assert_eq!(await_terminal(&owner), TaskState::Canceled);
@@ -7743,7 +7862,8 @@ pub(crate) mod tests {
             },
         )
         .unwrap()
-        .bind_native_slots(&[10])
+        // The compiled fixture's one output is local slot zero.
+        .bind_native_slots(&[0])
         .unwrap();
         let receipt = fixture.create(
             &descriptor,
@@ -8480,9 +8600,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             author.path(),
-            &novarocks_proto_codec::error::FieldPath::root("plan_fragment")
-                .field("sink")
-                .field("root_result")
+            &novarocks_proto_codec::error::FieldPath::root("fragment.sink.root_result")
         );
         let expected = FailureFact::new(
             FailureClass::Data,

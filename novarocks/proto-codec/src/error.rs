@@ -88,6 +88,7 @@ pub enum ProtocolErrorKind {
     Capacity,
     VersionMismatch,
     CompileControl(novarocks_type_contract::CompileControlError),
+    Domain(novarocks_execution_contract::failure::SharedFailureCause),
 }
 
 impl fmt::Display for ProtocolErrorKind {
@@ -104,6 +105,7 @@ impl fmt::Display for ProtocolErrorKind {
             Self::Capacity => f.write_str("capacity"),
             Self::VersionMismatch => f.write_str("version mismatch"),
             Self::CompileControl(error) => fmt::Display::fmt(error, f),
+            Self::Domain(_) => f.write_str("domain failure"),
         }
     }
 }
@@ -122,6 +124,16 @@ impl ProtocolError {
             kind,
             detail: detail.into(),
         }
+    }
+
+    /// Attach protocol context without reclassifying a domain-owned refusal.
+    pub fn from_domain<E>(path: FieldPath, cause: E) -> Self
+    where
+        E: Error + novarocks_execution_contract::failure::FailureProjection + Send + Sync + 'static,
+    {
+        let source = novarocks_execution_contract::failure::SharedFailureCause::new(cause);
+        let detail = source.detail().to_owned();
+        Self::new(path, ProtocolErrorKind::Domain(source), detail)
     }
 
     pub fn path(&self) -> &FieldPath {
@@ -151,6 +163,7 @@ impl Error for ProtocolError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
             ProtocolErrorKind::CompileControl(error) => Some(error),
+            ProtocolErrorKind::Domain(source) => Some(source),
             _ => None,
         }
     }
@@ -285,6 +298,7 @@ impl novarocks_execution_contract::failure::FailureProjection for ProtocolError 
         use novarocks_execution_contract::failure::*;
         let (class, code) = match self.kind() {
             ProtocolErrorKind::CompileControl(cause) => return cause.failure_fact(),
+            ProtocolErrorKind::Domain(source) => return source.failure_fact(),
             ProtocolErrorKind::MissingField => (FailureClass::Data, 1),
             ProtocolErrorKind::InvalidEnum => (FailureClass::Data, 2),
             ProtocolErrorKind::InvalidValue => (FailureClass::Data, 3),
@@ -306,6 +320,30 @@ impl novarocks_execution_contract::failure::FailureProjection for ProtocolError 
 mod failure_projection_tests {
     use super::*;
     use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+    #[test]
+    fn protocol_domain_preserves_the_original_fact_and_source_without_control_intent() {
+        use novarocks_execution_contract::failure::SharedFailureCause;
+        let original = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+            "private source detail",
+        );
+        let fact = original.failure_fact();
+        let error =
+            ProtocolError::from_domain(FieldPath::root("provider_payload"), original.clone());
+        assert_eq!(error.failure_fact(), fact);
+        assert!(matches!(error.kind(), ProtocolErrorKind::Domain(_)));
+        assert_eq!(error.kind().to_string(), "domain failure");
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            source.downcast_ref::<novarocks_spi::connector::ConnectorError>(),
+            Some(&original)
+        );
+    }
+
     #[test]
     fn protocol_fact_preserves_control_and_ignores_misleading_detail() {
         let cause = novarocks_type_contract::CompileControlError::DeadlineExceeded;

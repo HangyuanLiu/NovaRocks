@@ -42,12 +42,12 @@ use std::{
 };
 
 const BACKENDS: usize = 3;
-// The non-foldable finite relation forces real Native execution. The hint is
+// The finite UNION ALL uses real compiled Native preparation. The hint is
 // statement-scoped; neither subsequent query inherits its one-byte hard limit.
-const RESOURCE_SQL: &str = "SELECT /*+ SET_VAR(query_mem_limit=1) */ CAST(v AS VARCHAR) AS payload FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
+const RESOURCE_SQL: &str = "SELECT /*+ SET_VAR(query_mem_limit=1) */ CAST(v AS VARCHAR) AS payload FROM (SELECT 17 AS v UNION ALL SELECT 19) t ORDER BY v";
 pub(super) const NEXT_SQL: &str =
     "SELECT CAST(v AS VARCHAR) AS payload FROM (SELECT 17 AS v UNION ALL SELECT 19) t ORDER BY v";
-pub(super) const INDEPENDENT_SQL: &str = "SELECT CAST(v AS VARCHAR) AS payload FROM (SELECT sleep(0) AS v UNION ALL SELECT sleep(0)) t ORDER BY v";
+pub(super) const INDEPENDENT_SQL: &str = "SELECT CAST(v AS VARCHAR) AS payload FROM (SELECT TRUE AS v UNION ALL SELECT TRUE) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(ResourceRecoveryPolicy::default())]

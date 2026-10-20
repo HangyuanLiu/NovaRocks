@@ -19,7 +19,7 @@
 #![cfg(unix)]
 
 use super::native_creation::{
-    RawBackendSession, RawCreate, ensure_accepted, observe_task_terminal_and_stopped,
+    RawBackendSession, RawCreate, RawSink, ensure_accepted, observe_task_terminal_and_stopped,
     quiesce_session, raw_create_identity,
 };
 use super::native_direct_controls::{DirectIntentOwner, close_hold, read_marker, release_hold};
@@ -37,7 +37,7 @@ use novarocks_execution_contract::{
     },
 };
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_models::{novarocks as proto, plan};
+use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::operation::{CoveredStatusStreamFact, decode_covered_status_event};
 use prost::Message;
 use serde_json::{Value, json};
@@ -53,8 +53,7 @@ use std::{
 const ACTION: &str = "prepared-failure-exit-hold";
 // Local Display is diagnostic; the native boundary carries the neutral summary.
 const SAFE_DETAIL: &str = "Unexpected failure (reason 13:20)";
-const HEALTHY_SQL: &str =
-    "SELECT v FROM (SELECT sleep(0) AS v UNION ALL SELECT sleep(0)) t ORDER BY v";
+const HEALTHY_SQL: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 1) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(AcceptedPreparedFailureDelayedExit::default())]
@@ -128,14 +127,7 @@ impl Scenario for AcceptedPreparedFailureDelayedExit {
             let sibling = &sessions[1].0;
             let mut failed = RawCreate::values(session, 1);
             failed.pipeline_dop = 1;
-            failed.sink = plan::data_sink::Kind::RootResult(
-                novarocks_proto_codec::root_result::encode_root_contract(
-                    &novarocks_result_contract::RootOutputContract::new(
-                        novarocks_result_contract::RootProfileId::V1,
-                        novarocks_result_contract::FrozenRootOutput::CountOnly,
-                    ),
-                ),
-            );
+            failed.sink = RawSink::CountOnly;
             exercise(context, session, sibling, &failed, &mut gate, &baseline)
         })();
         drop(gate);

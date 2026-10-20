@@ -414,12 +414,7 @@ impl ConnectorWriteRecipe {
             }
             Ok(Self(canonical))
         })();
-        if matches!(&result, Err(ConnectorWriteRecipeCompileError::Control(_))) {
-            return result;
-        }
-        work.finish()
-            .map_err(ConnectorWriteRecipeCompileError::Control)?;
-        result
+        work.finish_result(result, ConnectorWriteRecipeCompileError::Control)
     }
     pub const fn draft(&self) -> &ConnectorWriteRecipeDraft {
         &self.0
@@ -699,12 +694,11 @@ mod tests {
     }
 
     #[test]
-    fn writer_seal_observes_ordinary_error_tail_and_never_rechecks_primary_control() {
+    fn writer_seal_preserves_original_error_control_prefix_and_success_tail() {
         use std::sync::Mutex;
         struct Trace {
             units: Mutex<Vec<u32>>,
-            cause: CompileControlError,
-            refuse_tail: bool,
+            refusal: Option<(usize, CompileControlError)>,
         }
         impl PureCompileControl for Trace {
             fn checkpoint(
@@ -715,10 +709,9 @@ mod tests {
                 assert_eq!(phase, CompilePhase::ProviderValidation);
                 let mut trace = self.units.lock().unwrap();
                 trace.push(units);
-                if self.refuse_tail && trace.len() == 3 {
-                    Err(self.cause.clone())
-                } else {
-                    Ok(())
+                match &self.refusal {
+                    Some((at, cause)) if *at == trace.len() => Err(cause.clone()),
+                    _ => Ok(()),
                 }
             }
         }
@@ -731,8 +724,8 @@ mod tests {
                 _: &dyn PureCompileControl,
             ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<Self::Error>>
             {
-                match self.0.clone() {
-                    Some(cause) => Err(PureProviderCompileError::Control(cause)),
+                match &self.0 {
+                    Some(cause) => Err(PureProviderCompileError::Control(cause.clone())),
                     None => Err(PureProviderCompileError::Provider(invalid(
                         "private refusal",
                     ))),
@@ -742,20 +735,52 @@ mod tests {
         let original = draft(ConnectorWriteInputShape::Data {
             fields: vec![field(1)],
         });
+        let success = Trace {
+            units: Mutex::default(),
+            refusal: None,
+        };
+        ConnectorWriteRecipe::try_compile_with_provider(&original, &Compiler(0), &success).unwrap();
+        let successful_trace = success.units.lock().unwrap().clone();
+        assert!(*successful_trace.last().unwrap() > 0);
         for cause in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Trace {
+            let late = Trace {
                 units: Mutex::default(),
-                cause: cause.clone(),
-                refuse_tail: true,
+                refusal: Some((3, cause.clone())),
+            };
+            let error =
+                ConnectorWriteRecipe::try_compile_with_provider(&original, &Refusal(None), &late)
+                    .unwrap_err();
+            let ConnectorWriteRecipeCompileError::Provider(source) = &error else {
+                panic!("late callback replaced provider refusal");
+            };
+            assert_eq!(source, &invalid("private refusal"));
+            assert_eq!(
+                error.source().unwrap().downcast_ref::<ConnectorError>(),
+                Some(source)
+            );
+            assert_eq!(*late.units.lock().unwrap(), [0, 0]);
+            for at in 1..=2 {
+                let early = Trace {
+                    units: Mutex::default(),
+                    refusal: Some((at, cause.clone())),
+                };
+                assert!(
+                    matches!(ConnectorWriteRecipe::try_compile_with_provider(&original, &Refusal(None), &early), Err(ConnectorWriteRecipeCompileError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*early.units.lock().unwrap(), vec![0; at]);
+            }
+            let primary = Trace {
+                units: Mutex::default(),
+                refusal: Some((3, cause.clone())),
             };
             let error = ConnectorWriteRecipe::try_compile_with_provider(
                 &original,
-                &Refusal(None),
-                &control,
+                &Refusal(Some(cause.clone())),
+                &primary,
             )
             .unwrap_err();
             assert!(
@@ -768,46 +793,16 @@ mod tests {
                     .downcast_ref::<CompileControlError>(),
                 Some(&cause)
             );
-            assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0, 0]);
-
-            let control = Trace {
+            assert_eq!(*primary.units.lock().unwrap(), [0, 0]);
+            let tail = Trace {
                 units: Mutex::default(),
-                cause: cause.clone(),
-                refuse_tail: true,
+                refusal: Some((successful_trace.len(), cause.clone())),
             };
-            let error = ConnectorWriteRecipe::try_compile_with_provider(
-                &original,
-                &Refusal(Some(cause.clone())),
-                &control,
-            )
-            .unwrap_err();
             assert!(
-                matches!(&error, ConnectorWriteRecipeCompileError::Control(actual) if actual == &cause)
+                matches!(ConnectorWriteRecipe::try_compile_with_provider(&original, &Compiler(0), &tail), Err(ConnectorWriteRecipeCompileError::Control(actual)) if actual == cause)
             );
-            assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0]);
+            assert_eq!(*tail.units.lock().unwrap(), successful_trace);
         }
-        let control = Trace {
-            units: Mutex::default(),
-            cause: CompileControlError::Cancelled,
-            refuse_tail: false,
-        };
-        let error =
-            ConnectorWriteRecipe::try_compile_with_provider(&original, &Refusal(None), &control)
-                .unwrap_err();
-        assert!(matches!(
-            error,
-            ConnectorWriteRecipeCompileError::Provider(_)
-        ));
-        assert_eq!(
-            error
-                .source()
-                .unwrap()
-                .downcast_ref::<ConnectorError>()
-                .unwrap()
-                .message(),
-            "private refusal"
-        );
-        assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0, 0]);
     }
 }
 

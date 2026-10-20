@@ -373,7 +373,11 @@ impl DecimalArithmetic {
                     "Expr evaluate meet error: The 'mod' operation involving decimal values overflows"
                 }
             };
-            ArithmeticRowResult::RowError(RowDataError::new(ordinal, message))
+            ArithmeticRowResult::RowError(RowDataError::with_reason(
+                ordinal,
+                crate::DataFailureReason::NumericOutOfRange,
+                message,
+            ))
         } else {
             ArithmeticRowResult::Null
         }

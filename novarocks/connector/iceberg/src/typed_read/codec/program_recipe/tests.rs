@@ -23,13 +23,13 @@ use std::{
 
 use arrow::datatypes::{DataType, FieldRef, Schema as ArrowSchema};
 use novarocks_connector_contract::{
-    CatalogHandle, CatalogVersion, ConnectorEnvelopeHeader, ConnectorExpression,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding,
-    ConnectorReadDistribution, ConnectorReadInputVersion, ConnectorReadMetadataKind,
-    ConnectorReadProgramCompileError, ConnectorReadProgramRecipe, ConnectorReadProperties,
-    ConnectorReadPublicFacts, ConnectorReadRelationKind, ConnectorReadRelationPayload,
-    ConnectorReadStaticFacts, ConnectorValue, ConnectorValueType, FrozenConnectorScan,
-    ScanColumnId, StaticScanAssignment, StaticScanDynamicFilter, TupleDomain,
+    CatalogHandle, CatalogVersion, ConnectorEnvelopeHeader, ConnectorErrorKind,
+    ConnectorExpression, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+    ConnectorReadBinding, ConnectorReadDistribution, ConnectorReadInputVersion,
+    ConnectorReadMetadataKind, ConnectorReadProgramCompileError, ConnectorReadProgramRecipe,
+    ConnectorReadProperties, ConnectorReadPublicFacts, ConnectorReadRelationKind,
+    ConnectorReadRelationPayload, ConnectorReadStaticFacts, ConnectorValue, ConnectorValueType,
+    FrozenConnectorScan, ScanColumnId, StaticScanAssignment, StaticScanDynamicFilter, TupleDomain,
     connector_type_for_value_type,
 };
 use novarocks_spi::connector::read_stack::{ConnectorTableHandle as _, SchemaTableName};
@@ -647,10 +647,31 @@ fn codec_legal_table_function_and_merge_remain_unsupported_as_complete_static_re
             work_source: ConnectorReadWorkSource::RuntimeSplits,
         };
         assert!(!bytes.is_empty());
-        assert!(
-            matches!(iceberg_final_static_facts(&fixture.relation), Err(ref error) if error.kind() == ConnectorErrorKind::Unsupported)
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        let original = iceberg_final_static_facts(&fixture.relation).unwrap_err();
+        assert_eq!(original.kind(), ConnectorErrorKind::Unsupported);
+        let Err(ConnectorReadProgramCompileError::Provider(actual)) =
+            ConnectorReadProgramRecipe::try_compile_with_provider(
+                &fixture.build(),
+                &IcebergReadRecipeCompiler,
+                &Control::accept(),
+            )
+        else {
+            panic!("the actual source capability author must refuse");
+        };
+        assert!(matches!(actual.kind(), ConnectorCodecErrorKind::Domain(_)));
+        assert_eq!(actual.path().to_string(), "iceberg_read.source");
+        assert_eq!(actual.failure_fact(), original.failure_fact());
+        assert_eq!(actual.failure_fact().class(), FailureClass::Unsupported);
+        assert_eq!(actual.failure_fact().reason().code(), 4);
+        let source = std::error::Error::source(&actual)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            source.downcast_ref::<novarocks_spi::connector::ConnectorError>(),
+            Some(&original)
         );
-        assert_provider(&fixture.build(), ConnectorCodecErrorKind::Unsupported);
     }
 }
 
@@ -1039,34 +1060,60 @@ fn complete_read_actual_wide_source_or_wire_work_refuses_first_256_without_reche
 }
 
 #[test]
-fn complete_read_success_publication_tail_and_ordinary_error_tail_preserve_three_causes() {
+fn complete_read_success_tail_and_ordinary_error_prefix_preserve_three_causes() {
+    use novarocks_failure_contract::FailureProjection;
     let success = Fixture::table().build();
     let mut wrong = Fixture::table();
     wrong.fields[1] = Arc::new(wrong.fields[1].as_ref().clone().with_nullable(true));
     let failure = wrong.build();
     for frozen in [&success, &failure] {
+        let succeeded = std::ptr::eq(frozen, &success);
         let reference = Control::accept();
         let result = ConnectorReadProgramRecipe::try_compile_with_provider(
             frozen,
             &IcebergReadRecipeCompiler,
             &reference,
         );
-        if std::ptr::eq(frozen, &success) {
-            assert!(result.is_ok());
+        let expected = if succeeded {
+            result.unwrap();
+            None
         } else {
-            assert!(matches!(
-                result,
-                Err(ConnectorReadProgramCompileError::Provider(_))
-            ));
-        }
+            let Err(ConnectorReadProgramCompileError::Provider(original)) = result else {
+                panic!("wrong original field must reject as provider error");
+            };
+            Some(original)
+        };
         let calls = reference.calls.lock().unwrap().clone();
         assert!(calls.len() > 2);
-        for error in causes() {
+        for cause in causes() {
+            for at in 1..=calls.len() {
+                let control = Control {
+                    failure: Some((at, cause.clone())),
+                    ..Control::accept()
+                };
+                assert_control(frozen, &control, cause.clone());
+                assert_eq!(*control.calls.lock().unwrap(), calls[..at]);
+            }
             let control = Control {
-                failure: Some((calls.len(), error.clone())),
+                failure: Some((calls.len() + 1, cause)),
                 ..Control::accept()
             };
-            assert_control(frozen, &control, error);
+            let result = ConnectorReadProgramRecipe::try_compile_with_provider(
+                frozen,
+                &IcebergReadRecipeCompiler,
+                &control,
+            );
+            if let Some(original) = &expected {
+                let Err(ConnectorReadProgramCompileError::Provider(actual)) = result else {
+                    panic!("late control replaced the original provider error");
+                };
+                assert_eq!(actual.kind(), original.kind());
+                assert_eq!(actual.path(), original.path());
+                assert_eq!(actual.failure_fact(), original.failure_fact());
+                assert_eq!(actual.detail(), original.detail());
+            } else {
+                result.unwrap();
+            }
             assert_eq!(*control.calls.lock().unwrap(), calls);
         }
     }

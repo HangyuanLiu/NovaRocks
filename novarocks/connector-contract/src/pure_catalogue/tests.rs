@@ -626,64 +626,106 @@ fn original_control_failures_remain_typed_at_registration_entry_and_private_quan
 }
 
 #[test]
-fn ordinary_provider_and_catalog_errors_observe_tail_without_erasing_control() {
+fn ordinary_read_provider_and_catalog_errors_keep_the_original_error_and_control_prefix() {
     let port = Port::new(
         "alpha",
         Behavior::Provider(ConnectorErrorKind::InvalidRequest),
     );
     let catalog = catalogue(&port, true, true);
-    for write_call in [false, true] {
-        let baseline = Control::default();
-        let result = if write_call {
-            catalog
-                .compile_write(&write("alpha"), &baseline)
-                .map(|_| ())
-        } else {
-            catalog
-                .compile_read(&frozen_read("alpha", 1), &baseline)
-                .map(|_| ())
-        };
-        assert!(
-            matches!(result, Err(PureProviderProgramError::Provider(error)) if error.message() == "private refusal")
-        );
-        let trace = baseline.trace.lock().unwrap().clone();
-        assert_eq!(
-            trace.last(),
-            Some(&0),
-            "the catalogue must flush even an ordinary provider refusal"
-        );
-        for cause in errors() {
+    let frozen = frozen_read("alpha", 1);
+    let baseline = Control::default();
+    let Err(PureProviderProgramError::Provider(original)) =
+        catalog.compile_read(&frozen, &baseline)
+    else {
+        panic!("original read provider error required");
+    };
+    assert_eq!(original.message(), "private refusal");
+    let trace = baseline.trace.lock().unwrap().clone();
+    for cause in errors() {
+        for at in 1..=trace.len() {
             let owner = Control {
                 trace: Mutex::default(),
-                refusal: Some((cause.clone(), Stop::Call(trace.len()))),
-            };
-            let result = if write_call {
-                catalog.compile_write(&write("alpha"), &owner).map(|_| ())
-            } else {
-                catalog
-                    .compile_read(&frozen_read("alpha", 1), &owner)
-                    .map(|_| ())
+                refusal: Some((cause.clone(), Stop::Call(at))),
             };
             assert!(
-                matches!(result, Err(PureProviderProgramError::Control(error)) if error == cause)
+                matches!(catalog.compile_read(&frozen, &owner), Err(PureProviderProgramError::Control(actual)) if actual == cause)
             );
+            assert_eq!(*owner.trace.lock().unwrap(), trace[..at]);
         }
-    }
-    let baseline = Control::default();
-    assert!(
-        catalog
-            .compile_read(&frozen_read("missing", 1), &baseline)
-            .is_err()
-    );
-    let count = baseline.trace.lock().unwrap().len();
-    for cause in errors() {
         let owner = Control {
             trace: Mutex::default(),
-            refusal: Some((cause.clone(), Stop::Call(count))),
+            refusal: Some((cause, Stop::Call(trace.len() + 1))),
+        };
+        let Err(PureProviderProgramError::Provider(actual)) = catalog.compile_read(&frozen, &owner)
+        else {
+            panic!("a later callback replaced the original provider error");
+        };
+        assert_eq!(actual, original);
+        assert_eq!(*owner.trace.lock().unwrap(), trace);
+    }
+    let missing = frozen_read("missing", 1);
+    let baseline = Control::default();
+    assert!(
+        matches!(catalog.compile_read(&missing, &baseline), Err(PureProviderProgramError::Catalog(PureProviderCatalogError::MissingProvider(actual))) if actual == id("missing"))
+    );
+    let trace = baseline.trace.lock().unwrap().clone();
+    assert_eq!(trace, [0]);
+    for cause in errors() {
+        let early = Control {
+            trace: Mutex::default(),
+            refusal: Some((cause.clone(), Stop::Call(1))),
         };
         assert!(
-            matches!(catalog.compile_read(&frozen_read("missing", 1), &owner), Err(PureProviderProgramError::Control(error)) if error == cause)
+            matches!(catalog.compile_read(&missing, &early), Err(PureProviderProgramError::Control(actual)) if actual == cause)
         );
+        let late = Control {
+            trace: Mutex::default(),
+            refusal: Some((cause, Stop::Call(2))),
+        };
+        assert!(
+            matches!(catalog.compile_read(&missing, &late), Err(PureProviderProgramError::Catalog(PureProviderCatalogError::MissingProvider(actual))) if actual == id("missing"))
+        );
+        assert_eq!(*late.trace.lock().unwrap(), trace);
+    }
+}
+
+#[test]
+fn ordinary_writer_provider_error_keeps_original_cause_and_actual_control_prefix() {
+    let port = Port::new(
+        "alpha",
+        Behavior::Provider(ConnectorErrorKind::InvalidRequest),
+    );
+    let catalog = catalogue(&port, true, true);
+    let draft = write("alpha");
+    let baseline = Control::default();
+    let Err(PureProviderProgramError::Provider(original)) =
+        catalog.compile_write(&draft, &baseline)
+    else {
+        panic!("original provider error required");
+    };
+    assert_eq!(original.message(), "private refusal");
+    let trace = baseline.trace.lock().unwrap().clone();
+    for cause in errors() {
+        for at in 1..=trace.len() {
+            let early = Control {
+                trace: Mutex::default(),
+                refusal: Some((cause.clone(), Stop::Call(at))),
+            };
+            assert!(
+                matches!(catalog.compile_write(&draft, &early), Err(PureProviderProgramError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*early.trace.lock().unwrap(), trace[..at]);
+        }
+        let late = Control {
+            trace: Mutex::default(),
+            refusal: Some((cause, Stop::Call(trace.len() + 1))),
+        };
+        let Err(PureProviderProgramError::Provider(actual)) = catalog.compile_write(&draft, &late)
+        else {
+            panic!("late callback replaced original provider error");
+        };
+        assert_eq!(actual, original);
+        assert_eq!(*late.trace.lock().unwrap(), trace);
     }
 }
 

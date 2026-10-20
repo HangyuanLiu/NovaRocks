@@ -183,12 +183,13 @@ fn connector_error(path: FieldPath, error: ConnectorCodecError) -> ProtocolError
         }
         ConnectorCodecErrorKind::DuplicateField => ProtocolErrorKind::DuplicateField,
         ConnectorCodecErrorKind::InconsistentFields => ProtocolErrorKind::InconsistentFields,
-        ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
-        ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
         ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
         ConnectorCodecErrorKind::CompileControl(cause) => {
             ProtocolErrorKind::CompileControl(cause.clone())
         }
+        ConnectorCodecErrorKind::Domain(_)
+        | ConnectorCodecErrorKind::Capacity
+        | ConnectorCodecErrorKind::Unsupported => return ProtocolError::from_domain(path, error),
     };
     ProtocolError::new(path, kind, error.to_string())
 }
@@ -408,6 +409,89 @@ mod compile_control_adapter_tests {
     }
 
     #[test]
+    fn connector_error_domain_keeps_whole_source_and_both_field_paths() {
+        use novarocks_execution_contract::failure::{FailureProjection, SharedFailureCause};
+        let raw = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+            "provider detail",
+        );
+        let codec =
+            ConnectorCodecError::from_domain(ConnectorFieldPath::root("columns").index(17), raw);
+        let fact = codec.failure_fact();
+        let error = connector_error(FieldPath::root("outer"), codec.clone());
+        assert_eq!(error.path().to_string(), "outer");
+        assert_eq!(error.failure_fact(), fact);
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(source.downcast_ref::<ConnectorCodecError>(), Some(&codec));
+    }
+
+    #[test]
+    fn nominal_capacity_and_unsupported_keep_original_fact_quantities_and_source() {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureProjection, SharedFailureCause,
+        };
+        use novarocks_spi::connector::{
+            ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorFieldPath,
+        };
+        let mut ledger =
+            ConnectorDecodeLedger::new(ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap());
+        ledger.charge_raw(7).unwrap();
+        let known = ledger.charge_raw(2).unwrap_err();
+        let unknown = ConnectorCodecError::new(
+            ConnectorFieldPath::root("payload").field("header"),
+            ConnectorCodecErrorKind::Capacity,
+            "pure compilation was cancelled",
+        );
+        let unsupported = ConnectorCodecError::new(
+            ConnectorFieldPath::root("payload").field("header"),
+            ConnectorCodecErrorKind::Unsupported,
+            "dependency permission denied",
+        );
+        for original in [known, unknown, unsupported] {
+            let fact = original.failure_fact();
+            let error = connector_error(FieldPath::root("scan"), original.clone());
+            let protocol = &error;
+            assert_eq!(protocol.path().to_string(), "scan");
+            assert!(matches!(protocol.kind(), ProtocolErrorKind::Domain(_)));
+            assert_eq!(protocol.failure_fact(), fact);
+            let shared = std::error::Error::source(protocol)
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            assert_eq!(
+                shared.downcast_ref::<ConnectorCodecError>(),
+                Some(&original)
+            );
+            if original.kind() == &ConnectorCodecErrorKind::Unsupported {
+                assert_eq!(fact.class(), FailureClass::Unsupported);
+                assert_eq!(fact.reason().code(), 166);
+                assert!(fact.resource().is_none());
+            } else {
+                assert_eq!(fact.class(), FailureClass::Resource);
+                assert_eq!(fact.reason().code(), 167);
+                if let Some(resource) = fact.resource() {
+                    assert_eq!(
+                        (
+                            resource.requested,
+                            resource.required_growth,
+                            resource.committed,
+                            resource.limit,
+                            resource.live
+                        ),
+                        (Some(2), Some(2), Some(7), Some(8), None)
+                    );
+                } else {
+                    assert_eq!(original.path().to_string(), "payload.header");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn connector_error_adapter_preserves_ordinary_categories_despite_control_spelling() {
         let categories = [
             (
@@ -433,14 +517,6 @@ mod compile_control_adapter_tests {
             (
                 ConnectorCodecErrorKind::InconsistentFields,
                 ProtocolErrorKind::InconsistentFields,
-            ),
-            (
-                ConnectorCodecErrorKind::Unsupported,
-                ProtocolErrorKind::Unsupported,
-            ),
-            (
-                ConnectorCodecErrorKind::Capacity,
-                ProtocolErrorKind::Capacity,
             ),
             (
                 ConnectorCodecErrorKind::VersionMismatch,

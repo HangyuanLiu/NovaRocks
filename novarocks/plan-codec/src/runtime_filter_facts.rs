@@ -186,12 +186,12 @@ mod tests {
                     let ordinal = seen;
                     seen += 1;
                     if ordinal == stop {
-                        Err(Failure::Control(reason))
+                        Err(Failure::Control(reason.clone()))
                     } else {
                         Ok(())
                     }
                 });
-                assert_eq!(result, Err(Failure::Control(reason)));
+                assert_eq!(result, Err(Failure::Control(reason.clone())));
                 assert_eq!(seen, stop + 1);
             }
         }

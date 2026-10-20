@@ -127,14 +127,11 @@ fn functions() -> PureEngineFunctionCatalog {
     builder.register(definition.clone()).unwrap();
     builder.seal_pure(installed).unwrap()
 }
-fn interpreter() -> CompiledPackageInterpreter<std::io::Error> {
-    let providers =
-        novarocks_connector_contract::PureProviderProgramCatalog::<std::io::Error>::try_new(
-            &[],
-            vec![],
-            &Control,
-        )
-        .unwrap();
+fn interpreter() -> CompiledPackageInterpreter<std::convert::Infallible> {
+    let providers = novarocks_connector_contract::PureProviderProgramCatalog::<
+        std::convert::Infallible,
+    >::try_new(&[], vec![], &Control)
+    .unwrap();
     CompiledPackageInterpreter::new(
         FragmentDecodeResourceModel::try_new(&Control).unwrap(),
         decode_limits(),
@@ -746,8 +743,7 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
 #[test]
 fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
     use novarocks_execution::runtime::{
-        fragment::ExecutionFailureCause,
-        preparation_memory::{PreparationMemoryRefusal, PreparationMemoryStop},
+        fragment::ExecutionFailureCause, preparation_memory::PreparationMemoryRefusal,
         preparation_metadata::PreparationMetadataFailure,
     };
     use novarocks_worker::TestPreparationIntent;
@@ -786,6 +782,9 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
     assert!(owner.stop(TestPreparationIntent::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
+    let accepted = loan
+        .checkpoint()
+        .expect_err("original Worker accepted abort");
     let error = prepare_window_metadata_for_test(
         second,
         node,
@@ -796,14 +795,13 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
     )
     .err()
     .unwrap();
-    assert_eq!(
-        error.cause(),
-        &ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
-            PreparationMemoryRefusal::Stopped(PreparationMemoryStop::Abort(
-                novarocks_execution_contract::AbortCause::QueryFailed
-            )),
-        ))
-    );
+    let ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
+        PreparationMemoryRefusal::Interrupted(original),
+    )) = error.cause()
+    else {
+        panic!("expected original Worker interruption: {error:?}");
+    };
+    assert!(std::ptr::eq(original.cause(), accepted.cause()));
 }
 #[test]
 fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage() {

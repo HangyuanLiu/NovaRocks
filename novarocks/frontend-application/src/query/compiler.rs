@@ -1344,12 +1344,32 @@ mod compile_control_tests {
                     matches!(error, FrontendQueryCompilerError::Control(actual) if actual == control)
                 );
             }
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            let original = novarocks_plan_codec::PhysicalEncodeError::Invalid(control.to_string());
+            let expected = original.failure_fact();
+            let FrontendQueryCompilerError::Source(source) =
+                FrontendQueryCompilerError::from_encode(original)
+            else {
+                panic!("the original Invalid author must survive")
+            };
+            assert_eq!(source.failure_fact(), expected);
+            assert_eq!(expected.class(), FailureClass::Invariant);
+            assert_ne!(expected, control.failure_fact());
             assert!(matches!(
-                FrontendQueryCompilerError::from_encode(
-                    novarocks_plan_codec::PhysicalEncodeError::Invalid(control.to_string())
-                ),
-                FrontendQueryCompilerError::Engine(_)
+                source.downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>(),
+                Some(novarocks_plan_codec::PhysicalEncodeError::Invalid(detail))
+                    if detail == &control.to_string()
             ));
+            let service = service(FrontendQueryCompilerError::Source(source));
+            assert_eq!(service.execution_failure().unwrap().fact(), expected);
+            assert_ne!(
+                service.kind(),
+                novarocks_query_application::session_error::QueryServiceErrorKind::Interrupted
+            );
+            assert_ne!(
+                service.kind(),
+                novarocks_query_application::session_error::QueryServiceErrorKind::Timeout
+            );
         }
     }
 }

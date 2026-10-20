@@ -689,6 +689,15 @@ impl InputEncodingPolicy for CompiledProjectProcessor {
     }
 }
 impl TransformKernel for CompiledProjectProcessor {
+    fn end_input(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
+        // Every accepted input has already emitted its sole result. This
+        // computing boundary owns no EOS payload or further materialization.
+        Ok(crate::exec::pipeline::shape::TransformInputEnd::Finished)
+    }
+
     fn apply(
         &mut self,
         _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
@@ -938,6 +947,15 @@ impl OperatorLifecycle for CompiledFilterProcessor {
 }
 impl crate::exec::pipeline::operator::InputEncodingPolicy for CompiledFilterProcessor {}
 impl crate::exec::pipeline::shape::TransformKernel for CompiledFilterProcessor {
+    fn end_input(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
+        // Every accepted input has already emitted its sole result. This
+        // computing boundary owns no EOS payload or further materialization.
+        Ok(crate::exec::pipeline::shape::TransformInputEnd::Finished)
+    }
+
     fn apply(
         &mut self,
         _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
