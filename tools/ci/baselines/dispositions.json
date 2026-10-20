@@ -3183,6 +3183,48 @@
       "owner": "UEA-5E B6",
       "exit_condition": "UEA-5E B6 restores metadata files relation; rerun this original complete native1FE+3BE case with all original result, expected-error, fault, lifecycle and cleanup assertions passing, then remove this quarantine.",
       "review_by": "2026-12-15"
+    },
+    {
+      "unit": "system-scenario:statistics/native-aggregate-and-collect-on-write",
+      "reason": "The original scenario exits 1 at SELECT count(*) FROM native_statistics.native_statistics_db.native_statistics_source$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
+      "owner": "UEA-5E B6",
+      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE statistics/native-aggregate-and-collect-on-write scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
+      "review_by": "2026-12-15"
+    },
+    {
+      "unit": "system-scenario:connector/distributed-writer-overwrite",
+      "reason": "The original scenario exits 1 at SELECT count(*) FROM distributed_overwrite.distributed_overwrite_db.distributed_overwrite_data$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
+      "owner": "UEA-5E B6",
+      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE connector/distributed-writer-overwrite scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
+      "review_by": "2026-12-15"
+    },
+    {
+      "unit": "system-scenario:connector/distributed-writer-row-level",
+      "reason": "The original scenario exits 1 at SELECT count(*) FROM row_level_writer.row_level_writer_db.row_level_dv$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
+      "owner": "UEA-5E B6",
+      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE connector/distributed-writer-row-level scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
+      "review_by": "2026-12-15"
+    },
+    {
+      "unit": "system-scenario:connector/distributed-writer-faults",
+      "reason": "The original scenario exits 1 at SELECT count(*) FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_data$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
+      "owner": "UEA-5E B6",
+      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE connector/distributed-writer-faults scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
+      "review_by": "2026-12-15"
+    },
+    {
+      "unit": "system-scenario:connector/distributed-writer-dataflow",
+      "reason": "D0-5(a): clean 1f15 native 1FE+3BE case actually exits1 before the measured INSERT. Its exact first SQL SELECT count(*) FROM distributed_writer.distributed_writer_db.distributed_writer_data$snapshots is refused with UnsupportedCompiledShape (rendered LOCAL_COMPILER19:1). The snapshot metadata producer is SingleCoordinator, FE freezes WholeRelation, and the existing LocalCompiler scan guard refuses whole-relation provider reads. This is the registered umbrella B6 metadata/provider gap, not an inferred distributed-writer capability. Original later assertions remain UNKNOWN; native record_complete/terminated/identity and producer teardown cleanup are actual ok.",
+      "owner": "B6",
+      "exit_condition": "B6 delivers this exact compiled metadata/whole-relation provider read, then rerun the entire unchanged scenario on one clean source and canonical native 1FE+3BE artifacts. Remove quarantine only when snapshot counts, measured distributed writer/DOP/root aggregation, single-commit/data/resource and cleanup assertions all pass; independently review any newly exposed first cause.",
+      "review_by": "2026-12-15"
+    },
+    {
+      "unit": "system-scenario:execution-failure/representation-recovery-policy",
+      "owner": "B7",
+      "review_by": "2026-12-15",
+      "reason": "D0-5(a) proposal only: the unchanged real native 1FE+3BE scenario fails before execution with sql.analyze.unavailable_implementation for the already registered exact builtin.scalar/array_repeat/dynamic-v1 gap. Clean 1f15 original invocation exits 1 with stable declared inputs and producer cleanup ok. Its expected Execution Representation ERR/fact and subsequent recovery checks remain unchanged and unreached. This is not a known-failure disposition or a passing Representation test.",
+      "exit_condition": "B7 delivers the actual selected pure array_repeat/dynamic-v1 carrier, effects and required array scalar closure. On one clean candidate and canonical artifacts, run this complete unchanged native 1FE+3BE scenario: original 1105/HY000 ERR; originating Representation KERNEL:320, MinimumUnit layout KERNEL:63, required=2147483648, extent_limit=2147483647, no resource/row/prefix inventions; original attempt 1 and no replacement; actual Worker convergence; exact rows on the original socket and an independent connection; unchanged deadline, exact process identity and cleanup. Reassess each newly exposed first failure separately; admission alone or replacing the expected error with the early refusal is insufficient. Remove this exact quarantine only after the full original scenario passes."
     }
   ]
 }
