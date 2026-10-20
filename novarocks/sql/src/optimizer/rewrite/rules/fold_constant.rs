@@ -2524,11 +2524,18 @@ mod complete_fold_type_tests {
             FunctionValueType::new(DataType::Decimal256(76, -7), false),
         ];
         let mut arena = ScalarArena::new();
-        let child = arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
-            nested_type.clone(),
-        );
         for result_type in &root_types {
+            // Preserve each complete domain through a legal identity conversion.
+            // A nonnullable decimal uses an actual value, never a forged NULL.
+            let literal = if result_type.nullable() {
+                LiteralValue::Null
+            } else {
+                LiteralValue::Decimal("0".into())
+            };
+            let child = arena.intern(
+                ScalarNode::Literal(HashableLiteral(literal)),
+                result_type.clone(),
+            );
             let root = arena.intern(
                 ScalarNode::Cast {
                     child,
@@ -2540,10 +2547,56 @@ mod complete_fold_type_tests {
             );
             assert!(try_fold_test_node(&mut arena, root, &EVALUATOR).is_none());
         }
-        let requests = EVALUATOR.0.lock().unwrap();
-        assert_eq!(requests.len(), root_types.len());
-        for (request, expected) in requests.iter().zip(&root_types) {
-            assert_eq!(&request.result_type, expected);
+
+        let nested_child = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            nested_type.clone(),
+        );
+        let text_type = FunctionValueType::new(DataType::Utf8, true);
+        // The fold output gate excludes Struct, so a nested identity cannot
+        // reach this evaluator. This same-domain physical carrier request tests
+        // SQL freezing only; it does not claim runtime Struct -> Utf8 support.
+        let nested_root = arena.intern(
+            ScalarNode::Cast {
+                child: nested_child,
+                target: DataType::Utf8,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            text_type.clone(),
+        );
+        assert!(try_fold_test_node(&mut arena, nested_root, &EVALUATOR).is_none());
+        {
+            let requests = EVALUATOR.0.lock().unwrap();
+            assert_eq!(requests.len(), root_types.len() + 1);
+            for (request, expected) in requests.iter().zip(&root_types) {
+                assert_eq!(&request.result_type, expected);
+                assert_eq!(request.args.len(), 1);
+                assert_eq!(&request.args[0].value_type, expected);
+                assert_eq!(
+                    request.args[0]
+                        .value
+                        .is_null_observed(
+                            CompilePhase::Validate,
+                            crate::optimizer::test_optimizer_control()
+                        )
+                        .unwrap(),
+                    expected.nullable(),
+                );
+                assert!(matches!(
+                    request.kind,
+                    FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
+                        plan: crate::compiler::ConversionPlan::Identity,
+                    })
+                ));
+            }
+            let request = requests.last().unwrap();
+            assert_eq!(request.result_type, text_type);
+            assert!(matches!(
+                request.kind,
+                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
+                    plan: crate::compiler::ConversionPlan::Carrier(_),
+                })
+            ));
             assert_eq!(request.args.len(), 1);
             assert!(
                 request.args[0]
@@ -2564,6 +2617,29 @@ mod complete_fold_type_tests {
             assert_eq!(fields[0].dict_id(), None);
             assert_eq!(fields[0].dict_is_ordered(), None);
             assert_eq!(fields[0].metadata().capacity(), 0);
+        }
+
+        // The old fixture incorrectly cast one nullable structure into unrelated
+        // nominal domains, then into a nonnullable decimal. Those requests are
+        // invalid before the evaluator, independently of its willingness to fold.
+        for result_type in &root_types {
+            let root = arena.intern(
+                ScalarNode::Cast {
+                    child: nested_child,
+                    target: result_type.data_type().clone(),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+                result_type.clone(),
+            );
+            let control = crate::optimizer::rewrite::context::unbounded_rewrite_test_control();
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+            assert!(matches!(
+                try_fold_node(&mut arena, root, &EVALUATOR, &mut work),
+                Err(SqlCompileError::InvalidRequest(_))
+            ));
+            assert_eq!(EVALUATOR.0.lock().unwrap().len(), root_types.len() + 1);
+            assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
         }
     }
 
