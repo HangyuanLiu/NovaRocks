@@ -273,8 +273,15 @@ impl TableMaintenanceProduct {
         self.jobs.wait_for_completion(handle).await
     }
 
-    pub async fn wait_automatic_optimize(&self, handle: JobHandle) -> Result<OptimizeJob, String> {
+    pub async fn wait_optimize_terminal_record(
+        &self,
+        handle: JobHandle,
+    ) -> Result<OptimizeJob, String> {
         self.jobs.wait_for_terminal_record(handle).await
+    }
+
+    pub async fn wait_automatic_optimize(&self, handle: JobHandle) -> Result<OptimizeJob, String> {
+        self.wait_optimize_terminal_record(handle).await
     }
 
     /// Executes a user action after the SQL adapter has resolved its target.
@@ -578,11 +585,13 @@ fn abort_rewrite_terminal(
 ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
     match session.abort(error.message.clone()) {
         Ok(()) => Err(TerminalError::known_uncommitted(error.message)
-            .with_compile_control(error.compile_control)),
+            .with_compile_control(error.compile_control)
+            .with_execution_failure(error.execution_failure)),
         Err(abort) => Err(TerminalError::commit_unknown(format!(
             "{error}; distributed rewrite abort failed: {abort}"
         ))
-        .with_compile_control(error.compile_control)),
+        .with_compile_control(error.compile_control)
+        .with_execution_failure(error.execution_failure)),
     }
 }
 
@@ -1254,6 +1263,8 @@ mod tests {
     }
     struct CompileFailureSession {
         control: novarocks_type_contract::CompileControlError,
+        execution_failure:
+            Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
         abort_fails: bool,
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
@@ -1269,7 +1280,8 @@ mod tests {
         fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError> {
             assert_eq!(ordinal, 0);
             self.calls.lock().unwrap().push("cohort");
-            Err(TerminalError::from_compile_control(self.control.clone()))
+            Err(TerminalError::from_compile_control(self.control.clone())
+                .with_execution_failure(self.execution_failure.clone()))
         }
         fn commit(&mut self) -> Result<RewriteCommit, String> {
             panic!("a compilation failure must not commit")
@@ -1300,6 +1312,7 @@ mod tests {
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let session = CompileFailureSession {
                     control: control.clone(),
+                    execution_failure: None,
                     abort_fails,
                     calls: calls.clone(),
                 };
@@ -1319,6 +1332,41 @@ mod tests {
                 );
                 assert_eq!(*calls.lock().unwrap(), ["cohort", "abort"]);
             }
+        }
+    }
+
+    #[test]
+    fn cohort_selected_failure_survives_abort_without_changing_publication_state_or_tail() {
+        let input =
+            novarocks_query_application::session_error::QueryServiceError::from_compile_control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+            .execution_failure()
+            .unwrap()
+            .clone();
+        for abort_fails in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let session = CompileFailureSession {
+                control: novarocks_type_contract::CompileControlError::ResourceExhausted,
+                execution_failure: Some(input.clone()),
+                abort_fails,
+                calls: calls.clone(),
+            };
+            let failure = TableMaintenanceProduct::run_rewrite_session_terminal(
+                Box::new(session),
+                RewriteIntent::DataFiles { rewrite_all: true },
+            )
+            .unwrap_err();
+            assert_eq!(failure.execution_failure, Some(input.clone()));
+            assert_eq!(
+                failure.state,
+                if abort_fails {
+                    MaintenanceJobState::CommitUnknown
+                } else {
+                    MaintenanceJobState::KnownUncommitted
+                }
+            );
+            assert_eq!(*calls.lock().unwrap(), ["cohort", "abort"]);
         }
     }
 

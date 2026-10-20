@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use crate::native::data_runtime::FrontendDataRuntime;
@@ -241,19 +242,17 @@ pub(crate) fn open_round_split_source(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     blocking_io: ConnectorBlockingIoSupervisor,
     responsibility: ConnectorBlockingIoResponsibility,
-) -> Result<OpenedRoundSplitSource, String> {
+) -> Result<OpenedRoundSplitSource, ConnectorError> {
     let access = &recipe.access;
     let connector_context = crate::connector::context_for_planning_lease_typed(
         access.planning_lease(),
         connector_context.clone(),
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     let attempt_context =
         novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(connector_context);
     let capabilities = access
         .access()
-        .for_attempt(&attempt_context, access.planning_lease())
-        .map_err(|error| error.to_string())?;
+        .for_attempt(&attempt_context, access.planning_lease())?;
     let source = capabilities
         .splits()
         .get_splits(
@@ -268,10 +267,12 @@ pub(crate) fn open_round_split_source(
             &recipe.constraint,
         )
         .map_err(|error| {
-            format!(
-                "typed connector scan node_id={} cannot open its split source: {error}",
-                recipe.plan_node_id
-            )
+            error.map_message(|message| {
+                format!(
+                    "typed connector scan node_id={} cannot open its split source: {message}",
+                    recipe.plan_node_id
+                )
+            })
         })?;
     let backing = responsibility.retain_backing();
     let source =

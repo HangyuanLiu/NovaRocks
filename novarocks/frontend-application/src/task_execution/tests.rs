@@ -8557,6 +8557,14 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
             None,
             "an accepted root seal cannot be revoked by residual observation exhaustion"
         );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
+            ),
+            None,
+            "an accepted root seal cannot be revoked by residual observation exhaustion"
+        );
     }
     assert!(
         round
@@ -8597,6 +8605,14 @@ fn covered_exhaustion_fails_only_still_required_work_without_timing_healthy_task
         Some(SubscriptionState::BudgetExhausted),
         "a still-required leaf losing bounded transport recovery must reach the original failure owner"
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted),
+        "a still-required leaf losing bounded transport recovery must reach the original failure owner"
+    );
     for state in [
         SubscriptionState::Rejected,
         SubscriptionState::ProcessMismatch,
@@ -8629,6 +8645,13 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         Some(SubscriptionState::BudgetExhausted)
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted)
+    );
     round
         .execution_mut()
         .stand_down_task_normally(leaf_identity)
@@ -8641,6 +8664,13 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         None
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        None
+    );
     let root_context = round
         .execution()
         .task(round.root_task().task_id())
@@ -8650,9 +8680,23 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
         round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
         Some(SubscriptionState::BudgetExhausted)
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            root_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted)
+    );
     round.begin_terminal_cleanup();
     assert_eq!(
         round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
+        None
+    );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            root_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
         None
     );
 }
@@ -8694,6 +8738,14 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
             Some(SubscriptionState::BudgetExhausted),
             "EOS alone cannot replace missing root terminal evidence"
         );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
+            Some(SubscriptionState::ConnectionLossExhausted),
+            "EOS alone cannot replace missing root terminal evidence"
+        );
         status.publish(StatusEvent::Published(
             TaskStatus::try_new(
                 root,
@@ -8710,6 +8762,14 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
         }
         assert_eq!(
             round.classify_covered_subscription_state(context, SubscriptionState::BudgetExhausted),
+            None,
+            "observed complete root evidence survives a status-stream disconnect; outstanding data-plane fetch has its own owner"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
             None,
             "observed complete root evidence survives a status-stream disconnect; outstanding data-plane fetch has its own owner"
         );
@@ -8746,6 +8806,14 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
                 SubscriptionState::BudgetExhausted
             ),
             Some(SubscriptionState::BudgetExhausted),
+            "EOS does not substitute for the root's terminal output fact"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                root_context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
+            Some(SubscriptionState::ConnectionLossExhausted),
             "EOS does not substitute for the root's terminal output fact"
         );
         for (version, state, output) in [
@@ -8791,6 +8859,14 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         assert_eq!(
             round.classify_covered_subscription_state(
                 leaf_context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
+            (!result_consumer).then_some(SubscriptionState::ConnectionLossExhausted),
+            "only an attached Result consumer retires residual transport evidence before seal intake"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                leaf_context,
                 SubscriptionState::ProcessMismatch
             ),
             Some(SubscriptionState::ProcessMismatch),
@@ -8801,6 +8877,14 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
             round.turn().unwrap();
             assert_eq!(reply.try_recv().unwrap(), Ok(()));
             assert!(round.root_success_sealed());
+            assert_eq!(
+                round.classify_covered_subscription_state(
+                    leaf_context,
+                    SubscriptionState::ConnectionLossExhausted
+                ),
+                None,
+                "an accepted success seal cannot be revoked by residual transport loss"
+            );
         }
     }
 }
@@ -8836,6 +8920,13 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         None
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        None
+    );
 
     let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
         novarocks_execution_contract::failure::FailureFact::new(
@@ -8862,6 +8953,14 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
     assert_eq!(
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         Some(SubscriptionState::BudgetExhausted),
+        "an accepted failure cannot be hidden by the completed root"
+    );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted),
         "an accepted failure cannot be hidden by the completed root"
     );
     let mut reply = source.begin_success_seal_request().unwrap();
@@ -8933,6 +9032,14 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
             round.classify_covered_subscription_state(
                 context,
                 crate::native::task_transport::SubscriptionState::BudgetExhausted
+            ),
+            None,
+            "retired transport evidence does not clear a real application gap"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
             ),
             None,
             "retired transport evidence does not clear a real application gap"
@@ -9699,6 +9806,13 @@ fn revoked_result_control_uses_one_deadline_even_without_eos_or_after_root_finis
                 crate::native::task_transport::SubscriptionState::BudgetExhausted
             ),
             Some(crate::native::task_transport::SubscriptionState::BudgetExhausted)
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                root_context,
+                crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
+            ),
+            Some(crate::native::task_transport::SubscriptionState::ConnectionLossExhausted)
         );
         clock.advance(Duration::from_secs(29));
         let mut repeated = source.begin_terminal_control_request().unwrap();

@@ -85,6 +85,8 @@ pub struct JobRecord<T, O> {
     pub outcome: Option<O>,
     pub error_message: Option<String>,
     pub compile_control: Option<novarocks_type_contract::CompileControlError>,
+    pub execution_failure:
+        Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
@@ -155,9 +157,19 @@ pub struct TerminalError {
     pub state: MaintenanceJobState,
     pub message: String,
     pub compile_control: Option<novarocks_type_contract::CompileControlError>,
+    pub execution_failure:
+        Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
 }
 
 impl TerminalError {
+    pub fn with_execution_failure(
+        mut self,
+        input: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
+    ) -> Self {
+        self.execution_failure = input;
+        self
+    }
+
     pub fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
         let mut failure = Self::pre_dispatch_failed(error.to_string());
         failure.compile_control = Some(error);
@@ -175,6 +187,7 @@ impl TerminalError {
             state: MaintenanceJobState::PreDispatchFailed,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
         }
     }
     pub fn failed(message: impl Into<String>) -> Self {
@@ -182,6 +195,7 @@ impl TerminalError {
             state: MaintenanceJobState::Failed,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
         }
     }
     pub fn target_replaced(message: impl Into<String>) -> Self {
@@ -189,6 +203,7 @@ impl TerminalError {
             state: MaintenanceJobState::TargetReplaced,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
         }
     }
     pub fn cancelled_before_dispatch(message: impl Into<String>) -> Self {
@@ -196,6 +211,7 @@ impl TerminalError {
             state: MaintenanceJobState::CancelledBeforeDispatch,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
         }
     }
     pub fn known_uncommitted(message: impl Into<String>) -> Self {
@@ -203,6 +219,7 @@ impl TerminalError {
             state: MaintenanceJobState::KnownUncommitted,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
         }
     }
     pub fn commit_unknown(message: impl Into<String>) -> Self {
@@ -210,6 +227,7 @@ impl TerminalError {
             state: MaintenanceJobState::CommitUnknown,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
         }
     }
     pub fn known_committed_finalization_failed(message: impl Into<String>) -> Self {
@@ -217,6 +235,7 @@ impl TerminalError {
             state: MaintenanceJobState::KnownCommittedFinalizationFailed,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
         }
     }
 }
@@ -319,6 +338,7 @@ where
             outcome: None,
             error_message: None,
             compile_control: None,
+            execution_failure: None,
             created_at_ms: request.created_at_ms,
             started_at_ms: None,
             finished_at_ms: None,
@@ -395,6 +415,7 @@ where
                 terminal.state = error.state;
                 terminal.error_message = Some(error.message);
                 terminal.compile_control = error.compile_control;
+                terminal.execution_failure = error.execution_failure;
             }
         }
         terminal.finished_at_ms = Some(at_ms);
@@ -702,5 +723,43 @@ mod tests {
             runtime.request_cancel(job.job_id).await.unwrap();
             assert!(!runtime.cancellation_requested(job.job_id).await.unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod selected_execution_retention_tests {
+    use super::*;
+    #[tokio::test]
+    async fn completed_job_keeps_selected_execution_input_in_its_original_terminal_state() {
+        let input =
+            novarocks_query_application::session_error::QueryServiceError::from_compile_control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+            .execution_failure()
+            .unwrap()
+            .clone();
+        let runtime: ProcessRuntime<String, (), ()> = ProcessRuntime::new();
+        let request = JobCreate {
+            target: "orders".into(),
+            effect_id: None,
+            object_id: vec![1],
+            base_snapshot_id: 1,
+            created_at_ms: 1,
+        };
+        let job = runtime.submit(request, ()).await.unwrap();
+        runtime.claim_next(2).await.unwrap().unwrap();
+        runtime
+            .finish(
+                job.job_id,
+                Err(TerminalError::known_uncommitted("selected failure")
+                    .with_execution_failure(Some(input.clone()))),
+                3,
+            )
+            .await
+            .unwrap();
+        let terminal = runtime.wait_for_completion(job.job_id).await.unwrap();
+        assert_eq!(terminal.execution_failure, Some(input));
+        assert_eq!(terminal.state, MaintenanceJobState::KnownUncommitted);
+        assert_eq!(terminal.error_message.as_deref(), Some("selected failure"));
     }
 }

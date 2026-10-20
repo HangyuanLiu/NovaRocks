@@ -437,7 +437,7 @@ impl TaskRound {
         state: SubscriptionState,
     ) -> Option<SubscriptionState> {
         match state {
-            SubscriptionState::BudgetExhausted => {
+            SubscriptionState::BudgetExhausted | SubscriptionState::ConnectionLossExhausted => {
                 if self.success_sealed || self.terminal_cleanup_started {
                     return None;
                 }
@@ -1375,7 +1375,13 @@ impl TaskRound {
                     self.covered_subscriber
                         .as_ref()
                         .and_then(|subscriber| subscriber.state(context))
-                        == Some(SubscriptionState::BudgetExhausted)
+                        .is_some_and(|state| {
+                            matches!(
+                                state,
+                                SubscriptionState::BudgetExhausted
+                                    | SubscriptionState::ConnectionLossExhausted
+                            )
+                        })
                 });
             if exhausted {
                 self.pending_success_seal.take().expect("pending recovery request").reject(
@@ -1606,6 +1612,7 @@ fn actor_abort_receipt_context(
 
 fn participant_observation_failure(state: SubscriptionState) -> ParticipantObservationFailure {
     match state {
+        SubscriptionState::ConnectionLossExhausted => ParticipantObservationFailure::ConnectionLost,
         SubscriptionState::ProcessMismatch | SubscriptionState::QueryMismatch => {
             ParticipantObservationFailure::IdentityViolation(state.as_str())
         }

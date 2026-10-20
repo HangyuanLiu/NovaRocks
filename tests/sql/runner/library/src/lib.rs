@@ -1617,7 +1617,7 @@ fn execute_target_query_with_selected_control(
                     Ok(())
                 },
             );
-            if !result.0 {
+            if fault_injection::has_fault(meta) && !result.0 {
                 eprintln!(
                     "target query before fault verification failed: {}",
                     result.2
