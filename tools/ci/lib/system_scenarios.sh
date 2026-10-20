@@ -95,6 +95,7 @@ ci_prepare_system_scenario_binaries() {
   : >"$log_path"
   while IFS= read -r requirement; do
     [ "$requirement" != primary ] || continue
+    ci_set_default_build_jobs || return $?
     built=true
     destination="$(ci_target_directory variants)/$requirement/novarocks"
     mkdir -p "$(dirname "$destination")" || { code=$?; break; }

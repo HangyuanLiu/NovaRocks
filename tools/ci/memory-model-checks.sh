@@ -42,6 +42,8 @@ if [[ $# != 1 || ( "$mode" != --loom && "$mode" != --miri && "$mode" != --all ) 
 fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
+source "$repo_root/tools/ci/lib/build_capabilities.sh"
+ci_set_default_build_jobs
 command -v cargo >/dev/null || fail 'cargo is unavailable; no toolchain will be installed.'
 export CARGO_NET_OFFLINE=true
 # Also prevent cargo's rustup proxy from fetching a selected missing toolchain.

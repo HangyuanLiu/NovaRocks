@@ -562,7 +562,7 @@ class NativeNextest(unittest.TestCase):
         fixture = self.root / "fixture"
         (fixture / "src").mkdir(parents=True)
         (fixture / "tools/ci/lib").mkdir(parents=True)
-        for relative in ("test-run.py", "cargo-artifacts.py", "lib/build_capabilities.sh", "lib/identity_snapshot.py"):
+        for relative in ("test-run.py", "cargo-artifacts.py", "lib/build_capabilities.sh", "lib/build_jobs.py", "lib/identity_snapshot.py"):
             shutil.copy2(REPO / "tools/ci" / relative, fixture / "tools/ci" / relative)
         (fixture / ".config").mkdir()
         configuration = (REPO / ".config/nextest.toml").read_text().split("[test-groups.")[0]

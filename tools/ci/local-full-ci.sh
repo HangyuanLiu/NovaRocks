@@ -603,6 +603,7 @@ MATERIALS
 }
 
 run_cargo_gates() {
+  ci_set_default_build_jobs || return $?
   run_fail_fast_stage "CI build inputs" "build-inputs.log" \
     ci_validate_build_inputs "$NOVA_CI_CARGO_PROFILE"
   local main_target
@@ -1224,6 +1225,7 @@ EOF
 # Development selection delegates to the same native stage commands. This
 # dispatcher executes one declared stage and creates no parallel command map.
 ci_execute_selected_stage() (
+  ci_set_default_build_jobs || return $?
   CI_SELECTED_STAGE="$1"
   NOVA_CI_ARTIFACT_RECEIPT="$2"
   CI_RUN_DIR="$3"

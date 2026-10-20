@@ -19,6 +19,14 @@ under the License.
 
 # Rust test entry and retained execution materials
 
+Project build/test entries default Cargo compilation to
+`max(1, logical_cpu_count // 2)` jobs, computed on each host. For example, a
+10-core host defaults to five jobs. An explicitly set `CARGO_BUILD_JOBS` is
+preserved, and native Cargo `-j` / `--jobs` keeps its usual precedence. Set
+`CARGO_BUILD_JOBS=8 tools/ci/dev-test.sh test` to override compilation jobs;
+nextest's `--test-threads` / `-j` separately controls test execution. Bare Cargo
+commands retain Cargo's own defaults. The development profile remains unchanged.
+
 `tools/ci/dev-test.sh test` prepares the workspace's development graph and then
 executes native nextest in the foreground. Nextest owns per-test processes,
 parallel scheduling, TTY progress, input and job control. It requires nextest

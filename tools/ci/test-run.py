@@ -43,6 +43,7 @@ import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
 import identity_snapshot
+import build_jobs
 
 REPO = Path(__file__).resolve().parents[2]
 ARTIFACTS = REPO / "tools/ci/cargo-artifacts.py"
@@ -756,6 +757,7 @@ def main():
     separator = argv.index("--") if "--" in argv else len(argv)
     options = parser.parse_args(argv[:separator])
     arguments = argv[separator + 1:]
+    build_jobs.configure()
     if options.action == "prepare":
         prepare(options.output, arguments, options.formal_store)
         return 0

@@ -18,6 +18,16 @@
 
 
 # Native Cargo remains the build and test owner. Paths are bound from its JSON.
+ci_set_default_build_jobs() {
+  if [ "${CARGO_BUILD_JOBS+x}" != x ]; then
+    local jobs
+    jobs="$(python3 "$(dirname "${BASH_SOURCE[0]}")/build_jobs.py")" || return $?
+    export CARGO_BUILD_JOBS="$jobs"
+  else
+    export CARGO_BUILD_JOBS
+  fi
+}
+
 ci_validate_build_environment() {
   python3 - <<'ENV'
 import os, sys
@@ -44,10 +54,12 @@ ci_target_directory() {
 ci_validate_build_inputs() {
   ci_validate_build_environment || return $?
   [ "$1" = dev ] || { echo "error: daily test graph requires profile dev" >&2; return 2; }
+  ci_set_default_build_jobs
 }
 
 ci_main_cargo() {
   local command="$1"; shift
+  ci_set_default_build_jobs || return $?
   cargo "$command" --workspace --profile dev --locked --target-dir "$(ci_target_directory main)" "$@"
 }
 
