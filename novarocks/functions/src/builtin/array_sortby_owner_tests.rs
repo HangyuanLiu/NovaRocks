@@ -943,3 +943,180 @@ fn array_sortby_public_canonical_result_creator_survives_the_last_output_alias()
     assert_eq!(exits.load(Ordering::SeqCst), 1);
     empty(&host);
 }
+
+// Only the shared representation author constructs the execution array. The
+// checked pool still authors three rows, the selected ordinal and its semantics.
+fn canonical_sortby_constant_pool(rows: Vec<Vec<i64>>) -> (crate::ConstantPool, ArrayRef) {
+    let base = arrays(rows);
+    let list = base.as_any().downcast_ref::<ListArray>().unwrap();
+    let raw: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(
+            Field::new("provider-element", DataType::Int64, true)
+                .with_metadata([("provider.fact".into(), "preserved".into())].into()),
+        ),
+        list.offsets().clone(),
+        list.values().clone(),
+        list.nulls().cloned(),
+    ));
+    let pool = crate::ConstantPool::try_new(
+        Arc::new(Field::new("source", raw.data_type().clone(), true)),
+        FunctionValueType::new(raw.data_type().clone(), true),
+        raw.to_data(),
+        crate::ConstantPolicy {
+            max_rows: 3,
+            max_array_nodes: 16,
+            max_logical_elements: 64,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 8,
+            max_type_nodes: 32,
+            max_dictionary_depth: 2,
+            max_metadata_bytes: 4096,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 22,
+        },
+        novarocks_type_contract::CompilePhase::Validate,
+        crate::binding_test_control(),
+    )
+    .unwrap();
+    let canonical = crate::array_projection::normalize_execution_array(pool.array()).unwrap();
+    assert!(!Arc::ptr_eq(&canonical, pool.array()));
+    (pool, canonical)
+}
+
+#[test]
+fn array_sortby_public_constant_view_broadcasts_original_ordinal_through_actual_array_and_owned_sources()
+ {
+    use super::super::array_invocation_source::{OwnedArraySource, actual_array};
+    let (pool, canonical) =
+        canonical_sortby_constant_pool(vec![vec![111, 112], vec![30, 40], vec![999, 998]]);
+    let (key_pool, key_canonical) =
+        canonical_sortby_constant_pool(vec![vec![1, 2], vec![2, 1], vec![1, 2]]);
+    let original = pool.value(1).unwrap();
+    let key_original = key_pool.value(1).unwrap();
+    let source = ScalarInvocationSource::ConstantView(
+        crate::CanonicalConstantView::from_authored_projection(&original, &canonical),
+    );
+    let key = ScalarInvocationSource::ConstantView(
+        crate::CanonicalConstantView::from_authored_projection(&key_original, &key_canonical),
+    );
+    let OwnedArraySource::ConstantView(owned_original, owned_values) =
+        OwnedArraySource::from_source(&source)
+    else {
+        panic!("the installed source must retain the explicit ConstantView");
+    };
+    assert_eq!(owned_original.ordinal(), 1);
+    assert_eq!(
+        owned_original.pool().backing_identity(),
+        pool.backing_identity()
+    );
+    assert!(Arc::ptr_eq(&owned_values, &canonical));
+    let actual_rows = [2, 4, 7];
+    let demanded = [2, 7];
+    for scope in [
+        ScalarInvocationScope::new(Selection::all(4), Selection::all(4)),
+        ScalarInvocationScope::new(
+            Selection::try_sparse(8, &actual_rows).unwrap(),
+            Selection::try_sparse(8, &demanded).unwrap(),
+        ),
+        ScalarInvocationScope::new(Selection::all(0), Selection::all(0)),
+    ] {
+        let host = Host::with_limit(64 * 1024 * 1024);
+        let mut kernel = instance(
+            &[
+                canonical.data_type().clone(),
+                key_canonical.data_type().clone(),
+            ],
+            &host,
+        );
+        scope.validate(&Control::default()).unwrap();
+        source
+            .validate(scope, original.value_type(), &Control::default())
+            .unwrap();
+        let control = Control::default();
+        let mut work = crate::EvaluationCheckpoints::new(&control);
+        let expanded = match actual_array(&source, scope, &mut work) {
+            Ok(expanded) => expanded,
+            Err(_) => panic!("real explicit constant expansion"),
+        };
+        work.finish().unwrap();
+        assert_eq!(expanded.len(), scope.actual_domain().len());
+        for at in 0..expanded.len() {
+            assert_eq!(row(&expanded, at), vec![Some(30), Some(40)]);
+        }
+        let sources = [source, key];
+        let output = kernel
+            .evaluate_scoped(
+                scope,
+                &sources,
+                ScalarInvocationActivation::Activated,
+                &Control::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            output.selection().iter().collect::<Vec<_>>(),
+            scope.demand().iter().collect::<Vec<_>>()
+        );
+        assert_eq!(output.values().len(), scope.demand().len());
+        for at in 0..output.values().len() {
+            // The selected key is [2,1], so [30,40] becomes [40,30].
+            assert_eq!(row(output.values(), at), vec![Some(40), Some(30)]);
+        }
+        assert!(output.errors().is_empty());
+        drop(output);
+        drop(kernel);
+        empty(&host);
+    }
+    let DataType::List(field) = original.field().data_type() else {
+        panic!("raw List")
+    };
+    assert_eq!(field.name(), "provider-element");
+    assert_eq!(field.metadata()["provider.fact"], "preserved");
+    assert_eq!(original.ordinal(), 1);
+    assert_eq!(original.pool().backing_identity(), pool.backing_identity());
+}
+
+#[test]
+fn array_sortby_public_constant_view_rejects_changed_pool_shape_before_original_call() {
+    let (pool, canonical) =
+        canonical_sortby_constant_pool(vec![vec![111], vec![30, 40], vec![999]]);
+    let original = pool.value(1).unwrap();
+    let shortened = canonical.slice(0, 2);
+    let source = ScalarInvocationSource::ConstantView(
+        crate::CanonicalConstantView::from_authored_projection(&original, &shortened),
+    );
+    let key = arrays(vec![vec![2, 1]]);
+    let host = Host::with_limit(64 * 1024 * 1024);
+    let mut kernel = instance(
+        &[canonical.data_type().clone(), key.data_type().clone()],
+        &host,
+    );
+    let sources = [source, ScalarInvocationSource::Scalar(&key)];
+    let scope = ScalarInvocationScope::new(Selection::all(4), Selection::all(4));
+    let error = kernel
+        .evaluate_scoped(
+            scope,
+            &sources,
+            ScalarInvocationActivation::Activated,
+            &Control::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(error,
+        ScalarInvocationFailure::Kernel(KernelFailure::InvalidProgram(ref cause))
+        if cause.message() == "evaluated argument length differs from its explicit shape"));
+    assert!(kernel.is_failed());
+    assert!(matches!(
+        kernel.evaluate_scoped(
+            scope,
+            &sources,
+            ScalarInvocationActivation::Activated,
+            &Control::default()
+        ),
+        Err(ScalarInvocationFailure::Kernel(
+            KernelFailure::InstanceFailed
+        ))
+    ));
+    assert_eq!(original.ordinal(), 1);
+    assert_eq!(original.pool().array().len(), 3);
+    drop(kernel);
+    empty(&host);
+}
