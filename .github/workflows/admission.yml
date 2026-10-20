@@ -61,11 +61,43 @@ jobs:
       - name: Publish admission summary
         if: always()
         run: |
-          if [ -f "$RUNNER_TEMP/admission/summary.md" ]; then
-            cat "$RUNNER_TEMP/admission/summary.md" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo 'Admission summary was not produced; inspect the preceding steps.' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          # Keep the entire step below GitHub's 1 MiB upload limit. The full
+          # report and native materials remain unchanged for artifact upload.
+          limit = 512 * 1024
+          source = Path(os.environ["RUNNER_TEMP"]) / "admission/summary.md"
+          destination = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          artifact = "admission-{}-{}".format(os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"])
+          run_url = "{}/{}/actions/runs/{}".format(
+              os.environ["GITHUB_SERVER_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"])
+          footer = ("\n\n---\nComplete summary and raw materials: artifact `" + artifact
+                    + "` on [this workflow run](" + run_url
+                    + "). Available after successful artifact upload.\n").encode("utf-8")
+          previous_size = destination.stat().st_size if destination.exists() else 0
+          available = limit - previous_size
+          budget = max(0, available - len(footer))
+          if source.is_file():
+              with source.open("rb") as stream:
+                  preview = stream.read(budget + 1)
+              if len(preview) > budget:
+                  notice = ("\n\nPreview truncated; complete summary is "
+                            + str(source.stat().st_size) + " bytes.\n").encode("utf-8")
+                  preview = preview[:max(0, budget - len(notice))]
+                  # Retain complete Markdown lines and UTF-8 characters.
+                  preview = preview.rsplit(b"\n", 1)[0] if b"\n" in preview else b""
+                  preview = preview.decode("utf-8", errors="ignore").encode("utf-8") + notice
+          else:
+              preview = b"Admission summary was not produced; inspect the preceding steps.\n"
+          payload = preview + footer
+          if len(payload) <= available:
+              with destination.open("ab") as stream:
+                  stream.write(payload)
+          else:
+              print("No space remains for the admission preview; inspect the workflow artifact after upload.")
+          PY
 
       - name: Upload admission materials
         if: always()

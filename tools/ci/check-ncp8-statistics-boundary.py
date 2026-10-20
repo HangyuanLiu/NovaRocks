@@ -16,11 +16,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Verify statistics wire reservations and sketch dependency boundaries.
+"""Verify statistics sink retirement and sketch dependency boundaries.
 
 Cargo's resolved graph defines the permitted dependency kinds and features.
-The source check protects reservations on the current DataSink carrier;
-descriptor and unknown-field behavior are exercised by the protocol tests.
+The source check prevents the retired DataSink/StatisticsSink wire path from
+returning and keeps statistics out of the compiled FragmentSink vocabulary.
 """
 
 import argparse
@@ -332,8 +332,12 @@ def verify_dependency_boundary(metadata, repo_root):
         )
 
 
+def proto_code(source):
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
+
+
 def extract_proto_message(source, message_name):
-    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
+    code = proto_code(source)
     match = re.search(rf"\bmessage\s+{re.escape(message_name)}\s*\{{", code)
     if match is None:
         fail(f"proto message {message_name} is missing")
@@ -350,23 +354,40 @@ def extract_proto_message(source, message_name):
     return code[match.end() : index - 1]
 
 
-def require_reserved(message_body, number, name, context):
-    if re.search(rf"\breserved\s+{number}\s*;", message_body) is None:
-        fail(f"{context} must reserve field number {number}")
-    if re.search(rf'\breserved\s+"{re.escape(name)}"\s*;', message_body) is None:
-        fail(f"{context} must reserve field name {name}")
-
-
 def verify_source_boundary(repo_root):
-    plan = (repo_root / "idl/novarocks/plan.proto").read_text(encoding="utf-8")
-    sink = extract_proto_message(plan, "DataSink")
-    require_reserved(sink, 8, "statistics", "DataSink")
+    # ADR-0185 removed the entire old plan carrier, including DataSink. Its
+    # reserved tag 8 belonged to novarocks.plan.DataSink; protobuf field numbers
+    # are local to a message, so the independent compiled FragmentSink must not
+    # inherit that tag reservation. ADR-0136 still forbids a statistics sink.
+    proto_root = repo_root / "idl/novarocks"
+    if (proto_root / "plan.proto").exists():
+        fail("retired plan.proto must not be restored")
+    sources = {}
+    try:
+        for path in sorted(proto_root.rglob("*.proto")):
+            sources[path] = proto_code(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as error:
+        fail(f"cannot read native proto source: {error}")
+    for path, source in sources.items():
+        for name in ("DataSink", "StatisticsSink"):
+            if re.search(rf"\bmessage\s+{name}\s*\{{", source):
+                fail(f"retired proto message {name} must not be restored in {path.relative_to(repo_root)}")
+    package_path = proto_root / "physical_package_v2.proto"
+    if package_path not in sources:
+        fail("compiled physical_package_v2.proto is missing")
+    sink = extract_proto_message(sources[package_path], "FragmentSink")
+    # Inspect only sink field declarations. Ordinary statistics facts elsewhere
+    # in the protocol, and comments or reservations, are outside this boundary.
+    fields = re.findall(r"\b([\w.]+)\s+(\w+)\s*=\s*\d+\s*(?:\[[^\]]*\])?\s*;", sink)
+    for field_type, field_name in fields:
+        if "statistic" in field_type.lower() or "statistic" in field_name.lower():
+            fail(f"FragmentSink must not declare a statistics sink: {field_type} {field_name}")
 
 
 def main():
     default_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(
-        description="Verify statistics wire reservations and sketch dependency boundaries."
+        description="Verify statistics sink retirement and sketch dependency boundaries."
     )
     parser.add_argument("--repo-root", type=Path, default=default_root)
     parser.add_argument("--manifest-path", type=Path)
