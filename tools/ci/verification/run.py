@@ -133,6 +133,7 @@ def rust_environment(repo, native):
     return dict(os.environ, NOVAROCKS_BIN=native['receipt']['novarocks']['path'], NOVAROCKS_WORKSPACE_ROOT=str(Path(repo).resolve()))
 
 
+# Design: ADR-0186 (docs/adr/ADR-0186-layered-verification-and-read-only-evidence-composition.md)
 def scopes(repo, native, chosen):
     """Build obligations from native declarations before reading any attempt."""
     inputs = Path(native['inputs'])

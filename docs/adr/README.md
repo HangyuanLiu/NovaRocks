@@ -71,6 +71,7 @@ code-anchors:
 
 领域哲学：实际 debug assertions 决定开发接缝是否编入，默认开发共用主测试图与产品装配，标准 release 排除接缝；编入的能力仍须经每个实际角色启动的有限授权，准确绑定产品 owner 签发的工作身份。来源只在薄 CLI 冻结。构建事实、权限、控制结束、helper join、角色退出与资源收敛分别取证。共享测试层只提供机械能力，领域解释和生命周期仍属于原 owner。
 
+- [ADR-0186](ADR-0186-layered-verification-and-read-only-evidence-composition.md) — 验证为何按开发、准入、全量分层，并由原生 owner 采集事实、只读消费者按同输入与完整生命周期组合证据（active）
 - [ADR-0184](ADR-0184-native-test-execution-and-process-monitor-ownership.md) — 原生逐测试进程为何与独立 payload monitor、懒建调用租约和封闭材料汇总分工（active；部分替代 ADR-0069 的进程内 reader / Drop 所有权，机械叶子与领域边界保留）
 - [ADR-0181](ADR-0181-unified-development-capabilities-and-executable-provenance.md) — 开发接缝为何按实际 cfg 编入、产品装配与主测试图共用，来源为何只在薄程序入口冻结（active；部分替代测试控制 ADR-0175 的编译排除、独立普通/控制产物与选择规则）
 - [ADR-0175](ADR-0175-test-capabilities-and-finite-role-authorization.md) — 测试控制为何分离编译能力、准确角色启动授权与实际退出（active；编译与分产物规则由 ADR-0181 部分替代，准确授权、有限绑定、原期限与实际退出保留）

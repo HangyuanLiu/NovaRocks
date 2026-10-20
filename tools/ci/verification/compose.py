@@ -50,6 +50,7 @@ def _confirmed_cleanup(observation, confirmations):
     return False
 
 
+# Design: ADR-0186 (docs/adr/ADR-0186-layered-verification-and-read-only-evidence-composition.md)
 def compose(target, layer, attempts, declarations, dispositions=None, confirmations=()):
     """Return a derived schema-1 record; all input objects remain unchanged.
 
