@@ -130,7 +130,7 @@ fn c12_p1_trim_fixed_white_nonwhite_long_constants_and_empty_match_v1() {
 }
 #[test]
 fn c12_p1_trim_real_sql_column_calls_keep_ordered_requests_for_compiled() {
-    use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_single_field;
+    use crate::exec::expr::sql_test_source::sql_source_with_single_field;
     use novarocks_physical_plan::{
         ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
     };

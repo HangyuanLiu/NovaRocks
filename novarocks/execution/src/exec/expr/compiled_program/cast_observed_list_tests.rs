@@ -32,7 +32,7 @@ fn source_type(null_child: bool) -> DataType {
         true,
     )))
 }
-fn target_type(null_child: bool, field_id: Option<&str>) -> DataType {
+pub(super) fn target_type(null_child: bool, field_id: Option<&str>) -> DataType {
     let field = Field::new(
         if field_id.is_some() { "element" } else { "" },
         if null_child {
@@ -49,7 +49,7 @@ fn target_type(null_child: bool, field_id: Option<&str>) -> DataType {
     }));
     FunctionValueType::new(raw, true).data_type().clone()
 }
-fn input(null_child: bool) -> ArrayRef {
+pub(super) fn input(null_child: bool) -> ArrayRef {
     let DataType::List(field) = source_type(null_child) else {
         unreachable!()
     };

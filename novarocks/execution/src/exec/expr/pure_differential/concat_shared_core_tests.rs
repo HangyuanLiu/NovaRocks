@@ -173,7 +173,7 @@ fn c12_p2_concat_fixed_boundaries_constants_and_empty_match_v1() {
 }
 #[test]
 fn c12_p2_concat_real_sql_calls_keep_ordered_child_type_correspondence_for_compiled() {
-    use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
+    use crate::exec::expr::sql_test_source::sql_source_with_declared_fields;
     use novarocks_physical_plan::{
         ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
     };

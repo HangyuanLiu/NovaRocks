@@ -17,8 +17,8 @@
 //! Actual SQL emitter -> package -> installed owner -> LocalCompiler provenance.
 //! This observes the prepared retained call; native real-fold calls are not inferred.
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
+use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
 use novarocks_local_program::ProgramStateTemplate;
 

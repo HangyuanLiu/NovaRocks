@@ -405,13 +405,14 @@ impl BoundedRowMutationMatchCollector {
 
 /// Normalize an already converted match batch to its signed layout. The whole
 /// batch is preflighted before dictionary or layout construction allocates.
+#[cfg(test)]
 pub fn normalize_to_signed_selection(
     schema: &SchemaRef,
     batch: &RecordBatch,
 ) -> Result<RecordBatch, String> {
     CowSignedLayoutFootprint::for_batch(schema, batch, 0, 0, 0)
         .map_err(|error| error.to_string())?;
-    signed_layout::normalize(schema, batch)
+    signed_layout::normalize(schema, batch).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -471,7 +472,7 @@ fn normalize_owned_to_signed_selection(
         )?,
         None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?,
     };
-    let normalized = signed_layout::normalize(schema, input).map_err(invalid_match)?;
+    let normalized = signed_layout::normalize(schema, input)?;
     let mut columns = owner.children(schema.fields().len())?;
     let mut node = 0;
     for column in normalized.columns() {

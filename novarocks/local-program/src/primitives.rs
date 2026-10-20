@@ -54,10 +54,12 @@ impl From<CompileControlError> for ProgramPrimitiveError {
 }
 impl From<ComparisonPrepareError> for ProgramPrimitiveError {
     fn from(value: ComparisonPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Comparison(value)
+        match value {
+            ComparisonPrepareError::Control(cause)
+            | ComparisonPrepareError::Kernel(novarocks_functions::KernelFailure::CompileControl(
+                cause,
+            )) => Self::Control(cause),
+            original => Self::Comparison(original),
         }
     }
 }
@@ -404,10 +406,12 @@ fn compile_core<H>(
 
 impl From<novarocks_functions::ArithmeticPrepareError> for ProgramPrimitiveError {
     fn from(value: novarocks_functions::ArithmeticPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Arithmetic(value)
+        match value {
+            novarocks_functions::ArithmeticPrepareError::Control(cause)
+            | novarocks_functions::ArithmeticPrepareError::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(cause),
+            ) => Self::Control(cause),
+            original => Self::Arithmetic(original),
         }
     }
 }
@@ -523,10 +527,12 @@ pub(crate) fn compile_arithmetic_with_factory<H, F: ValueSchemaCreationFactory<H
 
 impl From<novarocks_functions::CastPrepareError> for ProgramPrimitiveError {
     fn from(value: novarocks_functions::CastPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Cast(value)
+        match value {
+            novarocks_functions::CastPrepareError::Control(cause)
+            | novarocks_functions::CastPrepareError::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(cause),
+            ) => Self::Control(cause),
+            original => Self::Cast(original),
         }
     }
 }
@@ -1164,4 +1170,94 @@ pub fn prepare_native_bitnot_node(
     Ok(novarocks_functions::PreparedNativeBitNotRecipe::try_new(
         source, result, control,
     )?)
+}
+
+#[cfg(test)]
+mod primitive_source_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureProjection, FailureReason, domain};
+    use novarocks_functions::{
+        ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
+        KernelFailure,
+    };
+    use std::{error::Error, num::NonZeroU16};
+
+    #[test]
+    fn primitive_preparation_keeps_bare_kernel_stops_capacity_and_domain_sources() {
+        for original in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::Capacity(novarocks_functions::KernelCapacityRefusal::new(
+                FailureReason::new(domain::MEMORY, NonZeroU16::new(8).unwrap()),
+                16,
+                8,
+                16,
+            )),
+            KernelFailure::from(novarocks_type_contract::ValueTypeError::TooDeep),
+            KernelFailure::from(
+                novarocks_type_contract::ValueTypeError::InvalidLogicalCarrier(
+                    ValueLogicalType::Json,
+                ),
+            ),
+        ] {
+            let expected = original.failure_fact();
+            for error in [
+                ProgramPrimitiveError::from(A::Kernel(original.clone())),
+                ProgramPrimitiveError::from(B::Kernel(original.clone())),
+                ProgramPrimitiveError::from(C::Kernel(original.clone())),
+            ] {
+                assert!(!matches!(error, ProgramPrimitiveError::Control(_)));
+                assert_eq!(error.failure_fact(), expected);
+                let kernel = error
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<KernelFailure>()
+                    .unwrap();
+                // Kernel Source equality retains the same shared occurrence,
+                // not just a replacement with equal diagnostic text.
+                assert_eq!(kernel, &original);
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_preparation_unwraps_only_actual_caller_control_channels() {
+        for original in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::from_domain(novarocks_type_contract::ValueTypeError::TooDeep),
+        ] {
+            let expected = original.failure_fact();
+            for error in [
+                ProgramPrimitiveError::from(A::Control(original.clone())),
+                ProgramPrimitiveError::from(B::Control(original.clone())),
+                ProgramPrimitiveError::from(C::Control(original.clone())),
+                ProgramPrimitiveError::from(A::Kernel(KernelFailure::CompileControl(
+                    original.clone(),
+                ))),
+                ProgramPrimitiveError::from(B::Kernel(KernelFailure::CompileControl(
+                    original.clone(),
+                ))),
+                ProgramPrimitiveError::from(C::Kernel(KernelFailure::CompileControl(
+                    original.clone(),
+                ))),
+            ] {
+                assert_eq!(error.failure_fact(), expected);
+                assert_eq!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<CompileControlError>(),
+                    Some(&original)
+                );
+                assert!(
+                    matches!(error, ProgramPrimitiveError::Control(actual) if actual == original)
+                );
+            }
+        }
+    }
 }

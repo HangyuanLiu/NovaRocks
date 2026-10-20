@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Real SQL ORDER source producer, original support before and exact after.
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_semantics;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
+use super::sql_test_source::sql_source_with_semantics;
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,

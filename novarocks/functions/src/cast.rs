@@ -1038,8 +1038,8 @@ impl PreparedCastRecipe {
             // Preserve original signed MIN abs and -128 negation panics; static
             // factor errors also retain their real selected row attribution.
             CastBody::FloatDecimal { .. } => true,
-            // Raw Date32 admits invalid days and original unchecked arithmetic.
-            // Preserve its data error and overflow panic rather than promising never-fails.
+            // Raw Date32 admits invalid days. Checked calendar conversion
+            // retains their row-data errors under every build profile.
             CastBody::DateFloat { .. } => true,
             // Conservatively retain failure awareness for the original i128 MIN
             // positive-scale abs bug; do not translate its panic into a row error.

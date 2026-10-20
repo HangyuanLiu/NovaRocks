@@ -230,7 +230,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
     use super::super::compiled_program::CompiledExpressionInstance;
     use super::super::filter_conjunction_actual_sql_compiler_tests::compiler_results;
     use super::super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-    use super::super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
+    use super::super::sql_test_source::sql_source_with_declared_fields;
     use novarocks_local_program::{ProgramExpressionRootSite, ProgramNodeKind, StaticExprKind};
     use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition};
 

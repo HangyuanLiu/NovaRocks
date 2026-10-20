@@ -22,11 +22,7 @@ use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition, StaticFunctionAr
 use novarocks_type_contract::{FunctionArgumentType, FunctionValueType, ValueLogicalType};
 const SQL: &str = "SELECT parse_json('[1,2,3]') AS parsed";
 fn check() {
-    let source =
-        super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields(
-            SQL,
-            &[],
-        );
+    let source = super::sql_test_source::sql_source_with_declared_fields(SQL, &[]);
     let mut count = 0;
     for fragment in source.plan().fragments().values() {
         for (id, node) in fragment.expressions().iter() {

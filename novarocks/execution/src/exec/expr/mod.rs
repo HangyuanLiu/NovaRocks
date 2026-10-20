@@ -1694,7 +1694,16 @@ mod legacy_array_match_baseline_tests;
 mod legacy_array_difference_baseline_tests;
 
 #[cfg(test)]
-mod numeric_unary_original_nonnull_sql_baseline_tests;
+mod sql_test_source;
+
+#[cfg(test)]
+mod f3_json_object_sql_boundary_tests;
+
+#[cfg(test)]
+mod f3_concat_trim_sql_boundary_tests;
+
+#[cfg(test)]
+mod f3_substring_field_sql_boundary_tests;
 
 #[cfg(test)]
 #[path = "cast_decimal_float_oracle_tests.rs"]

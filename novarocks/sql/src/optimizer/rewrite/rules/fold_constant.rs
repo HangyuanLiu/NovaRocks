@@ -2680,10 +2680,14 @@ mod complete_fold_type_tests {
             KernelFailure::Cancelled,
             KernelFailure::DeadlineExceeded,
             KernelFailure::ResourceExhausted,
+            KernelFailure::CompileControl(CompileControlError::from_domain(
+                ProjectedOuterFoldSource,
+            )),
+            KernelFailure::from_domain(ProjectedOuterFoldSource),
             KernelFailure::InvalidProgram(KernelDiagnostic::new("frozen binding mismatch")),
             KernelFailure::Internal(KernelDiagnostic::new("unexpected pure preparation failure")),
         ] {
-            let SqlConstantEvaluationError::Source(converted) =
+            let SqlConstantEvaluationError::Outer(converted) =
                 SqlConstantEvaluationError::from(failure.clone())
             else {
                 panic!("kernel evidence must not mint controller intent");
@@ -2724,6 +2728,22 @@ mod complete_fold_type_tests {
             )
         }
     }
+    #[derive(Debug)]
+    struct ProjectedOuterFoldSource;
+    impl std::fmt::Display for ProjectedOuterFoldSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            ProjectedFoldSource(novarocks_failure_contract::FailureClass::Data).fmt(f)
+        }
+    }
+    impl std::error::Error for ProjectedOuterFoldSource {}
+    impl novarocks_failure_contract::FailureProjection for ProjectedOuterFoldSource {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureProjection::failure_fact(&ProjectedFoldSource(
+                novarocks_failure_contract::FailureClass::Data,
+            ))
+        }
+    }
+    impl novarocks_failure_contract::OuterFailureProjection for ProjectedOuterFoldSource {}
     struct ProjectedFoldEvaluator(Mutex<Option<novarocks_failure_contract::SharedFailureCause>>);
     impl SqlConstantEvaluator for ProjectedFoldEvaluator {
         fn eval_scalar(

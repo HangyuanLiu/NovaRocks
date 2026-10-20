@@ -18,8 +18,8 @@
 //! Actual SQL author -> native package -> LocalCompiler -> mutable Frame.
 //! New fixtures are UNRUN until the root's serialized Execution test window.
 use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
+use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;

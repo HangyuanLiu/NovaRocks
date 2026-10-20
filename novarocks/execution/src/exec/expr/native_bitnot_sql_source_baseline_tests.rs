@@ -18,7 +18,7 @@
 //! The reused fixture uses its explicitly supplied no-fold evaluator, so these
 //! tests prove analyzed/published FVT, not production FE folding/case closure.
 use super::*;
-use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
+use crate::exec::expr::sql_test_source::sql_source;
 use novarocks_physical_plan::{ExprKind, UnaryOperator};
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
@@ -92,7 +92,7 @@ fn native_bitnot_sql_before_actual_nullable_values_and_integer_literal_are_signe
 }
 #[test]
 fn native_bitnot_sql_original_unsigned_source_has_typed_intrinsic_refusal_before_provider() {
-    use crate::exec::expr::numeric_unary_original_nonnull_sql_baseline_tests::try_sql_source_with_declared_fields;
+    use crate::exec::expr::sql_test_source::try_sql_source_with_declared_fields;
     use arrow::datatypes::Field;
     use novarocks_sql::{
         analyze_error::AnalyzeErrorKind,

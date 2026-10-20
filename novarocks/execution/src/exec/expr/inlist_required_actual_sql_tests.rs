@@ -19,10 +19,10 @@
 //! Before preparation these are RED at UnsupportedExpression(InList).
 use super::compiled_program::CompiledExpressionInstance;
 use super::legacy_inlist_required_baseline_tests::{original, original_required_case_operand};
-use super::numeric_unary_original_nonnull_sql_baseline_tests::{
+use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
+use super::sql_test_source::{
     sql_source_with_single_field, sql_source_with_single_field_and_core_residuals,
 };
-use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Borrow the original retained corpus call and journal; no preparation or value validation.
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
+use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     FunctionArgumentType, FunctionResultType, PureCallLifecycle, ResolvedFunctionBinding,

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual original SQL semantic sources; no new environment checker.
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_semantics;
+use super::sql_test_source::sql_source_with_semantics;
 use arrow::datatypes::DataType;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::SemanticParameterValue;
@@ -28,7 +28,7 @@ pub(super) fn concat_source() -> SqlAuthoredPhysicalPlan {
 }
 pub(super) fn unix_source()
 -> Result<SqlAuthoredPhysicalPlan, novarocks_sql::compiler::SqlCompileProgressError> {
-    super::numeric_unary_original_nonnull_sql_baseline_tests::try_sql_source_with_declared_fields(
+    super::sql_test_source::try_sql_source_with_declared_fields(
         "SELECT FROM_UNIXTIME(CAST(k AS BIGINT)) FROM fixture",
         &[arrow::datatypes::Field::new("k", DataType::Int64, false)],
     )

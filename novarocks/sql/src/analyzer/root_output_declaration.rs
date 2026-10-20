@@ -36,11 +36,30 @@ fn step(control: &SqlCompileControl) -> Result<(), SqlCompileError> {
 fn invalid(error: impl std::fmt::Display) -> SqlCompileError {
     SqlCompileError::InvalidRequest(error.to_string())
 }
+fn compilation_source<E>(error: E) -> SqlCompileError
+where
+    E: std::error::Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
+{
+    SqlCompileError::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(error))
+}
+fn allocation_source(error: std::collections::TryReserveError) -> SqlCompileError {
+    compilation_source(
+        novarocks_functions::allocation_failure::AllocationRefusal::new(
+            "root output declaration",
+            error,
+        ),
+    )
+}
 fn check_type(ty: &FunctionValueType, control: &SqlCompileControl) -> Result<(), SqlCompileError> {
-    super::helpers::validate_value_type(ty, control).map_err(|error| match error.control_error() {
-        Some(cause) => cause.into(),
-        None => invalid(error),
-    })
+    let mut work =
+        novarocks_type_contract::CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = novarocks_functions::validate_function_value_type_observed(ty, &mut work).map_err(
+        |error| match error {
+            novarocks_functions::KernelFailure::CompileControl(cause) => cause.into(),
+            error => compilation_source(error),
+        },
+    );
+    work.finish_result(result, SqlCompileError::from)
 }
 /// Compare an actual COW root against its exact declaration. Only NULL promises
 /// may differ; nominal domains, names, physical widths and parameters stay exact.
@@ -192,7 +211,7 @@ pub(crate) fn apply_root_output_declaration(
     let mut projection = Vec::new();
     projection
         .try_reserve_exact(original.len())
-        .map_err(|_| SqlCompileError::ResourceExhausted)?;
+        .map_err(allocation_source)?;
     for ((mut item, output), declared) in original
         .into_iter()
         .zip(&mut query.output_columns)
@@ -232,9 +251,9 @@ fn widen_declaration(
     control: &SqlCompileControl,
 ) -> Result<FunctionValueType, SqlCompileError> {
     let (semantic, layout) = widen(value.value_type(), value.data_type(), true, control)?;
-    let layout =
-        ValueLayout::try_new(&layout, ValueTypeStorageLifetime::pure()).map_err(invalid)?;
-    FunctionValueType::try_from_value(semantic, layout).map_err(invalid)
+    let layout = ValueLayout::try_new(&layout, ValueTypeStorageLifetime::pure())
+        .map_err(compilation_source)?;
+    FunctionValueType::try_from_value(semantic, layout).map_err(compilation_source)
 }
 fn relabel(field: &FieldRef, ty: DataType, nullable: bool) -> FieldRef {
     Arc::new(Field::new(field.name(), ty, nullable).with_metadata(field.metadata().clone()))
@@ -279,10 +298,10 @@ fn widen(
             let mut types = Vec::new();
             values
                 .try_reserve_exact(fields.len())
-                .map_err(|_| SqlCompileError::ResourceExhausted)?;
+                .map_err(allocation_source)?;
             types
                 .try_reserve_exact(fields.len())
-                .map_err(|_| SqlCompileError::ResourceExhausted)?;
+                .map_err(allocation_source)?;
             for (field, layout) in fields.iter().zip(layouts) {
                 let (v, t) = widen(field.value_type(), layout.data_type(), true, c)?;
                 step(c)?;
@@ -326,12 +345,12 @@ fn widen(
             let mut ids = Vec::new();
             values
                 .try_reserve_exact(fields.len())
-                .map_err(|_| SqlCompileError::ResourceExhausted)?;
+                .map_err(allocation_source)?;
             types
                 .try_reserve_exact(fields.len())
-                .map_err(|_| SqlCompileError::ResourceExhausted)?;
+                .map_err(allocation_source)?;
             ids.try_reserve_exact(fields.len())
-                .map_err(|_| SqlCompileError::ResourceExhausted)?;
+                .map_err(allocation_source)?;
             for (field, (id, layout)) in fields.iter().zip(layouts.iter()) {
                 if field.type_id != id {
                     return Err(invalid(
@@ -354,7 +373,7 @@ fn widen(
         }
         (kind, layout) => (kind.clone(), layout.clone()),
     };
-    let semantic = ValueTypeRef::try_new(kind, nullable, storage).map_err(invalid)?;
+    let semantic = ValueTypeRef::try_new(kind, nullable, storage).map_err(compilation_source)?;
     Ok((semantic, layout))
 }
 

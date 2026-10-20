@@ -19,8 +19,8 @@
 //! at the original package effect author; raw scalar oracles remain independent.
 use super::compiled_program::CompiledExpressionInstance;
 use super::legacy_between_observed_baseline_tests::original;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_scan_residuals;
+use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Int64Array, UInt64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;

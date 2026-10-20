@@ -417,7 +417,7 @@ fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation
         .collect::<Vec<_>>();
     let mut records = Vec::new();
     for (query, sql) in ORIGINAL_SQL {
-        let source = super::super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields(sql, &fields);
+        let source = super::super::sql_test_source::sql_source_with_declared_fields(sql, &fields);
         let plan = source.plan();
         let result = plan.result_port().unwrap();
         let live = ancestors(plan, (result.fragment, result.output.node));

@@ -18,8 +18,8 @@
 //! Frame. The shared SQL fixture deliberately disables folding; native whole
 //! cases and production FE folding remain separate acceptance obligations.
 use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::{batch, programs_with_catalogue};
+use super::sql_test_source::sql_source;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprNode, function};
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};

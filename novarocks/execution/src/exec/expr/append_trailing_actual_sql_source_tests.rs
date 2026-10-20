@@ -16,7 +16,7 @@
 // under the License.
 //! The actual SQL case with no-op folding retains the original emitted call and request authors.
 //! Prior native PASS alone does not establish that a call survived real constant folding.
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
+use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,

@@ -419,8 +419,8 @@ fn numeric_not_preserves_zero_nonzero_nan_and_null_in_the_original_successful_do
 
 #[test]
 fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values() {
-    use super::super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
     use super::super::numeric_unary_owned_transaction_tests::{batch, programs_with_catalogue};
+    use super::super::sql_test_source::sql_source;
     use super::CompiledExpressionInstance;
     let functions =
         super::super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();

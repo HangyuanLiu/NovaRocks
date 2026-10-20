@@ -622,7 +622,7 @@ pub trait SqlConstantEvaluator: Send + Sync {
     }
 }
 
-/// Request failures stay distinct from a failed optional legacy evaluation.
+/// Outer author failures stay distinct from a normal optional row-data result.
 /// Kernel strings are not interpreted to infer a control category.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlConstantEvaluationError {
@@ -681,7 +681,7 @@ impl From<novarocks_type_contract::ValueTypeError> for SqlConstantEvaluationErro
 
 impl From<novarocks_functions::KernelFailure> for SqlConstantEvaluationError {
     fn from(error: novarocks_functions::KernelFailure) -> Self {
-        Self::from_domain(error)
+        Self::outer_domain(error)
     }
 }
 

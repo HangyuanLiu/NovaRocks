@@ -16,8 +16,8 @@
 // under the License.
 
 //! Actual compiled List CAST failure/admission witnesses, separate from raw oracles.
+use super::observed_list_cast_profile_tests::{input, target_type};
 use super::*;
-use crate::exec::expr::legacy_observed_list_cast_baseline_tests::{input, target_type};
 fn list_batch(program: &LocalProgram, source: ArrayRef) -> RecordBatch {
     let len = source.len();
     RecordBatch::try_new(

@@ -18,7 +18,7 @@
 //! installed provider contract fixture, LocalCompiler and the actual Frame.
 //! This fixture does not execute a connector or claim a host memory grant.
 use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
+use super::sql_test_source::sql_source;
 use arrow::{
     array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::{DataType, Field, Schema},

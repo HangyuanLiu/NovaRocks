@@ -98,3 +98,57 @@ fn layout_preflight_rejects_large_dictionary_expansion_without_allocating_it() {
     let error = CowSignedLayoutFootprint::for_batch(&schema, &input, 0, 0, 0).unwrap_err();
     assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
 }
+
+#[test]
+fn layout_preflight_preserves_utf8_extent_from_small_legal_dictionary() {
+    use novarocks_failure_contract::{
+        FailureClass, FailureProjection, RepresentationBoundary, SharedFailureCause,
+    };
+    use std::error::Error;
+
+    const ROWS: usize = 524_288;
+    const VALUE_BYTES: usize = 4096;
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0; ROWS]),
+            Arc::new(StringArray::from(vec!["x".repeat(VALUE_BYTES)])),
+        )
+        .unwrap(),
+    );
+    let input = batch(Arc::clone(&dictionary));
+    let schema = Schema::new(vec![Field::new("v", DataType::Utf8, true)]);
+    assert!(ROWS <= MAX_ROWS);
+    assert!(ConnectorRowConversionFootprint::retained_batch_bytes(&input).unwrap() < INPUT_BYTES);
+    assert!(dictionary.get_buffer_memory_size() < 3 * 1024 * 1024);
+
+    // Only the footprint runs. No expanded output array is materialized.
+    let error = CowSignedLayoutFootprint::for_batch(&schema, &input, 0, 0, 0).unwrap_err();
+    let measured_error =
+        super::super::signed_layout::decoded_dictionary_bytes(&dictionary).unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    let fact = error.failure_fact();
+    assert_eq!(fact, measured_error.failure_fact());
+    assert_eq!(fact.class(), FailureClass::Representation);
+    assert!(fact.resource().is_none());
+    let representation = fact.representation().unwrap();
+    assert_eq!(
+        representation.boundary,
+        RepresentationBoundary::SingleOutput
+    );
+    assert_eq!(
+        representation.required,
+        Some(ROWS as u64 * VALUE_BYTES as u64)
+    );
+    assert_eq!(representation.extent_limit, Some(i32::MAX as u64));
+    assert_eq!(representation.representable_prefix, None);
+    // A blanket InvalidRequest/Resource remap would discard this typed source.
+    let shared = error
+        .source()
+        .unwrap()
+        .downcast_ref::<SharedFailureCause>()
+        .unwrap();
+    assert_eq!(shared.failure_fact(), fact);
+    assert!(shared.source().is_some());
+    assert!(Arc::ptr_eq(input.column(0), &dictionary));
+    assert_eq!(dictionary.len(), ROWS);
+}

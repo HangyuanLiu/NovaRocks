@@ -21,8 +21,8 @@
 //! survive SQL completion and LocalCompiler, over literal/constant leaves.
 
 use super::super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use super::super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_semantics;
 use super::super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
+use super::super::sql_test_source::sql_source_with_semantics;
 use super::CompiledExpressionInstance;
 use super::constant_node::{
     ConstantCarrierStep, ConstantConversion, ConstantNode, ConstantNodeOutcome,

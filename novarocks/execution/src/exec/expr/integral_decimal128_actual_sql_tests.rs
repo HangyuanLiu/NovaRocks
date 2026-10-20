@@ -18,8 +18,8 @@
 //! Actual required signed source binding; no name-based re-resolution or fake provider.
 use super::compiled_program::CompiledExpressionInstance;
 use super::legacy_integral_decimal128_baseline_tests::{actual, integral_input, values};
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
+use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;

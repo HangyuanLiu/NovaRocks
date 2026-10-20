@@ -16,7 +16,7 @@
 // under the License.
 //! Real SQL fact/resume sources and complete BY window compilation oracles.
 use super::filter_conjunction_actual_sql_compiler_tests::compiler_results_with_declared_read_fields;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
+use super::sql_test_source::sql_source_with_declared_fields;
 use arrow::datatypes::{DataType, Field};
 use novarocks_physical_plan::ExprKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;

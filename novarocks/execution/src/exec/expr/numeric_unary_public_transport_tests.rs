@@ -18,7 +18,7 @@
 //! Frozen v12/v10 VALUES probes stay unchanged as diagnostic evidence.
 //! Required source columns use the sole actual ConnectorReadTableFacts producer.
 //! Public NULL guarantees are the completed expression owner's guarantees.
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source as nonnull_source;
+use super::sql_test_source::sql_source as nonnull_source;
 use arrow::datatypes::DataType;
 use novarocks_functions::ConstantPolicy;
 use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};

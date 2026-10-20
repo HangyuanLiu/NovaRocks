@@ -159,8 +159,7 @@ fn layout(array: &ArrayRef, field: &Field) -> Result<(usize, usize), ConnectorEr
         (DataType::Dictionary(key, value), DataType::Utf8)
             if **key == DataType::Int32 && **value == DataType::Utf8 =>
         {
-            let bytes = super::signed_layout::decoded_dictionary_bytes(array)
-                .map_err(|_| invalid("COW dictionary offsets or keys violate its signed layout"))?;
+            let bytes = super::signed_layout::decoded_dictionary_bytes(array)?;
             let expanded = add(
                 add(round64(bytes)?, round64(mul(add(rows, 1)?, 4)?)?)?,
                 bitmap(rows)?,
