@@ -25,3 +25,155 @@ NULL
 -- query 14
 id
 2
+
+-- query 17
+folded_upper
+MIXED
+
+-- query 18
+folded_abs
+7
+
+-- query 19
+folded_if
+10
+
+-- query 20
+folded_coalesce
+8
+
+-- query 21
+folded_ifnull
+9
+
+-- query 22
+folded_nullif
+NULL
+
+-- query 23
+folded_and
+NULL
+
+-- query 24
+folded_or
+1
+
+-- query 25
+folded_not
+NULL
+
+-- query 26
+folded_decimal_compare
+1
+
+-- query 27
+folded_temporal_compare
+1
+
+-- query 28
+folded_nullsafe_equal
+1
+
+-- query 29
+folded_nullsafe_distinct
+0
+
+-- query 30
+folded_narrow
+12
+
+-- query 31
+folded_integer_parse
+42
+
+-- query 32
+folded_date_parse
+2020-01-02
+
+-- query 33
+folded_decimal_rounding
+12.35
+
+-- query 34
+folded_decimal_overflow
+NULL
+
+-- query 36
+folded_upper
+MIXED
+
+-- query 37
+folded_abs
+7
+
+-- query 38
+folded_if
+10
+
+-- query 39
+folded_coalesce
+8
+
+-- query 40
+folded_ifnull
+9
+
+-- query 41
+folded_nullif
+NULL
+
+-- query 42
+folded_and
+NULL
+
+-- query 43
+folded_or
+1
+
+-- query 44
+folded_not
+NULL
+
+-- query 45
+folded_decimal_compare
+1
+
+-- query 46
+folded_temporal_compare
+1
+
+-- query 47
+folded_nullsafe_equal
+1
+
+-- query 48
+folded_nullsafe_distinct
+0
+
+-- query 49
+folded_narrow
+12
+
+-- query 50
+folded_integer_parse
+42
+
+-- query 51
+folded_date_parse
+2020-01-02
+
+-- query 52
+folded_decimal_rounding
+12.35
+
+-- query 53
+folded_decimal_overflow
+NULL
+
+-- query 56
+checked_decimal_rounding
+12.35
+
+-- query 60
+checked_decimal_rounding
+12.35

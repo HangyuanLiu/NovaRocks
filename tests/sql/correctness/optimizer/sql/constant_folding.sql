@@ -106,3 +106,160 @@ SELECT 40000 + 2000 + 96;
 
 -- @explain_contains=predicates: dt = CAST('2020-01-01' AS Date32)
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
+
+-- ---------------------------------------------------------------------------
+-- 9. Each supported folding family keeps its value and constant plan shape.
+--    The matching FoldConstant-disabled block below exercises today's compiled
+--    runtime as an independent result oracle. Keep explicit aliases so plan
+--    assertions cannot accidentally match a parsed expression in a column label.
+-- ---------------------------------------------------------------------------
+SET disable_optimizer_rules = '';
+SET sql_mode = 32;
+
+-- @explain_contains=['MIXED' AS folded_upper]
+SELECT upper('MiXeD') AS folded_upper;
+
+-- @explain_contains=[7 AS folded_abs]
+SELECT abs(7) AS folded_abs;
+
+-- @explain_contains=[10 AS folded_if]
+SELECT if(true, 10, 20) AS folded_if;
+
+-- @explain_contains=[8 AS folded_coalesce]
+SELECT coalesce(CAST(NULL AS INT), 8) AS folded_coalesce;
+
+-- @explain_contains=[9 AS folded_ifnull]
+SELECT ifnull(CAST(NULL AS INT), 9) AS folded_ifnull;
+
+-- @explain_contains=[NULL AS folded_nullif]
+SELECT nullif(9, 9) AS folded_nullif;
+
+-- @explain_contains=[NULL AS folded_and]
+SELECT CAST(NULL AS BOOLEAN) AND true AS folded_and;
+
+-- @explain_contains=[true AS folded_or]
+SELECT CAST(NULL AS BOOLEAN) OR true AS folded_or;
+
+-- @explain_contains=[NULL AS folded_not]
+SELECT NOT CAST(NULL AS BOOLEAN) AS folded_not;
+
+-- @explain_contains=[true AS folded_decimal_compare]
+SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decimal_compare;
+
+-- @explain_contains=[true AS folded_temporal_compare]
+SELECT CAST('2020-01-01' AS DATE) = '2020-01-01' AS folded_temporal_compare;
+
+-- @explain_contains=[true AS folded_nullsafe_equal]
+SELECT CAST(NULL AS INT) <=> CAST(NULL AS INT) AS folded_nullsafe_equal;
+
+-- @explain_contains=[false AS folded_nullsafe_distinct]
+SELECT CAST(NULL AS INT) <=> CAST(1 AS INT) AS folded_nullsafe_distinct;
+
+-- @explain_contains=[12 AS folded_narrow]
+SELECT CAST(12 AS TINYINT) AS folded_narrow;
+
+-- @explain_contains=[42 AS folded_integer_parse]
+SELECT CAST('42' AS INT) AS folded_integer_parse;
+
+-- @explain_contains=[2020-01-02 AS folded_date_parse]
+SELECT CAST('2020-01-02' AS DATE) AS folded_date_parse;
+
+-- @explain_contains=[12.35 AS folded_decimal_rounding]
+SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS folded_decimal_rounding;
+
+-- @explain_contains=[NULL AS folded_decimal_overflow]
+SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
+
+-- ---------------------------------------------------------------------------
+-- 10. Disable folding and require the original operation to remain visible.
+--     Every result must match the corresponding folded query above.
+-- ---------------------------------------------------------------------------
+SET disable_optimizer_rules = 'FoldConstant';
+
+-- @explain_contains=[upper(
+SELECT upper('MiXeD') AS folded_upper;
+
+-- @explain_contains=[abs(
+SELECT abs(7) AS folded_abs;
+
+-- @explain_contains=[if(
+SELECT if(true, 10, 20) AS folded_if;
+
+-- @explain_contains=[coalesce(
+SELECT coalesce(CAST(NULL AS INT), 8) AS folded_coalesce;
+
+-- @explain_contains=[ifnull(
+SELECT ifnull(CAST(NULL AS INT), 9) AS folded_ifnull;
+
+-- @explain_contains=[nullif(
+SELECT nullif(9, 9) AS folded_nullif;
+
+-- @explain_contains= AND true AS folded_and]
+SELECT CAST(NULL AS BOOLEAN) AND true AS folded_and;
+
+-- @explain_contains= OR true AS folded_or]
+SELECT CAST(NULL AS BOOLEAN) OR true AS folded_or;
+
+-- @explain_contains=[NOT
+SELECT NOT CAST(NULL AS BOOLEAN) AS folded_not;
+
+-- @explain_contains= = CAST(
+SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decimal_compare;
+
+-- @explain_contains= = CAST(
+SELECT CAST('2020-01-01' AS DATE) = '2020-01-01' AS folded_temporal_compare;
+
+-- @explain_contains=<=>
+SELECT CAST(NULL AS INT) <=> CAST(NULL AS INT) AS folded_nullsafe_equal;
+
+-- @explain_contains=<=>
+SELECT CAST(NULL AS INT) <=> CAST(1 AS INT) AS folded_nullsafe_distinct;
+
+-- @explain_contains=[CAST(12 AS
+SELECT CAST(12 AS TINYINT) AS folded_narrow;
+
+-- @explain_contains=[CAST('42' AS
+SELECT CAST('42' AS INT) AS folded_integer_parse;
+
+-- @explain_contains=[CAST('2020-01-02' AS
+SELECT CAST('2020-01-02' AS DATE) AS folded_date_parse;
+
+-- @explain_contains=[CAST(CAST(12.345 AS
+SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS folded_decimal_rounding;
+
+-- @explain_contains=[CAST(1000 AS
+SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
+
+-- ---------------------------------------------------------------------------
+-- 11. ERROR_IF_OVERFLOW still folds successful rounding, and an actual row
+--     error stays unfolded so execution owns the same error in both modes.
+-- ---------------------------------------------------------------------------
+SET disable_optimizer_rules = '';
+SET sql_mode = 'ERROR_IF_OVERFLOW';
+
+-- @explain_contains=[12.35 AS checked_decimal_rounding]
+SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS checked_decimal_rounding;
+
+-- @skip_result_check=true
+-- @result_contains=[CAST(1000 AS
+EXPLAIN VERBOSE SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
+
+-- @skip_result_check=true
+-- @expect_error=numeric type cast involving decimal overflows
+SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
+
+SET disable_optimizer_rules = 'FoldConstant';
+
+-- @explain_contains=[CAST(CAST(12.345 AS
+SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS checked_decimal_rounding;
+
+-- @skip_result_check=true
+-- @result_contains=[CAST(1000 AS
+EXPLAIN VERBOSE SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
+
+-- @skip_result_check=true
+-- @expect_error=numeric type cast involving decimal overflows
+SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
+
+SET sql_mode = 32;
+SET disable_optimizer_rules = '';
