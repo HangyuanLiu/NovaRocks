@@ -1479,6 +1479,157 @@ fn entrance_rechecks_long_computation_dependencies_and_isolates_targets() {
     drop((lease_a, lease_b));
 }
 
+fn publication_terminal_fixture(
+    operation: ConnectorDocumentManagementOperation,
+) -> (ManagementEntrance, ManagedMvTarget, ManagementRequest) {
+    let target = target("mv", b"object-a");
+    let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    let request = ManagementRequest::try_new(
+        target.catalog().clone(),
+        target.table().clone(),
+        Some(target.object_id().clone()),
+        operation,
+        Some(dependencies),
+        EffectScope::CATALOG_COMMIT,
+    )
+    .unwrap();
+    (entrance, target, request)
+}
+
+#[test]
+fn publication_refused_before_dispatch_releases_only_its_local_activity() {
+    let (entrance, target, request) =
+        publication_terminal_fixture(ConnectorDocumentManagementOperation::Publication);
+    let mut first = entrance
+        .request(
+            request.clone(),
+            crate::activity::MvActivityOwner::ScheduledRefresh,
+        )
+        .unwrap();
+    let first = first.try_acquire().unwrap().unwrap();
+    let mut next = entrance
+        .request(request, crate::activity::MvActivityOwner::ManualRefresh)
+        .unwrap();
+    assert!(next.try_acquire().unwrap().is_none());
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Managing
+    );
+    first
+        .record_publication_terminal(EffectDisposition::KnownUncommitted)
+        .unwrap();
+    assert!(entrance.unsettled_effects(target.table()).is_empty());
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+    let next = next
+        .try_acquire()
+        .unwrap()
+        .expect("local refusal releases the FIFO turn");
+    drop(next);
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+}
+
+#[test]
+fn local_publication_cannot_claim_an_unissued_commit_or_unknown_effect() {
+    for disposition in [
+        EffectDisposition::KnownCommitted,
+        EffectDisposition::CommitUnknown,
+    ] {
+        let (entrance, target, request) =
+            publication_terminal_fixture(ConnectorDocumentManagementOperation::Publication);
+        let lease = entrance.acquire(request.clone(), || false).unwrap();
+        assert_eq!(
+            lease.record_publication_terminal(disposition),
+            Err(ManagementAdmissionError::EffectNotDispatched)
+        );
+        assert!(entrance.unsettled_effects(target.table()).is_empty());
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::Manageable
+        );
+        // The original general effect API remains strict even for Publication.
+        assert_eq!(
+            entrance
+                .acquire(request, || false)
+                .unwrap()
+                .record_terminal(EffectDisposition::KnownUncommitted),
+            Err(ManagementAdmissionError::EffectNotDispatched)
+        );
+    }
+    let (entrance, target, request) =
+        publication_terminal_fixture(ConnectorDocumentManagementOperation::SingleTargetUpdate);
+    assert_eq!(
+        entrance
+            .acquire(request, || false)
+            .unwrap()
+            .record_publication_terminal(EffectDisposition::KnownUncommitted),
+        Err(ManagementAdmissionError::InvalidEffect)
+    );
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+}
+
+#[test]
+fn dispatched_publication_preserves_the_providers_actual_terminal() {
+    for (disposition, expected_phase) in [
+        (
+            EffectDisposition::KnownUncommitted,
+            MvManagementPhase::Manageable,
+        ),
+        (
+            EffectDisposition::KnownCommitted,
+            MvManagementPhase::AwaitingConvergence,
+        ),
+        (
+            EffectDisposition::CommitUnknown,
+            MvManagementPhase::AwaitingEffectSettlement { unsettled: 1 },
+        ),
+    ] {
+        let (entrance, target, request) =
+            publication_terminal_fixture(ConnectorDocumentManagementOperation::Publication);
+        let mut lease = entrance.acquire(request.clone(), || false).unwrap();
+        let identity = EffectIdentity::from_bytes([19; 16]);
+        lease
+            .mark_dispatched(EffectResponsibility::new(
+                identity,
+                target.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                ManagementTimestamp::from_unix_millis(1_000),
+            ))
+            .unwrap();
+        lease.record_publication_terminal(disposition).unwrap();
+        assert_eq!(entrance.management_phase(target.table()), expected_phase);
+        let unsettled = entrance.unsettled_effects(target.table());
+        if disposition == EffectDisposition::CommitUnknown {
+            assert_eq!(unsettled.len(), 1);
+            assert_eq!(unsettled[0].responsibility().identity(), identity);
+            assert_eq!(
+                unsettled[0].original_disposition(),
+                EffectDisposition::CommitUnknown
+            );
+            assert_eq!(
+                entrance.acquire(request, || false).err().unwrap(),
+                ManagementAdmissionError::EffectUnsettled
+            );
+        } else {
+            assert!(unsettled.is_empty());
+        }
+    }
+}
+
 #[test]
 fn unknown_or_dropped_after_dispatch_keeps_conflicting_management_closed() {
     let target = target("mv", b"object-a");

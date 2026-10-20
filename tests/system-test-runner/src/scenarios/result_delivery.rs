@@ -745,8 +745,10 @@ impl ContextRootRetention {
             manifest.client_receive_buffer_bytes,
         ))?;
         let connection_id = stream.connection_id()?;
-        let before_logs = (0..3)
-            .map(|index| context.handle().be_log_contents(index))
+        // Task-create observations are emitted on stdout. The diagnostic view
+        // combines two streams and therefore cannot serve as an append cursor.
+        let before_stdout = (0..3)
+            .map(|index| context.handle().be_stdout_contents(index, usize::MAX))
             .collect::<Result<Vec<_>>>()?;
         let applied = stream
             .receive_buffer_bytes()
@@ -860,7 +862,13 @@ impl ContextRootRetention {
                                 root.as_ref().is_some_and(|root| root["channels"] == 1)
                             })
                             .context("held root has no exact backend")?;
-                        installed_root_protocol(context, &before_logs, occupied_be, self.0, &job)?;
+                        installed_root_protocol(
+                            context,
+                            &before_stdout,
+                            occupied_be,
+                            self.0,
+                            &job,
+                        )?;
                         if self.0 == RootProtocolMode::FinalAck {
                             let kill_deadline = Instant::now()
                                 + context
@@ -971,7 +979,7 @@ fn installed_root_request(
 
 fn installed_root_protocol(
     context: &mut ScenarioContext,
-    before_logs: &[String],
+    before_stdout: &[String],
     backend: usize,
     mode: RootProtocolMode,
     job: &tokio::task::JoinHandle<TextResultObservation>,
@@ -1067,12 +1075,12 @@ fn installed_root_protocol(
         "unsupported installed-root protocol freeze"
     );
     let deadline = Instant::now() + Duration::from_millis(freeze.phase_ms);
-    let after_logs = (0..3)
-        .map(|index| context.handle().be_log_contents(index))
+    let after_stdout = (0..3)
+        .map(|index| context.handle().be_stdout_contents(index, usize::MAX))
         .collect::<Result<Vec<_>>>()?;
     let candidates = super::result_delivery_root_protocol::parse_created_task_candidates(
-        before_logs,
-        &after_logs,
+        before_stdout,
+        &after_stdout,
         backend,
     )?;
     ensure!(

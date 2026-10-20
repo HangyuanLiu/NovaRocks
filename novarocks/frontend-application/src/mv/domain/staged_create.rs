@@ -1199,10 +1199,14 @@ impl AdmittedMvPublication {
         .map_err(|e| format!("encode MV publication record: {e}"))
     }
 
-    /// Close the publication's responsibility with the outcome the provider
-    /// actually reported.
+    /// Close either the local admission or the dispatched publication with
+    /// its actual outcome. A pre-dispatch refusal owns no external effect.
     pub(crate) fn record_terminal(self, disposition: EffectDisposition) -> Result<(), String> {
-        record_terminal(self.management, disposition)
+        self.management
+            .record_publication_terminal(disposition)
+            .map_err(|error| {
+                format!("record the MV publication terminal responsibility: {error:?}")
+            })
     }
 }
 
