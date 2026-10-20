@@ -186,6 +186,58 @@ class Run(unittest.TestCase):
         self.assertEqual(gap['status'],'not_run')
         self.assertIsNone(json.loads((attempt/'selection.json').read_text())['resume_exception'])
 
+    def test_regular_filter_compresses_full_native_binary_and_checks_membership(self):
+        listing={'rust-suites':{'p':{'testcases':{name:{'ignored':False,'filter-match':{'status':'matches'}}
+                    for name in ('regular','done')}}}}
+        listing['rust-suites']['p']['testcases']['helper']={'ignored':True,'filter-match':{'status':'mismatch'}}
+        bindings=json.loads((self.inputs/'test-artifacts.json').read_text())['binaries']
+        metadata={'p':self.metadata['packages'][0]}
+        all_scopes=[self.scope('rust-test','p::'+name) for name in ('regular','done')]
+        with mock.patch.object(run,'native_list',return_value=listing):
+            expression,actual=run._regular_expression(all_scopes,bindings,metadata,self.inputs,listing)
+        self.assertEqual(expression,'(package(=pkg) & binary(=pkg))')
+        self.assertEqual(set(actual),{scope.key for scope in all_scopes})
+        narrowed=json.loads(json.dumps(listing))
+        narrowed['rust-suites']['p']['testcases']['done']['filter-match']['status']='mismatch'
+        with mock.patch.object(run,'native_list',return_value=narrowed):
+            expression,_=run._regular_expression(all_scopes[:1],bindings,metadata,self.inputs,listing)
+        self.assertIn('test(=regular)',expression);self.assertNotIn('test(=done)',expression)
+        with mock.patch.object(run,'native_list',return_value=listing):
+            with self.assertRaisesRegex(ValueError,'changes requested'):
+                run._regular_expression(all_scopes[:1],bindings,metadata,self.inputs,listing)
+
+    def test_native_lib_module_prefix_is_not_guessed_as_an_integration_binary(self):
+        bindings={'p':{'package-id':'p','binary-name':'lib'},'p::exec':{'package-id':'p','binary-name':'exec'}}
+        listing={'rust-suites':{'p':{'testcases':{'exec::module::check':{'ignored':False}}},
+                               'p::exec':{'testcases':{'different_check':{'ignored':False}}}}}
+        value=self.scope('rust-test','p::exec::module::check')
+        expression=run._rust_expression(value,bindings,{'p':self.metadata['packages'][0]},listing)
+        self.assertIn('binary(=lib)',expression)
+        self.assertIn('test(=exec::module::check)',expression)
+        with self.assertRaisesRegex(ValueError,'no unique'):
+            run._rust_expression(value,bindings,{'p':self.metadata['packages'][0]})
+        listing['rust-suites']['p::exec']['testcases']['module::check']={'ignored':False}
+        with self.assertRaisesRegex(ValueError,'no unique'):
+            run._rust_expression(value,bindings,{'p':self.metadata['packages'][0]},listing)
+
+    def test_repeated_or_heavy_unit_requires_unique_native_selector(self):
+        bindings={key:{'package-id':'p','binary-name':'same'} for key in ('p::one','p::two')}
+        listing={'rust-suites':{key:{'testcases':{'check':{'ignored':False}}} for key in bindings}}
+        value=self.scope('rust-test','p::one::check')
+        self.assertEqual(run._rust_binding(value,bindings,listing),('p::one','check'))
+        with self.assertRaisesRegex(ValueError,'selector is not unique'):
+            run._rust_expression(value,bindings,{'p':self.metadata['packages'][0]},listing)
+
+    def test_large_complete_regular_binary_filter_has_bounded_argv(self):
+        names=['parser::session::case_%05d'%n for n in range(13228)]
+        listing={'rust-suites':{'p':{'testcases':{name:{'ignored':False,'filter-match':{'status':'matches'}} for name in names}}}}
+        values=[self.scope('rust-test','p::'+name) for name in names]
+        bindings=json.loads((self.inputs/'test-artifacts.json').read_text())['binaries']
+        with mock.patch.object(run,'native_list',return_value=listing):
+            expression,actual=run._regular_expression(values,bindings,{'p':self.metadata['packages'][0]},self.inputs,listing)
+        self.assertLess(len(expression.encode()),128)
+        self.assertEqual(len(actual),13228)
+
     def test_native_inventory_keeps_deferred_aggregate_scope_before_results(self):
         item={'name':'workspace nextest and doctests','tier':'admission','domain':['**']}
         self.native['stages']['stages']=[item]
@@ -289,13 +341,15 @@ class Run(unittest.TestCase):
         self.assertFalse(value['layer_ok'])
 
     def test_doc_exception_requires_matching_satisfied_regular_scope(self):
-        for mutation in ('identity','heavy','unselected','cleanup','counterexample'):
+        for mutation in ('identity','heavy','unselected','cleanup','counterexample','binding'):
             root,old,regular,doc=self.doc_resume_fixture('refuse-'+mutation)
             if mutation=='identity':regular.identity=dict(regular.identity,executable_sha256='changed')
             elif mutation=='heavy':regular.tier='heavy'
             elif mutation=='unselected':regular.selected=False
             elif mutation=='cleanup':
                 (old/'rust/rust-run/cleanup-summary.json').unlink()
+            elif mutation=='binding':
+                self.native['regular_inventory']={'rust-suites':{}}
             else:
                 junit=old/'rust/nextest/default/junit.xml'
                 junit.write_text('<testsuites><testsuite name="p"><testcase name="regular" classname="p"><failure/></testcase></testsuite></testsuites>')
@@ -303,6 +357,18 @@ class Run(unittest.TestCase):
                 _,_,attempt=run.execute(self.repo,root,self.native,self.chosen,[regular,doc],{doc.key})
                 executor.assert_not_called()
                 self.assertIsNone(json.loads((attempt/'selection.json').read_text())['resume_exception'])
+
+    def test_heavy_native_binding_refusal_is_recorded_and_composed(self):
+        heavy=self.scope('rust-test','missing::heavy',tier='heavy')
+        self.native['ignored_units']={heavy.key:{'class':'heavy','requires':['binary:novarocks']}}
+        with mock.patch.object(run,'_rust_batch') as batch:
+            value,_,attempt=run.execute(self.repo,self.base/'heavy-refusal',self.native,self.chosen,[heavy])
+        batch.assert_not_called()
+        self.assertFalse(value['layer_ok'])
+        errors=json.loads((attempt/'execution.json').read_text())['errors']
+        self.assertEqual(errors[0]['kind'],'rust-heavy')
+        self.assertIn('no unique binary/test binding',errors[0]['error'])
+        self.assertTrue((attempt/'result.json').is_file())
 
     def test_spawn_failure_has_no_fabricated_native_exit(self):
         attempt=run.exclusive(self.base/'spawn');put(attempt/'selection.json',{'schema':1})

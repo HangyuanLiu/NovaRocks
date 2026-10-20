@@ -138,6 +138,7 @@ def scopes(repo, native, chosen):
     inputs = Path(native['inputs'])
     listing = native_list(inputs, ignored='all')
     ignored = ignored_inventory(native, listing)
+    native['regular_inventory'] = listing
     selected = native_list(inputs, chosen['rust_filterset'], 'all') if chosen['rust_filterset'] else {'rust-suites':{}}
     env = rust_environment(repo, native)
     identity_inputs=exclusive(inputs.parent/'identity-inputs','target')
@@ -660,13 +661,59 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
     return checks
 
 
-def _rust_expression(scope, bindings, metadata):
+def _rust_binding(scope, bindings, listing=None):
     native_id=scope.units[0].id
-    binary=max((key for key in bindings if native_id.startswith(key+'::')),key=len)
-    name=native_id[len(binary)+2:]
+    candidates=[]
+    for binary in bindings:
+        if not native_id.startswith(binary+'::'):
+            continue
+        name=native_id[len(binary)+2:]
+        if listing is None or name in listing['rust-suites'].get(binary,{}).get('testcases',{}):
+            candidates.append((binary,name))
+    if len(candidates)!=1:
+        raise ValueError('native Rust unit has no unique binary/test binding: '+str(scope.units[0]))
+    return candidates[0]
+
+
+def _rust_expression(scope, bindings, metadata, listing=None):
+    binary,name=_rust_binding(scope,bindings,listing)
     binding=bindings[binary]
     package=metadata[binding['package-id']]['name']
+    for other,value in bindings.items():
+        if (other!=binary and value['package-id']==binding['package-id']
+                and value['binary-name']==binding['binary-name']
+                and (listing is None or name in listing['rust-suites'].get(other,{}).get('testcases',{}))):
+            raise ValueError('native package/binary/test selector is not unique: '+str(scope.units[0]))
     return '(package(={}) & binary(={}) & test(={}))'.format(package,binding['binary-name'],name)
+
+
+def _regular_expression(scopes, bindings, metadata, inputs, listing):
+    """Compress only complete native binaries, then verify exact native membership."""
+    wanted = {str(unit) for scope in scopes for unit in scope.units}
+    groups = {}
+    for scope in scopes:
+        binary,name = _rust_binding(scope, bindings, listing)
+        groups.setdefault(binary, []).append(name)
+    expressions = []
+    for binary, names in sorted(groups.items()):
+        binding = bindings[binary]
+        package = metadata[binding['package-id']]['name']
+        prefix = '(package(={}) & binary(={})'.format(package, binding['binary-name'])
+        all_regular = {name for name, case in listing['rust-suites'][binary]['testcases'].items()
+                       if not case.get('ignored')}
+        if set(names) == all_regular:
+            expressions.append(prefix+')')
+        else:
+            expressions.append(prefix+' & ('+' | '.join('test(={})'.format(name) for name in sorted(names))+'))')
+    expression = ' | '.join(expressions)
+    verified = native_list(inputs, expression)
+    actual = {'rust-test:'+binary+'::'+name
+              for binary, suite in verified['rust-suites'].items()
+              for name, case in suite['testcases'].items()
+              if not case.get('ignored') and case.get('filter-match', {}).get('status') == 'matches'}
+    if actual != wanted:
+        raise ValueError('compressed native filter changes requested regular scope membership')
+    return expression, sorted(actual)
 
 
 def _rust_batch(repo, attempt, output, expression, environment, ignored=False):
@@ -693,6 +740,7 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
     bindings=json.loads((Path(native['inputs'])/'test-artifacts.json').read_text())['binaries']
     metadata={package['id']:package for package in native['metadata']['packages']}
     exception=None
+    candidate_refusals=[]
     # An explicit resume plus a fresh composition is required. A caller-provided
     # pending set alone cannot establish that another scope was satisfied.
     if pending is not None and {scope.key for scope in selected} == {'rust-doctest:workspace'}:
@@ -703,15 +751,20 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
             candidates=sorted((scope for scope in scope_values if scope.selected and not scope.suspended
                                and scope.tier=='regular' and scope.units[0].kind=='rust-test'
                                and scope.key in satisfied),key=lambda scope:scope.key)
-            if candidates:
-                repeated=candidates[0]
+            for repeated in candidates:
+                try:
+                    expression=_rust_expression(repeated,bindings,metadata,native.get('regular_inventory'))
+                except ValueError as error:
+                    candidate_refusals.append({'scope':repeated.key,'error':str(error)})
+                    continue
                 selected.append(repeated)
                 exception={'kind':'doctest-only-native-batch',
                     'reason':'only workspace doctest remains; native G6a batch requires nonempty nextest',
                     'pending_scopes':['rust-doctest:workspace'],'repeated_satisfied_scopes':[repeated.key],
-                    'actual_filterset':_rust_expression(repeated,bindings,metadata),
+                    'actual_filterset':expression,
                     'prior_composition':str(prior_path),
                     'accepted_execution':satisfied[repeated.key]['accepted_execution']}
+                break
     attempt=exclusive(root)
     if exception:
         exception['batch_output']=str(attempt/'rust')
@@ -719,7 +772,7 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
     write_record(attempt/'selection.json',{'schema':1,'selection':chosen,
         'scopes':[scope_dict(scope) for scope in scope_values],
         'executed_scope_keys':sorted(selected_keys),'unselected_obligations':unselected_obligations(scope_values),
-        'resume_exception':exception})
+        'resume_exception':exception,'resume_candidate_refusals':candidate_refusals})
     errors=[]
     source_start=None
     try:
@@ -767,10 +820,19 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
             except (OSError,ValueError,subprocess.SubprocessError) as error:record_error('stage',workspace['name'],error=error)
             batch_attempted=True
         elif regular:
-            expression=' | '.join(_rust_expression(scope,bindings,metadata) for scope in regular)
-            code=_rust_batch(repo,attempt,attempt/'rust',expression,env)
             batch_attempted=True
-            if code!=0:record_error('rust-batch','regular native tests',code=code,error='executor did not start' if code is None else None)
+            try:
+                if not exception and native.get('regular_inventory') is not None:
+                    expression,verified=_regular_expression(regular,bindings,metadata,Path(native['inputs']),native['regular_inventory'])
+                    write_record(attempt/'regular-filter.json',{'schema':1,'actual_filterset':expression,
+                        'requested_scopes':sorted(scope.key for scope in regular),'native_selected_scopes':verified,
+                        'membership_equal':True,'filter_utf8_bytes':len(expression.encode())})
+                else:
+                    expression=' | '.join(_rust_expression(scope,bindings,metadata,native.get('regular_inventory')) for scope in regular)
+                code=_rust_batch(repo,attempt,attempt/'rust',expression,env)
+                if code!=0:record_error('rust-batch','regular native tests',code=code,error='executor did not start' if code is None else None)
+            except (OSError,ValueError,subprocess.SubprocessError) as error:
+                record_error('rust-batch','regular native tests',error=error)
         groups={}
         for scope in heavy:
             declaration=native.get('ignored_units',{}).get(str(scope.units[0]))
@@ -788,11 +850,14 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
                 continue
             groups.setdefault(tuple(sorted(requirements)),[]).append(scope)
         for index,group in enumerate(groups.values(),1):
-            expression=' | '.join(_rust_expression(scope,bindings,metadata) for scope in group)
             output=attempt/('rust-heavy-%04d'%index)
-            code=_rust_batch(repo,attempt,output,expression,env,ignored=True)
-            batch_attempted=True
-            if code!=0:record_error('rust-heavy',output.name,code=code,error='executor did not start' if code is None else None)
+            try:
+                expression=' | '.join(_rust_expression(scope,bindings,metadata,native.get('regular_inventory')) for scope in group)
+                code=_rust_batch(repo,attempt,output,expression,env,ignored=True)
+                batch_attempted=True
+                if code!=0:record_error('rust-heavy',output.name,code=code,error='executor did not start' if code is None else None)
+            except (OSError,ValueError,subprocess.SubprocessError) as error:
+                record_error('rust-heavy',output.name,error=error)
         if doc and not batch_attempted:
             reason='doctest-only resume has no eligible satisfied regular nextest scope, or other target obligations remain'
             write_record(attempt/'doctest-only-gap.json',{'schema':1,'scope':'rust-doctest:workspace',
